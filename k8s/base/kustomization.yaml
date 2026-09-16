@@ -8,4 +8,5 @@ resources:
   - runtime-config.yaml
   - deployments.yaml
   - services.yaml
+  - certificate.yaml
   - ingress.yaml

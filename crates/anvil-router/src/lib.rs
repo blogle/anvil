@@ -24,6 +24,7 @@ type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub base_domain: String,
+    pub namespace: String,
     pub upstream: Url,
     pub listen_addr: SocketAddr,
 }
@@ -41,11 +42,20 @@ impl Config {
         base_domain: impl Into<String>,
         upstream: impl AsRef<str>,
     ) -> Result<Self, ConfigError> {
+        Self::new_with_namespace(base_domain, "default", upstream)
+    }
+
+    fn new_with_namespace(
+        base_domain: impl Into<String>,
+        namespace: impl Into<String>,
+        upstream: impl AsRef<str>,
+    ) -> Result<Self, ConfigError> {
         let base_domain = base_domain
             .into()
             .trim()
             .trim_end_matches('.')
             .to_ascii_lowercase();
+        let namespace = namespace.into().trim().to_owned();
         if base_domain.is_empty()
             || base_domain.parse::<std::net::IpAddr>().is_ok()
             || base_domain.contains('/')
@@ -54,6 +64,12 @@ impl Config {
             return Err(ConfigError::Invalid {
                 field: "BASE_DOMAIN",
                 reason: "must be a DNS domain name".into(),
+            });
+        }
+        if namespace.is_empty() {
+            return Err(ConfigError::Invalid {
+                field: "ANVIL_NAMESPACE",
+                reason: "must not be empty".into(),
             });
         }
         let upstream = Url::parse(upstream.as_ref()).map_err(|error| ConfigError::Invalid {
@@ -75,14 +91,16 @@ impl Config {
             })?;
         Ok(Self {
             base_domain,
+            namespace,
             upstream,
             listen_addr,
         })
     }
 
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::new(
+        Self::new_with_namespace(
             env::var("BASE_DOMAIN").map_err(|_| ConfigError::Missing("BASE_DOMAIN"))?,
+            env::var("ANVIL_NAMESPACE").unwrap_or_else(|_| "default".into()),
             env::var("AGENT_SANDBOX_ROUTER_URL")
                 .map_err(|_| ConfigError::Missing("AGENT_SANDBOX_ROUTER_URL"))?,
         )
@@ -167,12 +185,17 @@ fn prepare_request(
     }
     headers.insert(
         "x-sandbox-id",
-        session
-            .to_string()
+        format!("anvil-{session}")
             .parse()
             .map_err(|_| StatusCode::BAD_GATEWAY)?,
     );
-    headers.insert("x-sandbox-namespace", "default".parse().unwrap());
+    headers.insert(
+        "x-sandbox-namespace",
+        config
+            .namespace
+            .parse()
+            .map_err(|_| StatusCode::BAD_GATEWAY)?,
+    );
     headers.insert("x-sandbox-port", port.get().to_string().parse().unwrap());
     Ok((request, session, port))
 }
@@ -213,7 +236,7 @@ pub async fn run(config: Config) -> Result<(), std::io::Error> {
         .json()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    info!(%addr, base_domain = %config.base_domain, upstream = %config.upstream, "anvil router listening");
+    info!(%addr, base_domain = %config.base_domain, namespace = %config.namespace, upstream = %config.upstream, "anvil router listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app(config))
         .with_graceful_shutdown(shutdown())

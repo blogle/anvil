@@ -19,4 +19,4 @@ patches:
     patch: |-
       - op: replace
         path: /spec/rules/0/host
-        value: '*.anvil.test'
+        value: '*.preview.thejeffer.net'

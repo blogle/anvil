@@ -5,7 +5,7 @@ use anvil_core::{
 };
 use async_trait::async_trait;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -26,14 +26,6 @@ use tracing::warn;
 
 const MANAGED: &str = "app.kubernetes.io/managed-by";
 const APP: &str = "app.kubernetes.io/name";
-const SESSION_LABEL: &str = "anvil.thejeffer.net/session";
-const PROJECT_LABEL: &str = "anvil.thejeffer.net/project";
-const A_PROJECT: &str = "anvil.thejeffer.net/project";
-const A_REPOSITORY: &str = "anvil.thejeffer.net/repository";
-const A_BASE_REF: &str = "anvil.thejeffer.net/base-ref";
-const A_WORK_BRANCH: &str = "anvil.thejeffer.net/work-branch";
-const A_OC_SESSION: &str = "anvil.thejeffer.net/opencode-session-id";
-const A_CREATED: &str = "anvil.thejeffer.net/created-at";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -45,6 +37,7 @@ pub struct Config {
     pub request_timeout: Duration,
     pub secret_name: Option<String>,
     pub preview_domain: String,
+    pub annotation_prefix: String,
 }
 impl Config {
     pub fn from_env() -> Result<Self, ServiceError> {
@@ -72,7 +65,12 @@ impl Config {
             secret_name: env::var("ANVIL_OPENCODE_ENV_SECRET")
                 .ok()
                 .filter(|v| !v.is_empty()),
-            preview_domain: get("ANVIL_PREVIEW_DOMAIN", "anvil.test"),
+            preview_domain: env::var("ANVIL_PREVIEW_DOMAIN")
+                .map_err(|_| ServiceError::Config("ANVIL_PREVIEW_DOMAIN is required".into()))?,
+            annotation_prefix: env::var("ANVIL_ANNOTATION_PREFIX")
+                .map_err(|_| ServiceError::Config("ANVIL_ANNOTATION_PREFIX is required".into()))?
+                .trim_end_matches('/')
+                .to_owned(),
         })
     }
 }
@@ -133,6 +131,11 @@ pub struct CreateRequest {
 pub struct PromptRequest {
     pub prompt: String,
 }
+#[derive(Debug, Deserialize)]
+pub struct DiffQuery {
+    #[serde(rename = "messageID")]
+    pub message_id: Option<String>,
+}
 
 #[async_trait]
 pub trait SandboxApi: Send + Sync + 'static {
@@ -184,18 +187,18 @@ fn sandbox_resource() -> ApiResource {
     ar("Sandbox", "sandboxes", "agents.x-k8s.io", "v1beta1")
 }
 
-fn labels(id: &str) -> Value {
-    let project = SessionId::parse(id)
-        .map(|session| session.project().to_owned())
-        .unwrap_or_default();
-    json!({MANAGED:"anvil", APP:"sandbox", SESSION_LABEL:id, PROJECT_LABEL:project})
+fn annotation_key(config: &Config, name: &str) -> String {
+    format!("{}/{}", config.annotation_prefix, name)
 }
-fn session_from(o: &DynamicObject) -> Result<Session, ServiceError> {
+fn labels() -> Value {
+    json!({MANAGED:"anvil", APP:"sandbox"})
+}
+fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceError> {
     let a = o.annotations();
-    let id = a
-        .get(SESSION_LABEL)
-        .or_else(|| a.get("anvil.dev/session"))
-        .cloned()
+    let id = o
+        .name_any()
+        .strip_prefix("anvil-")
+        .map(str::to_owned)
         .ok_or(ServiceError::NotFound)?;
     Ok(Session {
         id,
@@ -213,12 +216,26 @@ fn session_from(o: &DynamicObject) -> Result<Session, ServiceError> {
             .and_then(|v| v.get("phase"))
             .and_then(Value::as_str)
             .map(String::from),
-        project: a.get(A_PROJECT).cloned().unwrap_or_default(),
-        repository: a.get(A_REPOSITORY).cloned().unwrap_or_default(),
-        base_ref: a.get(A_BASE_REF).cloned().unwrap_or_default(),
-        work_branch: a.get(A_WORK_BRANCH).cloned().unwrap_or_default(),
-        model: a.get("anvil.thejeffer.net/model").cloned(),
-        opencode_session_id: a.get(A_OC_SESSION).cloned(),
+        project: a
+            .get(&annotation_key(config, "project"))
+            .cloned()
+            .unwrap_or_default(),
+        repository: a
+            .get(&annotation_key(config, "repository"))
+            .cloned()
+            .unwrap_or_default(),
+        base_ref: a
+            .get(&annotation_key(config, "base-ref"))
+            .cloned()
+            .unwrap_or_default(),
+        work_branch: a
+            .get(&annotation_key(config, "work-branch"))
+            .cloned()
+            .unwrap_or_default(),
+        model: a.get(&annotation_key(config, "model")).cloned(),
+        opencode_session_id: a
+            .get(&annotation_key(config, "opencode-session-id"))
+            .cloned(),
     })
 }
 #[async_trait]
@@ -238,9 +255,35 @@ impl SandboxApi for KubeSandboxApi {
         let ns = &self.config.namespace;
         let name = format!("anvil-{id}");
         let now = chrono_like_now();
-        let l = labels(id);
+        let l = labels();
         let work_branch = branch_name(&SessionId::parse(id).unwrap());
-        let annotations = json!({A_PROJECT:&r.project,A_REPOSITORY:&r.repository,A_BASE_REF:&r.base_ref,A_WORK_BRANCH:&work_branch,A_CREATED:now,"anvil.thejeffer.net/model":&r.model});
+        let mut annotations = serde_json::Map::new();
+        annotations.insert(
+            annotation_key(&self.config, "project"),
+            Value::String(r.project.clone()),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "repository"),
+            Value::String(r.repository.clone()),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "base-ref"),
+            Value::String(r.base_ref.clone()),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "work-branch"),
+            Value::String(work_branch.clone()),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "created-at"),
+            Value::String(now),
+        );
+        if let Some(model) = &r.model {
+            annotations.insert(
+                annotation_key(&self.config, "model"),
+                Value::String(model.clone()),
+            );
+        }
         // The prompt is deliberately not represented in this object (nor in logs).
         let mut container = json!({"name":"sandbox","image":self.config.image,"ports":[{"name":"opencode","containerPort":self.config.opencode_port}],"env":[{"name":"ANVIL_PROJECT","value":r.project},{"name":"ANVIL_REPOSITORY","value":r.repository},{"name":"ANVIL_REF","value":r.base_ref},{"name":"ANVIL_WORK_BRANCH","value":work_branch}],"volumeMounts":[{"name":"workspace","mountPath":"/workspace"}]});
         if let Some(secret) = &self.config.secret_name {
@@ -297,7 +340,12 @@ impl SandboxApi for KubeSandboxApi {
         .map_err(|e| ServiceError::Kubernetes(e.to_string()))
     }
     async fn set_opencode_session(&self, id: &str, oc: &str) -> Result<(), ServiceError> {
-        self.patch(id, json!({"metadata":{"annotations":{A_OC_SESSION:oc}}}))
+        let mut annotations = serde_json::Map::new();
+        annotations.insert(
+            annotation_key(&self.config, "opencode-session-id"),
+            Value::String(oc.to_owned()),
+        );
+        self.patch(id, json!({"metadata":{"annotations":annotations}}))
             .await
     }
 }
@@ -379,16 +427,16 @@ async fn create(
     let id = SessionId::new(&p).to_string();
     let mut sess = s.kube.create(&id, &r).await?;
     let mut obj = wait_ready(&s, &id).await?;
-    sess = session_from(&obj).unwrap_or(sess);
+    sess = session_from(&obj, &s.config).unwrap_or(sess);
     let oc = OpenCode::new(service_url(&sess, &s.config), s.config.request_timeout);
-    oc.health().await?;
+    wait_opencode(&oc, s.config.request_timeout).await?;
     let oc_id = oc.create_session().await?;
     s.kube.set_opencode_session(&id, &oc_id).await?;
     oc.prompt_async(&oc_id, prompt.as_str()).await?;
     obj = s.kube.get(&id).await?;
     Ok((
         StatusCode::CREATED,
-        Json(session_from(&obj).unwrap_or_else(|_| {
+        Json(session_from(&obj, &s.config).unwrap_or_else(|_| {
             sess.opencode_session_id = Some(oc_id);
             sess
         })),
@@ -420,6 +468,25 @@ async fn wait_ready(s: &AppState, id: &str) -> Result<DynamicObject, ServiceErro
         tokio::time::sleep(Duration::from_millis(250)).await
     }
 }
+
+async fn wait_opencode(opencode: &OpenCode, timeout: Duration) -> Result<(), ServiceError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    // A sandbox can be Ready before OpenCode has bound its port. Keep each
+    // probe short so a failed early TCP attempt does not consume provisioning.
+    let probe = OpenCode::new(opencode.base.to_string(), Duration::from_secs(5));
+    loop {
+        match probe.health().await {
+            Ok(()) => return Ok(()),
+            Err(error) if tokio::time::Instant::now() >= deadline => {
+                return Err(ServiceError::OpenCode(format!(
+                    "OpenCode health timed out: {error}"
+                )));
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
 fn service_url(sess: &Session, c: &Config) -> String {
     let host = if sess.service.is_empty() {
         format!("anvil-{}", sess.id)
@@ -434,7 +501,7 @@ async fn enumerate(State(s): State<AppState>) -> Result<Json<Vec<Session>>, Serv
             .list()
             .await?
             .iter()
-            .filter_map(|o| session_from(o).ok())
+            .filter_map(|o| session_from(o, &s.config).ok())
             .collect(),
     ))
 }
@@ -442,7 +509,7 @@ async fn session(
     Path(id): Path<String>,
     State(s): State<AppState>,
 ) -> Result<Json<Session>, ServiceError> {
-    Ok(Json(session_from(&s.kube.get(&id).await?)?))
+    Ok(Json(session_from(&s.kube.get(&id).await?, &s.config)?))
 }
 async fn suspend(
     Path(id): Path<String>,
@@ -471,7 +538,7 @@ async fn prompt(
     Json(r): Json<PromptRequest>,
 ) -> Result<Json<Value>, ServiceError> {
     let p = Prompt::new(&r.prompt).map_err(|e| ServiceError::Invalid(e.to_string()))?;
-    let x = session_from(&s.kube.get(&id).await?)?;
+    let x = session_from(&s.kube.get(&id).await?, &s.config)?;
     Ok(Json(
         OpenCode::new(service_url(&x, &s.config), s.config.request_timeout)
             .prompt_async(
@@ -488,17 +555,19 @@ async fn proxy(
     State(s): State<AppState>,
     op: &str,
     method: reqwest::Method,
+    query: Option<&str>,
 ) -> Result<Json<Value>, ServiceError> {
-    let x = session_from(&s.kube.get(&id).await?)?;
+    let x = session_from(&s.kube.get(&id).await?, &s.config)?;
     Ok(Json(
         OpenCode::new(service_url(&x, &s.config), s.config.request_timeout)
             .request(
                 &format!(
-                    "session/{}/{}",
+                    "session/{}/{}{}",
                     x.opencode_session_id
                         .as_deref()
                         .ok_or(ServiceError::NotFound)?,
-                    op
+                    op,
+                    query.map_or_else(String::new, |value| format!("?messageID={value}"))
                 ),
                 method,
                 None,
@@ -507,13 +576,13 @@ async fn proxy(
     ))
 }
 async fn messages(p: Path<String>, s: State<AppState>) -> Result<Json<Value>, ServiceError> {
-    proxy(p, s, "message", reqwest::Method::GET).await
+    proxy(p, s, "message", reqwest::Method::GET, None).await
 }
 async fn status(
     Path(id): Path<String>,
     State(s): State<AppState>,
 ) -> Result<Json<Value>, ServiceError> {
-    let x = session_from(&s.kube.get(&id).await?)?;
+    let x = session_from(&s.kube.get(&id).await?, &s.config)?;
     let v = OpenCode::new(service_url(&x, &s.config), s.config.request_timeout)
         .request("session/status", reqwest::Method::GET, None)
         .await?;
@@ -527,11 +596,15 @@ async fn status(
         .unwrap_or(Value::Null);
     Ok(Json(selected))
 }
-async fn diff(p: Path<String>, s: State<AppState>) -> Result<Json<Value>, ServiceError> {
-    proxy(p, s, "diff", reqwest::Method::GET).await
+async fn diff(
+    p: Path<String>,
+    Query(q): Query<DiffQuery>,
+    s: State<AppState>,
+) -> Result<Json<Value>, ServiceError> {
+    proxy(p, s, "diff", reqwest::Method::GET, q.message_id.as_deref()).await
 }
 async fn abort(p: Path<String>, s: State<AppState>) -> Result<Json<Value>, ServiceError> {
-    proxy(p, s, "abort", reqwest::Method::POST).await
+    proxy(p, s, "abort", reqwest::Method::POST, None).await
 }
 async fn preview(
     Path((id, port)): Path<(String, u16)>,
@@ -597,7 +670,7 @@ impl OpenCode {
         let r = q
             .send()
             .await
-            .map_err(|e| ServiceError::OpenCode(e.to_string()))?;
+            .map_err(|e| ServiceError::OpenCode(format!("{e:?}")))?;
         let st = r.status();
         let bytes = r
             .bytes()

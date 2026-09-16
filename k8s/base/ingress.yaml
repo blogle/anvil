@@ -6,6 +6,10 @@ metadata:
     kubernetes.io/ingress.class: traefik
     traefik.ingress.kubernetes.io/router.middlewares: auth-sso-auth@kubernetescrd,auth-sso-errors@kubernetescrd
 spec:
+  tls:
+    - hosts:
+        - '*.preview.thejeffer.net'
+      secretName: preview-thejeffer-net-tls
   rules:
     - host: '*.anvil.example.invalid'
       http:

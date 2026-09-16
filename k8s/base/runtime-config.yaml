@@ -9,6 +9,7 @@ data:
   ANVIL_WORKSPACE_SIZE: 20Gi
   ANVIL_PROVISION_TIMEOUT: "180"
   ANVIL_PREVIEW_DOMAIN: preview.thejeffer.net
+  ANVIL_ANNOTATION_PREFIX: anvil.thejeffer.net
   ANVIL_API_URL: http://anvild:8080
   BASE_DOMAIN: preview.thejeffer.net
   AGENT_SANDBOX_ROUTER_URL: http://sandbox-router-svc.agent-sandbox-system.svc.cluster.local:8080
