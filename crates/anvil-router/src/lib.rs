@@ -96,6 +96,7 @@ struct AppState {
 }
 
 pub fn app(config: Config) -> Router {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let connector = HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_or_http()

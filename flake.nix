@@ -5,9 +5,10 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     crane.url = "github:ipetkov/crane";
+    opencode.url = "github:anomalyco/opencode/v1.18.30";
   };
 
-  outputs = { self, nixpkgs, flake-utils, crane }:
+  outputs = { self, nixpkgs, flake-utils, crane, opencode }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
@@ -40,7 +41,7 @@
           experimental-features = nix-command flakes
           sandbox = false
         '';
-        opencode = pkgs.lib.attrByPath [ "opencode" ] null pkgs;
+        opencodePackage = opencode.packages.${system}.default;
         anvilImage = pkgs.dockerTools.buildLayeredImage {
           name = "anvil";
           tag = "dev";
@@ -56,7 +57,8 @@
           contents = [
             pkgs.bash pkgs.coreutils pkgs.curl pkgs.cacert pkgs.git pkgs.nix
             nixConf entrypoint
-          ] ++ pkgs.lib.optional (opencode != null) opencode;
+          opencodePackage
+          ];
           config = {
             Cmd = [ "/bin/sandbox-entrypoint" ];
             Env = [

@@ -4,6 +4,7 @@ metadata:
   name: anvil-runtime
 data:
   ANVIL_NAMESPACE: anvil
+  ANVIL_BIND_PORT: "8080"
   ANVIL_SANDBOX_IMAGE: anvil-sandbox:dev
   ANVIL_WORKSPACE_SIZE: 20Gi
   ANVIL_PROVISION_TIMEOUT: "180"

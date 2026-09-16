@@ -55,7 +55,7 @@ impl Config {
                 .unwrap_or_else(|| d.into())
         };
         Ok(Self {
-            bind_port: get("ANVILD_PORT", "8080")
+            bind_port: get("ANVIL_BIND_PORT", "8080")
                 .parse()
                 .map_err(|_| ServiceError::Config("ANVILD_PORT".into()))?,
             namespace: get("ANVIL_NAMESPACE", "anvil"),

@@ -59,6 +59,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "reqwest",
+ "rustls",
  "serde",
  "thiserror 2.0.20",
  "tokio",

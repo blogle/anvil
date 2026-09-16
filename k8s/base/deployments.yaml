@@ -12,6 +12,7 @@ spec:
       labels:
         app.kubernetes.io/name: anvild
     spec:
+      enableServiceLinks: false
       serviceAccountName: anvild
       containers:
         - name: anvild
@@ -50,6 +51,7 @@ spec:
         app.kubernetes.io/name: anvil-mcp
     spec:
       automountServiceAccountToken: false
+      enableServiceLinks: false
       containers:
         - name: mcp
           image: anvil:dev
@@ -86,6 +88,7 @@ spec:
         app.kubernetes.io/name: anvil-router
     spec:
       automountServiceAccountToken: false
+      enableServiceLinks: false
       containers:
         - name: router
           image: anvil:dev
