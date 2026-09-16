@@ -1,0 +1,29 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: anvild-sandbox
+rules:
+  - apiGroups:
+      - agents.x-k8s.io
+    resources:
+      - sandboxes
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: anvild-sandbox
+subjects:
+  - kind: ServiceAccount
+    name: anvild
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: anvild-sandbox

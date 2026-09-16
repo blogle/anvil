@@ -1,0 +1,26 @@
+[package]
+name = "anvild"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anvil-core.workspace = true
+anyhow = "1.0"
+async-trait = "0.1"
+axum = "0.7"
+k8s-openapi = { version = "0.23", features = ["v1_30"] }
+kube = { version = "0.95", features = ["client", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+httpmock = "0.7"

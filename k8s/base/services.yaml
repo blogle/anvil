@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: anvild
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: anvild
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: anvil-mcp
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: anvil-mcp
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: anvil-router
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: anvil-router
+  ports:
+    - name: http
+      port: 8082
+      targetPort: http

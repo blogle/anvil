@@ -1,0 +1,23 @@
+[package]
+name = "anvil-router"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anvil-core.workspace = true
+axum = { version = "0.7", features = ["macros"] }
+http-body-util = "0.1"
+hyper = { version = "1.5", features = ["http1", "http2", "server"] }
+hyper-rustls = { version = "0.27", features = ["http1", "http2", "ring", "webpki-roots"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+serde.workspace = true
+thiserror.workspace = true
+tokio = { version = "1.41", features = ["io-util", "macros", "net", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url.workspace = true
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

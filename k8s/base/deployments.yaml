@@ -1,0 +1,110 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anvild
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: anvild
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: anvild
+    spec:
+      serviceAccountName: anvild
+      containers:
+        - name: anvild
+          image: anvil:dev
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: anvil-runtime
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anvil-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: anvil-mcp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: anvil-mcp
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: mcp
+          image: anvil:dev
+          imagePullPolicy: Never
+          command: ["/bin/anvil-mcp"]
+          envFrom:
+            - configMapRef:
+                name: anvil-runtime
+          ports:
+            - name: http
+              containerPort: 8081
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anvil-router
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: anvil-router
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: anvil-router
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: router
+          image: anvil:dev
+          imagePullPolicy: Never
+          command: ["/bin/anvil-router"]
+          envFrom:
+            - configMapRef:
+                name: anvil-runtime
+          ports:
+            - name: http
+              containerPort: 8082
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi

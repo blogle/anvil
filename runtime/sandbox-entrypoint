@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Runtime bootstrap only: workspace is the persistent Sandbox PVC.
+set -euo pipefail
+
+: "${ANVIL_PROJECT:?ANVIL_PROJECT is required}"
+: "${ANVIL_REPOSITORY:?ANVIL_REPOSITORY is required}"
+: "${ANVIL_REF:?ANVIL_REF is required}"
+: "${ANVIL_WORK_BRANCH:?ANVIL_WORK_BRANCH is required}"
+
+export HOME=/workspace/home
+project_dir="/workspace/${ANVIL_PROJECT}"
+mkdir -p "$HOME"
+
+if [ ! -d "$project_dir/.git" ]; then
+  git clone --branch "$ANVIL_REF" --single-branch "$ANVIL_REPOSITORY" "$project_dir"
+  git -C "$project_dir" switch -c "$ANVIL_WORK_BRANCH"
+else
+  git -C "$project_dir" switch "$ANVIL_WORK_BRANCH"
+fi
+
+cd "$project_dir"
+exec opencode serve --hostname 0.0.0.0 --port 4096

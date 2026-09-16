@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: anvil-runtime
+data:
+  ANVIL_NAMESPACE: anvil
+  ANVIL_SANDBOX_IMAGE: anvil-sandbox:dev
+  ANVIL_WORKSPACE_SIZE: 20Gi
+  ANVIL_PROVISION_TIMEOUT: "180"
+  ANVIL_PREVIEW_DOMAIN: preview.thejeffer.net
+  ANVIL_API_URL: http://anvild:8080
+  BASE_DOMAIN: preview.thejeffer.net
+  AGENT_SANDBOX_ROUTER_URL: http://sandbox-router-svc.agent-sandbox-system.svc.cluster.local:8080
+  LISTEN_ADDR: 0.0.0.0:8082
+  RUST_LOG: info

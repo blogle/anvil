@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/anvil-core",
+  # Reserved for the service crates owned by the other delegates.
+  "crates/anvild",
+  "crates/anvil-mcp",
+  "crates/anvil-router",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.82"
+
+[workspace.dependencies]
+anvil-core = { path = "crates/anvil-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+getrandom = "0.2"
+uuid = { version = "1.11", features = ["serde", "v4"] }
+url = { version = "2.5", features = ["serde"] }
