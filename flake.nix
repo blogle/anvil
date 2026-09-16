@@ -35,6 +35,7 @@
         anvild = mkBinary "anvild";
         anvilMcp = mkBinary "anvil-mcp";
         anvilRouter = mkBinary "anvil-router";
+        anvilCtl = mkBinary "anvilctl";
         entrypoint = pkgs.writeShellScriptBin "sandbox-entrypoint"
           (builtins.readFile ./runtime/sandbox-entrypoint);
         nixConf = pkgs.writeTextDir "etc/nix/nix.conf" ''
@@ -82,11 +83,12 @@
         packages.anvild = anvild;
         packages.anvil-mcp = anvilMcp;
         packages.anvil-router = anvilRouter;
+        packages.anvilctl = anvilCtl;
         packages.anvil-image = anvilImage;
         packages.anvil-sandbox-image = sandboxImage;
 
         checks = {
-          fmt = craneLib.cargoFmt (commonArgs // { cargoExtraArgs = "--all"; });
+          fmt = craneLib.cargoFmt (commonArgs // { cargoFmtExtraArgs = "--all"; });
           clippy = craneLib.cargoClippy (commonArgs // {
             inherit cargoArtifacts;
             cargoClippyExtraArgs = "--workspace --all-targets --all-features -- -D warnings";

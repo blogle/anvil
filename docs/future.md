@@ -19,3 +19,13 @@ work, after platform compatibility is established, includes:
 Do not turn the vendored upstream manifest into an application resource. It is
 kept to pin and audit the required platform release, not to make Anvil an
 installer for a cluster-scoped controller.
+
+* Replace the single-node `ReadWriteOnce` profile PVC assumption with an
+  RWX-capable backend or a dedicated profile distribution service before
+  multi-node scheduling.
+* Centralize OpenCode OAuth refresh handling. Multiple sandboxes can currently
+  read/write the shared `auth.json`; simultaneous rotation of one OAuth refresh
+  token can race. Anvil intentionally does not add a credential broker,
+  distributed lock, or OpenCode patch in this PoC.
+* Add safe shared-profile configuration mutation and provider logout after the
+  installed OpenCode API exposes a reliable credential-removal operation.

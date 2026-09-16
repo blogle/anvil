@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: anvil-opencode-profile
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: openebs-zfspv
+  resources:
+    requests:
+      storage: 1Gi

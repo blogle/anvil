@@ -48,6 +48,7 @@ deploy:
     just load-images
     kubectl apply -k k8s/overlays/dev
     kubectl rollout status deployment/anvild -n anvil
+    kubectl rollout status deployment/anvil-profile -n anvil
     kubectl rollout status deployment/anvil-mcp -n anvil
     kubectl rollout status deployment/anvil-router -n anvil
     just status

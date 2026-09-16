@@ -6,8 +6,8 @@ kubectl kustomize k8s/overlays/dev
 ```
 
 The development overlay remains in the `anvil` namespace, retains
-`imagePullPolicy: Never`, and changes only the wildcard host to
-`*.anvil.test`. Build or load the three local images into every target node
+`imagePullPolicy: Never`, and selects the wildcard host
+`*.preview.thejeffer.net`. Build or load the local Anvil and sandbox images into every target node
 before any platform-approved deployment. The repository intentionally provides
 no apply script and this document does not instruct applying to the current
 cluster.
@@ -33,3 +33,25 @@ The first command is server-side validation only. The expected authorization
 results are `yes` for Sandbox creation and `no` for Pod reads. Do not run this
 against the currently observed incompatible cluster, and do not use it as an
 upgrade procedure.
+
+## Operator workflow
+
+After Anvil is deployed, use the client rather than `kubectl` or `just` for
+normal administration:
+
+```sh
+anvilctl providers list
+anvilctl providers login openai
+anvilctl sessions list
+anvilctl sessions create --project dojo2 --repository https://github.com/blogle/dojo2.git --ref main --prompt "Inspect the repository."
+```
+
+`anvilctl --server URL` overrides `ANVIL_URL`. The client also supports
+`--json` for scripting. `sessions attach` is the deliberate exception: it
+queries `anvild`, then temporarily uses local `kubectl port-forward` and the
+installed `opencode` binary to attach a TUI.
+
+The shared profile is stored in `anvil-opencode-profile`, mounted at
+`/anvil/profile`, and reused by the singleton `anvil-profile` deployment and
+new Agent Sandboxes. The current ZFS storage is single-node `ReadWriteOnce`,
+not RWX; do not schedule this PoC across multiple nodes.

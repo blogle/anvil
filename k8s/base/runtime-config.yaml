@@ -10,6 +10,8 @@ data:
   ANVIL_PROVISION_TIMEOUT: "180"
   ANVIL_PREVIEW_DOMAIN: preview.thejeffer.net
   ANVIL_ANNOTATION_PREFIX: anvil.thejeffer.net
+  ANVIL_PROFILE_PVC: anvil-opencode-profile
+  ANVIL_PROFILE_OPENCODE_URL: http://anvil-profile.anvil.svc.cluster.local:4096
   ANVIL_API_URL: http://anvild:8080
   BASE_DOMAIN: preview.thejeffer.net
   AGENT_SANDBOX_ROUTER_URL: http://sandbox-router-svc.agent-sandbox-system.svc.cluster.local:8080

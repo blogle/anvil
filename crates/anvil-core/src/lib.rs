@@ -206,6 +206,66 @@ impl Port {
     }
 }
 
+// ── HTTP API contracts ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Session {
+    pub id: String,
+    pub sandbox: String,
+    pub service: String,
+    pub namespace: String,
+    pub opencode_port: u16,
+    pub phase: Option<String>,
+    pub project: String,
+    pub repository: String,
+    #[serde(rename = "ref")]
+    pub base_ref: String,
+    pub work_branch: String,
+    pub model: Option<String>,
+    pub opencode_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAuthMethod {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSummary {
+    pub id: String,
+    pub name: String,
+    pub authenticated: bool,
+    pub auth_methods: Vec<ProviderAuthMethod>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderListResponse {
+    pub providers: Vec<ProviderSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginFlow {
+    pub login_id: String,
+    pub provider: String,
+    pub state: String,
+    pub verification_url: Option<String>,
+    pub user_code: Option<String>,
+    pub method: String,
+    pub instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderStatus {
+    pub provider: String,
+    pub authenticated: bool,
+}
+
 // ── SessionId ────────────────────────────────────────────────────────
 // Format: `<normalized-project>-<8 random hex chars>`
 

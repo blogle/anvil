@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anvil-profile
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: anvil-profile
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: anvil-profile
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      containers:
+        - name: opencode
+          image: anvil-sandbox:dev
+          imagePullPolicy: Never
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              profile=/anvil/profile
+              auth="$profile/auth/auth.json"
+              mkdir -p "$profile/config" "$profile/auth" "$HOME/.local/share/opencode"
+              if [ ! -e "$auth" ]; then (umask 077; : > "$auth"); fi
+              chmod 600 "$auth"
+              link="$HOME/.local/share/opencode/auth.json"
+              if [ -L "$link" ]; then
+                [ "$(readlink "$link")" = "$auth" ] || ln -sfn "$auth" "$link"
+              elif [ ! -e "$link" ]; then
+                ln -s "$auth" "$link"
+              fi
+              if [ ! -e "$profile/config/opencode.jsonc" ]; then
+                printf '{}\n' > "$profile/config/opencode.jsonc"
+              fi
+              exec opencode serve --hostname 0.0.0.0 --port 4096
+          env:
+            - name: HOME
+              value: /tmp/anvil-profile-home
+            - name: OPENCODE_CONFIG
+              value: /anvil/profile/config/opencode.jsonc
+            - name: OPENCODE_CONFIG_DIR
+              value: /anvil/profile/config
+          ports:
+            - name: opencode
+              containerPort: 4096
+          volumeMounts:
+            - name: profile
+              mountPath: /anvil/profile
+          readinessProbe:
+            httpGet:
+              path: /global/health
+              port: opencode
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /global/health
+              port: opencode
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1
+              memory: 1Gi
+      volumes:
+        - name: profile
+          persistentVolumeClaim:
+            claimName: anvil-opencode-profile

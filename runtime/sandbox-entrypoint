@@ -10,6 +10,26 @@ set -euo pipefail
 export HOME=/workspace/home
 project_dir="/workspace/${ANVIL_PROJECT}"
 mkdir -p "$HOME"
+profile_dir=/anvil/profile
+mkdir -p "$profile_dir/config" "$profile_dir/auth" "$HOME/.local/share/opencode"
+if [ ! -e "$profile_dir/config/opencode.jsonc" ]; then
+  printf '{}\n' > "$profile_dir/config/opencode.jsonc"
+fi
+profile_auth="$profile_dir/auth/auth.json"
+if [ ! -e "$profile_auth" ]; then
+  (umask 077; : > "$profile_auth")
+fi
+chmod 600 "$profile_auth"
+auth_link="$HOME/.local/share/opencode/auth.json"
+if [ -L "$auth_link" ]; then
+  if [ "$(readlink "$auth_link")" != "$profile_auth" ]; then
+    ln -sfn "$profile_auth" "$auth_link"
+  fi
+elif [ ! -e "$auth_link" ]; then
+  ln -s "$profile_auth" "$auth_link"
+else
+  echo "warning: preserving existing sandbox OpenCode auth.json" >&2
+fi
 
 if [ ! -d "$project_dir/.git" ]; then
   git clone --branch "$ANVIL_REF" --single-branch "$ANVIL_REPOSITORY" "$project_dir"

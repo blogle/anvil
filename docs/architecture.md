@@ -31,3 +31,45 @@ in-place upgrade, or infer that the v0.5.3 CRDs/controllers are API-compatible.
 A platform owner must evaluate the upstream upgrade and router installation
 separately, with backup, compatibility, and rollback plans. No live-cluster
 operation is part of this repository.
+
+## OpenCode profile
+
+Anvil has one persistent OpenCode profile at `/anvil/profile`. The profile
+contains global OpenCode configuration and administrator-managed provider
+credentials, plus shared agents, commands, skills, and plugins. Individual
+session databases, conversations, logs, working trees, and project state remain
+on each Sandbox's private `/workspace` claim.
+
+```text
+anvilctl -> anvild -> anvil-profile (singleton OpenCode server)
+                         |
+                  anvil-opencode-profile PVC
+                         |
+              +----------+----------+
+              |                     |
+           Sandbox A             Sandbox B
+           OpenCode              OpenCode
+```
+
+The profile OpenCode service is ClusterIP-only and is never exposed through the
+preview Ingress. Its NetworkPolicy permits port 4096 only from `anvild`, and
+the profile pod has no Kubernetes service-account token. `anvild` is its only
+normal client. Workers receive
+`OPENCODE_CONFIG=/anvil/profile/config/opencode.jsonc` and
+`OPENCODE_CONFIG_DIR=/anvil/profile/config`. Their private
+`/workspace/home/.local/share/opencode/auth.json` is a symlink to the shared
+profile auth file; no other OpenCode data directory is shared. Existing local
+worker auth files are preserved rather than overwritten. The current
+single-node RWO fallback necessarily gives worker pods access to the mounted
+profile contents so OpenCode can refresh credentials; treat Anvil sandboxes as
+trusted until a mediated profile distribution mechanism replaces this PoC.
+
+## Storage access decision
+
+The required live checks reported one node (`nandstorm`), OpenEBS ZFS CSI
+(`zfs.csi.openebs.io`), and only `Persistent` CSI volume modes. Existing ZFS
+PVCs are `ReadWriteOnce`; RWX is not available. Anvil therefore uses the
+`anvil-opencode-profile` PVC with `ReadWriteOnce` on this deliberately
+single-node homelab. Multiple pods can mount it because they remain on the same
+node, but this is not a portable multi-node deployment. A future multi-node
+deployment needs an RWX-capable backend or a profile distribution service.

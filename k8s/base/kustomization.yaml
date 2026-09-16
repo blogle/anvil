@@ -6,7 +6,10 @@ resources:
   - service-account.yaml
   - rbac.yaml
   - runtime-config.yaml
+  - opencode-profile-pvc.yaml
   - deployments.yaml
+  - anvil-profile-deployment.yaml
   - services.yaml
+  - anvil-profile-service.yaml
   - certificate.yaml
   - ingress.yaml
