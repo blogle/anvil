@@ -7,10 +7,10 @@ work, after platform compatibility is established, includes:
   retain immutable production image digests.
 * Define real probes, route contracts, and NetworkPolicies from implemented
   service behavior instead of speculative configuration.
-* Have the platform team separately assess Agent Sandbox v1.0.2 migration,
-  compatible Sandbox Router deployment, CRD conversion/storage effects,
-  runtime-class requirements, backups, and rollback.
-* Add environment-specific TLS, hostname, and secret references through
+* Have the platform team separately assess Agent Sandbox upgrades, compatible
+  Sandbox Router deployment, CRD conversion/storage effects, runtime-class
+  requirements, backups, and rollback.
+* Keep environment-specific TLS, hostname, storage, and secret references in
   reviewed overlays. Secrets and Kubernetes credentials must remain absent from
   MCP and router pods.
 * Add policy and render validation in CI after the repository adopts a CI

@@ -5,19 +5,18 @@ Render without contacting a cluster:
 kubectl kustomize k8s/overlays/dev
 ```
 
-The development overlay remains in the `anvil` namespace and selects the
-wildcard host `*.preview.thejeffer.net`. It pulls the public `main` images from
-GHCR; immutable SHA tags should be selected by an environment-specific overlay
-for a controlled deployment. The repository intentionally provides no apply
-script and this document does not instruct applying to the current cluster.
+The development overlay remains in the `anvil` namespace and renders the
+portable base with placeholder preview values. It pulls the public `main`
+images from GHCR; immutable SHA tags should be selected by an
+environment-specific overlay for a controlled deployment. Hostnames, TLS,
+Ingress, middleware, storage classes, and platform service URLs belong in that
+overlay.
 
 Before a platform owner considers a deployment, independently verify all of:
 
 * Agent Sandbox v1.0.2 CRDs and controller are installed and healthy.
 * The compatible Sandbox Router exists at
   `sandbox-router.agent-sandbox-system.svc.cluster.local`.
-* Traefik supports `traefik.ingress.kubernetes.io/router.middlewares` and the
-  observed `auth/sso-auth` and `auth/sso-errors` Middleware CRDs exist.
 * Each node that can schedule Anvil can pull the two required public GHCR
   images.
 
@@ -30,9 +29,8 @@ kubectl auth can-i --as=system:serviceaccount:anvil:anvild get pods -n anvil
 ```
 
 The first command is server-side validation only. The expected authorization
-results are `yes` for Sandbox creation and `no` for Pod reads. Do not run this
-against the currently observed incompatible cluster, and do not use it as an
-upgrade procedure.
+results are `yes` for Sandbox creation and `no` for Pod reads. Do not apply the
+vendored Agent Sandbox asset through this repository.
 
 ## Operator workflow
 

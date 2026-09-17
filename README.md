@@ -8,8 +8,10 @@ The application manifests live under `k8s/`. `k8s/base` creates the `anvil`
 namespace, `anvild` service account and narrowly scoped Sandbox RBAC, runtime
 configuration, the persistent OpenCode profile PVC, the singleton
 `anvil-profile` OpenCode Deployment/Service, the `anvild`/MCP/router
-Deployments and Services, and a Traefik wildcard Ingress. `k8s/overlays/dev`
-selects the development hostname.
+Deployments and Services. The base deliberately does not include an Ingress,
+Certificate, storage-class selection, or other platform-specific resources;
+those belong in an environment repository's overlay. `k8s/overlays/dev`
+renders the base with portable placeholder runtime values.
 The normal deployment pulls public images from `ghcr.io/blogle/anvil` and
 `ghcr.io/blogle/anvil-sandbox`. The GitHub Actions workflow publishes immutable
 SHA tags plus the `main` and `latest` tags.
@@ -19,11 +21,11 @@ The pinned, unmodified Agent Sandbox v1.0.2 core release asset is vendored at
 Anvil does not install or change Agent Sandbox. Its provenance and checksum are
 in the adjacent README.
 
-The currently observed cluster is blocked: it has controller v0.5.3, not the
-required v1.0.2, and has no Sandbox Router. Do not apply the vendor asset or
-attempt an unsafe upgrade. See [architecture](docs/architecture.md),
+Agent Sandbox and Sandbox Router are platform prerequisites and are not
+installed by these manifests. See [architecture](docs/architecture.md),
 [runtime/API contract](docs/api.md), [development](docs/development.md), and
-[future work](docs/future.md) for boundaries and compatible-cluster checks.
+[future work](docs/future.md) for the deployment boundary and compatibility
+checks.
 
 ## Operator client
 

@@ -11,5 +11,3 @@ resources:
   - anvil-profile-deployment.yaml
   - services.yaml
   - anvil-profile-service.yaml
-  - certificate.yaml
-  - ingress.yaml

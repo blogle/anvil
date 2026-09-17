@@ -61,8 +61,8 @@ logs service:
     kubectl logs -n anvil deployment/{{service}} -f
 
 smoke:
-    @echo "Blocked: the installed Agent Sandbox controller is v0.5.3; required v1.0.2 router is absent. See docs/future.md."
-    exit 1
+    kubectl auth can-i --as=system:serviceaccount:anvil:anvild create sandboxes.agents.x-k8s.io -n anvil
+    kubectl auth can-i --as=system:serviceaccount:anvil:anvild get pods -n anvil
 
 smoke-clean:
     kubectl delete sandbox -n anvil -l app.kubernetes.io/managed-by=anvil
