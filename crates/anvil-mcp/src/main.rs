@@ -261,7 +261,10 @@ async fn main() -> anyhow::Result<()> {
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts()),
+        StreamableHttpServerConfig::default()
+            .with_allowed_hosts(allowed_hosts())
+            .with_legacy_session_mode(false)
+            .with_json_response(true),
     );
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
