@@ -20,13 +20,13 @@ jobs:
         run: |
           set -euo pipefail
           kubectl kustomize k8s/overlays/dev > /tmp/anvil-rendered.yaml
-          if rg -n 'image: (anvil(:|/)|anvil-sandbox:)|imagePullPolicy: Never' /tmp/anvil-rendered.yaml; then
+          if grep -En 'image: (anvil(:|/)|anvil-sandbox:)|imagePullPolicy: Never' /tmp/anvil-rendered.yaml; then
             echo 'rendered manifests contain a local image or Never pull policy'
             exit 1
           fi
-          rg -n 'image: ghcr.io/blogle/anvil:main' /tmp/anvil-rendered.yaml
-          rg -n 'image: ghcr.io/blogle/anvil-sandbox:main' /tmp/anvil-rendered.yaml
-          rg -n 'ANVIL_SANDBOX_IMAGE: ghcr.io/blogle/anvil-sandbox:main' /tmp/anvil-rendered.yaml
+          grep -En 'image: ghcr.io/blogle/anvil:main' /tmp/anvil-rendered.yaml
+          grep -En 'image: ghcr.io/blogle/anvil-sandbox:main' /tmp/anvil-rendered.yaml
+          grep -En 'ANVIL_SANDBOX_IMAGE: ghcr.io/blogle/anvil-sandbox:main' /tmp/anvil-rendered.yaml
 
   build:
     name: Build images
