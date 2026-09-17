@@ -57,6 +57,9 @@ spec:
           image: ghcr.io/blogle/anvil:main
           imagePullPolicy: Always
           command: ["/bin/anvil-mcp"]
+          env:
+            - name: MCP_ALLOWED_HOSTS
+              value: localhost,127.0.0.1,anvil-mcp,anvil-mcp:8081,anvil-mcp.anvil.svc,anvil-mcp.anvil.svc:8081,anvil-mcp.anvil.svc.cluster.local,anvil-mcp.anvil.svc.cluster.local:8081
           envFrom:
             - configMapRef:
                 name: anvil-runtime

@@ -237,6 +237,21 @@ impl ServerHandler for AnvilMcp {
     }
 }
 
+fn allowed_hosts() -> Vec<String> {
+    env::var("MCP_ALLOWED_HOSTS")
+        .ok()
+        .map(|hosts| {
+            hosts
+                .split(',')
+                .map(str::trim)
+                .filter(|host| !host.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .filter(|hosts: &Vec<String>| !hosts.is_empty())
+        .unwrap_or_else(|| vec!["localhost".into(), "127.0.0.1".into()])
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().json().init();
@@ -246,7 +261,7 @@ async fn main() -> anyhow::Result<()> {
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default(),
+        StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts()),
     );
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
