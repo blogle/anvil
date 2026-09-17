@@ -139,13 +139,13 @@ impl ApiClient {
     async fn begin_login(
         &self,
         provider: &str,
-        method: usize,
+        method: &str,
         inputs: HashMap<String, String>,
     ) -> Result<LoginFlow> {
         self.request(
             Method::POST,
             &format!("v1/providers/{provider}/login"),
-            Some(serde_json::json!({"method":method.to_string(),"inputs":inputs})),
+            Some(serde_json::json!({"method":method,"inputs":inputs})),
         )
         .await
     }
@@ -154,6 +154,7 @@ impl ApiClient {
         &self,
         flow: &LoginFlow,
         code: Option<String>,
+        key: Option<String>,
     ) -> Result<ProviderStatus> {
         self.request(
             Method::POST,
@@ -161,7 +162,7 @@ impl ApiClient {
                 "v1/providers/{}/login/{}/complete",
                 flow.provider, flow.login_id
             ),
-            Some(serde_json::json!({"code":code})),
+            Some(serde_json::json!({"code":code,"key":key})),
         )
         .await
     }
@@ -197,60 +198,111 @@ pub async fn run(cli: Cli) -> Result<()> {
                     .iter()
                     .find(|candidate| candidate.id == provider)
                     .with_context(|| format!("unknown provider: {provider}"))?;
-                let selected = method.as_deref().and_then(|requested| {
+                let requested = method.as_deref();
+                let selected = requested.and_then(|requested| {
                     requested.parse::<usize>().ok().or_else(|| {
                         provider_info.auth_methods.iter().position(|candidate| {
-                            candidate.kind == "oauth"
-                                && candidate.label.eq_ignore_ascii_case(requested)
+                            candidate.label.eq_ignore_ascii_case(requested)
+                                || candidate.kind.eq_ignore_ascii_case(requested)
+                                || (requested.eq_ignore_ascii_case("api-key")
+                                    && candidate.kind.eq_ignore_ascii_case("api_key"))
                         })
                     })
                 });
-                let method_index = selected.unwrap_or_else(|| {
-                    provider_info
-                        .auth_methods
-                        .iter()
-                        .position(|candidate| candidate.kind == "oauth")
-                        .unwrap_or(usize::MAX)
-                });
-                let selected_method =
-                    provider_info
-                        .auth_methods
-                        .get(method_index)
+                let method_index = selected
+                    .or_else(|| {
+                        provider_info.auth_methods.iter().position(|candidate| {
+                            candidate.kind == "oauth"
+                                && candidate.label.to_ascii_lowercase().contains("headless")
+                        })
+                    })
+                    .or_else(|| {
+                        provider_info
+                            .auth_methods
+                            .iter()
+                            .position(|candidate| candidate.kind == "oauth")
+                    });
+                let use_api_key = requested.is_some_and(|requested| {
+                    requested.eq_ignore_ascii_case("api")
+                        || requested.eq_ignore_ascii_case("api-key")
+                        || requested.eq_ignore_ascii_case("api_key")
+                }) || method_index
+                    .and_then(|index| provider_info.auth_methods.get(index))
+                    .is_some_and(|candidate| {
+                        candidate.kind == "api" || candidate.kind == "api_key"
+                    })
+                    || (requested.is_none() && method_index.is_none());
+                if use_api_key && !provider_info.api_key_available {
+                    return Err(anyhow!(
+                        "provider {provider} does not advertise API-key authentication"
+                    ));
+                }
+                let method_name = if use_api_key {
+                    "api".to_owned()
+                } else {
+                    method_index
                         .with_context(|| {
-                            format!("provider {provider} has no OAuth authentication method")
-                        })?;
-                if selected_method.kind != "oauth" {
-                    return Err(anyhow!("provider authentication method is not OAuth"));
-                }
-                let inputs = collect_prompt_inputs(selected_method.prompts.as_ref())?;
-                let flow = client.begin_login(&provider, method_index, inputs).await?;
-                println!("{} OAuth", provider_name(&provider));
-                if let Some(url) = &flow.verification_url {
-                    println!("\nOpen this URL in your browser:\n\n{url}");
-                }
-                if let Some(code) = &flow.user_code {
-                    println!("\nEnter code:\n\n{code}");
-                }
-                if let Some(instructions) = &flow.instructions {
-                    println!("\n{instructions}");
-                }
-                let code = if flow.method == "code" {
-                    print!("\nEnter authorization code: ");
-                    io::stdout().flush()?;
-                    let mut input = String::new();
-                    io::stdin().read_line(&mut input)?;
-                    Some(input.trim().to_owned())
-                } else {
-                    None
+                            format!("provider {provider} has no supported authentication method")
+                        })?
+                        .to_string()
                 };
-                println!("\nWaiting for authorization...");
-                let result = client.complete_login(&flow, code).await?;
-                if cli.json {
-                    println!("{}", serde_json::to_string_pretty(&result)?);
-                } else if result.authenticated {
-                    println!("Authenticated successfully.");
+                let inputs = if use_api_key {
+                    HashMap::new()
                 } else {
-                    return Err(anyhow!("provider authentication did not complete"));
+                    let selected_method = method_index
+                        .and_then(|index| provider_info.auth_methods.get(index))
+                        .with_context(|| {
+                            format!("invalid authentication method for provider {provider}")
+                        })?;
+                    if selected_method.kind != "oauth" {
+                        return Err(anyhow!(
+                            "provider authentication method is not OAuth or API key"
+                        ));
+                    }
+                    collect_prompt_inputs(selected_method.prompts.as_ref())?
+                };
+                let flow = client.begin_login(&provider, &method_name, inputs).await?;
+                if flow.method == "api_key" {
+                    println!("{} API key", provider_name(&provider));
+                    let key = rpassword::prompt_password("Enter API key: ")?;
+                    println!("\nSubmitting API key...");
+                    let result = client.complete_login(&flow, None, Some(key)).await?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else if result.authenticated {
+                        println!("Authenticated successfully.");
+                    } else {
+                        return Err(anyhow!("provider authentication did not complete"));
+                    }
+                } else {
+                    println!("{} OAuth", provider_name(&provider));
+                    if let Some(url) = &flow.verification_url {
+                        println!("\nOpen this URL in your browser:\n\n{url}");
+                    }
+                    if let Some(code) = &flow.user_code {
+                        println!("\nEnter code:\n\n{code}");
+                    }
+                    if let Some(instructions) = &flow.instructions {
+                        println!("\n{instructions}");
+                    }
+                    let code = if flow.method == "code" {
+                        print!("\nEnter authorization code: ");
+                        io::stdout().flush()?;
+                        let mut input = String::new();
+                        io::stdin().read_line(&mut input)?;
+                        Some(input.trim().to_owned())
+                    } else {
+                        None
+                    };
+                    println!("\nWaiting for authorization...");
+                    let result = client.complete_login(&flow, code, None).await?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else if result.authenticated {
+                        println!("Authenticated successfully.");
+                    } else {
+                        return Err(anyhow!("provider authentication did not complete"));
+                    }
                 }
             }
         },
@@ -543,18 +595,18 @@ mod tests {
         let complete = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/v1/providers/openai/login/login-1/complete")
-                .json_body(serde_json::json!({"code":"ABCD"}));
+                .json_body(serde_json::json!({"code":"ABCD","key":null}));
             then.status(200).json_body(serde_json::json!({
                 "provider":"openai","authenticated":true
             }));
         });
         let client = ApiClient::new(&server.base_url()).unwrap();
         let flow = client
-            .begin_login("openai", 0, HashMap::new())
+            .begin_login("openai", "0", HashMap::new())
             .await
             .unwrap();
         let result = client
-            .complete_login(&flow, Some("ABCD".into()))
+            .complete_login(&flow, Some("ABCD".into()), None)
             .await
             .unwrap();
         begin.assert_async().await;

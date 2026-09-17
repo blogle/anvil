@@ -16,8 +16,8 @@ spec:
       enableServiceLinks: false
       containers:
         - name: opencode
-          image: anvil-sandbox:dev
-          imagePullPolicy: Never
+          image: ghcr.io/blogle/anvil-sandbox:main
+          imagePullPolicy: Always
           command: ["/bin/bash", "-c"]
           args:
             - |

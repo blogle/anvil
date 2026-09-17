@@ -5,12 +5,11 @@ Render without contacting a cluster:
 kubectl kustomize k8s/overlays/dev
 ```
 
-The development overlay remains in the `anvil` namespace, retains
-`imagePullPolicy: Never`, and selects the wildcard host
-`*.preview.thejeffer.net`. Build or load the local Anvil and sandbox images into every target node
-before any platform-approved deployment. The repository intentionally provides
-no apply script and this document does not instruct applying to the current
-cluster.
+The development overlay remains in the `anvil` namespace and selects the
+wildcard host `*.preview.thejeffer.net`. It pulls the public `main` images from
+GHCR; immutable SHA tags should be selected by an environment-specific overlay
+for a controlled deployment. The repository intentionally provides no apply
+script and this document does not instruct applying to the current cluster.
 
 Before a platform owner considers a deployment, independently verify all of:
 
@@ -19,7 +18,8 @@ Before a platform owner considers a deployment, independently verify all of:
   `sandbox-router.agent-sandbox-system.svc.cluster.local`.
 * Traefik supports `traefik.ingress.kubernetes.io/router.middlewares` and the
   observed `auth/sso-auth` and `auth/sso-errors` Middleware CRDs exist.
-* Each node that can schedule Anvil has the three `:dev` images.
+* Each node that can schedule Anvil can pull the two required public GHCR
+  images.
 
 Only after those checks pass, a small, platform-owner-run smoke strategy is:
 

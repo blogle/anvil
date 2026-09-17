@@ -10,8 +10,9 @@ configuration, the persistent OpenCode profile PVC, the singleton
 `anvil-profile` OpenCode Deployment/Service, the `anvild`/MCP/router
 Deployments and Services, and a Traefik wildcard Ingress. `k8s/overlays/dev`
 selects the development hostname.
-All images use `imagePullPolicy: Never` and therefore must be present locally
-on eligible nodes.
+The normal deployment pulls public images from `ghcr.io/blogle/anvil` and
+`ghcr.io/blogle/anvil-sandbox`. The GitHub Actions workflow publishes immutable
+SHA tags plus the `main` and `latest` tags.
 
 The pinned, unmodified Agent Sandbox v1.0.2 core release asset is vendored at
 `k8s/vendor/agent-sandbox/v1.0.2/sandbox.yaml`. It is not a Kustomize resource:
@@ -32,6 +33,7 @@ then authenticate Anvil once:
 ```sh
 anvilctl providers list
 anvilctl providers login openai
+anvilctl providers login opencode-go --method api
 anvilctl sessions create --project dojo2 --repository https://github.com/blogle/dojo2.git --ref main --prompt "Inspect the repository."
 ```
 

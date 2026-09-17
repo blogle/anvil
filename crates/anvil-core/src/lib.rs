@@ -240,6 +240,8 @@ pub struct ProviderSummary {
     pub name: String,
     pub authenticated: bool,
     pub auth_methods: Vec<ProviderAuthMethod>,
+    #[serde(default)]
+    pub api_key_available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -44,8 +44,6 @@ load-images:
     k3s ctr images import ./result-anvil-sandbox
 
 deploy:
-    just image
-    just load-images
     kubectl apply -k k8s/overlays/dev
     kubectl rollout status deployment/anvild -n anvil
     kubectl rollout status deployment/anvil-profile -n anvil

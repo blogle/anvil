@@ -3,8 +3,8 @@
 The deployment assets deliberately stop at a safe application boundary. Future
 work, after platform compatibility is established, includes:
 
-* Add concrete `anvild`, MCP, and router image build/release references once
-  the services exist; retain immutable production image digests.
+* Promote the published GHCR image SHA tags into environment-specific overlays;
+  retain immutable production image digests.
 * Define real probes, route contracts, and NetworkPolicies from implemented
   service behavior instead of speculative configuration.
 * Have the platform team separately assess Agent Sandbox v1.0.2 migration,

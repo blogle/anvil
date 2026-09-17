@@ -7,16 +7,18 @@ normalized and never includes credential contents:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/v1/providers` | List providers, authentication status, and available auth methods |
-| `POST` | `/v1/providers/{provider}/login` | Begin an OpenCode OAuth attempt |
+| `GET` | `/v1/providers` | List providers, authentication status, available auth methods, and API-key capability |
+| `POST` | `/v1/providers/{provider}/login` | Begin an OpenCode OAuth or API-key attempt |
 | `POST` | `/v1/providers/{provider}/login/{login_id}/complete` | Complete the in-memory login attempt |
 | `GET` | `/v1/opencode/config` | Read the shared profile OpenCode configuration |
 
 Provider login is a relay to the singleton profile OpenCode server. OpenCode
 1.18.30 supplies `GET /provider`, `GET /provider/auth`,
-`POST /provider/{id}/oauth/authorize`, and
-`POST /provider/{id}/oauth/callback`. Anvil does not implement provider OAuth
-protocols or return tokens. Pending login IDs live only in `anvild` memory, so
+`POST /provider/{id}/oauth/authorize`, `POST /provider/{id}/oauth/callback`,
+and `PUT /auth/{providerID}` for API credentials. Anvil does not implement
+provider OAuth protocols or return tokens. API keys are accepted only for
+providers advertising an environment variable and are forwarded in memory to
+OpenCode without being logged or persisted by Anvil. Pending login IDs live only in `anvild` memory, so
 an `anvild` restart requires an in-progress login to be restarted; completed
 credentials remain on the profile PVC.
 
@@ -41,10 +43,11 @@ The base runtime ConfigMap also supplies the internal endpoints:
 | `ANVIL_PREVIEW_DOMAIN` | preview wildcard domain | anvild |
 | `RUST_LOG` | `info` | all services |
 
-The Deployment image name is the local development contract `anvil:dev` for
-Anvil services and `anvil-sandbox:dev` for OpenCode workers/profile. Every container uses
-`imagePullPolicy: Never`; the selected cluster nodes must already contain these
-exact images. No secret, token, or kubeconfig belongs in the ConfigMap.
+The Deployment image contract is the public GHCR images
+`ghcr.io/blogle/anvil` for Anvil services and
+`ghcr.io/blogle/anvil-sandbox` for OpenCode workers/profile. The base overlay
+uses the `main` tags for development; production overlays should pin immutable
+SHA tags. No secret, token, or kubeconfig belongs in the ConfigMap.
 
 Ingress accepts the configured preview wildcard; routing and authentication at
 that boundary are the router/Traefik responsibility.

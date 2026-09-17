@@ -16,8 +16,8 @@ spec:
       serviceAccountName: anvild
       containers:
         - name: anvild
-          image: anvil:dev
-          imagePullPolicy: Never
+          image: ghcr.io/blogle/anvil:main
+          imagePullPolicy: Always
           envFrom:
             - configMapRef:
                 name: anvil-runtime
@@ -54,8 +54,8 @@ spec:
       enableServiceLinks: false
       containers:
         - name: mcp
-          image: anvil:dev
-          imagePullPolicy: Never
+          image: ghcr.io/blogle/anvil:main
+          imagePullPolicy: Always
           command: ["/bin/anvil-mcp"]
           envFrom:
             - configMapRef:
@@ -91,8 +91,8 @@ spec:
       enableServiceLinks: false
       containers:
         - name: router
-          image: anvil:dev
-          imagePullPolicy: Never
+          image: ghcr.io/blogle/anvil:main
+          imagePullPolicy: Always
           command: ["/bin/anvil-router"]
           envFrom:
             - configMapRef:

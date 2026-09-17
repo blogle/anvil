@@ -149,19 +149,28 @@ pub struct ProviderLoginRequest {
 #[derive(Debug, Deserialize)]
 pub struct ProviderCompleteRequest {
     pub code: Option<String>,
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct PendingLogin {
     provider: String,
-    method: usize,
+    method: PendingLoginMethod,
     created_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PendingLoginMethod {
+    OAuth(usize),
+    ApiKey,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenCodeProvider {
     id: String,
     name: String,
+    #[serde(default)]
+    env: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -803,6 +812,7 @@ async fn providers(State(s): State<AppState>) -> Result<Json<ProviderListRespons
                     prompts: method.prompts,
                 })
                 .collect(),
+            api_key_available: !provider.env.is_empty(),
         });
     }
     Ok(Json(ProviderListResponse { providers: result }))
@@ -845,20 +855,72 @@ async fn begin_provider_login(
                     .flatten()
             })
     });
-    let method = selected.unwrap_or_else(|| {
-        methods
-            .iter()
-            .position(|method| method.kind == "oauth")
-            .unwrap_or(usize::MAX)
+    let oauth_method = methods.iter().position(|method| method.kind == "oauth");
+    let api_method = methods
+        .iter()
+        .position(|method| method.kind == "api" || method.kind == "api_key");
+    let api_key_available = !provider_info.env.is_empty();
+    let requested_api_key = body.method.as_deref().is_some_and(|requested| {
+        requested.eq_ignore_ascii_case("api")
+            || requested.eq_ignore_ascii_case("api-key")
+            || requested.eq_ignore_ascii_case("api_key")
     });
+    let selected = selected.or(api_method.filter(|_| requested_api_key));
+    let use_api_key = selected
+        .and_then(|index| methods.get(index))
+        .is_some_and(|method| method.kind == "api" || method.kind == "api_key")
+        || (selected.is_none() && requested_api_key)
+        || (selected.is_none()
+            && body.method.is_none()
+            && oauth_method.is_none()
+            && api_key_available);
+    if use_api_key {
+        if !api_key_available {
+            return Err(ServiceError::Invalid(format!(
+                "provider {provider} does not advertise API-key authentication"
+            )));
+        }
+        let login_id = uuid::Uuid::new_v4().simple().to_string();
+        let mut pending = s
+            .pending_logins
+            .lock()
+            .map_err(|_| ServiceError::Profile("login state unavailable".into()))?;
+        let now = std::time::Instant::now();
+        pending.retain(|_, flow| now.duration_since(flow.created_at) < LOGIN_TTL);
+        pending.retain(|_, flow| flow.provider != provider);
+        pending.insert(
+            login_id.clone(),
+            PendingLogin {
+                provider: provider.clone(),
+                method: PendingLoginMethod::ApiKey,
+                created_at: now,
+            },
+        );
+        info!(%provider, %login_id, provider_name = %provider_info.name, "provider API-key login started");
+        return Ok(Json(LoginFlow {
+            login_id,
+            provider,
+            state: "awaiting_user".into(),
+            verification_url: None,
+            user_code: None,
+            method: "api_key".into(),
+            instructions: Some("An API key is required. The key is never stored by Anvil.".into()),
+            prompts: None,
+        }));
+    }
+    let method = selected.or(oauth_method).ok_or_else(|| {
+        ServiceError::Invalid(format!(
+            "provider {provider} has no supported authentication method"
+        ))
+    })?;
     let selected_method = methods.get(method).ok_or_else(|| {
         ServiceError::Invalid(format!(
-            "provider {provider} has no OAuth authentication method"
+            "invalid authentication method for provider {provider}"
         ))
     })?;
     if selected_method.kind != "oauth" {
         return Err(ServiceError::Invalid(format!(
-            "provider {provider} authentication method is not OAuth"
+            "provider {provider} authentication method is not OAuth or API key"
         )));
     }
     let authorization: OpenCodeAuthorization = serde_json::from_value(
@@ -885,7 +947,7 @@ async fn begin_provider_login(
         login_id.clone(),
         PendingLogin {
             provider: provider.clone(),
-            method,
+            method: PendingLoginMethod::OAuth(method),
             created_at: now,
         },
     );
@@ -929,16 +991,36 @@ async fn complete_provider_login(
         .lock()
         .map_err(|_| ServiceError::Profile("login state unavailable".into()))?
         .remove(&login_id);
-    let completed: bool = serde_json::from_value(
-        s.profile
-            .request(
-                reqwest::Method::POST,
-                &format!("provider/{provider}/oauth/callback"),
-                Some(json!({"method": pending.method, "code": request.code})),
+    let completed: bool = match pending.method {
+        PendingLoginMethod::OAuth(method) => serde_json::from_value(
+            s.profile
+                .request(
+                    reqwest::Method::POST,
+                    &format!("provider/{provider}/oauth/callback"),
+                    Some(json!({"method": method, "code": request.code})),
+                )
+                .await?,
+        )
+        .map_err(|e| ServiceError::Profile(e.to_string()))?,
+        PendingLoginMethod::ApiKey => {
+            let key = request
+                .key
+                .as_deref()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .ok_or_else(|| ServiceError::Invalid("API key is required".into()))?;
+            serde_json::from_value(
+                s.profile
+                    .request(
+                        reqwest::Method::PUT,
+                        &format!("auth/{provider}"),
+                        Some(json!({"type":"api","key":key})),
+                    )
+                    .await?,
             )
-            .await?,
-    )
-    .map_err(|e| ServiceError::Profile(e.to_string()))?;
+            .map_err(|e| ServiceError::Profile(e.to_string()))?
+        }
+    };
     if !completed {
         return Err(ServiceError::Profile(
             "provider authorization failed".into(),
@@ -1206,6 +1288,56 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(json_response(response).await["authenticated"], true);
+    }
+
+    #[tokio::test]
+    async fn begins_and_completes_api_key_login_without_logging_key() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/provider");
+            then.status(200).json_body(json!({
+                "all": [{"id":"opencode-go","name":"OpenCode Go","env":["OPENCODE_API_KEY"]}],
+                "connected": []
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/provider/auth");
+            then.status(200).json_body(json!({}));
+        });
+        let auth_set = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/auth/opencode-go")
+                .json_body(json!({"type":"api","key":"secret-go-key"}));
+            then.status(200).json_body(true);
+        });
+        let app = router(AppState::new(config(server.base_url()), FakeSandbox));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/providers/opencode-go/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"method":"api"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let flow = json_response(response).await;
+        assert_eq!(flow["method"], "api_key");
+        let login_id = flow["login_id"].as_str().unwrap();
+        let response = app
+            .oneshot(
+                Request::post(format!(
+                    "/v1/providers/opencode-go/login/{login_id}/complete"
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"key":"secret-go-key"}"#))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_response(response).await["authenticated"], true);
+        auth_set.assert_async().await;
     }
 
     #[tokio::test]
