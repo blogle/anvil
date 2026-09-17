@@ -74,6 +74,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
           prefix="ghcr.io/${GITHUB_REPOSITORY,,}"
           tags=("sha-${GITHUB_SHA}")
           if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
@@ -82,9 +83,14 @@ jobs:
             tags+=("${GITHUB_REF_NAME}")
           fi
           for image in anvil anvil-sandbox; do
+            if [[ "${image}" == anvil ]]; then
+              target="${prefix}"
+            else
+              target="ghcr.io/${owner,,}/anvil-sandbox"
+            fi
             for tag in "${tags[@]}"; do
-              docker tag "${image}:dev" "${prefix}/${image}:${tag}"
-              docker push "${prefix}/${image}:${tag}"
+              docker tag "${image}:dev" "${target}:${tag}"
+              docker push "${target}:${tag}"
             done
           done
       - name: Make GHCR packages public
