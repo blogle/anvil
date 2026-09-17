@@ -14,6 +14,6 @@ data:
   ANVIL_PROFILE_OPENCODE_URL: http://anvil-profile.anvil.svc.cluster.local:4096
   ANVIL_API_URL: http://anvild:8080
   BASE_DOMAIN: preview.example.invalid
-  AGENT_SANDBOX_ROUTER_URL: http://sandbox-router-svc.agent-sandbox-system.svc.cluster.local:8080
+  AGENT_SANDBOX_ROUTER_URL: http://sandbox-router.example.invalid:8080
   LISTEN_ADDR: 0.0.0.0:8082
   RUST_LOG: info
