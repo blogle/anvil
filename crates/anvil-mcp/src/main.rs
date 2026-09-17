@@ -229,6 +229,7 @@ impl AnvilMcp {
     }
 }
 
+#[rmcp::tool_handler]
 impl ServerHandler for AnvilMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
