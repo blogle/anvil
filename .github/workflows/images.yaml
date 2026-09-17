@@ -93,11 +93,3 @@ jobs:
               docker push "${target}:${tag}"
             done
           done
-      - name: Make GHCR packages public
-        if: github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh api --method PATCH user/packages/container/anvil --field visibility=public
-          gh api --method PATCH user/packages/container/anvil-sandbox --field visibility=public
