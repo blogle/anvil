@@ -21,6 +21,9 @@ spec:
           envFrom:
             - configMapRef:
                 name: anvil-runtime
+            - secretRef:
+                name: github-app-credentials
+                optional: true
           ports:
             - name: http
               containerPort: 8080

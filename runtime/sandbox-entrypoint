@@ -7,13 +7,46 @@ set -euo pipefail
 : "${ANVIL_REF:?ANVIL_REF is required}"
 : "${ANVIL_WORK_BRANCH:?ANVIL_WORK_BRANCH is required}"
 
-export HOME=/workspace/home
+export HOME=/home/anvil
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+export XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$XDG_STATE_HOME/runtime}"
+export DISPLAY="${DISPLAY:-:99}"
 project_dir="/workspace/${ANVIL_PROJECT}"
-mkdir -p "$HOME"
+
+mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" \
+  "$XDG_STATE_HOME" "$HOME/.local/share/opencode"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+
+if command -v nix-store >/dev/null 2>&1; then
+  nix-store --init >/dev/null 2>&1 || true
+fi
+
+if command -v Xvfb >/dev/null 2>&1 && ! pgrep -f "Xvfb ${DISPLAY}" >/dev/null 2>&1; then
+  Xvfb "$DISPLAY" -screen 0 1280x1024x24 -nolisten tcp >/tmp/anvil-xvfb.log 2>&1 &
+  xvfb_pid=$!
+  trap 'kill "$xvfb_pid" 2>/dev/null || true' EXIT
+fi
+
+git config --global credential.helper /bin/anvil-credential
+git config --global user.name "${ANVIL_GIT_COMMITTER_NAME:-Anvil}"
+git config --global user.email "${ANVIL_GIT_COMMITTER_EMAIL:-anvil@users.noreply.github.com}"
+if [ -n "${ANVIL_GIT_AUTHOR_NAME:-}" ]; then
+  export GIT_AUTHOR_NAME="$ANVIL_GIT_AUTHOR_NAME"
+fi
+if [ -n "${ANVIL_GIT_AUTHOR_EMAIL:-}" ]; then
+  export GIT_AUTHOR_EMAIL="$ANVIL_GIT_AUTHOR_EMAIL"
+fi
+export GIT_COMMITTER_NAME="${ANVIL_GIT_COMMITTER_NAME:-Anvil}"
+export GIT_COMMITTER_EMAIL="${ANVIL_GIT_COMMITTER_EMAIL:-anvil@users.noreply.github.com}"
+
 profile_dir=/anvil/profile
-mkdir -p "$profile_dir/config" "$profile_dir/auth" "$HOME/.local/share/opencode"
+mkdir -p "$profile_dir/config" "$profile_dir/auth"
 if [ ! -e "$profile_dir/config/opencode.jsonc" ]; then
-  printf '{}\n' > "$profile_dir/config/opencode.jsonc"
+  printf '{"$schema":"https://opencode.ai/config.json","permission":"allow"}\n' > "$profile_dir/config/opencode.jsonc"
 fi
 profile_auth="$profile_dir/auth/auth.json"
 if [ ! -e "$profile_auth" ]; then

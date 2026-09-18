@@ -41,7 +41,7 @@ normal administration:
 anvilctl providers list
 anvilctl providers login openai
 anvilctl sessions list
-anvilctl sessions create --project dojo2 --repository https://github.com/blogle/dojo2.git --ref main --prompt "Inspect the repository."
+anvilctl sessions create --project dojo2 --repository https://github.com/blogle/dojo2.git --ref main --prompt "Inspect the repository." --author-name "Developer Name" --author-email developer@example.com
 ```
 
 `anvilctl --server URL` overrides `ANVIL_URL`. The client also supports
@@ -53,3 +53,26 @@ The shared profile is stored in `anvil-opencode-profile`, mounted at
 `/anvil/profile`, and reused by the singleton `anvil-profile` deployment and
 new Agent Sandboxes. The current ZFS storage is single-node `ReadWriteOnce`,
 not RWX; do not schedule this PoC across multiple nodes.
+
+## GitHub broker setup
+
+Populate the `github-app-credentials` Secret through the deployment's secret
+manager with these keys before enabling private-repository sessions:
+
+* `ANVIL_GITHUB_APP_ID`
+* `ANVIL_GITHUB_INSTALLATION_ID`
+* `ANVIL_GITHUB_PRIVATE_KEY`
+* `ANVIL_SESSION_SIGNING_SECRET` (at least 32 random bytes)
+
+The Secret is referenced only by `anvild`. Sandboxes receive a signed,
+session-bound capability and the internal broker URL, never the App private
+key. Git and `gh` use the sandbox-provided `anvil-credential` helper and `gh`
+wrapper to obtain short-lived repository-scoped installation tokens.
+
+The opt-in acceptance harness checks the unprivileged user, XDG paths,
+`/usr/bin/env`, Nix development loop, Xvfb, Chromium, Git identity, and (when
+`ANVIL_ACCEPTANCE_GITHUB=1`) GitHub access:
+
+```sh
+ANVIL_SANDBOX_POD=... tests/sandbox-acceptance.sh
+```

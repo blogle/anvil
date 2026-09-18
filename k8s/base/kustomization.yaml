@@ -6,6 +6,7 @@ resources:
   - service-account.yaml
   - rbac.yaml
   - runtime-config.yaml
+  - github-app-secret.yaml
   - opencode-profile-pvc.yaml
   - deployments.yaml
   - anvil-profile-deployment.yaml

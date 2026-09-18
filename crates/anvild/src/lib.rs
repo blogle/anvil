@@ -1,5 +1,7 @@
 //! HTTP control plane for Anvil Kubernetes sandboxes.
 
+mod github;
+
 use anvil_core::{
     branch_name, preview_hostname, GitRef, LifecycleEvent, LoginFlow, Port, Project, Prompt,
     ProviderAuthMethod, ProviderListResponse, ProviderStatus, ProviderSummary, Repository, Session,
@@ -8,6 +10,7 @@ use anvil_core::{
 use async_trait::async_trait;
 use axum::{
     extract::{Path, Query, State},
+    http::HeaderMap,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -44,11 +47,17 @@ pub struct Config {
     pub workspace_size: String,
     pub opencode_port: u16,
     pub request_timeout: Duration,
-    pub secret_name: Option<String>,
     pub preview_domain: String,
     pub annotation_prefix: String,
     pub profile_opencode_url: String,
     pub profile_pvc: String,
+    pub credential_url: String,
+    pub github_app_id: Option<String>,
+    pub github_installation_id: Option<u64>,
+    pub github_private_key: Option<String>,
+    pub session_signing_secret: Option<String>,
+    pub session_capability_ttl: Duration,
+    pub github_api_url: String,
 }
 impl Config {
     pub fn from_env() -> Result<Self, ServiceError> {
@@ -58,6 +67,23 @@ impl Config {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| d.into())
         };
+        let required = |key: &str| {
+            env::var(key)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| ServiceError::Config(format!("{key} is required")))
+        };
+        let session_signing_secret = required("ANVIL_SESSION_SIGNING_SECRET")?;
+        if session_signing_secret.len() < 32 {
+            return Err(ServiceError::Config(
+                "ANVIL_SESSION_SIGNING_SECRET must be at least 32 bytes".into(),
+            ));
+        }
+        let github_app_id = required("ANVIL_GITHUB_APP_ID")?;
+        let github_private_key = required("ANVIL_GITHUB_PRIVATE_KEY")?;
+        let github_installation_id = required("ANVIL_GITHUB_INSTALLATION_ID")?
+            .parse()
+            .map_err(|_| ServiceError::Config("ANVIL_GITHUB_INSTALLATION_ID".into()))?;
         Ok(Self {
             bind_port: get("ANVIL_BIND_PORT", "8080")
                 .parse()
@@ -73,9 +99,6 @@ impl Config {
                     .parse()
                     .map_err(|_| ServiceError::Config("ANVIL_PROVISION_TIMEOUT".into()))?,
             ),
-            secret_name: env::var("ANVIL_OPENCODE_ENV_SECRET")
-                .ok()
-                .filter(|v| !v.is_empty()),
             preview_domain: env::var("ANVIL_PREVIEW_DOMAIN")
                 .map_err(|_| ServiceError::Config("ANVIL_PREVIEW_DOMAIN is required".into()))?,
             annotation_prefix: env::var("ANVIL_ANNOTATION_PREFIX")
@@ -86,6 +109,17 @@ impl Config {
                 ServiceError::Config("ANVIL_PROFILE_OPENCODE_URL is required".into())
             })?,
             profile_pvc: get("ANVIL_PROFILE_PVC", "anvil-opencode-profile"),
+            credential_url: get("ANVIL_CREDENTIAL_URL", "http://anvild:8080"),
+            github_app_id: Some(github_app_id),
+            github_installation_id: Some(github_installation_id),
+            github_private_key: Some(github_private_key),
+            session_signing_secret: Some(session_signing_secret),
+            session_capability_ttl: Duration::from_secs(
+                get("ANVIL_SESSION_CAPABILITY_TTL", "86400")
+                    .parse()
+                    .map_err(|_| ServiceError::Config("ANVIL_SESSION_CAPABILITY_TTL".into()))?,
+            ),
+            github_api_url: get("ANVIL_GITHUB_API_URL", "https://api.github.com"),
         })
     }
 }
@@ -102,6 +136,10 @@ pub enum ServiceError {
     Profile(String),
     #[error("session not found")]
     NotFound,
+    #[error("unauthorized")]
+    Unauthorized,
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("invalid request: {0}")]
     Invalid(String),
 }
@@ -109,6 +147,8 @@ impl IntoResponse for ServiceError {
     fn into_response(self) -> axum::response::Response {
         let status = match self {
             ServiceError::NotFound => StatusCode::NOT_FOUND,
+            ServiceError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ServiceError::Forbidden(_) => StatusCode::FORBIDDEN,
             ServiceError::Invalid(_) => StatusCode::BAD_REQUEST,
             ServiceError::OpenCode(_) => StatusCode::BAD_GATEWAY,
             ServiceError::Profile(_) => StatusCode::BAD_GATEWAY,
@@ -130,6 +170,10 @@ pub struct CreateRequest {
     pub base_ref: String,
     pub prompt: String,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_email: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 pub struct PromptRequest {
@@ -225,7 +269,12 @@ struct OpenCodeAuthorization {
 #[async_trait]
 pub trait SandboxApi: Send + Sync + 'static {
     async fn list(&self) -> Result<Vec<DynamicObject>, ServiceError>;
-    async fn create(&self, id: &str, request: &CreateRequest) -> Result<Session, ServiceError>;
+    async fn create(
+        &self,
+        id: &str,
+        request: &CreateRequest,
+        sandbox_env: &[(String, String)],
+    ) -> Result<Session, ServiceError>;
     async fn suspend(&self, id: &str) -> Result<(), ServiceError>;
     async fn resume(&self, id: &str) -> Result<(), ServiceError>;
     async fn delete(&self, id: &str) -> Result<(), ServiceError>;
@@ -355,7 +404,12 @@ impl SandboxApi for KubeSandboxApi {
         .map(|x| x.items)
         .map_err(|e| ServiceError::Kubernetes(e.to_string()))
     }
-    async fn create(&self, id: &str, r: &CreateRequest) -> Result<Session, ServiceError> {
+    async fn create(
+        &self,
+        id: &str,
+        r: &CreateRequest,
+        sandbox_env: &[(String, String)],
+    ) -> Result<Session, ServiceError> {
         let ns = &self.config.namespace;
         let name = format!("anvil-{id}");
         let now = chrono_like_now();
@@ -389,11 +443,28 @@ impl SandboxApi for KubeSandboxApi {
             );
         }
         // The prompt is deliberately not represented in this object (nor in logs).
-        let mut container = json!({"name":"sandbox","image":self.config.image,"ports":[{"name":"opencode","containerPort":self.config.opencode_port}],"env":[{"name":"ANVIL_PROJECT","value":r.project},{"name":"ANVIL_REPOSITORY","value":r.repository},{"name":"ANVIL_REF","value":r.base_ref},{"name":"ANVIL_WORK_BRANCH","value":work_branch},{"name":"OPENCODE_CONFIG","value":"/anvil/profile/config/opencode.jsonc"},{"name":"OPENCODE_CONFIG_DIR","value":"/anvil/profile/config"}],"volumeMounts":[{"name":"workspace","mountPath":"/workspace"},{"name":"shared-profile","mountPath":"/anvil/profile"}]});
-        if let Some(secret) = &self.config.secret_name {
-            container["envFrom"] = json!([{"secretRef":{"name":secret}}]);
-        }
-        let obj = json!({"apiVersion":"agents.x-k8s.io/v1beta1","kind":"Sandbox","metadata":{"name":name,"namespace":ns,"labels":l,"annotations":annotations},"spec":{"service":true,"podTemplate":{"spec":{"containers":[container],"volumes":[{"name":"shared-profile","persistentVolumeClaim":{"claimName":self.config.profile_pvc}}]}},"volumeClaimTemplates":[{"metadata":{"name":"workspace"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":self.config.workspace_size}}}}]}});
+        let mut env = vec![
+            json!({"name":"ANVIL_PROJECT","value":r.project}),
+            json!({"name":"ANVIL_REPOSITORY","value":r.repository}),
+            json!({"name":"ANVIL_REF","value":r.base_ref}),
+            json!({"name":"ANVIL_WORK_BRANCH","value":work_branch}),
+            json!({"name":"OPENCODE_CONFIG","value":"/anvil/profile/config/opencode.jsonc"}),
+            json!({"name":"OPENCODE_CONFIG_DIR","value":"/anvil/profile/config"}),
+            json!({"name":"HOME","value":"/home/anvil"}),
+            json!({"name":"XDG_CONFIG_HOME","value":"/home/anvil/.config"}),
+            json!({"name":"XDG_CACHE_HOME","value":"/home/anvil/.cache"}),
+            json!({"name":"XDG_DATA_HOME","value":"/home/anvil/.local/share"}),
+            json!({"name":"XDG_STATE_HOME","value":"/home/anvil/.local/state"}),
+            json!({"name":"XDG_RUNTIME_DIR","value":"/home/anvil/.local/state/runtime"}),
+            json!({"name":"DISPLAY","value":":99"}),
+        ];
+        env.extend(
+            sandbox_env
+                .iter()
+                .map(|(name, value)| json!({"name":name,"value":value})),
+        );
+        let container = json!({"name":"sandbox","image":self.config.image,"ports":[{"name":"opencode","containerPort":self.config.opencode_port}],"env":env,"volumeMounts":[{"name":"workspace","mountPath":"/workspace"},{"name":"shared-profile","mountPath":"/anvil/profile"}]});
+        let obj = json!({"apiVersion":"agents.x-k8s.io/v1beta1","kind":"Sandbox","metadata":{"name":name,"namespace":ns,"labels":l,"annotations":annotations},"spec":{"service":true,"podTemplate":{"spec":{"securityContext":{"runAsUser":1000,"runAsGroup":1000,"fsGroup":1000},"containers":[container],"volumes":[{"name":"shared-profile","persistentVolumeClaim":{"claimName":self.config.profile_pvc}}]}},"volumeClaimTemplates":[{"metadata":{"name":"workspace"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":self.config.workspace_size}}}}]}});
         Api::<DynamicObject>::namespaced_with(self.client.clone(), ns, &sandbox_resource())
             .create(
                 &PostParams::default(),
@@ -502,16 +573,39 @@ pub struct AppState {
     pub kube: Arc<dyn SandboxApi>,
     profile: ProfileClient,
     pending_logins: Arc<Mutex<HashMap<String, PendingLogin>>>,
+    capability_signer: Option<github::CapabilitySigner>,
+    github: Option<github::GithubBroker>,
 }
 impl AppState {
     pub fn new<K: SandboxApi>(config: Config, kube: K) -> Self {
         let profile = ProfileClient::new(&config.profile_opencode_url)
             .expect("ANVIL_PROFILE_OPENCODE_URL must be a valid URL");
+        let capability_signer = config.session_signing_secret.as_deref().and_then(|secret| {
+            github::CapabilitySigner::new(secret, config.session_capability_ttl).ok()
+        });
+        let github = match (
+            config.github_app_id.clone(),
+            config.github_installation_id,
+            config.github_private_key.clone(),
+            reqwest::Url::parse(&config.github_api_url),
+        ) {
+            (Some(app_id), Some(installation_id), Some(private_key), Ok(api_url)) => {
+                Some(github::GithubBroker::new(github::GithubConfig {
+                    app_id,
+                    installation_id,
+                    private_key,
+                    api_url,
+                }))
+            }
+            _ => None,
+        };
         Self {
             config,
             kube: Arc::new(kube),
             profile,
             pending_logins: Arc::new(Mutex::new(HashMap::new())),
+            capability_signer,
+            github,
         }
     }
 }
@@ -529,6 +623,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sessions/:id/resume", post(resume))
         .route("/v1/sessions/:id/previews/:port", get(preview))
         .route("/v1/sessions/:id/activity", get(activity))
+        .route(
+            "/v1/sessions/:id/credentials/github",
+            post(github_credentials),
+        )
         .route("/assets/app.js", get(asset_js))
         .route("/assets/styles.css", get(asset_css))
         .route("/", get(index))
@@ -588,8 +686,42 @@ async fn create(
     {
         return Err(ServiceError::Invalid("model must not be empty".into()));
     }
+    if r.author_name.is_some() != r.author_email.is_some() {
+        return Err(ServiceError::Invalid(
+            "author_name and author_email must be provided together".into(),
+        ));
+    }
     let id = SessionId::new(&p).to_string();
-    let mut sess = s.kube.create(&id, &r).await?;
+    let mut sandbox_env = vec![
+        ("ANVIL_SESSION_ID".into(), id.clone()),
+        (
+            "ANVIL_CREDENTIAL_URL".into(),
+            s.config.credential_url.clone(),
+        ),
+    ];
+    if let Some(signer) = &s.capability_signer {
+        sandbox_env.push((
+            "ANVIL_SESSION_CREDENTIAL".into(),
+            signer
+                .mint(&id, &r.repository)
+                .map_err(ServiceError::Config)?,
+        ));
+    }
+    if let Some(name) = r
+        .author_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        sandbox_env.push(("ANVIL_GIT_AUTHOR_NAME".into(), name.to_owned()));
+    }
+    if let Some(email) = r
+        .author_email
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        sandbox_env.push(("ANVIL_GIT_AUTHOR_EMAIL".into(), email.to_owned()));
+    }
+    let mut sess = s.kube.create(&id, &r, &sandbox_env).await?;
     let mut obj = wait_ready(&s, &id).await?;
     let ready_at = chrono_like_now();
     s.kube.set_ready_at(&id, &ready_at).await?;
@@ -617,6 +749,46 @@ async fn create(
             sess
         })),
     ))
+}
+
+async fn github_credentials(
+    Path(id): Path<String>,
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<github::GithubCredential>, ServiceError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+        .ok_or(ServiceError::Unauthorized)?;
+    let signer = s.capability_signer.as_ref().ok_or_else(|| {
+        ServiceError::Config("GitHub session capabilities are not configured".into())
+    })?;
+    let claims = signer
+        .verify(token)
+        .map_err(|_| ServiceError::Unauthorized)?;
+    if claims.session_id != id || claims.capability != "github-repository" {
+        return Err(ServiceError::Forbidden(
+            "capability is not valid for this session".into(),
+        ));
+    }
+    let object = s.kube.get(&id).await?;
+    let session = session_from(&object, &s.config)?;
+    if session.repository != claims.repository {
+        return Err(ServiceError::Forbidden(
+            "capability repository does not match session".into(),
+        ));
+    }
+    let broker = s
+        .github
+        .as_ref()
+        .ok_or_else(|| ServiceError::Config("GitHub App credentials are not configured".into()))?;
+    broker
+        .credential(&session.repository)
+        .await
+        .map(Json)
+        .map_err(ServiceError::Config)
 }
 async fn wait_ready(s: &AppState, id: &str) -> Result<DynamicObject, ServiceError> {
     let end = tokio::time::Instant::now() + s.config.request_timeout;
@@ -1670,6 +1842,7 @@ mod tests {
             &self,
             _id: &str,
             _request: &CreateRequest,
+            _sandbox_env: &[(String, String)],
         ) -> Result<Session, ServiceError> {
             Err(ServiceError::Invalid("not used in provider tests".into()))
         }
@@ -1694,6 +1867,7 @@ mod tests {
             &self,
             _id: &str,
             _request: &CreateRequest,
+            _sandbox_env: &[(String, String)],
         ) -> Result<Session, ServiceError> {
             Err(ServiceError::Invalid("not used in activity tests".into()))
         }
@@ -1719,11 +1893,17 @@ mod tests {
             workspace_size: "1Gi".into(),
             opencode_port: 4096,
             request_timeout: Duration::from_secs(5),
-            secret_name: None,
             preview_domain: "preview.example.test".into(),
             annotation_prefix: "anvil.example".into(),
             profile_opencode_url,
             profile_pvc: "anvil-opencode-profile".into(),
+            credential_url: "http://anvild:8080".into(),
+            github_app_id: None,
+            github_installation_id: None,
+            github_private_key: None,
+            session_signing_secret: None,
+            session_capability_ttl: Duration::from_secs(86400),
+            github_api_url: "https://api.github.com".into(),
         }
     }
 

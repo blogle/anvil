@@ -80,6 +80,14 @@ pub struct CreateArgs {
     pub prompt: String,
     #[arg(long)]
     pub model: Option<String>,
+    /// Git author name to carry into the Sandbox session.
+    #[arg(long, env = "ANVIL_GIT_AUTHOR_NAME")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_name: Option<String>,
+    /// Git author email to carry into the Sandbox session.
+    #[arg(long, env = "ANVIL_GIT_AUTHOR_EMAIL")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_email: Option<String>,
 }
 
 #[derive(Clone)]
@@ -563,6 +571,8 @@ mod tests {
             reference: "main".into(),
             prompt: "Inspect".into(),
             model: None,
+            author_name: None,
+            author_email: None,
         };
         let _: Session = ApiClient::new(&server.base_url())
             .unwrap()

@@ -14,6 +14,10 @@ spec:
     spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
       containers:
         - name: opencode
           image: ghcr.io/blogle/anvil-sandbox:main
@@ -34,12 +38,12 @@ spec:
                 ln -s "$auth" "$link"
               fi
               if [ ! -e "$profile/config/opencode.jsonc" ]; then
-                printf '{}\n' > "$profile/config/opencode.jsonc"
+                printf '{"$schema":"https://opencode.ai/config.json","permission":"allow"}\n' > "$profile/config/opencode.jsonc"
               fi
               exec opencode serve --hostname 0.0.0.0 --port 4096
           env:
             - name: HOME
-              value: /tmp/anvil-profile-home
+              value: /home/anvil
             - name: OPENCODE_CONFIG
               value: /anvil/profile/config/opencode.jsonc
             - name: OPENCODE_CONFIG_DIR
