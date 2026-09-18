@@ -171,6 +171,8 @@ struct OpenCodeProvider {
     name: String,
     #[serde(default)]
     env: Vec<String>,
+    #[serde(default)]
+    models: HashMap<String, OpenCodeModel>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,6 +181,24 @@ struct OpenCodeProviderList {
     all: Vec<OpenCodeProvider>,
     #[serde(default)]
     connected: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenCodeModel {
+    id: String,
+    #[serde(rename = "providerID")]
+    provider_id: String,
+}
+impl OpenCodeModel {
+    fn qualified_id(&self) -> String {
+        format!("{}/{}", self.provider_id, self.id)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenCodeConfiguredProviders {
+    #[serde(default)]
+    providers: Vec<OpenCodeProvider>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,6 +235,9 @@ pub trait SandboxApi: Send + Sync + 'static {
             .ok_or(ServiceError::NotFound)
     }
     async fn set_opencode_session(&self, _id: &str, _oc: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn set_model(&self, _id: &str, _model: &str) -> Result<(), ServiceError> {
         Ok(())
     }
 }
@@ -415,6 +438,15 @@ impl SandboxApi for KubeSandboxApi {
         self.patch(id, json!({"metadata":{"annotations":annotations}}))
             .await
     }
+    async fn set_model(&self, id: &str, model: &str) -> Result<(), ServiceError> {
+        let mut annotations = serde_json::Map::new();
+        annotations.insert(
+            annotation_key(&self.config, "model"),
+            Value::String(model.to_owned()),
+        );
+        self.patch(id, json!({"metadata":{"annotations":annotations}}))
+            .await
+    }
 }
 impl KubeSandboxApi {
     async fn patch(&self, id: &str, v: Value) -> Result<(), ServiceError> {
@@ -510,9 +542,18 @@ async fn create(
     sess = session_from(&obj, &s.config).unwrap_or(sess);
     let oc = OpenCode::new(service_url(&sess, &s.config), s.config.request_timeout);
     wait_opencode(&oc, s.config.request_timeout).await?;
+    let model = match r.model.as_deref() {
+        Some(requested) => {
+            let model = oc.resolve_model(requested).await?;
+            s.kube.set_model(&id, &model.qualified_id()).await?;
+            Some(model)
+        }
+        None => None,
+    };
     let oc_id = oc.create_session().await?;
     s.kube.set_opencode_session(&id, &oc_id).await?;
-    oc.prompt_async(&oc_id, prompt.as_str()).await?;
+    oc.prompt_async(&oc_id, prompt.as_str(), model.as_ref())
+        .await?;
     obj = s.kube.get(&id).await?;
     Ok((
         StatusCode::CREATED,
@@ -619,15 +660,20 @@ async fn prompt(
 ) -> Result<Json<Value>, ServiceError> {
     let p = Prompt::new(&r.prompt).map_err(|e| ServiceError::Invalid(e.to_string()))?;
     let x = session_from(&s.kube.get(&id).await?, &s.config)?;
+    let oc = OpenCode::new(service_url(&x, &s.config), s.config.request_timeout);
+    let model = match x.model.as_deref() {
+        Some(requested) => Some(oc.resolve_model(requested).await?),
+        None => None,
+    };
     Ok(Json(
-        OpenCode::new(service_url(&x, &s.config), s.config.request_timeout)
-            .prompt_async(
-                x.opencode_session_id
-                    .as_deref()
-                    .ok_or(ServiceError::NotFound)?,
-                p.as_str(),
-            )
-            .await?,
+        oc.prompt_async(
+            x.opencode_session_id
+                .as_deref()
+                .ok_or(ServiceError::NotFound)?,
+            p.as_str(),
+            model.as_ref(),
+        )
+        .await?,
     ))
 }
 async fn proxy(
@@ -1102,11 +1148,60 @@ impl OpenCode {
             .map(String::from)
             .ok_or_else(|| ServiceError::OpenCode("session response has no id".into()))
     }
-    async fn prompt_async(&self, id: &str, p: &str) -> Result<Value, ServiceError> {
+    async fn resolve_model(&self, requested: &str) -> Result<OpenCodeModel, ServiceError> {
+        let requested = requested.trim();
+        let configured: OpenCodeConfiguredProviders = serde_json::from_value(
+            self.request("config/providers", reqwest::Method::GET, None)
+                .await?,
+        )
+        .map_err(|e| ServiceError::OpenCode(format!("invalid provider catalog: {e}")))?;
+
+        let matches = if let Some((provider_id, model_id)) = requested.split_once('/') {
+            configured
+                .providers
+                .iter()
+                .filter(|provider| provider.id == provider_id)
+                .flat_map(|provider| provider.models.values())
+                .filter(|model| model.id == model_id)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            configured
+                .providers
+                .iter()
+                .flat_map(|provider| provider.models.values())
+                .filter(|model| model.id == requested)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        match matches.as_slice() {
+            [model] => Ok(model.clone()),
+            [] => Err(ServiceError::OpenCode(format!(
+                "requested model is unavailable: {requested}"
+            ))),
+            _ => Err(ServiceError::OpenCode(format!(
+                "requested model is ambiguous: {requested}"
+            ))),
+        }
+    }
+    async fn prompt_async(
+        &self,
+        id: &str,
+        p: &str,
+        model: Option<&OpenCodeModel>,
+    ) -> Result<Value, ServiceError> {
+        let mut body = json!({"parts":[{"type":"text","text":p}]});
+        if let Some(model) = model {
+            body["model"] = json!({
+                "providerID": model.provider_id,
+                "modelID": model.id,
+            });
+        }
         self.request(
             &format!("session/{id}/prompt_async"),
             reqwest::Method::POST,
-            Some(json!({"parts":[{"type":"text","text":p}]})),
+            Some(body),
         )
         .await
     }
@@ -1192,6 +1287,62 @@ mod tests {
             profile_opencode_url,
             profile_pvc: "anvil-opencode-profile".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn forwards_the_resolved_model_to_async_prompts() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/config/providers");
+            then.status(200).json_body(json!({
+                "providers": [{
+                    "id": "openai",
+                    "name": "OpenAI",
+                    "models": {
+                        "gpt-5.6-luna": {
+                            "id": "gpt-5.6-luna",
+                            "providerID": "openai"
+                        }
+                    }
+                }]
+            }));
+        });
+        let prompt = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/session/session-1/prompt_async")
+                .json_body(json!({
+                    "model": {
+                        "providerID": "openai",
+                        "modelID": "gpt-5.6-luna"
+                    },
+                    "parts": [{"type": "text", "text": "Inspect the repository."}]
+                }));
+            then.status(204);
+        });
+
+        let oc = OpenCode::new(server.base_url(), Duration::from_secs(5));
+        let model = oc.resolve_model("gpt-5.6-luna").await.unwrap();
+        assert_eq!(model.qualified_id(), "openai/gpt-5.6-luna");
+        oc.prompt_async("session-1", "Inspect the repository.", Some(&model))
+            .await
+            .unwrap();
+        prompt.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rejects_unavailable_explicit_models() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/config/providers");
+            then.status(200).json_body(json!({"providers": []}));
+        });
+
+        let oc = OpenCode::new(server.base_url(), Duration::from_secs(5));
+        let error = oc.resolve_model("gpt-5.6-luna").await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "OpenCode error: requested model is unavailable: gpt-5.6-luna"
+        );
     }
 
     async fn json_response(response: axum::response::Response) -> Value {
