@@ -70,6 +70,26 @@
           sandbox = false
           build-users-group =
         '';
+        userFiles = [
+          (pkgs.writeTextDir "etc/passwd" ''
+            root:x:0:0::/root:${pkgs.bash}/bin/bash
+            anvil:x:1000:1000::/home/anvil:${pkgs.bash}/bin/bash
+            nobody:x:65534:65534:nobody:/var/empty:${pkgs.coreutils}/bin/false
+          '')
+          (pkgs.writeTextDir "etc/group" ''
+            root:x:0:
+            anvil:x:1000:
+            nobody:x:65534:
+          '')
+          (pkgs.writeTextDir "etc/shadow" ''
+            root:!x:::::::
+            anvil:!:::::::
+          '')
+          (pkgs.writeTextDir "etc/gshadow" ''
+            root:x::
+            anvil:x::
+          '')
+        ];
         opencodePackage = opencode.packages.${system}.default;
         anvilImage = pkgs.dockerTools.buildLayeredImage {
           name = "anvil";
@@ -90,18 +110,16 @@
             pkgs.chromium pkgs.electron pkgs.xorg-server
             nixConf entrypoint credentialHelper ghWrapper
             opencodePackage
-          ];
+          ] ++ userFiles;
           extraCommands = ''
-            mkdir -p ./usr/bin ./tmp ./home/anvil ./nix/var
+            mkdir -p ./usr/bin ./tmp ./home/anvil ./nix/store ./nix/var
             ln -sfn ${pkgs.coreutils}/bin/env ./usr/bin/env
             chmod 1777 ./tmp
           '';
           fakeRootCommands = ''
-            ${pkgs.dockerTools.shadowSetup}
-            groupadd --gid 1000 anvil
-            useradd --uid 1000 --gid 1000 --home-dir /home/anvil --shell ${pkgs.bash}/bin/bash anvil
             chown -R 1000:1000 ./home/anvil ./nix/var
             chown 1000:1000 ./nix/store
+            chmod 600 ./etc/shadow ./etc/gshadow
             chmod 1777 ./tmp
           '';
           config = {

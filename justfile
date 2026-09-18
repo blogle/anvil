@@ -8,6 +8,11 @@ check:
     cargo fmt --check
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo nextest run --workspace
+    just security-check
+
+security-check:
+    bash tests/credential-helper.sh
+    bash tests/manifest-security.sh
 
 test:
     cargo nextest run --workspace
