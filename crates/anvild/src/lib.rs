@@ -1,17 +1,19 @@
 //! HTTP control plane for Anvil Kubernetes sandboxes.
 
 use anvil_core::{
-    branch_name, preview_hostname, GitRef, LoginFlow, Port, Project, Prompt, ProviderAuthMethod,
-    ProviderListResponse, ProviderStatus, ProviderSummary, Repository, Session, SessionId,
+    branch_name, preview_hostname, GitRef, LifecycleEvent, LoginFlow, Port, Project, Prompt,
+    ProviderAuthMethod, ProviderListResponse, ProviderStatus, ProviderSummary, Repository, Session,
+    SessionActivity, SessionId, SessionRequest,
 };
 use async_trait::async_trait;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use chrono::{DateTime, Utc};
 use kube::{
     api::{
         Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams, PostParams,
@@ -240,6 +242,9 @@ pub trait SandboxApi: Send + Sync + 'static {
     async fn set_model(&self, _id: &str, _model: &str) -> Result<(), ServiceError> {
         Ok(())
     }
+    async fn set_ready_at(&self, _id: &str, _at: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
 }
 
 pub struct KubeSandboxApi {
@@ -324,6 +329,17 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
         opencode_session_id: a
             .get(&annotation_key(config, "opencode-session-id"))
             .cloned(),
+        created_at: a
+            .get(&annotation_key(config, "created-at"))
+            .cloned()
+            .or_else(|| {
+                o.data
+                    .get("metadata")
+                    .and_then(|value| value.get("creationTimestamp"))
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            }),
+        ready_at: a.get(&annotation_key(config, "ready-at")).cloned(),
     })
 }
 #[async_trait]
@@ -364,7 +380,7 @@ impl SandboxApi for KubeSandboxApi {
         );
         annotations.insert(
             annotation_key(&self.config, "created-at"),
-            Value::String(now),
+            Value::String(now.clone()),
         );
         if let Some(model) = &r.model {
             annotations.insert(
@@ -398,6 +414,8 @@ impl SandboxApi for KubeSandboxApi {
             work_branch: branch_name(&SessionId::parse(id).unwrap()),
             model: r.model.clone(),
             opencode_session_id: None,
+            created_at: Some(now),
+            ready_at: None,
         })
     }
     async fn suspend(&self, id: &str) -> Result<(), ServiceError> {
@@ -447,6 +465,15 @@ impl SandboxApi for KubeSandboxApi {
         self.patch(id, json!({"metadata":{"annotations":annotations}}))
             .await
     }
+    async fn set_ready_at(&self, id: &str, at: &str) -> Result<(), ServiceError> {
+        let mut annotations = serde_json::Map::new();
+        annotations.insert(
+            annotation_key(&self.config, "ready-at"),
+            Value::String(at.to_owned()),
+        );
+        self.patch(id, json!({"metadata":{"annotations":annotations}}))
+            .await
+    }
 }
 impl KubeSandboxApi {
     async fn patch(&self, id: &str, v: Value) -> Result<(), ServiceError> {
@@ -466,13 +493,7 @@ impl KubeSandboxApi {
     }
 }
 fn chrono_like_now() -> String {
-    format!(
-        "{}Z",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-    )
+    Utc::now().to_rfc3339()
 }
 
 #[derive(Clone)]
@@ -507,6 +528,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sessions/:id/suspend", post(suspend))
         .route("/v1/sessions/:id/resume", post(resume))
         .route("/v1/sessions/:id/previews/:port", get(preview))
+        .route("/v1/sessions/:id/activity", get(activity))
+        .route("/assets/app.js", get(asset_js))
+        .route("/assets/styles.css", get(asset_css))
+        .route("/", get(index))
         .route("/v1/providers", get(providers))
         .route("/v1/providers/:provider/login", post(begin_provider_login))
         .route(
@@ -518,6 +543,33 @@ pub fn router(state: AppState) -> Router {
 }
 async fn health() -> Json<Value> {
     Json(json!({"status":"ok"}))
+}
+
+async fn index() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("../../../web/index.html"),
+    )
+        .into_response()
+}
+
+async fn asset_js() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/javascript; charset=utf-8",
+        )],
+        include_str!("../../../web/app.js"),
+    )
+        .into_response()
+}
+
+async fn asset_css() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../../../web/styles.css"),
+    )
+        .into_response()
 }
 async fn ready() -> StatusCode {
     StatusCode::OK
@@ -539,7 +591,10 @@ async fn create(
     let id = SessionId::new(&p).to_string();
     let mut sess = s.kube.create(&id, &r).await?;
     let mut obj = wait_ready(&s, &id).await?;
+    let ready_at = chrono_like_now();
+    s.kube.set_ready_at(&id, &ready_at).await?;
     sess = session_from(&obj, &s.config).unwrap_or(sess);
+    sess.ready_at = Some(ready_at);
     let oc = OpenCode::new(service_url(&sess, &s.config), s.config.request_timeout);
     wait_opencode(&oc, s.config.request_timeout).await?;
     let model = match r.model.as_deref() {
@@ -631,6 +686,41 @@ async fn session(
     State(s): State<AppState>,
 ) -> Result<Json<Session>, ServiceError> {
     Ok(Json(session_from(&s.kube.get(&id).await?, &s.config)?))
+}
+
+async fn activity(
+    Path(id): Path<String>,
+    State(s): State<AppState>,
+) -> Result<Json<SessionActivity>, ServiceError> {
+    let object = s.kube.get(&id).await?;
+    let session = session_from(&object, &s.config)?;
+    let phase = session.phase.as_deref().unwrap_or("Starting");
+    let operating_mode = object
+        .data
+        .get("spec")
+        .and_then(|value| value.get("operatingMode"))
+        .and_then(Value::as_str);
+    let messages = if let Some(opencode_id) = session.opencode_session_id.as_deref() {
+        let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
+        let messages_path = format!("session/{opencode_id}/message");
+        let (messages, status) = tokio::join!(
+            op.request(&messages_path, reqwest::Method::GET, None),
+            op.request("session/status", reqwest::Method::GET, None),
+        );
+        let messages = messages.unwrap_or_else(|_| Value::Array(Vec::new()));
+        let status = status.unwrap_or(Value::Null);
+        build_activity(&session, phase, operating_mode, messages, status, &s.config)
+    } else {
+        build_activity(
+            &session,
+            phase,
+            operating_mode,
+            Value::Array(Vec::new()),
+            Value::Null,
+            &s.config,
+        )
+    };
+    Ok(Json(messages))
 }
 async fn suspend(
     Path(id): Path<String>,
@@ -742,6 +832,323 @@ async fn preview(
     Ok(Json(
         json!({"url":format!("https://{}",preview_hostname(&sid,port,&s.config.preview_domain).map_err(|e|ServiceError::Invalid(e.to_string()))?)}),
     ))
+}
+
+fn timestamp_from_millis(value: i64) -> Option<String> {
+    DateTime::<Utc>::from_timestamp_millis(value).map(|time| time.to_rfc3339())
+}
+
+fn timestamp_from_value(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::Number(number)) => {
+            number.as_i64().and_then(timestamp_from_millis).or_else(|| {
+                number
+                    .as_u64()
+                    .and_then(|value| timestamp_from_millis(value as i64))
+            })
+        }
+        Some(Value::String(value)) => {
+            if let Ok(number) = value.parse::<i64>() {
+                return timestamp_from_millis(if value.len() <= 11 {
+                    number.saturating_mul(1000)
+                } else {
+                    number
+                });
+            }
+            DateTime::parse_from_rfc3339(value)
+                .ok()
+                .map(|time| time.with_timezone(&Utc).to_rfc3339())
+        }
+        _ => None,
+    }
+}
+
+fn timestamp_millis(value: Option<&Value>) -> Option<i64> {
+    match value {
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .or_else(|| number.as_u64().map(|v| v as i64)),
+        Some(Value::String(value)) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn message_items(value: Value) -> Vec<Value> {
+    match value {
+        Value::Array(items) => items,
+        Value::Object(object) => object
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn text_parts(message: &Value) -> String {
+    message
+        .get("parts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn assistant_for<'a>(messages: &'a [Value], parent_id: &str) -> Option<&'a Value> {
+    messages
+        .iter()
+        .filter(|message| {
+            let info = message.get("info").unwrap_or(message);
+            info.get("role").and_then(Value::as_str) == Some("assistant")
+                && info.get("parentID").and_then(Value::as_str) == Some(parent_id)
+        })
+        .max_by_key(|message| {
+            let info = message.get("info").unwrap_or(message);
+            timestamp_millis(info.get("time").and_then(|time| time.get("created")))
+                .unwrap_or_default()
+        })
+}
+
+fn assistant_operation(message: &Value) -> Option<String> {
+    let parts = message.get("parts")?.as_array()?;
+    parts.iter().rev().find_map(|part| {
+        if part.get("type").and_then(Value::as_str) != Some("tool") {
+            return None;
+        }
+        let state = part.get("state")?;
+        if !matches!(
+            state.get("status").and_then(Value::as_str),
+            Some("running" | "pending")
+        ) {
+            return None;
+        }
+        state
+            .get("title")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or_else(|| {
+                part.get("tool")
+                    .and_then(Value::as_str)
+                    .map(|tool| format!("Running {tool}"))
+            })
+    })
+}
+
+fn assistant_last_activity(message: &Value) -> Option<String> {
+    let info = message.get("info").unwrap_or(message);
+    let mut latest = timestamp_millis(info.get("time").and_then(|time| time.get("created")));
+    if let Some(parts) = message.get("parts").and_then(Value::as_array) {
+        for part in parts {
+            let candidate = part
+                .get("state")
+                .and_then(|state| state.get("time"))
+                .and_then(|time| time.get("end").or_else(|| time.get("start")))
+                .and_then(|value| timestamp_millis(Some(value)));
+            latest = latest.max(candidate);
+        }
+    }
+    latest.and_then(timestamp_from_millis)
+}
+
+fn assistant_error(message: &Value) -> Option<String> {
+    let info = message.get("info").unwrap_or(message);
+    let error = info.get("error")?;
+    error
+        .get("data")
+        .and_then(|data| data.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| error.get("message").and_then(Value::as_str))
+        .map(String::from)
+        .or_else(|| Some(error.to_string()))
+}
+
+fn status_is_busy(status: &Value, session_id: &str) -> bool {
+    status
+        .get(session_id)
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        == Some("busy")
+}
+
+fn build_activity(
+    session: &Session,
+    phase: &str,
+    operating_mode: Option<&str>,
+    raw_messages: Value,
+    status: Value,
+    config: &Config,
+) -> SessionActivity {
+    let messages = message_items(raw_messages);
+    let user_messages = messages
+        .iter()
+        .filter(|message| {
+            let info = message.get("info").unwrap_or(message);
+            info.get("role").and_then(Value::as_str) == Some("user")
+        })
+        .collect::<Vec<_>>();
+    let busy = session
+        .opencode_session_id
+        .as_deref()
+        .is_some_and(|id| status_is_busy(&status, id));
+    let mut requests = Vec::with_capacity(user_messages.len());
+    let mut lifecycle = Vec::new();
+
+    if let Some(at) = session.created_at.clone() {
+        lifecycle.push(LifecycleEvent {
+            kind: "created".into(),
+            at,
+            detail: Some(format!(
+                "Repository: {} · Branch: {}",
+                session.project, session.work_branch
+            )),
+        });
+    }
+    if let Some(at) = session.ready_at.clone() {
+        lifecycle.push(LifecycleEvent {
+            kind: "ready".into(),
+            at,
+            detail: Some("Sandbox environment ready".into()),
+        });
+    }
+
+    for (index, message) in user_messages.iter().enumerate() {
+        let info = message.get("info").unwrap_or(message);
+        let id = info
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("request")
+            .to_owned();
+        let started_at =
+            timestamp_from_value(info.get("time").and_then(|time| time.get("created")))
+                .unwrap_or_else(|| session.created_at.clone().unwrap_or_default());
+        let assistant = assistant_for(&messages, &id);
+        let assistant_info = assistant.map(|value| value.get("info").unwrap_or(value));
+        let completed_at = assistant_info.and_then(|value| {
+            timestamp_from_value(value.get("time").and_then(|time| time.get("completed")))
+        });
+        let started_ms = timestamp_millis(info.get("time").and_then(|time| time.get("created")));
+        let completed_ms = assistant_info.and_then(|value| {
+            timestamp_millis(value.get("time").and_then(|time| time.get("completed")))
+        });
+        let error = assistant.and_then(assistant_error);
+        let state = if error.is_some() {
+            "failed"
+        } else if completed_at.is_some() {
+            "completed"
+        } else {
+            "running"
+        };
+        let operation = assistant.and_then(assistant_operation);
+        let last_activity_at = assistant
+            .and_then(assistant_last_activity)
+            .or_else(|| Some(started_at.clone()));
+        let request = SessionRequest {
+            id: id.clone(),
+            number: (index + 1) as u32,
+            origin: "Anvil controller".into(),
+            prompt: text_parts(message),
+            state: state.into(),
+            started_at: started_at.clone(),
+            completed_at: completed_at.clone(),
+            duration_ms: started_ms
+                .and_then(|start| completed_ms.map(|end| end.saturating_sub(start) as u64)),
+            last_activity_at: last_activity_at.clone(),
+            current_operation: operation.clone(),
+            provider: assistant_info
+                .and_then(|value| value.get("providerID"))
+                .and_then(Value::as_str)
+                .map(String::from),
+            model: assistant_info
+                .and_then(|value| value.get("modelID"))
+                .and_then(Value::as_str)
+                .map(String::from),
+            error: error.clone(),
+        };
+        lifecycle.push(LifecycleEvent {
+            kind: "request_started".into(),
+            at: started_at,
+            detail: Some(format!(
+                "Request #{} started by {}",
+                index + 1,
+                request.origin
+            )),
+        });
+        if let Some(completed_at) = completed_at {
+            lifecycle.push(LifecycleEvent {
+                kind: if error.is_some() {
+                    "request_failed"
+                } else {
+                    "request_completed"
+                }
+                .into(),
+                at: completed_at,
+                detail: error,
+            });
+        }
+        requests.push(request);
+    }
+
+    let current = requests.last().filter(|request| request.state == "running");
+    let request_state = requests.last().map_or_else(
+        || "idle".into(),
+        |request| {
+            if request.state == "failed" {
+                "failed".into()
+            } else if request.state == "running" {
+                "running".into()
+            } else {
+                "idle".into()
+            }
+        },
+    );
+    let state = if operating_mode == Some("Suspended") {
+        "stopped"
+    } else if phase.eq_ignore_ascii_case("failed") {
+        "failed"
+    } else if !phase.eq_ignore_ascii_case("ready") || session.opencode_session_id.is_none() {
+        "starting"
+    } else if current.is_some() || busy {
+        "active"
+    } else if requests
+        .last()
+        .is_some_and(|request| request.state == "failed")
+    {
+        "failed"
+    } else {
+        "idle"
+    };
+    let current_operation = current.and_then(|request| request.current_operation.clone());
+    let last_activity_at = requests
+        .last()
+        .and_then(|request| request.last_activity_at.clone())
+        .or_else(|| session.ready_at.clone())
+        .or_else(|| session.created_at.clone());
+    let opencode_url = (state != "starting").then(|| {
+        preview_hostname(
+            &SessionId::parse(&session.id).expect("session IDs are validated by session_from"),
+            Port::new(session.opencode_port).expect("configured OpenCode port is non-zero"),
+            &config.preview_domain,
+        )
+        .map(|host| format!("https://{host}"))
+        .unwrap_or_default()
+    });
+
+    lifecycle.sort_by(|left, right| left.at.cmp(&right.at));
+    SessionActivity {
+        session: session.clone(),
+        state: state.into(),
+        request_state,
+        current_operation,
+        last_activity_at,
+        requests,
+        lifecycle,
+        preview_url: None,
+        opencode_url,
+        attach_command: format!("anvilctl sessions attach {}", session.id),
+    }
 }
 
 #[derive(Clone)]
@@ -1250,6 +1657,10 @@ mod tests {
 
     struct FakeSandbox;
 
+    struct ActivitySandbox {
+        object: DynamicObject,
+    }
+
     #[async_trait]
     impl SandboxApi for FakeSandbox {
         async fn list(&self) -> Result<Vec<DynamicObject>, ServiceError> {
@@ -1273,6 +1684,33 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl SandboxApi for ActivitySandbox {
+        async fn list(&self) -> Result<Vec<DynamicObject>, ServiceError> {
+            Ok(vec![self.object.clone()])
+        }
+
+        async fn create(
+            &self,
+            _id: &str,
+            _request: &CreateRequest,
+        ) -> Result<Session, ServiceError> {
+            Err(ServiceError::Invalid("not used in activity tests".into()))
+        }
+
+        async fn suspend(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn resume(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
     fn config(profile_opencode_url: String) -> Config {
         Config {
             bind_port: 8080,
@@ -1287,6 +1725,139 @@ mod tests {
             profile_opencode_url,
             profile_pvc: "anvil-opencode-profile".into(),
         }
+    }
+
+    fn activity_session() -> Session {
+        Session {
+            id: "demo-12345678".into(),
+            sandbox: "anvil-demo-12345678".into(),
+            service: "anvil-demo-12345678.anvil.svc".into(),
+            namespace: "anvil".into(),
+            opencode_port: 4096,
+            phase: Some("Ready".into()),
+            project: "demo".into(),
+            repository: "https://github.com/example/demo.git".into(),
+            base_ref: "main".into(),
+            work_branch: "anvil/demo-12345678".into(),
+            model: None,
+            opencode_session_id: Some("ses_demo".into()),
+            created_at: Some("2026-01-01T10:00:00Z".into()),
+            ready_at: Some("2026-01-01T10:00:41Z".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_endpoint_returns_read_model_and_embedded_dashboard() {
+        let object: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {
+                "name": "anvil-demo-12345678",
+                "annotations": {
+                    "anvil.example/project": "demo",
+                    "anvil.example/repository": "https://github.com/example/demo.git",
+                    "anvil.example/base-ref": "main",
+                    "anvil.example/work-branch": "anvil/demo-12345678",
+                    "anvil.example/created-at": "2026-01-01T10:00:00Z",
+                    "anvil.example/ready-at": "2026-01-01T10:00:41Z"
+                }
+            },
+            "status": {"phase": "Ready", "serviceFQDN": "anvil-demo-12345678"}
+        }))
+        .unwrap();
+        let app = router(AppState::new(
+            config("http://profile.test".into()),
+            ActivitySandbox { object },
+        ));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/sessions/demo-12345678/activity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_response(response).await;
+        assert_eq!(body["session"]["project"], "demo");
+        assert_eq!(body["state"], "starting");
+        assert_eq!(
+            body["attach_command"],
+            "anvilctl sessions attach demo-12345678"
+        );
+        assert_eq!(body["lifecycle"][0]["kind"], "created");
+
+        let response = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/html; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn activity_preserves_prompts_and_completed_duration() {
+        let session = activity_session();
+        let activity = build_activity(
+            &session,
+            "Ready",
+            Some("Running"),
+            json!([
+                {
+                    "info": {"id":"msg_1","role":"user","time":{"created":1767261600000i64}},
+                    "parts": [{"type":"text","text":"Make the mobile layout\nwithout changing the API."}]
+                },
+                {
+                    "info": {
+                        "id":"msg_2","role":"assistant","parentID":"msg_1",
+                        "providerID":"openai","modelID":"gpt-5.6-luna",
+                        "time":{"created":1767261601000i64,"completed":1767261606000i64}
+                    },
+                    "parts": []
+                }
+            ]),
+            json!({"ses_demo":{"type":"idle"}}),
+            &config("http://profile.test".into()),
+        );
+
+        assert_eq!(activity.state, "idle");
+        assert_eq!(activity.requests.len(), 1);
+        assert_eq!(
+            activity.requests[0].prompt,
+            "Make the mobile layout\nwithout changing the API."
+        );
+        assert_eq!(activity.requests[0].state, "completed");
+        assert_eq!(activity.requests[0].duration_ms, Some(6_000));
+        assert_eq!(activity.requests[0].provider.as_deref(), Some("openai"));
+        assert!(activity
+            .lifecycle
+            .iter()
+            .any(|event| event.kind == "request_completed"));
+    }
+
+    #[test]
+    fn activity_represents_an_unfinished_request_as_active() {
+        let session = activity_session();
+        let activity = build_activity(
+            &session,
+            "Ready",
+            Some("Running"),
+            json!([{
+                "info": {"id":"msg_1","role":"user","time":{"created":1767261600000i64}},
+                "parts": [{"type":"text","text":"Run the test suite."}]
+            }]),
+            json!({"ses_demo":{"type":"busy"}}),
+            &config("http://profile.test".into()),
+        );
+
+        assert_eq!(activity.state, "active");
+        assert_eq!(activity.request_state, "running");
+        assert_eq!(activity.requests[0].duration_ms, None);
+        assert_eq!(activity.requests[0].prompt, "Run the test suite.");
     }
 
     #[tokio::test]

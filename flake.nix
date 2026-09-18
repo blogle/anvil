@@ -19,7 +19,13 @@
         # Do not override with rustc alone: Crane needs a complete toolchain
         # (cargo plus rustc) for dependency derivations.
         craneLib = crane.mkLib pkgs;
-        src = craneLib.cleanCargoSource ./.;
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            craneLib.filterCargoSources path type
+            || pkgs.lib.hasSuffix "/web" (toString path)
+            || pkgs.lib.hasInfix "/web/" (toString path);
+        };
         commonArgs = {
           inherit src;
           pname = "anvil";

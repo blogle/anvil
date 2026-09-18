@@ -223,6 +223,56 @@ pub struct Session {
     pub work_branch: String,
     pub model: Option<String>,
     pub opencode_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRequest {
+    pub id: String,
+    pub number: u32,
+    pub origin: String,
+    pub prompt: String,
+    pub state: String,
+    pub started_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_operation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleEvent {
+    pub kind: String,
+    pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionActivity {
+    pub session: Session,
+    pub state: String,
+    pub request_state: String,
+    pub current_operation: Option<String>,
+    pub last_activity_at: Option<String>,
+    pub requests: Vec<SessionRequest>,
+    pub lifecycle: Vec<LifecycleEvent>,
+    pub preview_url: Option<String>,
+    pub opencode_url: Option<String>,
+    pub attach_command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

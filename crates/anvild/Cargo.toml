@@ -10,6 +10,7 @@ anvil-core.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 axum = "0.7"
+chrono.workspace = true
 k8s-openapi = { version = "0.23", features = ["v1_30"] }
 kube = { version = "0.95", features = ["client", "rustls-tls"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
