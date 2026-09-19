@@ -46,7 +46,7 @@
           (builtins.readFile ./runtime/sandbox-entrypoint);
         credentialHelper = pkgs.writeShellScriptBin "anvil-credential"
           (builtins.readFile ./runtime/anvil-credential);
-        anvilReportPlugin = pkgs.writeTextDir "share/anvil/anvil-report.ts"
+        anvilReportPlugin = pkgs.writeTextDir "usr/share/anvil/anvil-report.ts"
           (builtins.readFile ./runtime/anvil-report.ts);
         ghWrapper = pkgs.writeShellScriptBin "gh" ''
           set -euo pipefail
