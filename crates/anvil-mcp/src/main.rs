@@ -407,12 +407,8 @@ fn allowed_hosts() -> Vec<String> {
         .unwrap_or_else(|| vec!["localhost".into(), "127.0.0.1".into()])
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().json().init();
-    let base =
-        Url::parse(&env::var("ANVIL_API_URL").unwrap_or_else(|_| "http://127.0.0.1:8080/".into()))?;
-    let server = AnvilMcp::new(base).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+fn app(base: Url) -> Router {
+    let server = AnvilMcp::new(base).expect("Anvil MCP server should initialize");
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
@@ -421,9 +417,17 @@ async fn main() -> anyhow::Result<()> {
             .with_legacy_session_mode(false)
             .with_json_response(true),
     );
-    let app = Router::new()
+    Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .nest_service("/mcp", service);
+        .nest_service("/mcp", service)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().json().init();
+    let base =
+        Url::parse(&env::var("ANVIL_API_URL").unwrap_or_else(|_| "http://127.0.0.1:8080/".into()))?;
+    let app = app(base);
     axum::serve(tokio::net::TcpListener::bind("0.0.0.0:8081").await?, app).await?;
     Ok(())
 }
@@ -440,6 +444,7 @@ mod tests {
         for operation in [
             "anvil_list_sessions",
             "anvil_get_session",
+            "anvil_get_activity",
             "anvil_get_status",
             "anvil_create_session",
             "anvil_send_message",
@@ -456,6 +461,69 @@ mod tests {
             assert!(
                 CONTROLLER_OPERATIONS.contains(&operation),
                 "missing {operation}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn streamable_http_tools_list_exposes_complete_controller_surface() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = super::app(reqwest::Url::parse("http://127.0.0.1:8080/").unwrap());
+        let initialize = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("host", "127.0.0.1")
+            .header("mcp-protocol-version", "2025-06-18")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "anvil-mcp-test", "version": "0.1.0"}
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(initialize).await.unwrap();
+        assert!(response.status().is_success());
+
+        let tools_list = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("host", "127.0.0.1")
+            .header("mcp-protocol-version", "2025-06-18")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}).to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(tools_list).await.unwrap();
+        assert!(response.status().is_success());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let tools = payload["result"]["tools"]
+            .as_array()
+            .expect("tools/list must return a tool array");
+        let names: std::collections::HashSet<&str> = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        for operation in CONTROLLER_OPERATIONS {
+            assert!(
+                names.contains(operation),
+                "transport is missing {operation}"
             );
         }
     }
