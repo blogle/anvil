@@ -2549,6 +2549,7 @@ fn merge_history(mut activity: SessionActivity, history: &[HistoryEvent]) -> Ses
                 (event.kind == "request_failed").then(|| event.detail.clone().unwrap_or_default())
             }),
         });
+        matched.push(true);
     }
     activity
         .requests
@@ -3458,6 +3459,63 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].prompt.as_deref(), Some("Inspect the repository"));
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[test]
+    fn merge_history_tracks_requests_added_from_multiple_events() {
+        let session: Session = serde_json::from_value(json!({
+            "id": "demo-12345678",
+            "sandbox": "anvil-demo-12345678",
+            "service": "anvil-demo-12345678",
+            "namespace": "anvil",
+            "opencode_port": 4096,
+            "phase": "Ready",
+            "project": "demo",
+            "repository": "https://github.com/example/demo.git",
+            "ref": "main",
+            "work_branch": "anvil/demo-12345678",
+            "model": "openai/gpt-5.6-luna",
+            "environment_state": "ready",
+            "work_state": "in_progress"
+        }))
+        .unwrap();
+        let activity = build_activity(
+            &session,
+            "Ready",
+            None,
+            json!([]),
+            json!({}),
+            &config("http://profile.test".into()),
+        );
+        let history = vec![
+            HistoryEvent {
+                session_id: session.id.clone(),
+                kind: "request_started".into(),
+                at: "2026-01-01T10:00:00Z".into(),
+                request_id: Some("request_1".into()),
+                prompt: Some("first prompt".into()),
+                origin: Some("Anvil controller".into()),
+                run_id: None,
+                detail: None,
+                model: Some("openai/gpt-5.6-luna".into()),
+            },
+            HistoryEvent {
+                session_id: session.id,
+                kind: "request_started".into(),
+                at: "2026-01-01T10:01:00Z".into(),
+                request_id: Some("request_2".into()),
+                prompt: Some("second prompt".into()),
+                origin: Some("Anvil controller".into()),
+                run_id: None,
+                detail: None,
+                model: Some("openai/gpt-5.6-luna".into()),
+            },
+        ];
+
+        let activity = merge_history(activity, &history);
+        assert_eq!(activity.requests.len(), 2);
+        assert_eq!(activity.requests[0].prompt, "first prompt");
+        assert_eq!(activity.requests[1].prompt, "second prompt");
     }
 
     #[tokio::test]
