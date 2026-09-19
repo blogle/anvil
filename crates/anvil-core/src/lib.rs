@@ -331,6 +331,18 @@ pub struct Session {
     pub current_run: Option<Run>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run: Option<Run>,
+    #[serde(default)]
+    pub session_binding_state: String,
+    #[serde(default)]
+    pub session_binding_continuity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_binding_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_binding_checked_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_opencode_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_binding_recovery_event: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,6 +405,12 @@ pub struct SessionActivity {
     pub work_state_summary: Option<String>,
     pub current_run: Option<Run>,
     pub last_run: Option<Run>,
+    pub session_binding_state: String,
+    pub session_binding_continuity: String,
+    pub session_binding_error: Option<String>,
+    pub session_binding_checked_at: Option<String>,
+    pub previous_opencode_session_id: Option<String>,
+    pub session_binding_recovery_event: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

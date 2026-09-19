@@ -18,6 +18,7 @@ project_dir="/workspace/${ANVIL_PROJECT}"
 
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" \
   "$XDG_STATE_HOME" "$HOME/.local/share/opencode"
+mkdir -p "$XDG_DATA_HOME/opencode"
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 
@@ -67,6 +68,14 @@ elif [ ! -e "$auth_link" ]; then
   ln -s "$profile_auth" "$auth_link"
 else
   echo "warning: preserving existing sandbox OpenCode auth.json" >&2
+fi
+data_auth_link="$XDG_DATA_HOME/opencode/auth.json"
+if [ -L "$data_auth_link" ]; then
+  if [ "$(readlink "$data_auth_link")" != "$profile_auth" ]; then
+    ln -sfn "$profile_auth" "$data_auth_link"
+  fi
+elif [ ! -e "$data_auth_link" ]; then
+  ln -s "$profile_auth" "$data_auth_link"
 fi
 
 git config --global --add safe.directory "$project_dir"

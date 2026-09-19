@@ -143,6 +143,8 @@ pub enum ServiceError {
     Forbidden(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("session recovery required: {0}")]
+    Recovery(String),
     #[error("invalid request: {0}")]
     Invalid(String),
 }
@@ -153,6 +155,7 @@ impl IntoResponse for ServiceError {
             ServiceError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServiceError::Forbidden(_) => StatusCode::FORBIDDEN,
             ServiceError::Conflict(_) => StatusCode::CONFLICT,
+            ServiceError::Recovery(_) => StatusCode::CONFLICT,
             ServiceError::Invalid(_) => StatusCode::BAD_REQUEST,
             ServiceError::OpenCode(_) => StatusCode::BAD_GATEWAY,
             ServiceError::Profile(_) => StatusCode::BAD_GATEWAY,
@@ -182,6 +185,11 @@ pub struct CreateRequest {
 #[derive(Debug, Deserialize)]
 pub struct PromptRequest {
     pub prompt: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecoveryRequest {
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -321,6 +329,13 @@ pub trait SandboxApi: Send + Sync + 'static {
     ) -> Result<(), ServiceError> {
         Ok(())
     }
+    async fn set_binding_state(
+        &self,
+        _id: &str,
+        _state: &BindingStateRecord,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -331,6 +346,16 @@ pub struct WorkStateRecord {
     pub run_id: Option<String>,
     pub current_run: Option<Run>,
     pub last_run: Option<Run>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BindingStateRecord {
+    pub state: String,
+    pub continuity: String,
+    pub checked_at: String,
+    pub error: Option<String>,
+    pub previous_session_id: Option<String>,
+    pub recovery_event: Option<String>,
 }
 
 pub struct KubeSandboxApi {
@@ -420,6 +445,38 @@ fn run_value(run: Option<&Run>) -> Value {
     })
 }
 
+fn binding_state_record(o: &DynamicObject, config: &Config) -> BindingStateRecord {
+    let annotations = o.annotations();
+    BindingStateRecord {
+        state: annotations
+            .get(&annotation_key(config, "binding-state"))
+            .cloned()
+            .unwrap_or_else(|| "unknown".into()),
+        continuity: annotations
+            .get(&annotation_key(config, "binding-continuity"))
+            .cloned()
+            .unwrap_or_else(|| "unknown".into()),
+        checked_at: annotations
+            .get(&annotation_key(config, "binding-checked-at"))
+            .cloned()
+            .or_else(|| {
+                annotations
+                    .get(&annotation_key(config, "created-at"))
+                    .cloned()
+            })
+            .unwrap_or_else(chrono_like_now),
+        error: annotations
+            .get(&annotation_key(config, "binding-error"))
+            .cloned(),
+        previous_session_id: annotations
+            .get(&annotation_key(config, "binding-previous-session-id"))
+            .cloned(),
+        recovery_event: annotations
+            .get(&annotation_key(config, "binding-recovery-event"))
+            .cloned(),
+    }
+}
+
 fn labels() -> Value {
     json!({MANAGED:"anvil", APP:"sandbox"})
 }
@@ -436,6 +493,7 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
         .and_then(|v| v.get("phase"))
         .and_then(Value::as_str);
     let work = work_state_record(o, config);
+    let binding = binding_state_record(o, config);
     let suspended = o
         .data
         .get("spec")
@@ -493,6 +551,12 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
         work_state_run_id: work.run_id,
         current_run: work.current_run,
         last_run: work.last_run,
+        session_binding_state: binding.state,
+        session_binding_continuity: binding.continuity,
+        session_binding_error: binding.error,
+        session_binding_checked_at: Some(binding.checked_at),
+        previous_opencode_session_id: binding.previous_session_id,
+        session_binding_recovery_event: binding.recovery_event,
     })
 }
 #[async_trait]
@@ -563,6 +627,18 @@ impl SandboxApi for KubeSandboxApi {
             annotation_key(&self.config, "run-current"),
             Value::String(serde_json::to_string(&initial_run).unwrap()),
         );
+        annotations.insert(
+            annotation_key(&self.config, "binding-state"),
+            Value::String("pending".into()),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "binding-continuity"),
+            Value::String("exact".into()),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "binding-checked-at"),
+            Value::String(now.clone()),
+        );
         if let Some(model) = &r.model {
             annotations.insert(
                 annotation_key(&self.config, "model"),
@@ -578,12 +654,13 @@ impl SandboxApi for KubeSandboxApi {
             json!({"name":"ANVIL_RUN_ID","value":run_id}),
             json!({"name":"OPENCODE_CONFIG","value":"/anvil/profile/config/opencode.jsonc"}),
             json!({"name":"OPENCODE_CONFIG_DIR","value":"/anvil/profile/config"}),
+            json!({"name":"OPENCODE_DISABLE_CHANNEL_DB","value":"1"}),
             json!({"name":"HOME","value":"/home/anvil"}),
             json!({"name":"XDG_CONFIG_HOME","value":"/home/anvil/.config"}),
-            json!({"name":"XDG_CACHE_HOME","value":"/home/anvil/.cache"}),
-            json!({"name":"XDG_DATA_HOME","value":"/home/anvil/.local/share"}),
-            json!({"name":"XDG_STATE_HOME","value":"/home/anvil/.local/state"}),
-            json!({"name":"XDG_RUNTIME_DIR","value":"/home/anvil/.local/state/runtime"}),
+            json!({"name":"XDG_CACHE_HOME","value":"/workspace/.anvil/opencode/cache"}),
+            json!({"name":"XDG_DATA_HOME","value":"/workspace/.anvil/opencode/data"}),
+            json!({"name":"XDG_STATE_HOME","value":"/workspace/.anvil/opencode/state"}),
+            json!({"name":"XDG_RUNTIME_DIR","value":"/workspace/.anvil/opencode/runtime"}),
             json!({"name":"DISPLAY","value":":99"}),
         ];
         env.extend(
@@ -596,7 +673,7 @@ impl SandboxApi for KubeSandboxApi {
             "image": self.config.image,
             "command": ["/bin/bash", "-c"],
             "args": [
-                "set -euo pipefail\nmkdir -p /workspace\nchown -R 1000:1000 \"/workspace/$ANVIL_PROJECT\""
+                 "set -euo pipefail\nmkdir -p /workspace/.anvil/opencode/{cache,data,state,runtime} \"/workspace/$ANVIL_PROJECT\"\nchown -R 1000:1000 /workspace/.anvil \"/workspace/$ANVIL_PROJECT\""
             ],
             "env": [{"name": "ANVIL_PROJECT", "value": r.project}],
             "securityContext": {"runAsUser": 0, "runAsGroup": 0},
@@ -624,7 +701,7 @@ impl SandboxApi for KubeSandboxApi {
             work_branch: branch_name(&SessionId::parse(id).unwrap()),
             model: r.model.clone(),
             opencode_session_id: None,
-            created_at: Some(now),
+            created_at: Some(now.clone()),
             ready_at: None,
             environment_state: "provisioning".into(),
             work_state: WorkState::InProgress.as_str().into(),
@@ -633,6 +710,12 @@ impl SandboxApi for KubeSandboxApi {
             work_state_run_id: Some(initial_run.id.clone()),
             current_run: Some(initial_run),
             last_run: None,
+            session_binding_state: "pending".into(),
+            session_binding_continuity: "exact".into(),
+            session_binding_error: None,
+            session_binding_checked_at: Some(now.clone()),
+            previous_opencode_session_id: None,
+            session_binding_recovery_event: None,
         })
     }
     async fn suspend(&self, id: &str) -> Result<(), ServiceError> {
@@ -720,6 +803,45 @@ impl SandboxApi for KubeSandboxApi {
         self.patch(id, json!({"metadata":{"annotations":annotations}}))
             .await
     }
+    async fn set_binding_state(
+        &self,
+        id: &str,
+        state: &BindingStateRecord,
+    ) -> Result<(), ServiceError> {
+        let mut annotations = serde_json::Map::new();
+        annotations.insert(
+            annotation_key(&self.config, "binding-state"),
+            Value::String(state.state.clone()),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "binding-continuity"),
+            Value::String(state.continuity.clone()),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "binding-checked-at"),
+            Value::String(state.checked_at.clone()),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "binding-error"),
+            state.error.clone().map_or(Value::Null, Value::String),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "binding-previous-session-id"),
+            state
+                .previous_session_id
+                .clone()
+                .map_or(Value::Null, Value::String),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "binding-recovery-event"),
+            state
+                .recovery_event
+                .clone()
+                .map_or(Value::Null, Value::String),
+        );
+        self.patch(id, json!({"metadata":{"annotations":annotations}}))
+            .await
+    }
 }
 impl KubeSandboxApi {
     async fn patch(&self, id: &str, v: Value) -> Result<(), ServiceError> {
@@ -798,6 +920,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sessions/:id/report", post(report))
         .route("/v1/sessions/:id/report-context", get(report_context))
         .route("/v1/sessions/:id/complete", post(complete))
+        .route("/v1/sessions/:id/rebind", post(rebind))
         .route("/v1/sessions/:id/status", get(status))
         .route("/v1/sessions/:id/diff", get(diff))
         .route("/v1/sessions/:id/abort", post(abort))
@@ -921,6 +1044,14 @@ async fn create(
     };
     let oc_id = oc.create_session().await?;
     s.kube.set_opencode_session(&id, &oc_id).await?;
+    let recovered = reconcile_binding(&s, &id).await?;
+    if !binding_is_usable(&recovered) {
+        return Err(ServiceError::Recovery(
+            recovered
+                .session_binding_error
+                .unwrap_or_else(|| "new OpenCode session could not be verified".into()),
+        ));
+    }
     oc.prompt_async(&oc_id, prompt.as_str(), model.as_ref())
         .await?;
     obj = s.kube.get(&id).await?;
@@ -1025,21 +1156,148 @@ fn service_url(sess: &Session, c: &Config) -> String {
     };
     format!("http://{host}:{}", c.opencode_port)
 }
+
+fn binding_is_usable(session: &Session) -> bool {
+    matches!(
+        session.session_binding_state.as_str(),
+        "available" | "rebound"
+    )
+}
+
+async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceError> {
+    let object = s.kube.get(id).await?;
+    let session = session_from(&object, &s.config)?;
+    let Some(opencode_id) = session.opencode_session_id.as_deref() else {
+        return Ok(session);
+    };
+    let previous = binding_state_record(&object, &s.config);
+    let checked_at = chrono_like_now();
+    s.kube
+        .set_binding_state(
+            id,
+            &BindingStateRecord {
+                state: "recovering".into(),
+                continuity: previous.continuity.clone(),
+                checked_at: checked_at.clone(),
+                error: None,
+                previous_session_id: previous.previous_session_id.clone(),
+                recovery_event: previous.recovery_event.clone(),
+            },
+        )
+        .await?;
+    let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
+    match op.session_exists(opencode_id).await {
+        Ok(true) => {
+            let state = if previous.state == "rebound" {
+                "rebound"
+            } else {
+                "available"
+            };
+            s.kube
+                .set_binding_state(
+                    id,
+                    &BindingStateRecord {
+                        state: state.into(),
+                        continuity: if previous.continuity == "lost" {
+                            "lost".into()
+                        } else {
+                            "exact".into()
+                        },
+                        checked_at,
+                        error: None,
+                        previous_session_id: previous.previous_session_id,
+                        recovery_event: previous.recovery_event,
+                    },
+                )
+                .await?;
+        }
+        Ok(false) => {
+            s.kube
+                .set_binding_state(
+                    id,
+                    &BindingStateRecord {
+                        state: "missing".into(),
+                        continuity: previous.continuity,
+                        checked_at,
+                        error: Some(format!("OpenCode session {opencode_id} was not found")),
+                        previous_session_id: previous.previous_session_id,
+                        recovery_event: previous.recovery_event,
+                    },
+                )
+                .await?;
+        }
+        Err(error) => {
+            s.kube
+                .set_binding_state(
+                    id,
+                    &BindingStateRecord {
+                        state: "recovering".into(),
+                        continuity: previous.continuity,
+                        checked_at,
+                        error: Some(error.to_string()),
+                        previous_session_id: previous.previous_session_id,
+                        recovery_event: previous.recovery_event,
+                    },
+                )
+                .await?;
+        }
+    }
+    session_from(&s.kube.get(id).await?, &s.config)
+}
+
+async fn rebind(
+    Path(id): Path<String>,
+    State(s): State<AppState>,
+    Json(request): Json<RecoveryRequest>,
+) -> Result<Json<Session>, ServiceError> {
+    let prompt = request
+        .prompt
+        .as_deref()
+        .map(|prompt| Prompt::new(prompt).map_err(|error| ServiceError::Invalid(error.to_string())))
+        .transpose()?;
+    let session = session_from(&s.kube.get(&id).await?, &s.config)?;
+    let old_id = session.opencode_session_id.clone();
+    let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
+    wait_opencode(&op, s.config.request_timeout).await?;
+    let new_id = op.create_session().await?;
+    s.kube.set_opencode_session(&id, &new_id).await?;
+    let checked_at = chrono_like_now();
+    s.kube
+        .set_binding_state(
+            &id,
+            &BindingStateRecord {
+                state: "rebound".into(),
+                continuity: "lost".into(),
+                checked_at,
+                error: None,
+                previous_session_id: old_id,
+                recovery_event: Some(
+                    "OpenCode session rebound; conversation continuity was lost".into(),
+                ),
+            },
+        )
+        .await?;
+    if let Some(prompt) = prompt {
+        op.prompt_async(&new_id, prompt.as_str(), None).await?;
+    }
+    Ok(Json(reconcile_binding(&s, &id).await?))
+}
+
 async fn enumerate(State(s): State<AppState>) -> Result<Json<Vec<Session>>, ServiceError> {
-    Ok(Json(
-        s.kube
-            .list()
-            .await?
-            .iter()
-            .filter_map(|o| session_from(o, &s.config).ok())
-            .collect(),
-    ))
+    let objects = s.kube.list().await?;
+    let mut sessions = Vec::with_capacity(objects.len());
+    for object in objects {
+        if let Ok(session) = session_from(&object, &s.config) {
+            sessions.push(reconcile_binding(&s, &session.id).await.unwrap_or(session));
+        }
+    }
+    Ok(Json(sessions))
 }
 async fn session(
     Path(id): Path<String>,
     State(s): State<AppState>,
 ) -> Result<Json<Session>, ServiceError> {
-    Ok(Json(session_from(&s.kube.get(&id).await?, &s.config)?))
+    Ok(Json(reconcile_binding(&s, &id).await?))
 }
 
 async fn activity(
@@ -1047,14 +1305,15 @@ async fn activity(
     State(s): State<AppState>,
 ) -> Result<Json<SessionActivity>, ServiceError> {
     let object = s.kube.get(&id).await?;
-    let session = session_from(&object, &s.config)?;
+    let session = reconcile_binding(&s, &id).await?;
     let phase = session.phase.as_deref().unwrap_or("Starting");
     let operating_mode = object
         .data
         .get("spec")
         .and_then(|value| value.get("operatingMode"))
         .and_then(Value::as_str);
-    let messages = if let Some(opencode_id) = session.opencode_session_id.as_deref() {
+    let messages = if binding_is_usable(&session) {
+        let opencode_id = session.opencode_session_id.as_deref().unwrap();
         let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
         let messages_path = format!("session/{opencode_id}/message");
         let (messages, status) = tokio::join!(
@@ -1074,7 +1333,12 @@ async fn activity(
             &s.config,
         )
     };
-    Ok(Json(messages))
+    let mut activity = messages;
+    if !binding_is_usable(&session) && session.opencode_session_id.is_some() {
+        activity.execution_state = "unavailable".into();
+        activity.state = "failed".into();
+    }
+    Ok(Json(activity))
 }
 async fn suspend(
     Path(id): Path<String>,
@@ -1086,9 +1350,21 @@ async fn suspend(
 async fn resume(
     Path(id): Path<String>,
     State(s): State<AppState>,
-) -> Result<StatusCode, ServiceError> {
+) -> Result<Json<Session>, ServiceError> {
     s.kube.resume(&id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    let object = wait_ready(&s, &id).await?;
+    let session = session_from(&object, &s.config)?;
+    let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
+    wait_opencode(&op, s.config.request_timeout).await?;
+    let session = reconcile_binding(&s, &id).await?;
+    if !binding_is_usable(&session) {
+        return Err(ServiceError::Recovery(
+            session
+                .session_binding_error
+                .unwrap_or_else(|| "exact OpenCode session recovery is unavailable".into()),
+        ));
+    }
+    Ok(Json(session))
 }
 async fn remove(
     Path(id): Path<String>,
@@ -1103,8 +1379,22 @@ async fn prompt(
     Json(r): Json<PromptRequest>,
 ) -> Result<Json<Value>, ServiceError> {
     let p = Prompt::new(&r.prompt).map_err(|e| ServiceError::Invalid(e.to_string()))?;
+    let current = reconcile_binding(&s, &id).await?;
+    if !binding_is_usable(&current) {
+        return Err(ServiceError::Recovery(
+            current
+                .session_binding_error
+                .unwrap_or_else(|| "exact OpenCode session recovery is unavailable".into()),
+        ));
+    }
     begin_run(&s, &id).await?;
     let x = session_from(&s.kube.get(&id).await?, &s.config)?;
+    if !binding_is_usable(&x) {
+        return Err(ServiceError::Recovery(
+            x.session_binding_error
+                .unwrap_or_else(|| "exact OpenCode session recovery is unavailable".into()),
+        ));
+    }
     let oc = OpenCode::new(service_url(&x, &s.config), s.config.request_timeout);
     let model = match x.model.as_deref() {
         Some(requested) => Some(oc.resolve_model(requested).await?),
@@ -1305,7 +1595,13 @@ async fn proxy(
     method: reqwest::Method,
     query: Option<&str>,
 ) -> Result<Json<Value>, ServiceError> {
-    let x = session_from(&s.kube.get(&id).await?, &s.config)?;
+    let x = reconcile_binding(&s, &id).await?;
+    if !binding_is_usable(&x) {
+        return Err(ServiceError::Recovery(
+            x.session_binding_error
+                .unwrap_or_else(|| "exact OpenCode session recovery is unavailable".into()),
+        ));
+    }
     Ok(Json(
         OpenCode::new(service_url(&x, &s.config), s.config.request_timeout)
             .request(
@@ -1330,7 +1626,26 @@ async fn status(
     Path(id): Path<String>,
     State(s): State<AppState>,
 ) -> Result<Json<Value>, ServiceError> {
-    let x = session_from(&s.kube.get(&id).await?, &s.config)?;
+    let x = reconcile_binding(&s, &id).await?;
+    if !binding_is_usable(&x) {
+        return Ok(Json(json!({
+            "environment_state": x.environment_state,
+            "execution_state": if x.session_binding_state == "missing" { "unavailable" } else { "recovering" },
+            "work_state": x.work_state,
+            "work_state_changed_at": x.work_state_changed_at,
+            "work_state_summary": x.work_state_summary,
+            "work_state_run_id": x.work_state_run_id,
+            "current_run": x.current_run,
+            "last_run": x.last_run,
+            "last_activity_at": x.work_state_changed_at,
+            "session_binding_state": x.session_binding_state,
+            "session_binding_continuity": x.session_binding_continuity,
+            "session_binding_error": x.session_binding_error,
+            "session_binding_checked_at": x.session_binding_checked_at,
+            "previous_opencode_session_id": x.previous_opencode_session_id,
+            "session_binding_recovery_event": x.session_binding_recovery_event,
+        })));
+    }
     let v = OpenCode::new(service_url(&x, &s.config), s.config.request_timeout)
         .request("session/status", reqwest::Method::GET, None)
         .await?;
@@ -1359,6 +1674,12 @@ async fn status(
         "current_run": x.current_run,
         "last_run": x.last_run,
         "last_activity_at": x.work_state_changed_at,
+        "session_binding_state": x.session_binding_state,
+        "session_binding_continuity": x.session_binding_continuity,
+        "session_binding_error": x.session_binding_error,
+        "session_binding_checked_at": x.session_binding_checked_at,
+        "previous_opencode_session_id": x.previous_opencode_session_id,
+        "session_binding_recovery_event": x.session_binding_recovery_event,
         "opencode": selected,
     })))
 }
@@ -1729,6 +2050,12 @@ fn build_activity(
         work_state_summary: session.work_state_summary.clone(),
         current_run: session.current_run.clone(),
         last_run: session.last_run.clone(),
+        session_binding_state: session.session_binding_state.clone(),
+        session_binding_continuity: session.session_binding_continuity.clone(),
+        session_binding_error: session.session_binding_error.clone(),
+        session_binding_checked_at: session.session_binding_checked_at.clone(),
+        previous_opencode_session_id: session.previous_opencode_session_id.clone(),
+        session_binding_recovery_event: session.session_binding_recovery_event.clone(),
     }
 }
 
@@ -2126,6 +2453,22 @@ impl OpenCode {
             .await
             .map(|_| ())
     }
+    async fn session_exists(&self, id: &str) -> Result<bool, ServiceError> {
+        match self
+            .request(&format!("session/{id}"), reqwest::Method::GET, None)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(ServiceError::OpenCode(error))
+                if error.contains("404")
+                    || error.to_ascii_lowercase().contains("not found")
+                    || error.contains("NotFoundError") =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
     async fn create_session(&self) -> Result<String, ServiceError> {
         let v = self
             .request("session", reqwest::Method::POST, Some(json!({})))
@@ -2427,6 +2770,12 @@ mod tests {
                 finished_at: None,
             }),
             last_run: None,
+            session_binding_state: "available".into(),
+            session_binding_continuity: "exact".into(),
+            session_binding_error: None,
+            session_binding_checked_at: Some("2026-01-01T10:00:41Z".into()),
+            previous_opencode_session_id: None,
+            session_binding_recovery_event: None,
         }
     }
 
@@ -2690,6 +3039,18 @@ mod tests {
             error.to_string(),
             "OpenCode error: requested model is unavailable: gpt-5.6-luna"
         );
+    }
+
+    #[tokio::test]
+    async fn treats_a_missing_opencode_session_as_recoverable_binding_loss() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/session/ses_missing");
+            then.status(404)
+                .json_body(json!({"name":"NotFoundError","message":"Session not found"}));
+        });
+        let op = OpenCode::new(server.base_url(), Duration::from_secs(5));
+        assert!(!op.session_exists("ses_missing").await.unwrap());
     }
 
     async fn json_response(response: axum::response::Response) -> Value {

@@ -34,6 +34,11 @@ struct Message {
     prompt: String,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
+struct Recovery {
+    session_id: String,
+    prompt: Option<String>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
 struct Preview {
     session_id: String,
     port: u16,
@@ -148,7 +153,9 @@ impl AnvilMcp {
         )
         .await
     }
-    #[rmcp::tool(description = "Get the current OpenCode execution status for a session.")]
+    #[rmcp::tool(
+        description = "Get independent environment, execution, work-state, and OpenCode conversation-binding status for a session."
+    )]
     async fn anvil_get_status(
         &self,
         Parameters(p): Parameters<Session>,
@@ -224,6 +231,20 @@ impl AnvilMcp {
             Method::POST,
             &format!("v1/sessions/{}/resume", p.session_id),
             None,
+        )
+        .await
+    }
+    #[rmcp::tool(
+        description = "Rebind a recovered Anvil workspace to a new OpenCode session when exact conversation recovery is unavailable. This loses conversation continuity and records that fact."
+    )]
+    async fn anvil_rebind_session(
+        &self,
+        Parameters(p): Parameters<Recovery>,
+    ) -> Result<String, ErrorData> {
+        self.call(
+            Method::POST,
+            &format!("v1/sessions/{}/rebind", p.session_id),
+            Some(json!({"prompt":p.prompt})),
         )
         .await
     }

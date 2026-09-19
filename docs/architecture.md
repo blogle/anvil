@@ -63,6 +63,12 @@ single-node RWO fallback necessarily gives worker pods access to the mounted
 profile contents so OpenCode can refresh credentials; treat Anvil sandboxes as
 trusted until a mediated profile distribution mechanism replaces this PoC.
 
+Each Sandbox also stores OpenCode's native database and XDG state under
+`/workspace/.anvil/opencode` on the workspace PVC. `anvild` verifies the
+durable OpenCode session ID after the server becomes reachable. A missing exact
+binding is reported as degraded rather than replaced; explicit rebind creates a
+new session and records that conversation continuity was lost.
+
 The profile also installs the small `anvil_report` OpenCode plugin. It injects a
 single end-of-turn instruction and reports only `ready_for_review` or
 `awaiting_input` through the Sandbox's existing session capability. It cannot set

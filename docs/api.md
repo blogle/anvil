@@ -33,11 +33,20 @@ execution state from OpenCode status, and work state is durable Anvil metadata.
 | `GET` | `/v1/sessions/{id}/report-context` | Return the current worker run ID |
 | `POST` | `/v1/sessions/{id}/report` | Report `ready_for_review` or `awaiting_input` |
 | `POST` | `/v1/sessions/{id}/complete` | Controller acceptance into `completed` |
+| `POST` | `/v1/sessions/{id}/rebind` | Explicitly create a replacement OpenCode session |
 
 Reports require `Authorization: Bearer <session capability>` and include the
 current `run_id`. Summaries are trimmed and limited to 500 characters. Run and
 work metadata are stored with the Sandbox annotations, so they survive service
 restarts and Sandbox suspension.
+
+OpenCode conversation data is stored in the Sandbox workspace PVC under the
+native OpenCode XDG data/state paths. Session reads reconcile the durable
+`opencode_session_id` against the running server and expose
+`session_binding_state` (`pending`, `recovering`, `available`, `missing`, or
+`rebound`) plus continuity and recovery error fields. A missing binding is not
+silently replaced. Use `rebind` only as an explicit fallback; it records lost
+conversation continuity and optionally accepts a recovery prompt.
 
 ## CLI boundary
 

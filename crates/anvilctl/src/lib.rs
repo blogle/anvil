@@ -68,6 +68,7 @@ pub enum SessionsSubcommand {
     Attach { session: String },
     Report(ReportArgs),
     Complete { session: String },
+    Rebind(RebindArgs),
 }
 
 #[derive(Debug, Args)]
@@ -78,6 +79,13 @@ pub struct ReportArgs {
     pub summary: Option<String>,
     #[arg(long, env = "ANVIL_SESSION_CREDENTIAL")]
     pub capability: String,
+}
+
+#[derive(Debug, Args, Serialize)]
+pub struct RebindArgs {
+    pub session: String,
+    #[arg(long)]
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug, Args, Serialize)]
@@ -506,9 +514,14 @@ async fn run_sessions(client: ApiClient, command: SessionsSubcommand, json: bool
                 .await
         }
         SessionsSubcommand::Resume { session } => {
-            client
-                .no_content(Method::POST, &format!("v1/sessions/{session}/resume"))
-                .await
+            print_response(
+                &client,
+                Method::POST,
+                &format!("v1/sessions/{session}/resume"),
+                None,
+                json,
+            )
+            .await
         }
         SessionsSubcommand::Delete { session } => {
             client
@@ -537,6 +550,16 @@ async fn run_sessions(client: ApiClient, command: SessionsSubcommand, json: bool
                 Method::POST,
                 &format!("v1/sessions/{session}/complete"),
                 None,
+                json,
+            )
+            .await
+        }
+        SessionsSubcommand::Rebind(args) => {
+            print_response(
+                &client,
+                Method::POST,
+                &format!("v1/sessions/{}/rebind", args.session),
+                Some(serde_json::to_value(args)?),
                 json,
             )
             .await
