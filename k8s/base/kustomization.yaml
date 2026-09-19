@@ -8,6 +8,7 @@ resources:
   - runtime-config.yaml
   - github-app-secret.yaml
   - opencode-profile-pvc.yaml
+  - anvil-history-pvc.yaml
   - deployments.yaml
   - anvil-profile-deployment.yaml
   - services.yaml

@@ -30,10 +30,12 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     env,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
 use thiserror::Error;
+use tokio::{io::AsyncWriteExt, sync::Mutex as AsyncMutex};
 use tracing::{info, warn};
 
 const MANAGED: &str = "app.kubernetes.io/managed-by";
@@ -59,6 +61,7 @@ pub struct Config {
     pub session_signing_secret: Option<String>,
     pub session_capability_ttl: Duration,
     pub github_api_url: String,
+    pub history_path: PathBuf,
 }
 impl Config {
     pub fn from_env() -> Result<Self, ServiceError> {
@@ -121,6 +124,7 @@ impl Config {
                     .map_err(|_| ServiceError::Config("ANVIL_SESSION_CAPABILITY_TTL".into()))?,
             ),
             github_api_url: get("ANVIL_GITHUB_API_URL", "https://api.github.com"),
+            history_path: PathBuf::from(get("ANVIL_HISTORY_PATH", "/var/lib/anvil/history.jsonl")),
         })
     }
 }
@@ -224,6 +228,73 @@ pub struct ProviderLoginRequest {
 pub struct ProviderCompleteRequest {
     pub code: Option<String>,
     pub key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoryEvent {
+    session_id: String,
+    kind: String,
+    at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+}
+
+#[derive(Clone)]
+struct HistoryStore {
+    path: PathBuf,
+    lock: Arc<AsyncMutex<()>>,
+}
+
+impl HistoryStore {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            lock: Arc::new(AsyncMutex::new(())),
+        }
+    }
+
+    async fn append(&self, event: HistoryEvent) -> Result<(), ServiceError> {
+        let _guard = self.lock.lock().await;
+        if let Some(parent) = self.path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| ServiceError::Kubernetes(format!("history directory: {error}")))?;
+        }
+        let mut line = serde_json::to_vec(&event)
+            .map_err(|error| ServiceError::Config(format!("history serialization: {error}")))?;
+        line.push(b'\n');
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await
+            .map_err(|error| ServiceError::Kubernetes(format!("history open: {error}")))?
+            .write_all(&line)
+            .await
+            .map_err(|error| ServiceError::Kubernetes(format!("history append: {error}")))
+    }
+
+    async fn for_session(&self, session_id: &str) -> Vec<HistoryEvent> {
+        let _guard = self.lock.lock().await;
+        let Ok(bytes) = tokio::fs::read(&self.path).await else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<HistoryEvent>(line).ok())
+            .filter(|event| event.session_id == session_id)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -456,6 +527,38 @@ fn sandbox_environment(o: &DynamicObject, suspended: bool) -> (&'static str, Opt
     (environment_state(phase, false), phase.map(str::to_owned))
 }
 
+fn annotation_time_millis(value: &str) -> Option<i64> {
+    let raw = value.strip_suffix('Z').unwrap_or(value);
+    if let Ok(number) = raw.parse::<i64>() {
+        return Some(if raw.len() <= 11 {
+            number.saturating_mul(1_000)
+        } else {
+            number
+        });
+    }
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|time| time.timestamp_millis())
+}
+
+fn provisioning_timeout_reason(
+    object: &DynamicObject,
+    config: &Config,
+    timeout: Duration,
+) -> Option<String> {
+    let created_at = object
+        .annotations()
+        .get(&annotation_key(config, "created-at"))?;
+    let created = annotation_time_millis(created_at)?;
+    let deadline = created.saturating_add(timeout.as_millis().try_into().ok()?);
+    (Utc::now().timestamp_millis() >= deadline).then(|| {
+        format!(
+            "Sandbox has not reported Ready within {} seconds of creation",
+            timeout.as_secs()
+        )
+    })
+}
+
 fn run_annotation(value: Option<&String>) -> Option<Run> {
     value.and_then(|value| serde_json::from_str(value).ok())
 }
@@ -574,7 +677,15 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
         .and_then(|value| value.get("operatingMode"))
         .and_then(Value::as_str)
         .is_some_and(|mode| mode.eq_ignore_ascii_case("suspended"));
-    let (environment_state, phase) = sandbox_environment(o, suspended);
+    let (mut environment_state, phase) = sandbox_environment(o, suspended);
+    let environment_error = if environment_state == "provisioning" {
+        provisioning_timeout_reason(o, config, config.request_timeout)
+    } else {
+        None
+    };
+    if environment_error.is_some() {
+        environment_state = "failed";
+    }
     Ok(Session {
         id,
         sandbox: o.name_any(),
@@ -620,6 +731,7 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
             }),
         ready_at: a.get(&annotation_key(config, "ready-at")).cloned(),
         environment_state: environment_state.into(),
+        environment_error,
         work_state: work.state.as_str().into(),
         work_state_changed_at: Some(work.changed_at),
         work_state_summary: work.summary,
@@ -720,7 +832,7 @@ impl SandboxApi for KubeSandboxApi {
                 Value::String(model.clone()),
             );
         }
-        // The prompt is deliberately not represented in this object (nor in logs).
+        // The prompt is kept in Anvil's append-only history, never in Kubernetes metadata.
         let mut env = vec![
             json!({"name":"ANVIL_PROJECT","value":r.project}),
             json!({"name":"ANVIL_REPOSITORY","value":r.repository}),
@@ -779,6 +891,7 @@ impl SandboxApi for KubeSandboxApi {
             created_at: Some(now.clone()),
             ready_at: None,
             environment_state: "provisioning".into(),
+            environment_error: None,
             work_state: WorkState::InProgress.as_str().into(),
             work_state_changed_at: Some(initial_run.started_at.clone()),
             work_state_summary: None,
@@ -919,10 +1032,47 @@ fn new_run_id() -> String {
     format!("run_{}", uuid::Uuid::new_v4().simple())
 }
 
+fn new_request_id() -> String {
+    format!("request_{}", uuid::Uuid::new_v4().simple())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_history(
+    state: &AppState,
+    session_id: &str,
+    kind: &str,
+    at: String,
+    request_id: Option<String>,
+    prompt: Option<String>,
+    origin: Option<&str>,
+    run_id: Option<String>,
+    detail: Option<String>,
+    model: Option<String>,
+) {
+    if let Err(error) = state
+        .history
+        .append(HistoryEvent {
+            session_id: session_id.into(),
+            kind: kind.into(),
+            at,
+            request_id,
+            prompt,
+            origin: origin.map(str::to_owned),
+            run_id,
+            detail,
+            model,
+        })
+        .await
+    {
+        warn!(session_id, kind, %error, "unable to persist Anvil history event");
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
     pub kube: Arc<dyn SandboxApi>,
+    history: HistoryStore,
     profile: ProfileClient,
     pending_logins: Arc<Mutex<HashMap<String, PendingLogin>>>,
     capability_signer: Option<github::CapabilitySigner>,
@@ -952,6 +1102,7 @@ impl AppState {
             _ => None,
         };
         Self {
+            history: HistoryStore::new(config.history_path.clone()),
             config,
             kube: Arc::new(kube),
             profile,
@@ -1090,9 +1241,35 @@ async fn create(
         sandbox_env.push(("ANVIL_GIT_AUTHOR_EMAIL".into(), email.to_owned()));
     }
     let mut sess = s.kube.create(&id, &r, &sandbox_env).await?;
+    record_history(
+        &s,
+        &id,
+        "created",
+        chrono_like_now(),
+        None,
+        None,
+        Some("Anvil controller"),
+        None,
+        None,
+        r.model.clone(),
+    )
+    .await;
     let mut obj = wait_ready(&s, &id).await?;
     let ready_at = chrono_like_now();
     s.kube.set_ready_at(&id, &ready_at).await?;
+    record_history(
+        &s,
+        &id,
+        "ready",
+        ready_at.clone(),
+        None,
+        None,
+        Some("Anvil controller"),
+        None,
+        None,
+        r.model.clone(),
+    )
+    .await;
     sess = session_from(&obj, &s.config).unwrap_or(sess);
     sess.ready_at = Some(ready_at);
     let oc = OpenCode::new(service_url(&sess, &s.config), s.config.request_timeout);
@@ -1115,8 +1292,39 @@ async fn create(
                 .unwrap_or_else(|| "new OpenCode session could not be verified".into()),
         ));
     }
-    oc.prompt_async(&oc_id, prompt.as_str(), model.as_ref())
-        .await?;
+    let request_id = new_request_id();
+    record_history(
+        &s,
+        &id,
+        "request_started",
+        chrono_like_now(),
+        Some(request_id.clone()),
+        Some(prompt.as_str().into()),
+        Some("Anvil controller"),
+        sess.current_run.as_ref().map(|run| run.id.clone()),
+        None,
+        model.as_ref().map(|model| model.qualified_id()),
+    )
+    .await;
+    if let Err(error) = oc
+        .prompt_async(&oc_id, prompt.as_str(), model.as_ref())
+        .await
+    {
+        record_history(
+            &s,
+            &id,
+            "request_failed",
+            chrono_like_now(),
+            Some(request_id),
+            None,
+            Some("Anvil controller"),
+            None,
+            Some(error.to_string()),
+            None,
+        )
+        .await;
+        return Err(error);
+    }
     obj = s.kube.get(&id).await?;
     Ok((
         StatusCode::CREATED,
@@ -1331,7 +1539,7 @@ async fn rebind(
             &BindingStateRecord {
                 state: "rebound".into(),
                 continuity: "lost".into(),
-                checked_at,
+                checked_at: checked_at.clone(),
                 error: None,
                 previous_session_id: old_id,
                 recovery_event: Some(
@@ -1340,8 +1548,50 @@ async fn rebind(
             },
         )
         .await?;
+    record_history(
+        &s,
+        &id,
+        "conversation_rebound",
+        checked_at,
+        None,
+        None,
+        Some("Anvil controller"),
+        None,
+        Some("OpenCode conversation rebound; continuity was lost".into()),
+        None,
+    )
+    .await;
     if let Some(prompt) = prompt {
-        op.prompt_async(&new_id, prompt.as_str(), None).await?;
+        let request_id = new_request_id();
+        record_history(
+            &s,
+            &id,
+            "request_started",
+            chrono_like_now(),
+            Some(request_id.clone()),
+            Some(prompt.as_str().into()),
+            Some("Anvil controller"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        if let Err(error) = op.prompt_async(&new_id, prompt.as_str(), None).await {
+            record_history(
+                &s,
+                &id,
+                "request_failed",
+                chrono_like_now(),
+                Some(request_id),
+                None,
+                Some("Anvil controller"),
+                None,
+                Some(error.to_string()),
+                None,
+            )
+            .await;
+            return Err(error);
+        }
     }
     Ok(Json(reconcile_binding(&s, &id).await?))
 }
@@ -1402,7 +1652,8 @@ async fn activity(
             &s.config,
         )
     };
-    let mut activity = messages;
+    let history = s.history.for_session(&id).await;
+    let mut activity = merge_history(messages, &history);
     if !binding_is_usable(&session) && session.opencode_session_id.is_some() {
         activity.execution_state = "unavailable".into();
         activity.state = "failed".into();
@@ -1414,6 +1665,19 @@ async fn suspend(
     State(s): State<AppState>,
 ) -> Result<StatusCode, ServiceError> {
     s.kube.suspend(&id).await?;
+    record_history(
+        &s,
+        &id,
+        "session_suspended",
+        chrono_like_now(),
+        None,
+        None,
+        Some("Anvil controller"),
+        None,
+        None,
+        None,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn resume(
@@ -1433,6 +1697,19 @@ async fn resume(
                 .unwrap_or_else(|| "exact OpenCode session recovery is unavailable".into()),
         ));
     }
+    record_history(
+        &s,
+        &id,
+        "session_resumed",
+        chrono_like_now(),
+        None,
+        None,
+        Some("Anvil controller"),
+        None,
+        None,
+        None,
+    )
+    .await;
     Ok(Json(session))
 }
 async fn remove(
@@ -1440,6 +1717,19 @@ async fn remove(
     State(s): State<AppState>,
 ) -> Result<StatusCode, ServiceError> {
     s.kube.delete(&id).await?;
+    record_history(
+        &s,
+        &id,
+        "session_deleted",
+        chrono_like_now(),
+        None,
+        None,
+        Some("Anvil controller"),
+        None,
+        None,
+        None,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn prompt(
@@ -1456,7 +1746,7 @@ async fn prompt(
                 .unwrap_or_else(|| "exact OpenCode session recovery is unavailable".into()),
         ));
     }
-    begin_run(&s, &id).await?;
+    let run_id = begin_run(&s, &id).await?;
     let x = session_from(&s.kube.get(&id).await?, &s.config)?;
     if !binding_is_usable(&x) {
         return Err(ServiceError::Recovery(
@@ -1469,16 +1759,48 @@ async fn prompt(
         Some(requested) => Some(oc.resolve_model(requested).await?),
         None => None,
     };
-    Ok(Json(
-        oc.prompt_async(
+    let request_id = new_request_id();
+    record_history(
+        &s,
+        &id,
+        "request_started",
+        chrono_like_now(),
+        Some(request_id.clone()),
+        Some(p.as_str().into()),
+        Some("Anvil controller"),
+        Some(run_id),
+        None,
+        model.as_ref().map(|model| model.qualified_id()),
+    )
+    .await;
+    match oc
+        .prompt_async(
             x.opencode_session_id
                 .as_deref()
                 .ok_or(ServiceError::NotFound)?,
             p.as_str(),
             model.as_ref(),
         )
-        .await?,
-    ))
+        .await
+    {
+        Ok(response) => Ok(Json(response)),
+        Err(error) => {
+            record_history(
+                &s,
+                &id,
+                "request_failed",
+                chrono_like_now(),
+                Some(request_id),
+                None,
+                Some("Anvil controller"),
+                None,
+                Some(error.to_string()),
+                None,
+            )
+            .await;
+            Err(error)
+        }
+    }
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, ServiceError> {
@@ -1577,6 +1899,19 @@ async fn report(
             },
         )
         .await?;
+    record_history(
+        &s,
+        &id,
+        "worker_reported",
+        changed_at.clone(),
+        None,
+        None,
+        Some("Sandbox worker"),
+        Some(request.run_id.clone()),
+        Some(state.as_str().into()),
+        None,
+    )
+    .await;
     Ok(Json(ReportResponse {
         accepted: true,
         session_id: id,
@@ -1614,6 +1949,19 @@ async fn complete(
             },
         )
         .await?;
+    record_history(
+        &s,
+        &id,
+        "session_completed",
+        changed_at.clone(),
+        None,
+        None,
+        Some("Anvil controller"),
+        Some(run_id.clone()),
+        None,
+        None,
+    )
+    .await;
     Ok(Json(ReportResponse {
         accepted: true,
         session_id: id,
@@ -1647,7 +1995,7 @@ async fn begin_run(s: &AppState, id: &str) -> Result<String, ServiceError> {
             id,
             &WorkStateRecord {
                 state: WorkState::InProgress,
-                changed_at,
+                changed_at: changed_at.clone(),
                 summary: None,
                 run_id: Some(run_id.clone()),
                 current_run: Some(run),
@@ -1655,6 +2003,19 @@ async fn begin_run(s: &AppState, id: &str) -> Result<String, ServiceError> {
             },
         )
         .await?;
+    record_history(
+        s,
+        id,
+        "run_started",
+        changed_at,
+        None,
+        None,
+        Some("Anvil controller"),
+        Some(run_id.clone()),
+        None,
+        None,
+    )
+    .await;
     Ok(run_id)
 }
 async fn proxy(
@@ -1699,6 +2060,7 @@ async fn status(
     if !binding_is_usable(&x) {
         return Ok(Json(json!({
             "environment_state": x.environment_state,
+            "environment_error": x.environment_error,
             "execution_state": if x.session_binding_state == "missing" { "unavailable" } else { "recovering" },
             "work_state": x.work_state,
             "work_state_changed_at": x.work_state_changed_at,
@@ -1735,6 +2097,7 @@ async fn status(
     };
     Ok(Json(json!({
         "environment_state": x.environment_state,
+        "environment_error": x.environment_error,
         "execution_state": execution_state,
         "work_state": x.work_state,
         "work_state_changed_at": x.work_state_changed_at,
@@ -2117,6 +2480,7 @@ fn build_activity(
         opencode_url,
         attach_command: format!("anvilctl sessions attach {}", session.id),
         environment_state: environment_state.into(),
+        environment_error: session.environment_error.clone(),
         execution_state: execution_state.into(),
         work_state: session.work_state.clone(),
         work_state_changed_at: session.work_state_changed_at.clone(),
@@ -2130,6 +2494,128 @@ fn build_activity(
         previous_opencode_session_id: session.previous_opencode_session_id.clone(),
         session_binding_recovery_event: session.session_binding_recovery_event.clone(),
     }
+}
+
+fn merge_history(mut activity: SessionActivity, history: &[HistoryEvent]) -> SessionActivity {
+    let mut matched = vec![false; activity.requests.len()];
+    for event in history
+        .iter()
+        .filter(|event| event.kind == "request_started" && event.prompt.is_some())
+    {
+        let prompt = event.prompt.as_deref().unwrap_or_default();
+        if let Some((index, _)) = activity
+            .requests
+            .iter()
+            .enumerate()
+            .find(|(index, request)| !matched[*index] && request.prompt == prompt)
+        {
+            matched[index] = true;
+            continue;
+        }
+        let completion = history.iter().find(|candidate| {
+            candidate.request_id == event.request_id
+                && matches!(
+                    candidate.kind.as_str(),
+                    "request_completed" | "request_failed"
+                )
+        });
+        let failed = completion.is_some_and(|event| event.kind == "request_failed");
+        activity.requests.push(SessionRequest {
+            id: event.request_id.clone().unwrap_or_else(new_request_id),
+            number: 0,
+            origin: event
+                .origin
+                .clone()
+                .unwrap_or_else(|| "Anvil controller".into()),
+            prompt: prompt.into(),
+            state: if failed {
+                "failed"
+            } else if completion.is_some() {
+                "completed"
+            } else {
+                "running"
+            }
+            .into(),
+            started_at: event.at.clone(),
+            completed_at: completion.map(|event| event.at.clone()),
+            duration_ms: None,
+            last_activity_at: completion
+                .map(|event| event.at.clone())
+                .or_else(|| Some(event.at.clone())),
+            current_operation: None,
+            provider: None,
+            model: event.model.clone(),
+            error: completion.and_then(|event| {
+                (event.kind == "request_failed").then(|| event.detail.clone().unwrap_or_default())
+            }),
+        });
+    }
+    activity
+        .requests
+        .sort_by(|left, right| left.started_at.cmp(&right.started_at));
+    for (index, request) in activity.requests.iter_mut().enumerate() {
+        request.number = (index + 1) as u32;
+    }
+    let matched_history_requests = history
+        .iter()
+        .filter(|event| event.kind == "request_started")
+        .filter_map(|event| {
+            event.prompt.as_ref().and_then(|prompt| {
+                activity
+                    .requests
+                    .iter()
+                    .any(|request| &request.prompt == prompt)
+                    .then(|| event.request_id.clone())
+            })
+        })
+        .flatten()
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut lifecycle_keys = activity
+        .lifecycle
+        .iter()
+        .map(|event| {
+            format!(
+                "{}:{}:{}",
+                event.kind,
+                event.at,
+                event.detail.as_deref().unwrap_or_default()
+            )
+        })
+        .collect::<std::collections::HashSet<_>>();
+    for event in history {
+        if matches!(
+            event.kind.as_str(),
+            "request_started" | "request_completed" | "request_failed"
+        ) && (event
+            .request_id
+            .as_ref()
+            .is_some_and(|id| matched_history_requests.contains(id))
+            || activity
+                .requests
+                .iter()
+                .any(|request| request.id == event.request_id.clone().unwrap_or_default()))
+        {
+            continue;
+        }
+        let key = format!(
+            "{}:{}:{}",
+            event.kind,
+            event.at,
+            event.detail.as_deref().unwrap_or_default()
+        );
+        if lifecycle_keys.insert(key) {
+            activity.lifecycle.push(LifecycleEvent {
+                kind: event.kind.clone(),
+                at: event.at.clone(),
+                detail: event.detail.clone().or_else(|| event.run_id.clone()),
+            });
+        }
+    }
+    activity
+        .lifecycle
+        .sort_by(|left, right| left.at.cmp(&right.at));
+    activity
 }
 
 #[derive(Clone)]
@@ -2812,6 +3298,7 @@ mod tests {
             session_signing_secret: None,
             session_capability_ttl: Duration::from_secs(86400),
             github_api_url: "https://api.github.com".into(),
+            history_path: PathBuf::from("/tmp/anvil-history.jsonl"),
         }
     }
 
@@ -2832,6 +3319,7 @@ mod tests {
             created_at: Some("2026-01-01T10:00:00Z".into()),
             ready_at: Some("2026-01-01T10:00:41Z".into()),
             environment_state: "ready".into(),
+            environment_error: None,
             work_state: "in_progress".into(),
             work_state_changed_at: Some("2026-01-01T10:00:00Z".into()),
             work_state_summary: None,
@@ -2919,6 +3407,57 @@ mod tests {
             response.headers()["content-type"],
             "text/javascript; charset=utf-8"
         );
+    }
+
+    #[test]
+    fn provisioning_timeout_is_projected_as_a_problem() {
+        let object: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {
+                "name": "anvil-demo-12345678",
+                "annotations": {
+                    "anvil.example/created-at": "2020-01-01T00:00:00Z"
+                }
+            },
+            "status": {"phase": "Pending"}
+        }))
+        .unwrap();
+        let reason = provisioning_timeout_reason(
+            &object,
+            &config("http://profile.test".into()),
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            reason.as_deref(),
+            Some("Sandbox has not reported Ready within 5 seconds of creation")
+        );
+    }
+
+    #[tokio::test]
+    async fn history_is_read_back_after_store_recreation() {
+        let path =
+            std::env::temp_dir().join(format!("anvil-history-{}.jsonl", uuid::Uuid::new_v4()));
+        let store = HistoryStore::new(path.clone());
+        store
+            .append(HistoryEvent {
+                session_id: "demo-12345678".into(),
+                kind: "request_started".into(),
+                at: "2026-01-01T10:00:00Z".into(),
+                request_id: Some("request_1".into()),
+                prompt: Some("Inspect the repository".into()),
+                origin: Some("Anvil controller".into()),
+                run_id: Some("run_1".into()),
+                detail: None,
+                model: None,
+            })
+            .await
+            .unwrap();
+        let restarted = HistoryStore::new(path.clone());
+        let events = restarted.for_session("demo-12345678").await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].prompt.as_deref(), Some("Inspect the repository"));
+        let _ = tokio::fs::remove_file(path).await;
     }
 
     #[tokio::test]

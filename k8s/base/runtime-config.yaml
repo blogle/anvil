@@ -14,6 +14,7 @@ data:
   ANVIL_PROFILE_OPENCODE_URL: http://anvil-profile.anvil.svc.cluster.local:4096
   ANVIL_API_URL: http://anvild:8080
   ANVIL_CREDENTIAL_URL: http://anvild:8080
+  ANVIL_HISTORY_PATH: /var/lib/anvil/history.jsonl
   ANVIL_GITHUB_API_URL: https://api.github.com
   BASE_DOMAIN: preview.example.invalid
   AGENT_SANDBOX_ROUTER_URL: http://sandbox-router.example.invalid:8080

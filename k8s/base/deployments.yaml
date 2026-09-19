@@ -24,6 +24,9 @@ spec:
             - secretRef:
                 name: github-app-credentials
                 optional: true
+          volumeMounts:
+            - name: history
+              mountPath: /var/lib/anvil
           ports:
             - name: http
               containerPort: 8080
@@ -38,6 +41,10 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+      volumes:
+        - name: history
+          persistentVolumeClaim:
+            claimName: anvil-history
 ---
 apiVersion: apps/v1
 kind: Deployment

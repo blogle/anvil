@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { applyServerRefresh, formatElapsedValue, operatorState, parseRoute } from "./ui-state.js"
+import { applyServerRefresh, detailRenderSignature, formatElapsedValue, operatorState, parseRoute, sessionUiState } from "./ui-state.js"
 
 test("poll payload preserves local interaction state and selected session", () => {
   const activities = new Map([["demo-12345678", {
@@ -45,4 +45,24 @@ test("fake clock updates elapsed time without changing the interaction model", (
   assert.equal(operatorState({ environment_state: "ready", execution_state: "idle", work_state: "in_progress", session_binding_state: "available" }), "working")
   assert.equal(parseRoute("#session/demo-12345678"), "demo-12345678")
   assert.equal(parseRoute("#settings"), null)
+})
+
+test("volatile binding checks do not change the detail render signature", () => {
+  const activity = { session: { id: "demo-12345678" }, session_binding_checked_at: "2026-09-19T12:00:00Z", requests: [] }
+  const next = { ...activity, session_binding_checked_at: "2026-09-19T12:00:04Z" }
+  assert.deepEqual(detailRenderSignature(activity), detailRenderSignature(next))
+})
+
+test("detail interaction state is scoped to each session", () => {
+  const state = { sessionUi: new Map() }
+  const first = sessionUiState(state, "first")
+  first.attachOpen = true
+  first.expandedPrompts.add("request-1")
+  first.tab = "runtime"
+  first.focusKey = "copy"
+  const second = sessionUiState(state, "second")
+  assert.equal(second.attachOpen, false)
+  assert.deepEqual(second.expandedPrompts, new Set())
+  assert.equal(second.tab, "logs")
+  assert.equal(second.focusKey, null)
 })

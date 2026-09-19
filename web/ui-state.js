@@ -28,6 +28,23 @@ export function applyServerRefresh(state, sessions, activities) {
   return next
 }
 
+export function detailRenderSignature(value) {
+  if (value === null || typeof value !== "object") return value
+  if (Array.isArray(value)) return value.map(detailRenderSignature)
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => key !== "session_binding_checked_at")
+    .map(([key, item]) => [key, detailRenderSignature(item)]))
+}
+
+export function sessionUiState(state, sessionId) {
+  if (!state.sessionUi) state.sessionUi = new Map()
+  if (!state.sessionUi.has(sessionId)) state.sessionUi.set(sessionId, {
+    tab: "logs", attachOpen: false, expandedPrompts: new Set(), copyStatus: null,
+    focusKey: null, scrollTop: 0, selectedText: null,
+  })
+  return state.sessionUi.get(sessionId)
+}
+
 export function formatElapsedValue(value, now = Date.now()) {
   const raw = String(value || "")
   let start = Date.parse(raw)

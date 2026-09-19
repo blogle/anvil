@@ -319,6 +319,8 @@ pub struct Session {
     pub ready_at: Option<String>,
     #[serde(default)]
     pub environment_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_error: Option<String>,
     #[serde(default)]
     pub work_state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -399,6 +401,7 @@ pub struct SessionActivity {
     pub opencode_url: Option<String>,
     pub attach_command: String,
     pub environment_state: String,
+    pub environment_error: Option<String>,
     pub execution_state: String,
     pub work_state: String,
     pub work_state_changed_at: Option<String>,
