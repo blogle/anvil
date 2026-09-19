@@ -142,7 +142,7 @@
           packages = [
             toolchain pkgs.cargo pkgs.rustfmt pkgs.clippy pkgs.rust-analyzer
             pkgs.cargo-nextest pkgs.just pkgs.git pkgs.gh pkgs.curl pkgs.jq
-            pkgs.kubectl pkgs.kustomize pkgs.nix
+            pkgs.kubectl pkgs.kustomize pkgs.nix pkgs.nodejs
           ];
         };
 

@@ -12,6 +12,26 @@ normalized and never includes credential contents:
 | `POST` | `/v1/providers/{provider}/login/{login_id}/complete` | Complete the in-memory login attempt |
 | `GET` | `/v1/opencode/config` | Read the shared profile OpenCode configuration |
 
+Session controller routes are:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/v1/sessions` | Create a session and dispatch its initial prompt |
+| `GET` | `/v1/sessions` | List sessions |
+| `GET` | `/v1/sessions/{id}` | Read durable session metadata and binding state |
+| `POST` | `/v1/sessions/{id}/messages` | Send steering to the current OpenCode session |
+| `GET` | `/v1/sessions/{id}/messages` | Read OpenCode messages |
+| `GET` | `/v1/sessions/{id}/status` | Read environment, execution, work, and binding state |
+| `GET` | `/v1/sessions/{id}/activity` | Read the normalized dashboard/activity model |
+| `GET` | `/v1/sessions/{id}/diff` | Read the repository diff |
+| `GET` | `/v1/sessions/{id}/previews/{port}` | Resolve a preview URL |
+| `POST` | `/v1/sessions/{id}/abort` | Abort the current OpenCode turn |
+| `POST` | `/v1/sessions/{id}/suspend` | Suspend the Sandbox |
+| `POST` | `/v1/sessions/{id}/resume` | Resume and reconcile the Sandbox |
+| `POST` | `/v1/sessions/{id}/rebind` | Explicitly create a replacement OpenCode binding |
+| `POST` | `/v1/sessions/{id}/complete` | Controller acceptance into `completed` |
+| `DELETE` | `/v1/sessions/{id}` | Delete the session and workspace |
+
 Provider login is a relay to the singleton profile OpenCode server. OpenCode
 1.18.30 supplies `GET /provider`, `GET /provider/auth`,
 `POST /provider/{id}/oauth/authorize`, `POST /provider/{id}/oauth/callback`,
@@ -47,6 +67,12 @@ native OpenCode XDG data/state paths. Session reads reconcile the durable
 `rebound`) plus continuity and recovery error fields. A missing binding is not
 silently replaced. Use `rebind` only as an explicit fallback; it records lost
 conversation continuity and optionally accepts a recovery prompt.
+
+The MCP server projects these controller routes as structured JSON tool
+results. Mutations include `accepted`, `session_id`, the authoritative result,
+and a current status projection where the session still exists. HTTP errors are
+returned as structured MCP error data containing the HTTP status and Anvil's
+`error.code`/`error.message` object rather than an opaque JSON string.
 
 ## CLI boundary
 

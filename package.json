@@ -1,0 +1,8 @@
+{
+  "name": "anvil-frontend-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test web/ui-state.test.js"
+  }
+}

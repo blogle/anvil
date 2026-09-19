@@ -411,6 +411,51 @@ fn environment_state(phase: Option<&str>, suspended: bool) -> &'static str {
     }
 }
 
+fn condition_indicates_failure(condition: &Value) -> bool {
+    let status = condition.get("status").and_then(Value::as_str);
+    let condition_type = condition.get("type").and_then(Value::as_str);
+    let reason = condition
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let message = condition
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    (condition_type == Some("Failed") && status == Some("True"))
+        || reason.contains("fail")
+        || reason.contains("error")
+        || message.contains("fail")
+        || message.contains("error")
+}
+
+fn sandbox_environment(o: &DynamicObject, suspended: bool) -> (&'static str, Option<String>) {
+    if suspended {
+        return ("suspended", None);
+    }
+    let status = o.data.get("status");
+    let conditions = status
+        .and_then(|value| value.get("conditions"))
+        .and_then(Value::as_array);
+    if conditions.is_some_and(|conditions| conditions.iter().any(condition_indicates_failure)) {
+        return ("failed", Some("Failed".into()));
+    }
+    if conditions.is_some_and(|conditions| {
+        conditions.iter().any(|condition| {
+            condition.get("type").and_then(Value::as_str) == Some("Ready")
+                && condition.get("status").and_then(Value::as_str) == Some("True")
+        })
+    }) {
+        return ("ready", Some("Ready".into()));
+    }
+    let phase = status
+        .and_then(|value| value.get("phase"))
+        .and_then(Value::as_str);
+    (environment_state(phase, false), phase.map(str::to_owned))
+}
+
 fn run_annotation(value: Option<&String>) -> Option<Run> {
     value.and_then(|value| serde_json::from_str(value).ok())
 }
@@ -441,8 +486,42 @@ fn work_state_record(o: &DynamicObject, config: &Config) -> WorkStateRecord {
 
 fn run_value(run: Option<&Run>) -> Value {
     run.map_or(Value::Null, |run| {
-        serde_json::to_value(run).unwrap_or(Value::Null)
+        serde_json::to_string(run)
+            .map(Value::String)
+            .unwrap_or(Value::Null)
     })
+}
+
+fn work_state_annotations(
+    config: &Config,
+    state: &WorkStateRecord,
+) -> serde_json::Map<String, Value> {
+    let mut annotations = serde_json::Map::new();
+    annotations.insert(
+        annotation_key(config, "work-state"),
+        Value::String(state.state.as_str().into()),
+    );
+    annotations.insert(
+        annotation_key(config, "work-state-changed-at"),
+        Value::String(state.changed_at.clone()),
+    );
+    annotations.insert(
+        annotation_key(config, "work-state-summary"),
+        state.summary.clone().map_or(Value::Null, Value::String),
+    );
+    annotations.insert(
+        annotation_key(config, "work-state-run-id"),
+        state.run_id.clone().map_or(Value::Null, Value::String),
+    );
+    annotations.insert(
+        annotation_key(config, "run-current"),
+        run_value(state.current_run.as_ref()),
+    );
+    annotations.insert(
+        annotation_key(config, "run-last"),
+        run_value(state.last_run.as_ref()),
+    );
+    annotations
 }
 
 fn binding_state_record(o: &DynamicObject, config: &Config) -> BindingStateRecord {
@@ -487,11 +566,6 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
         .strip_prefix("anvil-")
         .map(str::to_owned)
         .ok_or(ServiceError::NotFound)?;
-    let phase = o
-        .data
-        .get("status")
-        .and_then(|v| v.get("phase"))
-        .and_then(Value::as_str);
     let work = work_state_record(o, config);
     let binding = binding_state_record(o, config);
     let suspended = o
@@ -500,6 +574,7 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
         .and_then(|value| value.get("operatingMode"))
         .and_then(Value::as_str)
         .is_some_and(|mode| mode.eq_ignore_ascii_case("suspended"));
+    let (environment_state, phase) = sandbox_environment(o, suspended);
     Ok(Session {
         id,
         sandbox: o.name_any(),
@@ -512,7 +587,7 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
             .into(),
         namespace: config.namespace.clone(),
         opencode_port: config.opencode_port,
-        phase: phase.map(String::from),
+        phase,
         project: a
             .get(&annotation_key(config, "project"))
             .cloned()
@@ -544,7 +619,7 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
                     .map(String::from)
             }),
         ready_at: a.get(&annotation_key(config, "ready-at")).cloned(),
-        environment_state: environment_state(phase, suspended).into(),
+        environment_state: environment_state.into(),
         work_state: work.state.as_str().into(),
         work_state_changed_at: Some(work.changed_at),
         work_state_summary: work.summary,
@@ -775,31 +850,7 @@ impl SandboxApi for KubeSandboxApi {
             .await
     }
     async fn set_work_state(&self, id: &str, state: &WorkStateRecord) -> Result<(), ServiceError> {
-        let mut annotations = serde_json::Map::new();
-        annotations.insert(
-            annotation_key(&self.config, "work-state"),
-            Value::String(state.state.as_str().into()),
-        );
-        annotations.insert(
-            annotation_key(&self.config, "work-state-changed-at"),
-            Value::String(state.changed_at.clone()),
-        );
-        annotations.insert(
-            annotation_key(&self.config, "work-state-summary"),
-            state.summary.clone().map_or(Value::Null, Value::String),
-        );
-        annotations.insert(
-            annotation_key(&self.config, "work-state-run-id"),
-            state.run_id.clone().map_or(Value::Null, Value::String),
-        );
-        annotations.insert(
-            annotation_key(&self.config, "run-current"),
-            run_value(state.current_run.as_ref()),
-        );
-        annotations.insert(
-            annotation_key(&self.config, "run-last"),
-            run_value(state.last_run.as_ref()),
-        );
+        let annotations = work_state_annotations(&self.config, state);
         self.patch(id, json!({"metadata":{"annotations":annotations}}))
             .await
     }
@@ -1306,7 +1357,6 @@ async fn activity(
 ) -> Result<Json<SessionActivity>, ServiceError> {
     let object = s.kube.get(&id).await?;
     let session = reconcile_binding(&s, &id).await?;
-    let phase = session.phase.as_deref().unwrap_or("Starting");
     let operating_mode = object
         .data
         .get("spec")
@@ -1322,11 +1372,18 @@ async fn activity(
         );
         let messages = messages.unwrap_or_else(|_| Value::Array(Vec::new()));
         let status = status.unwrap_or(Value::Null);
-        build_activity(&session, phase, operating_mode, messages, status, &s.config)
+        build_activity(
+            &session,
+            &session.environment_state,
+            operating_mode,
+            messages,
+            status,
+            &s.config,
+        )
     } else {
         build_activity(
             &session,
-            phase,
+            &session.environment_state,
             operating_mode,
             Value::Array(Vec::new()),
             Value::Null,
@@ -1867,7 +1924,7 @@ fn execution_state(
 
 fn build_activity(
     session: &Session,
-    phase: &str,
+    _phase: &str,
     operating_mode: Option<&str>,
     raw_messages: Value,
     status: Value,
@@ -1998,9 +2055,9 @@ fn build_activity(
     );
     let state = if operating_mode == Some("Suspended") {
         "stopped"
-    } else if phase.eq_ignore_ascii_case("failed") {
+    } else if session.environment_state == "failed" {
         "failed"
-    } else if !phase.eq_ignore_ascii_case("ready") || session.opencode_session_id.is_none() {
+    } else if session.environment_state != "ready" || session.opencode_session_id.is_none() {
         "starting"
     } else if current.is_some() || busy {
         "active"
@@ -2029,7 +2086,11 @@ fn build_activity(
     });
 
     lifecycle.sort_by(|left, right| left.at.cmp(&right.at));
-    let environment_state = environment_state(Some(phase), operating_mode == Some("Suspended"));
+    let environment_state = if operating_mode == Some("Suspended") {
+        "suspended"
+    } else {
+        session.environment_state.as_str()
+    };
     let execution_state =
         execution_state(&status, session.opencode_session_id.as_deref(), &requests);
     SessionActivity {
@@ -2815,6 +2876,7 @@ mod tests {
         let body = json_response(response).await;
         assert_eq!(body["session"]["project"], "demo");
         assert_eq!(body["state"], "starting");
+        assert_eq!(body["environment_state"], "ready");
         assert_eq!(
             body["attach_command"],
             "anvilctl sessions attach demo-12345678"
@@ -2983,6 +3045,84 @@ mod tests {
         assert_eq!(activity.request_state, "running");
         assert_eq!(activity.requests[0].duration_ms, None);
         assert_eq!(activity.requests[0].prompt, "Run the test suite.");
+    }
+
+    #[test]
+    fn ready_condition_is_authoritative_when_sandbox_has_no_phase() {
+        let object: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {
+                "name": "anvil-demo-12345678",
+                "annotations": {
+                    "anvil.example/project": "demo",
+                    "anvil.example/repository": "https://github.com/example/demo.git",
+                    "anvil.example/base-ref": "main",
+                    "anvil.example/work-branch": "anvil/demo-12345678"
+                }
+            },
+            "status": {
+                "conditions": [{"type":"Ready","status":"True"}],
+                "serviceFQDN": "anvil-demo-12345678"
+            }
+        }))
+        .unwrap();
+        let session = session_from(&object, &config("http://profile.test".into())).unwrap();
+        assert_eq!(session.environment_state, "ready");
+        assert_eq!(session.phase.as_deref(), Some("Ready"));
+    }
+
+    #[test]
+    fn sandbox_environment_distinguishes_provisioning_suspended_and_failure() {
+        let base: DynamicObject = serde_json::from_value(json!({
+            "metadata": {"name": "anvil-demo-12345678"},
+            "status": {"conditions": [{"type":"Ready","status":"False","reason":"DependenciesNotReady"}]}
+        }))
+        .unwrap();
+        assert_eq!(sandbox_environment(&base, false).0, "provisioning");
+        assert_eq!(sandbox_environment(&base, true).0, "suspended");
+        let failed: DynamicObject = serde_json::from_value(json!({
+            "metadata": {"name": "anvil-demo-12345678"},
+            "status": {"conditions": [{"type":"Ready","status":"False","reason":"SandboxFailed"}]}
+        }))
+        .unwrap();
+        assert_eq!(sandbox_environment(&failed, false).0, "failed");
+    }
+
+    #[test]
+    fn run_annotations_are_json_encoded_strings() {
+        let run = Run {
+            id: "run_test".into(),
+            state: "running".into(),
+            started_at: "2026-01-01T10:00:00Z".into(),
+            finished_at: None,
+        };
+        let value = run_value(Some(&run));
+        let encoded = value.as_str().expect("annotation value must be a string");
+        assert_eq!(serde_json::from_str::<Run>(encoded).unwrap(), run);
+        assert!(run_value(None).is_null());
+
+        let annotations = work_state_annotations(
+            &config("http://profile.test".into()),
+            &WorkStateRecord {
+                state: WorkState::InProgress,
+                changed_at: run.started_at.clone(),
+                summary: None,
+                run_id: Some(run.id.clone()),
+                current_run: Some(run.clone()),
+                last_run: None,
+            },
+        );
+        assert!(annotations
+            .values()
+            .all(|value| value.is_string() || value.is_null()));
+        assert_eq!(
+            annotations
+                .get("anvil.example/run-current")
+                .and_then(Value::as_str)
+                .and_then(|value| serde_json::from_str::<Run>(value).ok()),
+            Some(run)
+        );
     }
 
     #[tokio::test]

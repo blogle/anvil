@@ -1,12 +1,42 @@
+import { applyServerRefresh, formatElapsedValue, operatorState, parseRoute } from "./ui-state.js"
+
 const app = document.querySelector("#app")
 const state = {
   sessions: [],
   activities: new Map(),
-  selected: location.hash.slice(1) || null,
+  selected: parseRoute(location.hash),
   filter: "all",
   tab: "logs",
+  expandedPrompts: new Set(),
+  attachOpen: false,
+  copyStatus: null,
   error: null,
   loading: true,
+  refreshInFlight: false,
+  refreshGeneration: 0,
+  renderedDetailKey: null,
+}
+
+function routeFor(sessionId) {
+  return sessionId ? `#session/${encodeURIComponent(sessionId)}` : ""
+}
+
+function navigate(sessionId, push = true) {
+  const hash = routeFor(sessionId)
+  if (location.hash === hash) {
+    applyRoute()
+    return
+  }
+  const url = `${location.pathname}${location.search}${hash}`
+  if (push) history.pushState(null, "", url)
+  else history.replaceState(null, "", url)
+  applyRoute()
+}
+
+function applyRoute() {
+  state.selected = parseRoute(location.hash)
+  updateSidebar()
+  updateDetail()
 }
 
 const api = async (path, options) => {
@@ -25,31 +55,8 @@ const timestamp = (value) => {
 }
 const formatClock = (value) => timestamp(value)?.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) || "--:--"
 const formatDate = (value) => timestamp(value)?.toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) || "Unknown"
-const formatElapsed = (request) => {
-  const start = timestamp(request.started_at)?.getTime()
-  if (!start) return "Unknown duration"
-  const end = request.completed_at ? timestamp(request.completed_at)?.getTime() : Date.now()
-  if (!end) return "Unknown duration"
-  let seconds = Math.max(0, Math.floor((end - start) / 1000))
-  const hours = Math.floor(seconds / 3600)
-  seconds %= 3600
-  const minutes = Math.floor(seconds / 60)
-  seconds %= 60
-  if (hours) return `${hours}h ${String(minutes).padStart(2, "0")}m`
-  if (minutes) return `${minutes}m ${String(seconds).padStart(2, "0")}s`
-  return `${seconds}s`
-}
-const formatStateElapsed = (activity) => formatElapsed({ started_at: activity?.work_state_changed_at })
-const operatorState = (activity) => {
-  if (!activity) return "starting"
-  if (["failed"].includes(activity.environment_state) || ["failed", "unavailable"].includes(activity.execution_state) || ["missing", "recovering"].includes(activity.session_binding_state)) return "problem"
-  if (activity.environment_state === "provisioning") return "starting"
-  if (activity.work_state === "awaiting_input") return "needs-input"
-  if (activity.execution_state === "running") return "working"
-  if (activity.work_state === "ready_for_review") return "ready-for-review"
-  if (activity.work_state === "completed") return "done"
-  return "working"
-}
+const formatElapsed = (request) => request.completed_at ? formatElapsedValue(request.started_at, timestamp(request.completed_at)?.getTime() || Date.now()) : formatElapsedValue(request.started_at)
+const formatStateElapsed = (activity) => formatElapsedValue(activity?.work_state_changed_at)
 const stateLabel = (value) => ({ working: "Working", "needs-input": "Needs input", "ready-for-review": "Ready for review", done: "Done", problem: "Problem", starting: "Starting" }[value] || "Starting")
 const titleFor = (activity) => {
   const prompt = activity?.requests?.[0]?.prompt?.trim()
@@ -59,73 +66,149 @@ const sessionActivity = (id) => state.activities.get(id)
 const selectedActivity = () => state.selected ? sessionActivity(state.selected) : null
 
 async function refresh() {
+  if (state.refreshInFlight || document.visibilityState === "hidden") return
+  state.refreshInFlight = true
+  const generation = ++state.refreshGeneration
   try {
     const sessions = await api("/v1/sessions")
-    state.sessions = sessions
-    const ids = sessions.map((session) => session.id)
-    await Promise.allSettled(ids.map(async (id) => state.activities.set(id, await api(`/v1/sessions/${encodeURIComponent(id)}/activity`))))
-    if (state.selected && !ids.includes(state.selected)) {
-      state.selected = ids[0] || null
-      updateHash()
-    }
+    const activities = await Promise.all(sessions.map(async (session) => {
+      try {
+        return [session.id, await api(`/v1/sessions/${encodeURIComponent(session.id)}/activity`)]
+      } catch {
+        return [session.id, state.activities.get(session.id)]
+      }
+    }))
+    if (generation !== state.refreshGeneration) return
+    const selectedBefore = state.selected
+    Object.assign(state, applyServerRefresh(state, sessions, new Map(activities.filter(([, activity]) => activity))))
+    if (selectedBefore && !state.selected) navigate(null, false)
     state.error = null
   } catch (error) {
-    state.error = error.message
+    if (generation === state.refreshGeneration) state.error = error.message
   } finally {
-    state.loading = false
-    render()
+    if (generation === state.refreshGeneration) {
+      state.loading = false
+      updateSidebar()
+      updateDetail()
+    }
+    state.refreshInFlight = false
   }
 }
 
-function updateHash() {
-  const hash = state.selected ? `#${encodeURIComponent(state.selected)}` : ""
-  if (location.hash !== hash) history.replaceState(null, "", hash || location.pathname)
-}
-
 function visibleSessions() {
-  return state.sessions.filter((session) => {
-    if (state.filter === "all") return true
-    const activity = sessionActivity(session.id)
-    const value = operatorState(activity)
-    return value === state.filter
-  })
+  return state.sessions.filter((session) => state.filter === "all" || operatorState(sessionActivity(session.id)) === state.filter)
 }
 
-function render() {
-  const mobileDetail = Boolean(state.selected)
-  app.className = mobileDetail ? "mobile-detail" : ""
+function ensureShell() {
+  if (document.querySelector(".app-shell")) return
   app.innerHTML = `<div class="app-shell">
     <header class="topbar">
       <a class="brand" href="${location.pathname}" aria-label="Anvil Sessions">
         <svg class="brand-mark" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 17.5h18M5.4 17.5l2.2-6.2h8.7l2.3 6.2M7.2 11.3V8.2h9.6v3.1M4.8 8.2h14.4M10.1 8.2V5.3h3.8v2.9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>Anvil</span>
       </a>
-      <nav class="nav" aria-label="Primary"><a class="active" href="${location.pathname}">Sessions</a><a href="${location.pathname}#providers">Providers</a><a href="${location.pathname}#settings">Settings</a></nav>
+      <nav class="nav" aria-label="Primary"><a class="active" href="${location.pathname}">Sessions</a></nav>
       <div class="topbar-status"><span class="status-dot"></span>Control plane connected</div>
     </header>
-    <main class="workspace">
-      ${renderSidebar()}
-      ${renderDetail()}
-    </main>
+    <main class="workspace"><aside id="sidebar" class="sidebar" aria-label="Sessions"></aside><section id="detail" class="detail"></section></main>
   </div>`
-  bindEvents()
+  app.addEventListener("click", handleClick)
+  app.addEventListener("toggle", (event) => {
+    if (event.target.matches("[data-attach]")) {
+      state.attachOpen = event.target.open
+    }
+  }, true)
 }
 
-function renderSidebar() {
+function updateSidebar() {
+  ensureShell()
+  const sidebar = document.querySelector("#sidebar")
+  const focused = sidebar.querySelector(":focus")?.dataset.focusKey || null
   const items = visibleSessions()
-  return `<aside class="sidebar" aria-label="Sessions">
-    <div class="sidebar-head"><h1>Sessions</h1><span class="count">${state.sessions.length} total</span></div>
-     <div class="filters" role="tablist" aria-label="Session filters">${[["all", "All"], ["working", "Working"], ["needs-input", "Needs input"], ["ready-for-review", "Ready for review"], ["done", "Done"], ["problem", "Problem"]].map(([filter, label]) => `<button class="filter ${state.filter === filter ? "selected" : ""}" data-filter="${filter}" role="tab" aria-selected="${state.filter === filter}">${label}</button>`).join("")}</div>
-    <div class="session-list">${state.loading ? `<div class="loading">Loading sessions...</div>` : state.error && !state.sessions.length ? `<div class="error-card"><strong>Sessions unavailable</strong>${escapeHtml(state.error)}</div>` : items.length ? items.map(renderSessionRow).join("") : `<div class="empty"><strong>${state.filter === "all" ? "No sessions yet" : `No ${state.filter} sessions`}</strong><span>Anvil sessions will appear here when work is dispatched.</span></div>`}</div>
-  </aside>`
+  sidebar.innerHTML = `<div class="sidebar-head"><h1>Sessions</h1><span class="count">${state.sessions.length} total</span></div>
+    <div class="filters" aria-label="Session filters">${[["all", "All"], ["working", "Working"], ["needs-input", "Needs input"], ["ready-for-review", "Ready for review"], ["done", "Done"], ["problem", "Problem"]].map(([filter, label]) => `<button class="filter ${state.filter === filter ? "selected" : ""}" data-focus-key="filter-${filter}" data-filter="${filter}" aria-pressed="${state.filter === filter}">${label}</button>`).join("")}</div>
+    <div class="session-list">${state.loading ? `<div class="loading">Loading sessions...</div>` : state.error && !state.sessions.length ? `<div class="error-card"><strong>Sessions unavailable</strong>${escapeHtml(state.error)}</div>` : items.length ? items.map(renderSessionRow).join("") : `<div class="empty"><strong>${state.filter === "all" ? "No sessions yet" : `No ${state.filter} sessions`}</strong><span>${state.filter === "all" ? "Anvil sessions will appear here when work is dispatched." : "No sessions match this filter."}</span></div>`}</div>`
+  if (focused) sidebar.querySelector(`[data-focus-key="${CSS.escape(focused)}"]`)?.focus({ preventScroll: true })
 }
 
 function renderSessionRow(session) {
   const activity = sessionActivity(session.id)
   const status = operatorState(activity)
-  const request = activity?.requests?.at(-1)
   const meta = `${stateLabel(status)} · ${formatStateElapsed(activity)}`
-  return `<button class="session-row ${state.selected === session.id ? "selected" : ""}" data-session="${escapeHtml(session.id)}"><div class="session-title">${escapeHtml(titleFor(activity))}</div><div class="session-meta"><span>${escapeHtml(session.project)}</span><span>·</span><span><code>${escapeHtml(session.work_branch)}</code></span></div><div class="session-state state-${escapeHtml(status)}"><span class="status-dot"></span><span>${stateLabel(status)}</span><span class="row-detail">${escapeHtml(meta)}</span></div></button>`
+  return `<button class="session-row ${state.selected === session.id ? "selected" : ""}" data-focus-key="session-${escapeHtml(session.id)}" data-session="${escapeHtml(session.id)}" aria-current="${state.selected === session.id ? "true" : "false"}"><div class="session-title">${escapeHtml(titleFor(activity))}</div><div class="session-meta"><span>${escapeHtml(session.project)}</span><span>·</span><span><code>${escapeHtml(session.work_branch)}</code></span></div><div class="session-state state-${escapeHtml(status)}"><span class="status-dot"></span><span>${stateLabel(status)}</span><span class="row-detail" data-live-state-elapsed="${escapeHtml(activity?.work_state_changed_at)}">${escapeHtml(meta)}</span></div></button>`
+}
+
+function captureDetailInteraction() {
+  const detail = document.querySelector("#detail")
+  const active = document.activeElement?.closest?.("[data-focus-key]")?.dataset.focusKey || null
+  const selection = window.getSelection?.()
+  const prompt = selection?.anchorNode?.parentElement?.closest?.("[data-prompt]")
+  let selectedText = null
+  if (prompt && selection.rangeCount) selectedText = { text: selection.toString(), prompt: prompt.dataset.promptId }
+  return { scrollTop: detail.scrollTop, active, selectedText }
+}
+
+function restoreDetailInteraction(saved) {
+  const detail = document.querySelector("#detail")
+  detail.scrollTop = saved.scrollTop
+  if (saved.active) detail.querySelector(`[data-focus-key="${CSS.escape(saved.active)}"]`)?.focus({ preventScroll: true })
+  if (saved.selectedText?.text) {
+    const prompt = detail.querySelector(`[data-prompt-id="${CSS.escape(saved.selectedText.prompt)}"]`)
+    if (prompt) {
+      const walker = document.createTreeWalker(prompt, NodeFilter.SHOW_TEXT)
+      let node
+      while ((node = walker.nextNode())) {
+        const index = node.nodeValue.indexOf(saved.selectedText.text)
+        if (index >= 0) {
+          const range = document.createRange()
+          range.setStart(node, index)
+          range.setEnd(node, index + saved.selectedText.text.length)
+          const selection = window.getSelection()
+          selection.removeAllRanges()
+          selection.addRange(range)
+          break
+        }
+      }
+    }
+  }
+}
+
+function updateDetail() {
+  ensureShell()
+  const detail = document.querySelector("#detail")
+  const activity = selectedActivity()
+  const session = activity?.session || state.sessions.find((item) => item.id === state.selected)
+  const key = JSON.stringify([state.selected, activity, state.tab, state.attachOpen, [...state.expandedPrompts], state.copyStatus])
+  if (key === state.renderedDetailKey) return
+  const saved = captureDetailInteraction()
+  state.renderedDetailKey = key
+  detail.innerHTML = renderDetail(activity, session)
+  restoreDetailInteraction(saved)
+}
+
+function renderDetail(activity, session) {
+  if (!state.selected) return `<div class="detail-inner"><div class="empty"><strong>Select a session</strong>Choose a session to inspect its lifecycle and requests.</div></div>`
+  if (!session) return `<div class="detail-inner"><div class="loading">Loading session...</div></div>`
+  const status = operatorState(activity)
+  const firstPrompt = activity?.requests?.[0]?.prompt
+  const attachCommand = activity?.attach_command || `anvilctl sessions attach ${session.id}`
+  return `<div class="detail-inner">
+    <a class="back-link" href="${location.pathname}" data-clear-selection>All sessions</a>
+    <div class="detail-header"><div><div class="eyebrow">Session overview</div><h2>${escapeHtml(titleFor(activity))}</h2><div class="detail-subtitle"><span>${escapeHtml(session.project)}</span><span>·</span><code>${escapeHtml(session.work_branch)}</code></div><div class="detail-status state-${escapeHtml(status)}"><span class="status-dot"></span><strong>${stateLabel(status)}</strong><span>${activity?.work_state_changed_at ? `· <span data-live-state-elapsed="${escapeHtml(activity.work_state_changed_at)}">${formatStateElapsed(activity)}</span>` : ""}</span></div></div></div>
+    ${activity?.session_binding_error || activity?.session_binding_recovery_event ? `<div class="recovery-card"><strong>${activity.session_binding_recovery_event ? "Conversation rebound" : "OpenCode conversation unavailable"}</strong><span>${escapeHtml(activity.session_binding_error || activity.session_binding_recovery_event)}</span>${activity.session_binding_state === "missing" ? `<button class="button" data-focus-key="rebind" data-rebind="${escapeHtml(session.id)}">Rebind workspace</button>` : ""}</div>` : ""}
+    ${activity?.work_state_summary ? `<div class="work-summary"><div class="eyebrow">Work summary</div>${escapeHtml(activity.work_state_summary)}</div>` : ""}
+    ${firstPrompt ? `<p class="description">${escapeHtml(firstPrompt)}</p>` : ""}
+    ${renderActions(activity, session, attachCommand)}
+    <div class="tabs" role="tablist" aria-label="Session detail"><button id="logs-tab" class="tab ${state.tab === "logs" ? "active" : ""}" data-tab="logs" data-focus-key="tab-logs" role="tab" aria-selected="${state.tab === "logs"}" aria-controls="logs-panel" tabindex="${state.tab === "logs" ? "0" : "-1"}">Logs</button><button id="runtime-tab" class="tab ${state.tab === "runtime" ? "active" : ""}" data-tab="runtime" data-focus-key="tab-runtime" role="tab" aria-selected="${state.tab === "runtime"}" aria-controls="runtime-panel" tabindex="${state.tab === "runtime" ? "0" : "-1"}">Runtime</button></div>
+    ${state.tab === "logs" ? `<div id="logs-panel" role="tabpanel" tabindex="0" aria-labelledby="logs-tab">${renderLogs(activity)}</div>` : `<div id="runtime-panel" role="tabpanel" tabindex="0" aria-labelledby="runtime-tab">${renderRuntime(activity, session)}</div>`}
+  </div>`
+}
+
+function renderActions(activity, session, attachCommand) {
+  const preview = activity?.preview_url
+  const opencode = activity?.opencode_url
+  const complete = activity?.work_state === "ready_for_review" ? `<button class="button primary" data-focus-key="complete" data-complete="${escapeHtml(session.id)}">Accept and complete</button>` : ""
+  return `<div class="actions">${preview ? `<a class="button primary" href="${escapeHtml(preview)}" target="_blank" rel="noreferrer">Open Preview</a>` : ""}${opencode ? `<a class="button" href="${escapeHtml(opencode)}" target="_blank" rel="noreferrer">Open in OpenCode</a>` : ""}${complete}<div class="attach"><details data-attach ${state.attachOpen ? "open" : ""}><summary class="button">Attach <span aria-hidden="true">⌄</span></summary><div class="attach-menu"><p>Run this command from a terminal with Anvil access.</p><code class="command">${escapeHtml(attachCommand)}</code><button class="button" data-focus-key="copy" data-copy="${escapeHtml(attachCommand)}" style="margin-top:9px">${state.copyStatus || "Copy command"}</button><span class="sr-only" aria-live="polite">${escapeHtml(state.copyStatus || "")}</span></div></details></div><button class="button danger" data-focus-key="stop" data-stop="${escapeHtml(session.id)}">Stop Session</button></div>`
 }
 
 function relativeTime(value) {
@@ -139,37 +222,11 @@ function relativeTime(value) {
   return `${Math.floor(hours / 24)}d ago`
 }
 
-function renderDetail() {
-  if (!state.selected) return `<section class="detail"><div class="detail-inner"><div class="empty"><strong>Select a session</strong>Choose a session to inspect its lifecycle and requests.</div></div></section>`
-  const activity = selectedActivity()
-  const session = activity?.session || state.sessions.find((item) => item.id === state.selected)
-  if (!session) return `<section class="detail"><div class="detail-inner"><div class="loading">Loading session...</div></div></section>`
-  const status = operatorState(activity)
-  const firstPrompt = activity?.requests?.[0]?.prompt
-  return `<section class="detail"><div class="detail-inner">
-    <a class="back-link" href="${location.pathname}" data-clear-selection>← All sessions</a>
-     <div class="detail-header"><div><div class="eyebrow">Session overview</div><h2>${escapeHtml(titleFor(activity))}</h2><div class="detail-subtitle"><span>${escapeHtml(session.project)}</span><span>·</span><code>${escapeHtml(session.work_branch)}</code></div><div class="detail-status state-${escapeHtml(status)}"><span class="status-dot"></span><strong>${stateLabel(status)}</strong><span>${activity?.work_state_changed_at ? `· ${formatStateElapsed(activity)}` : ""}</span></div></div></div>
-     ${activity?.session_binding_error || activity?.session_binding_recovery_event ? `<div class="recovery-card"><strong>${activity.session_binding_recovery_event ? "Conversation rebound" : "OpenCode conversation unavailable"}</strong><span>${escapeHtml(activity.session_binding_error || activity.session_binding_recovery_event)}</span>${activity.session_binding_state === "missing" ? `<button class="button" data-rebind="${escapeHtml(session.id)}">Rebind workspace</button>` : ""}</div>` : ""}
-     ${activity?.work_state_summary ? `<div class="work-summary"><div class="eyebrow">Work summary</div>${escapeHtml(activity.work_state_summary)}</div>` : ""}
-    ${firstPrompt ? `<p class="description">${escapeHtml(firstPrompt)}</p>` : ""}
-    ${renderActions(activity, session)}
-    <div class="tabs" role="tablist"><button class="tab ${state.tab === "logs" ? "active" : ""}" data-tab="logs" role="tab">Logs</button><button class="tab ${state.tab === "runtime" ? "active" : ""}" data-tab="runtime" role="tab">Runtime</button></div>
-    ${state.tab === "logs" ? renderLogs(activity) : renderRuntime(activity, session)}
-  </div></section>`
-}
-
-function renderActions(activity, session) {
-  const preview = activity?.preview_url
-  const opencode = activity?.opencode_url
-  return `<div class="actions">${preview ? `<a class="button primary" href="${escapeHtml(preview)}" target="_blank" rel="noreferrer">Open Preview</a>` : ""}${opencode ? `<a class="button" href="${escapeHtml(opencode)}" target="_blank" rel="noreferrer">Open in OpenCode</a>` : ""}<div class="attach"><details><summary class="button">Attach <span aria-hidden="true">⌄</span></summary><div class="attach-menu"><p>Run this command from a terminal with Anvil access.</p><code class="command">${escapeHtml(activity?.attach_command || `anvilctl sessions attach ${session.id}`)}</code><button class="button" data-copy="${escapeHtml(activity?.attach_command || `anvilctl sessions attach ${session.id}`)}" style="margin-top:9px">Copy command</button></div></details></div><button class="button danger" data-stop="${escapeHtml(session.id)}">Stop Session</button></div>`
-}
-
 function renderLogs(activity) {
   if (!activity) return `<div class="content-section"><div class="loading">Loading activity...</div></div>`
   if (!activity.requests.length && !activity.lifecycle.length) return `<div class="content-section"><div class="empty"><strong>No activity recorded</strong>OpenCode has not reported any requests for this session yet.</div></div>`
   const lifecycle = activity.lifecycle.map((event) => `<div class="timeline-event event-${escapeHtml(event.kind)}"><div class="event-time">${formatClock(event.at)}</div><div class="event-body"><span class="event-marker"></span><div class="event-title">${escapeHtml(eventTitle(event.kind))}</div>${event.detail ? `<div class="event-detail">${escapeHtml(event.detail)}</div>` : ""}</div></div>`).join("")
-  const requests = activity.requests.map(renderRequest).join("")
-  return `<div class="content-section"><div class="section-heading"><h3>Lifecycle & requests</h3><span>${activity.requests.length} request${activity.requests.length === 1 ? "" : "s"}</span></div><div class="timeline">${lifecycle}${requests}</div></div>`
+  return `<div class="content-section"><div class="section-heading"><h3>Lifecycle & requests</h3><span>${activity.requests.length} request${activity.requests.length === 1 ? "" : "s"}</span></div><div class="timeline">${lifecycle}${activity.requests.map(renderRequest).join("")}</div></div>`
 }
 
 function eventTitle(kind) {
@@ -177,26 +234,130 @@ function eventTitle(kind) {
 }
 
 function renderRequest(request) {
-  const expanded = request.prompt.length < 500
-  return `<article class="request-card ${escapeHtml(request.state)}"><div class="request-top"><span><strong>Request #${request.number}</strong> · ${escapeHtml(request.origin)}</span><span class="request-duration">${request.state === "running" ? "Running · " : request.state === "completed" ? "Completed · " : request.state === "failed" ? "Failed · " : ""}${formatElapsed(request)}</span></div><div class="prompt-label">Submitted prompt</div><pre class="prompt ${expanded ? "expanded" : ""}" data-prompt>${escapeHtml(request.prompt)}</pre>${expanded ? "" : `<button class="prompt-toggle" data-expand-prompt>Show full prompt</button>`}<div class="request-info"><span>Started ${formatDate(request.started_at)}</span>${request.completed_at ? `<span>Ended ${formatDate(request.completed_at)}</span>` : `<span>Last activity ${relativeTime(request.last_activity_at)}</span>`}${request.provider || request.model ? `<span>${escapeHtml([request.provider, request.model].filter(Boolean).join(" / "))}</span>` : ""}${request.current_operation ? `<span>Now: ${escapeHtml(request.current_operation)}</span>` : ""}</div>${request.error ? `<div class="failure">${escapeHtml(request.error)}</div>` : ""}</article>`
+  const requestId = request.id || `request-${request.number}`
+  const expanded = request.prompt.length < 500 || state.expandedPrompts.has(requestId)
+  return `<article class="request-card ${escapeHtml(request.state)}"><div class="request-top"><span><strong>Request #${request.number}</strong> · ${escapeHtml(request.origin)}</span><span class="request-duration">${request.state === "running" ? "Running · " : request.state === "completed" ? "Completed · " : request.state === "failed" ? "Failed · " : ""}<span data-live-elapsed="${escapeHtml(request.started_at)}" data-live-end="${escapeHtml(request.completed_at || "")}">${formatElapsed(request)}</span></span></div><div class="prompt-label">Submitted prompt</div><pre class="prompt ${expanded ? "expanded" : ""}" data-prompt data-prompt-id="${escapeHtml(requestId)}">${escapeHtml(request.prompt)}</pre>${request.prompt.length >= 500 ? `<button class="prompt-toggle" data-focus-key="prompt-${escapeHtml(requestId)}" data-expand-prompt="${escapeHtml(requestId)}">${expanded ? "Collapse prompt" : "Show full prompt"}</button>` : ""}<div class="request-info"><span>Started ${formatDate(request.started_at)}</span>${request.completed_at ? `<span>Ended ${formatDate(request.completed_at)}</span>` : `<span data-live-relative="${escapeHtml(request.last_activity_at || "")}">Last activity ${relativeTime(request.last_activity_at)}</span>`}${request.provider || request.model ? `<span>${escapeHtml([request.provider, request.model].filter(Boolean).join(" / "))}</span>` : ""}${request.current_operation ? `<span>Now: ${escapeHtml(request.current_operation)}</span>` : ""}</div>${request.error ? `<div class="failure">${escapeHtml(request.error)}</div>` : ""}</article>`
 }
 
 function renderRuntime(activity, session) {
-  return `<div class="content-section"><div class="section-heading"><h3>Runtime details</h3><span>Technical information</span></div><div class="runtime-grid"><div class="runtime-item"><label>Environment</label><value>${escapeHtml(activity?.environment_state || session.environment_state)}</value></div><div class="runtime-item"><label>Execution</label><value>${escapeHtml(activity?.execution_state || "idle")}</value></div><div class="runtime-item"><label>Work state</label><value>${escapeHtml(activity?.work_state || session.work_state)}</value></div><div class="runtime-item"><label>Conversation binding</label><value>${escapeHtml(activity?.session_binding_state || session.session_binding_state || "unknown")}</value></div><div class="runtime-item"><label>Continuity</label><value>${escapeHtml(activity?.session_binding_continuity || session.session_binding_continuity || "unknown")}</value></div><div class="runtime-item"><label>Created</label><value>${escapeHtml(formatDate(session.created_at))}</value></div><div class="runtime-item"><label>Sandbox</label><value>${escapeHtml(session.sandbox)}</value></div><div class="runtime-item"><label>OpenCode session</label><value>${escapeHtml(session.opencode_session_id || "Not assigned")}</value></div><div class="runtime-item"><label>Repository</label><value>${escapeHtml(session.repository)}</value></div><div class="runtime-item"><label>Base ref</label><value>${escapeHtml(session.base_ref)}</value></div></div><p class="muted" style="font-size:12px;line-height:1.5;margin-top:18px">Environment, execution, work state, and conversation binding are reported independently. Rebinding creates a new conversation and loses exact continuity.</p></div>`
+  return `<div class="content-section"><div class="section-heading"><h3>Runtime details</h3><span>Technical information</span></div><div class="runtime-grid"><div class="runtime-item"><label>Environment</label><span>${escapeHtml(activity?.environment_state || session.environment_state)}</span></div><div class="runtime-item"><label>Execution</label><span>${escapeHtml(activity?.execution_state || "idle")}</span></div><div class="runtime-item"><label>Work state</label><span>${escapeHtml(activity?.work_state || session.work_state)}</span></div><div class="runtime-item"><label>Conversation binding</label><span>${escapeHtml(activity?.session_binding_state || session.session_binding_state || "unknown")}</span></div><div class="runtime-item"><label>Continuity</label><span>${escapeHtml(activity?.session_binding_continuity || session.session_binding_continuity || "unknown")}</span></div><div class="runtime-item"><label>Created</label><span>${escapeHtml(formatDate(session.created_at))}</span></div><div class="runtime-item"><label>Sandbox</label><span>${escapeHtml(session.sandbox)}</span></div><div class="runtime-item"><label>OpenCode session</label><span>${escapeHtml(session.opencode_session_id || "Not assigned")}</span></div><div class="runtime-item"><label>Repository</label><span>${escapeHtml(session.repository)}</span></div><div class="runtime-item"><label>Base ref</label><span>${escapeHtml(session.base_ref)}</span></div></div><p class="muted" style="font-size:12px;line-height:1.5;margin-top:18px">Environment, execution, work state, and conversation binding are reported independently. Rebinding creates a new conversation and loses exact continuity.</p></div>`
 }
 
-function bindEvents() {
-  document.querySelectorAll("[data-session]").forEach((element) => element.addEventListener("click", () => { state.selected = element.dataset.session; state.tab = "logs"; updateHash(); render() }))
-  document.querySelectorAll("[data-filter]").forEach((element) => element.addEventListener("click", () => { state.filter = element.dataset.filter; render() }))
-  document.querySelectorAll("[data-tab]").forEach((element) => element.addEventListener("click", () => { state.tab = element.dataset.tab; render() }))
-  document.querySelectorAll("[data-clear-selection]").forEach((element) => element.addEventListener("click", (event) => { event.preventDefault(); state.selected = null; updateHash(); render() }))
-  document.querySelectorAll("[data-expand-prompt]").forEach((element) => element.addEventListener("click", () => { element.previousElementSibling.classList.add("expanded"); element.remove() }))
-  document.querySelectorAll("[data-copy]").forEach((element) => element.addEventListener("click", async () => { await navigator.clipboard?.writeText(element.dataset.copy); element.textContent = "Copied" }))
-  document.querySelectorAll("[data-stop]").forEach((element) => element.addEventListener("click", async () => { if (!confirm("Stop this session? Its workspace and conversation will be deleted.")) return; element.disabled = true; try { await api(`/v1/sessions/${encodeURIComponent(element.dataset.stop)}`, { method: "DELETE" }); state.selected = null; updateHash(); await refresh() } catch (error) { alert(error.message); element.disabled = false } }))
-  document.querySelectorAll("[data-rebind]").forEach((element) => element.addEventListener("click", async () => { if (!confirm("Create a new OpenCode conversation for this workspace? Exact conversation continuity is unavailable and will be lost.")) return; element.disabled = true; try { await api(`/v1/sessions/${encodeURIComponent(element.dataset.rebind)}/rebind`, { method: "POST", body: JSON.stringify({ prompt: null }) }); await refresh() } catch (error) { alert(error.message); element.disabled = false } }))
+async function handleClick(event) {
+  const session = event.target.closest("[data-session]")
+  if (session) {
+    state.tab = state.tab || "logs"
+    navigate(session.dataset.session)
+    return
+  }
+  const filter = event.target.closest("[data-filter]")
+  if (filter) {
+    state.filter = filter.dataset.filter
+    if (state.selected && !visibleSessions().some((item) => item.id === state.selected)) navigate(null, false)
+    else updateSidebar()
+    return
+  }
+  const tab = event.target.closest("[data-tab]")
+  if (tab) {
+    state.tab = tab.dataset.tab
+    updateDetail()
+    return
+  }
+  if (event.target.closest("[data-clear-selection]")) {
+    event.preventDefault()
+    navigate(null)
+    return
+  }
+  const expand = event.target.closest("[data-expand-prompt]")
+  if (expand) {
+    const id = expand.dataset.expandPrompt
+    if (state.expandedPrompts.has(id)) state.expandedPrompts.delete(id)
+    else state.expandedPrompts.add(id)
+    updateDetail()
+    document.querySelector(`[data-focus-key="prompt-${CSS.escape(id)}"]`)?.focus({ preventScroll: true })
+    return
+  }
+  const copy = event.target.closest("[data-copy]")
+  if (copy) {
+    try {
+      await navigator.clipboard?.writeText(copy.dataset.copy)
+      state.copyStatus = "Copied"
+      copy.textContent = "Copied"
+      copy.parentElement.querySelector(".sr-only").textContent = "Copied command to clipboard"
+      window.setTimeout(() => {
+        state.copyStatus = null
+        if (copy.isConnected) {
+          copy.textContent = "Copy command"
+          copy.parentElement.querySelector(".sr-only").textContent = ""
+        }
+      }, 2200)
+    } catch {
+      state.copyStatus = "Copy failed"
+      copy.textContent = "Copy failed"
+      copy.parentElement.querySelector(".sr-only").textContent = "Copy failed"
+    }
+    return
+  }
+  const stop = event.target.closest("[data-stop]")
+  if (stop) {
+    if (!confirm("Stop this session? Its workspace and conversation will be deleted.")) return
+    stop.disabled = true
+    try {
+      await api(`/v1/sessions/${encodeURIComponent(stop.dataset.stop)}`, { method: "DELETE" })
+      navigate(null, false)
+      await refresh()
+    } catch (error) {
+      alert(error.message)
+      stop.disabled = false
+    }
+    return
+  }
+  const rebind = event.target.closest("[data-rebind]")
+  if (rebind) {
+    if (!confirm("Create a new OpenCode conversation for this workspace? Exact conversation continuity is unavailable and will be lost.")) return
+    rebind.disabled = true
+    try {
+      await api(`/v1/sessions/${encodeURIComponent(rebind.dataset.rebind)}/rebind`, { method: "POST", body: JSON.stringify({ prompt: null }) })
+      await refresh()
+    } catch (error) {
+      alert(error.message)
+      rebind.disabled = false
+    }
+  }
+  const complete = event.target.closest("[data-complete]")
+  if (complete) {
+    if (!confirm("Accept this work and mark the session complete?")) return
+    complete.disabled = true
+    try {
+      await api(`/v1/sessions/${encodeURIComponent(complete.dataset.complete)}/complete`, { method: "POST" })
+      await refresh()
+    } catch (error) {
+      alert(error.message)
+      complete.disabled = false
+    }
+  }
 }
 
-window.addEventListener("hashchange", () => { state.selected = decodeURIComponent(location.hash.slice(1)) || null; render() })
+function updateClocks() {
+  if (document.visibilityState !== "visible") return
+  document.querySelectorAll("[data-live-elapsed]").forEach((element) => {
+    const end = element.dataset.liveEnd ? timestamp(element.dataset.liveEnd)?.getTime() : Date.now()
+    element.textContent = formatElapsedValue(element.dataset.liveElapsed, end || Date.now())
+  })
+  document.querySelectorAll("[data-live-state-elapsed]").forEach((element) => {
+    element.textContent = formatElapsedValue(element.dataset.liveStateElapsed)
+  })
+  document.querySelectorAll("[data-live-relative]").forEach((element) => {
+    element.textContent = `Last activity ${relativeTime(element.dataset.liveRelative)}`
+  })
+}
+
+window.addEventListener("hashchange", applyRoute)
+window.addEventListener("popstate", applyRoute)
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") refresh() })
+ensureShell()
+updateSidebar()
+updateDetail()
 refresh()
 setInterval(refresh, 4000)
-setInterval(() => { if (document.visibilityState === "visible" && state.selected) render() }, 1000)
+setInterval(updateClocks, 1000)

@@ -88,6 +88,7 @@ dependencies = [
  "anvil-core",
  "anyhow",
  "axum 0.8.9",
+ "httpmock",
  "reqwest",
  "rmcp",
  "schemars",
