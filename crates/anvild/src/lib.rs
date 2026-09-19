@@ -463,8 +463,19 @@ impl SandboxApi for KubeSandboxApi {
                 .iter()
                 .map(|(name, value)| json!({"name":name,"value":value})),
         );
+        let workspace_init = json!({
+            "name": "fix-workspace-permissions",
+            "image": self.config.image,
+            "command": ["/bin/bash", "-c"],
+            "args": [
+                "set -euo pipefail\nmkdir -p /workspace\nchown -R 1000:1000 \"/workspace/$ANVIL_PROJECT\""
+            ],
+            "env": [{"name": "ANVIL_PROJECT", "value": r.project}],
+            "securityContext": {"runAsUser": 0, "runAsGroup": 0},
+            "volumeMounts": [{"name": "workspace", "mountPath": "/workspace"}]
+        });
         let container = json!({"name":"sandbox","image":self.config.image,"ports":[{"name":"opencode","containerPort":self.config.opencode_port}],"env":env,"volumeMounts":[{"name":"workspace","mountPath":"/workspace"},{"name":"shared-profile","mountPath":"/anvil/profile"}]});
-        let obj = json!({"apiVersion":"agents.x-k8s.io/v1beta1","kind":"Sandbox","metadata":{"name":name,"namespace":ns,"labels":l,"annotations":annotations},"spec":{"service":true,"podTemplate":{"spec":{"securityContext":{"runAsUser":1000,"runAsGroup":1000,"fsGroup":1000},"containers":[container],"volumes":[{"name":"shared-profile","persistentVolumeClaim":{"claimName":self.config.profile_pvc}}]}},"volumeClaimTemplates":[{"metadata":{"name":"workspace"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":self.config.workspace_size}}}}]}});
+        let obj = json!({"apiVersion":"agents.x-k8s.io/v1beta1","kind":"Sandbox","metadata":{"name":name,"namespace":ns,"labels":l,"annotations":annotations},"spec":{"service":true,"podTemplate":{"spec":{"securityContext":{"runAsUser":1000,"runAsGroup":1000,"fsGroup":1000},"initContainers":[workspace_init],"containers":[container],"volumes":[{"name":"shared-profile","persistentVolumeClaim":{"claimName":self.config.profile_pvc}}]}},"volumeClaimTemplates":[{"metadata":{"name":"workspace"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":self.config.workspace_size}}}}]}});
         Api::<DynamicObject>::namespaced_with(self.client.clone(), ns, &sandbox_resource())
             .create(
                 &PostParams::default(),
