@@ -64,6 +64,7 @@ else
   echo "warning: preserving existing sandbox OpenCode auth.json" >&2
 fi
 
+git config --global --add safe.directory "$project_dir"
 if [ ! -d "$project_dir/.git" ]; then
   git clone --branch "$ANVIL_REF" --single-branch "$ANVIL_REPOSITORY" "$project_dir"
   git -C "$project_dir" switch -c "$ANVIL_WORK_BRANCH"
