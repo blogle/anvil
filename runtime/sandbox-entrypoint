@@ -44,9 +44,14 @@ export GIT_COMMITTER_NAME="${ANVIL_GIT_COMMITTER_NAME:-Anvil}"
 export GIT_COMMITTER_EMAIL="${ANVIL_GIT_COMMITTER_EMAIL:-anvil@users.noreply.github.com}"
 
 profile_dir=/anvil/profile
-mkdir -p "$profile_dir/config" "$profile_dir/auth"
+mkdir -p "$profile_dir/config" "$profile_dir/auth" "$profile_dir/plugins"
+cp -f /usr/share/anvil/anvil-report.ts "$profile_dir/plugins/anvil-report.ts"
 if [ ! -e "$profile_dir/config/opencode.jsonc" ]; then
-  printf '{"$schema":"https://opencode.ai/config.json","permission":"allow"}\n' > "$profile_dir/config/opencode.jsonc"
+  printf '{"$schema":"https://opencode.ai/config.json","permission":"allow","plugin":["/anvil/profile/plugins/anvil-report.ts"]}\n' > "$profile_dir/config/opencode.jsonc"
+elif ! jq -e '.plugin // [] | index("/anvil/profile/plugins/anvil-report.ts")' "$profile_dir/config/opencode.jsonc" >/dev/null 2>&1; then
+  tmp_config="$profile_dir/config/opencode.jsonc.tmp"
+  jq '.plugin = ((.plugin // []) + ["/anvil/profile/plugins/anvil-report.ts"] | unique)' "$profile_dir/config/opencode.jsonc" > "$tmp_config" \
+    && mv "$tmp_config" "$profile_dir/config/opencode.jsonc"
 fi
 profile_auth="$profile_dir/auth/auth.json"
 if [ ! -e "$profile_auth" ]; then

@@ -63,6 +63,11 @@ single-node RWO fallback necessarily gives worker pods access to the mounted
 profile contents so OpenCode can refresh credentials; treat Anvil sandboxes as
 trusted until a mediated profile distribution mechanism replaces this PoC.
 
+The profile also installs the small `anvil_report` OpenCode plugin. It injects a
+single end-of-turn instruction and reports only `ready_for_review` or
+`awaiting_input` through the Sandbox's existing session capability. It cannot set
+environment or execution state, complete a session, or choose an arbitrary state.
+
 ## Storage access decision
 
 The profile and generated workspaces use `ReadWriteOnce` by default. Multiple

@@ -39,7 +39,18 @@ const formatElapsed = (request) => {
   if (minutes) return `${minutes}m ${String(seconds).padStart(2, "0")}s`
   return `${seconds}s`
 }
-const stateLabel = (value) => ({ active: "Active", idle: "Idle", starting: "Starting", failed: "Failed", stopped: "Stopped" }[value] || "Unknown")
+const formatStateElapsed = (activity) => formatElapsed({ started_at: activity?.work_state_changed_at })
+const operatorState = (activity) => {
+  if (!activity) return "starting"
+  if (["failed"].includes(activity.environment_state) || activity.execution_state === "failed") return "problem"
+  if (activity.environment_state === "provisioning") return "starting"
+  if (activity.work_state === "awaiting_input") return "needs-input"
+  if (activity.execution_state === "running") return "working"
+  if (activity.work_state === "ready_for_review") return "ready-for-review"
+  if (activity.work_state === "completed") return "done"
+  return "working"
+}
+const stateLabel = (value) => ({ working: "Working", "needs-input": "Needs input", "ready-for-review": "Ready for review", done: "Done", problem: "Problem", starting: "Starting" }[value] || "Starting")
 const titleFor = (activity) => {
   const prompt = activity?.requests?.[0]?.prompt?.trim()
   return prompt ? prompt.split("\n")[0].slice(0, 72) : `${activity?.session?.project || "Anvil"} session`
@@ -75,7 +86,7 @@ function visibleSessions() {
   return state.sessions.filter((session) => {
     if (state.filter === "all") return true
     const activity = sessionActivity(session.id)
-    const value = activity?.state || (session.phase || "starting").toLowerCase()
+    const value = operatorState(activity)
     return value === state.filter
   })
 }
@@ -104,16 +115,16 @@ function renderSidebar() {
   const items = visibleSessions()
   return `<aside class="sidebar" aria-label="Sessions">
     <div class="sidebar-head"><h1>Sessions</h1><span class="count">${state.sessions.length} total</span></div>
-    <div class="filters" role="tablist" aria-label="Session filters">${["all", "active", "idle", "stopped"].map((filter) => `<button class="filter ${state.filter === filter ? "selected" : ""}" data-filter="${filter}" role="tab" aria-selected="${state.filter === filter}">${filter[0].toUpperCase() + filter.slice(1)}</button>`).join("")}</div>
+     <div class="filters" role="tablist" aria-label="Session filters">${[["all", "All"], ["working", "Working"], ["needs-input", "Needs input"], ["ready-for-review", "Ready for review"], ["done", "Done"], ["problem", "Problem"]].map(([filter, label]) => `<button class="filter ${state.filter === filter ? "selected" : ""}" data-filter="${filter}" role="tab" aria-selected="${state.filter === filter}">${label}</button>`).join("")}</div>
     <div class="session-list">${state.loading ? `<div class="loading">Loading sessions...</div>` : state.error && !state.sessions.length ? `<div class="error-card"><strong>Sessions unavailable</strong>${escapeHtml(state.error)}</div>` : items.length ? items.map(renderSessionRow).join("") : `<div class="empty"><strong>${state.filter === "all" ? "No sessions yet" : `No ${state.filter} sessions`}</strong><span>Anvil sessions will appear here when work is dispatched.</span></div>`}</div>
   </aside>`
 }
 
 function renderSessionRow(session) {
   const activity = sessionActivity(session.id)
-  const status = activity?.state || (session.phase || "starting").toLowerCase()
+  const status = operatorState(activity)
   const request = activity?.requests?.at(-1)
-  const meta = request?.state === "running" ? `Request running · ${formatElapsed(request)}` : activity?.last_activity_at ? `Updated ${relativeTime(activity.last_activity_at)}` : stateLabel(status)
+  const meta = `${stateLabel(status)} · ${formatStateElapsed(activity)}`
   return `<button class="session-row ${state.selected === session.id ? "selected" : ""}" data-session="${escapeHtml(session.id)}"><div class="session-title">${escapeHtml(titleFor(activity))}</div><div class="session-meta"><span>${escapeHtml(session.project)}</span><span>·</span><span><code>${escapeHtml(session.work_branch)}</code></span></div><div class="session-state state-${escapeHtml(status)}"><span class="status-dot"></span><span>${stateLabel(status)}</span><span class="row-detail">${escapeHtml(meta)}</span></div></button>`
 }
 
@@ -133,11 +144,12 @@ function renderDetail() {
   const activity = selectedActivity()
   const session = activity?.session || state.sessions.find((item) => item.id === state.selected)
   if (!session) return `<section class="detail"><div class="detail-inner"><div class="loading">Loading session...</div></div></section>`
-  const status = activity?.state || (session.phase || "starting").toLowerCase()
+  const status = operatorState(activity)
   const firstPrompt = activity?.requests?.[0]?.prompt
   return `<section class="detail"><div class="detail-inner">
     <a class="back-link" href="${location.pathname}" data-clear-selection>← All sessions</a>
-    <div class="detail-header"><div><div class="eyebrow">Session overview</div><h2>${escapeHtml(titleFor(activity))}</h2><div class="detail-subtitle"><span>${escapeHtml(session.project)}</span><span>·</span><code>${escapeHtml(session.work_branch)}</code></div><div class="detail-status state-${escapeHtml(status)}"><span class="status-dot"></span><strong>${stateLabel(status)}</strong><span>${session.created_at ? `Started ${relativeTime(session.created_at)}` : ""}</span></div></div></div>
+     <div class="detail-header"><div><div class="eyebrow">Session overview</div><h2>${escapeHtml(titleFor(activity))}</h2><div class="detail-subtitle"><span>${escapeHtml(session.project)}</span><span>·</span><code>${escapeHtml(session.work_branch)}</code></div><div class="detail-status state-${escapeHtml(status)}"><span class="status-dot"></span><strong>${stateLabel(status)}</strong><span>${activity?.work_state_changed_at ? `· ${formatStateElapsed(activity)}` : ""}</span></div></div></div>
+     ${activity?.work_state_summary ? `<div class="work-summary"><div class="eyebrow">Work summary</div>${escapeHtml(activity.work_state_summary)}</div>` : ""}
     ${firstPrompt ? `<p class="description">${escapeHtml(firstPrompt)}</p>` : ""}
     ${renderActions(activity, session)}
     <div class="tabs" role="tablist"><button class="tab ${state.tab === "logs" ? "active" : ""}" data-tab="logs" role="tab">Logs</button><button class="tab ${state.tab === "runtime" ? "active" : ""}" data-tab="runtime" role="tab">Runtime</button></div>
@@ -169,7 +181,7 @@ function renderRequest(request) {
 }
 
 function renderRuntime(activity, session) {
-  return `<div class="content-section"><div class="section-heading"><h3>Runtime details</h3><span>Technical information</span></div><div class="runtime-grid"><div class="runtime-item"><label>Sandbox state</label><value>${escapeHtml(stateLabel(activity?.state))}</value></div><div class="runtime-item"><label>Created</label><value>${escapeHtml(formatDate(session.created_at))}</value></div><div class="runtime-item"><label>Sandbox</label><value>${escapeHtml(session.sandbox)}</value></div><div class="runtime-item"><label>OpenCode session</label><value>${escapeHtml(session.opencode_session_id || "Not assigned")}</value></div><div class="runtime-item"><label>Repository</label><value>${escapeHtml(session.repository)}</value></div><div class="runtime-item"><label>Base ref</label><value>${escapeHtml(session.base_ref)}</value></div></div><p class="muted" style="font-size:12px;line-height:1.5;margin-top:18px">Raw runtime output is not exposed by this control plane. The Logs view shows the durable lifecycle and OpenCode activity facts available to Anvil.</p></div>`
+  return `<div class="content-section"><div class="section-heading"><h3>Runtime details</h3><span>Technical information</span></div><div class="runtime-grid"><div class="runtime-item"><label>Environment</label><value>${escapeHtml(activity?.environment_state || session.environment_state)}</value></div><div class="runtime-item"><label>Execution</label><value>${escapeHtml(activity?.execution_state || "idle")}</value></div><div class="runtime-item"><label>Work state</label><value>${escapeHtml(activity?.work_state || session.work_state)}</value></div><div class="runtime-item"><label>Created</label><value>${escapeHtml(formatDate(session.created_at))}</value></div><div class="runtime-item"><label>Sandbox</label><value>${escapeHtml(session.sandbox)}</value></div><div class="runtime-item"><label>OpenCode session</label><value>${escapeHtml(session.opencode_session_id || "Not assigned")}</value></div><div class="runtime-item"><label>Repository</label><value>${escapeHtml(session.repository)}</value></div><div class="runtime-item"><label>Base ref</label><value>${escapeHtml(session.base_ref)}</value></div></div><p class="muted" style="font-size:12px;line-height:1.5;margin-top:18px">Environment, execution, and work state are reported independently. Raw runtime output is not exposed by this control plane.</p></div>`
 }
 
 function bindEvents() {

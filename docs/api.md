@@ -22,11 +22,32 @@ OpenCode without being logged or persisted by Anvil. Pending login IDs live only
 an `anvild` restart requires an in-progress login to be restarted; completed
 credentials remain on the profile PVC.
 
+## Session work state
+
+Session responses expose independent `environment_state`, `execution_state`, and
+`work_state` fields. Environment state is derived from Sandbox lifecycle,
+execution state from OpenCode status, and work state is durable Anvil metadata.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/v1/sessions/{id}/report-context` | Return the current worker run ID |
+| `POST` | `/v1/sessions/{id}/report` | Report `ready_for_review` or `awaiting_input` |
+| `POST` | `/v1/sessions/{id}/complete` | Controller acceptance into `completed` |
+
+Reports require `Authorization: Bearer <session capability>` and include the
+current `run_id`. Summaries are trimmed and limited to 500 characters. Run and
+work metadata are stored with the Sandbox annotations, so they survive service
+restarts and Sandbox suspension.
+
 ## CLI boundary
 
 `anvilctl` uses `ANVIL_URL` or `--server` and talks to these API routes over
 HTTP. `just` remains a development/build/deployment workflow and does not
 provide provider-login or session-administration commands.
+
+Manual diagnostics use `anvilctl session report <session> <disposition>` with
+`ANVIL_SESSION_CREDENTIAL` (or `--capability`); controller acceptance uses
+`anvilctl session complete <session>`.
 
 Anvil uses the Agent Sandbox `agents.x-k8s.io/v1beta1` `Sandbox` resource. The
 `anvild` process is configured with `ANVIL_NAMESPACE` and is the sole component

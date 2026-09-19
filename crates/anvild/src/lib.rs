@@ -3,9 +3,10 @@
 mod github;
 
 use anvil_core::{
-    branch_name, preview_hostname, GitRef, LifecycleEvent, LoginFlow, Port, Project, Prompt,
-    ProviderAuthMethod, ProviderListResponse, ProviderStatus, ProviderSummary, Repository, Session,
-    SessionActivity, SessionId, SessionRequest,
+    branch_name, normalize_summary, preview_hostname, validate_worker_transition, GitRef,
+    LifecycleEvent, LoginFlow, Port, Project, Prompt, ProviderAuthMethod, ProviderListResponse,
+    ProviderStatus, ProviderSummary, Repository, Run, Session, SessionActivity, SessionId,
+    SessionRequest, WorkState, WorkerDisposition,
 };
 use async_trait::async_trait;
 use axum::{
@@ -24,7 +25,7 @@ use kube::{
     Client, ResourceExt,
 };
 use reqwest::Url;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -140,6 +141,8 @@ pub enum ServiceError {
     Unauthorized,
     #[error("forbidden: {0}")]
     Forbidden(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("invalid request: {0}")]
     Invalid(String),
 }
@@ -149,6 +152,7 @@ impl IntoResponse for ServiceError {
             ServiceError::NotFound => StatusCode::NOT_FOUND,
             ServiceError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServiceError::Forbidden(_) => StatusCode::FORBIDDEN,
+            ServiceError::Conflict(_) => StatusCode::CONFLICT,
             ServiceError::Invalid(_) => StatusCode::BAD_REQUEST,
             ServiceError::OpenCode(_) => StatusCode::BAD_GATEWAY,
             ServiceError::Profile(_) => StatusCode::BAD_GATEWAY,
@@ -178,6 +182,22 @@ pub struct CreateRequest {
 #[derive(Debug, Deserialize)]
 pub struct PromptRequest {
     pub prompt: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReportRequest {
+    pub run_id: String,
+    pub disposition: String,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportResponse {
+    pub accepted: bool,
+    pub session_id: String,
+    pub run_id: String,
+    pub work_state: String,
+    pub work_state_changed_at: String,
 }
 #[derive(Debug, Deserialize)]
 pub struct DiffQuery {
@@ -294,6 +314,23 @@ pub trait SandboxApi: Send + Sync + 'static {
     async fn set_ready_at(&self, _id: &str, _at: &str) -> Result<(), ServiceError> {
         Ok(())
     }
+    async fn set_work_state(
+        &self,
+        _id: &str,
+        _state: &WorkStateRecord,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkStateRecord {
+    pub state: WorkState,
+    pub changed_at: String,
+    pub summary: Option<String>,
+    pub run_id: Option<String>,
+    pub current_run: Option<Run>,
+    pub last_run: Option<Run>,
 }
 
 pub struct KubeSandboxApi {
@@ -330,6 +367,59 @@ fn sandbox_resource() -> ApiResource {
 fn annotation_key(config: &Config, name: &str) -> String {
     format!("{}/{}", config.annotation_prefix, name)
 }
+
+fn parse_work_state(value: Option<&String>) -> WorkState {
+    value
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(WorkState::InProgress)
+}
+
+fn environment_state(phase: Option<&str>, suspended: bool) -> &'static str {
+    if suspended {
+        "suspended"
+    } else if phase.is_some_and(|phase| phase.eq_ignore_ascii_case("failed")) {
+        "failed"
+    } else if phase.is_some_and(|phase| phase.eq_ignore_ascii_case("ready")) {
+        "ready"
+    } else {
+        "provisioning"
+    }
+}
+
+fn run_annotation(value: Option<&String>) -> Option<Run> {
+    value.and_then(|value| serde_json::from_str(value).ok())
+}
+
+fn work_state_record(o: &DynamicObject, config: &Config) -> WorkStateRecord {
+    let annotations = o.annotations();
+    WorkStateRecord {
+        state: parse_work_state(annotations.get(&annotation_key(config, "work-state"))),
+        changed_at: annotations
+            .get(&annotation_key(config, "work-state-changed-at"))
+            .cloned()
+            .or_else(|| {
+                annotations
+                    .get(&annotation_key(config, "created-at"))
+                    .cloned()
+            })
+            .unwrap_or_else(chrono_like_now),
+        summary: annotations
+            .get(&annotation_key(config, "work-state-summary"))
+            .cloned(),
+        run_id: annotations
+            .get(&annotation_key(config, "work-state-run-id"))
+            .cloned(),
+        current_run: run_annotation(annotations.get(&annotation_key(config, "run-current"))),
+        last_run: run_annotation(annotations.get(&annotation_key(config, "run-last"))),
+    }
+}
+
+fn run_value(run: Option<&Run>) -> Value {
+    run.map_or(Value::Null, |run| {
+        serde_json::to_value(run).unwrap_or(Value::Null)
+    })
+}
+
 fn labels() -> Value {
     json!({MANAGED:"anvil", APP:"sandbox"})
 }
@@ -340,6 +430,18 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
         .strip_prefix("anvil-")
         .map(str::to_owned)
         .ok_or(ServiceError::NotFound)?;
+    let phase = o
+        .data
+        .get("status")
+        .and_then(|v| v.get("phase"))
+        .and_then(Value::as_str);
+    let work = work_state_record(o, config);
+    let suspended = o
+        .data
+        .get("spec")
+        .and_then(|value| value.get("operatingMode"))
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("suspended"));
     Ok(Session {
         id,
         sandbox: o.name_any(),
@@ -352,12 +454,7 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
             .into(),
         namespace: config.namespace.clone(),
         opencode_port: config.opencode_port,
-        phase: o
-            .data
-            .get("status")
-            .and_then(|v| v.get("phase"))
-            .and_then(Value::as_str)
-            .map(String::from),
+        phase: phase.map(String::from),
         project: a
             .get(&annotation_key(config, "project"))
             .cloned()
@@ -389,6 +486,13 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
                     .map(String::from)
             }),
         ready_at: a.get(&annotation_key(config, "ready-at")).cloned(),
+        environment_state: environment_state(phase, suspended).into(),
+        work_state: work.state.as_str().into(),
+        work_state_changed_at: Some(work.changed_at),
+        work_state_summary: work.summary,
+        work_state_run_id: work.run_id,
+        current_run: work.current_run,
+        last_run: work.last_run,
     })
 }
 #[async_trait]
@@ -413,6 +517,13 @@ impl SandboxApi for KubeSandboxApi {
         let ns = &self.config.namespace;
         let name = format!("anvil-{id}");
         let now = chrono_like_now();
+        let run_id = new_run_id();
+        let initial_run = Run {
+            id: run_id.clone(),
+            state: "running".into(),
+            started_at: now.clone(),
+            finished_at: None,
+        };
         let l = labels();
         let work_branch = branch_name(&SessionId::parse(id).unwrap());
         let mut annotations = serde_json::Map::new();
@@ -436,6 +547,22 @@ impl SandboxApi for KubeSandboxApi {
             annotation_key(&self.config, "created-at"),
             Value::String(now.clone()),
         );
+        annotations.insert(
+            annotation_key(&self.config, "work-state"),
+            Value::String(WorkState::InProgress.as_str().into()),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "work-state-changed-at"),
+            Value::String(now.clone()),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "work-state-run-id"),
+            Value::String(run_id.clone()),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "run-current"),
+            Value::String(serde_json::to_string(&initial_run).unwrap()),
+        );
         if let Some(model) = &r.model {
             annotations.insert(
                 annotation_key(&self.config, "model"),
@@ -448,6 +575,7 @@ impl SandboxApi for KubeSandboxApi {
             json!({"name":"ANVIL_REPOSITORY","value":r.repository}),
             json!({"name":"ANVIL_REF","value":r.base_ref}),
             json!({"name":"ANVIL_WORK_BRANCH","value":work_branch}),
+            json!({"name":"ANVIL_RUN_ID","value":run_id}),
             json!({"name":"OPENCODE_CONFIG","value":"/anvil/profile/config/opencode.jsonc"}),
             json!({"name":"OPENCODE_CONFIG_DIR","value":"/anvil/profile/config"}),
             json!({"name":"HOME","value":"/home/anvil"}),
@@ -498,6 +626,13 @@ impl SandboxApi for KubeSandboxApi {
             opencode_session_id: None,
             created_at: Some(now),
             ready_at: None,
+            environment_state: "provisioning".into(),
+            work_state: WorkState::InProgress.as_str().into(),
+            work_state_changed_at: Some(initial_run.started_at.clone()),
+            work_state_summary: None,
+            work_state_run_id: Some(initial_run.id.clone()),
+            current_run: Some(initial_run),
+            last_run: None,
         })
     }
     async fn suspend(&self, id: &str) -> Result<(), ServiceError> {
@@ -556,6 +691,35 @@ impl SandboxApi for KubeSandboxApi {
         self.patch(id, json!({"metadata":{"annotations":annotations}}))
             .await
     }
+    async fn set_work_state(&self, id: &str, state: &WorkStateRecord) -> Result<(), ServiceError> {
+        let mut annotations = serde_json::Map::new();
+        annotations.insert(
+            annotation_key(&self.config, "work-state"),
+            Value::String(state.state.as_str().into()),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "work-state-changed-at"),
+            Value::String(state.changed_at.clone()),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "work-state-summary"),
+            state.summary.clone().map_or(Value::Null, Value::String),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "work-state-run-id"),
+            state.run_id.clone().map_or(Value::Null, Value::String),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "run-current"),
+            run_value(state.current_run.as_ref()),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "run-last"),
+            run_value(state.last_run.as_ref()),
+        );
+        self.patch(id, json!({"metadata":{"annotations":annotations}}))
+            .await
+    }
 }
 impl KubeSandboxApi {
     async fn patch(&self, id: &str, v: Value) -> Result<(), ServiceError> {
@@ -576,6 +740,10 @@ impl KubeSandboxApi {
 }
 fn chrono_like_now() -> String {
     Utc::now().to_rfc3339()
+}
+
+fn new_run_id() -> String {
+    format!("run_{}", uuid::Uuid::new_v4().simple())
 }
 
 #[derive(Clone)]
@@ -627,6 +795,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sessions", post(create).get(enumerate))
         .route("/v1/sessions/:id", get(session).delete(remove))
         .route("/v1/sessions/:id/messages", post(prompt).get(messages))
+        .route("/v1/sessions/:id/report", post(report))
+        .route("/v1/sessions/:id/report-context", get(report_context))
+        .route("/v1/sessions/:id/complete", post(complete))
         .route("/v1/sessions/:id/status", get(status))
         .route("/v1/sessions/:id/diff", get(diff))
         .route("/v1/sessions/:id/abort", post(abort))
@@ -932,6 +1103,7 @@ async fn prompt(
     Json(r): Json<PromptRequest>,
 ) -> Result<Json<Value>, ServiceError> {
     let p = Prompt::new(&r.prompt).map_err(|e| ServiceError::Invalid(e.to_string()))?;
+    begin_run(&s, &id).await?;
     let x = session_from(&s.kube.get(&id).await?, &s.config)?;
     let oc = OpenCode::new(service_url(&x, &s.config), s.config.request_timeout);
     let model = match x.model.as_deref() {
@@ -948,6 +1120,183 @@ async fn prompt(
         )
         .await?,
     ))
+}
+
+fn bearer_token(headers: &HeaderMap) -> Result<&str, ServiceError> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+        .ok_or(ServiceError::Unauthorized)
+}
+
+async fn authorized_worker_session(
+    s: &AppState,
+    id: &str,
+    headers: &HeaderMap,
+) -> Result<DynamicObject, ServiceError> {
+    let signer = s
+        .capability_signer
+        .as_ref()
+        .ok_or_else(|| ServiceError::Config("session capabilities are not configured".into()))?;
+    let claims = signer
+        .verify(bearer_token(headers)?)
+        .map_err(|_| ServiceError::Unauthorized)?;
+    if claims.session_id != id || claims.capability != "github-repository" {
+        return Err(ServiceError::Forbidden(
+            "capability is not valid for this session".into(),
+        ));
+    }
+    let object = s.kube.get(id).await?;
+    let session = session_from(&object, &s.config)?;
+    if session.repository != claims.repository {
+        return Err(ServiceError::Forbidden(
+            "capability repository does not match session".into(),
+        ));
+    }
+    Ok(object)
+}
+
+async fn report_context(
+    Path(id): Path<String>,
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ServiceError> {
+    let object = authorized_worker_session(&s, &id, &headers).await?;
+    let work = work_state_record(&object, &s.config);
+    if work.state == WorkState::Completed {
+        return Err(ServiceError::Conflict("session is completed".into()));
+    }
+    let run_id = work
+        .run_id
+        .ok_or_else(|| ServiceError::Conflict("session has no current run".into()))?;
+    Ok(Json(json!({"session_id":id,"run_id":run_id})))
+}
+
+async fn report(
+    Path(id): Path<String>,
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ReportRequest>,
+) -> Result<Json<ReportResponse>, ServiceError> {
+    let object = authorized_worker_session(&s, &id, &headers).await?;
+    let work = work_state_record(&object, &s.config);
+    let disposition = match request.disposition.parse::<WorkerDisposition>() {
+        Ok(disposition) => disposition,
+        Err(_) => {
+            return Err(ServiceError::Invalid(
+                "disposition must be ready_for_review or awaiting_input".into(),
+            ))
+        }
+    };
+    if work.run_id.as_deref() != Some(request.run_id.as_str()) {
+        return Err(ServiceError::Conflict(
+            "report run is stale or is not current".into(),
+        ));
+    }
+    let state = validate_worker_transition(work.state, disposition)
+        .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+    let summary = normalize_summary(request.summary.as_deref())
+        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let changed_at = chrono_like_now();
+    let finished = work.current_run.map(|mut run| {
+        run.state = "completed".into();
+        run.finished_at = Some(changed_at.clone());
+        run
+    });
+    s.kube
+        .set_work_state(
+            &id,
+            &WorkStateRecord {
+                state,
+                changed_at: changed_at.clone(),
+                summary,
+                run_id: Some(request.run_id.clone()),
+                current_run: None,
+                last_run: finished.or(work.last_run),
+            },
+        )
+        .await?;
+    Ok(Json(ReportResponse {
+        accepted: true,
+        session_id: id,
+        run_id: request.run_id,
+        work_state: state.as_str().into(),
+        work_state_changed_at: changed_at,
+    }))
+}
+
+async fn complete(
+    Path(id): Path<String>,
+    State(s): State<AppState>,
+) -> Result<Json<ReportResponse>, ServiceError> {
+    let object = s.kube.get(&id).await?;
+    let work = work_state_record(&object, &s.config);
+    if work.state != WorkState::ReadyForReview {
+        return Err(ServiceError::Conflict(
+            "only ready_for_review sessions can be completed".into(),
+        ));
+    }
+    let changed_at = chrono_like_now();
+    let run_id = work.run_id.clone().ok_or_else(|| {
+        ServiceError::Conflict("session has no run associated with its review state".into())
+    })?;
+    s.kube
+        .set_work_state(
+            &id,
+            &WorkStateRecord {
+                state: WorkState::Completed,
+                changed_at: changed_at.clone(),
+                summary: work.summary.clone(),
+                run_id: Some(run_id.clone()),
+                current_run: None,
+                last_run: work.last_run,
+            },
+        )
+        .await?;
+    Ok(Json(ReportResponse {
+        accepted: true,
+        session_id: id,
+        run_id,
+        work_state: WorkState::Completed.as_str().into(),
+        work_state_changed_at: changed_at,
+    }))
+}
+
+async fn begin_run(s: &AppState, id: &str) -> Result<String, ServiceError> {
+    let object = s.kube.get(id).await?;
+    let work = work_state_record(&object, &s.config);
+    if work.state == WorkState::Completed {
+        return Err(ServiceError::Conflict("session is completed".into()));
+    }
+    let changed_at = chrono_like_now();
+    let run = Run {
+        id: new_run_id(),
+        state: "running".into(),
+        started_at: changed_at.clone(),
+        finished_at: None,
+    };
+    let last_run = work.current_run.map(|mut previous| {
+        previous.state = "superseded".into();
+        previous.finished_at = Some(changed_at.clone());
+        previous
+    });
+    let run_id = run.id.clone();
+    s.kube
+        .set_work_state(
+            id,
+            &WorkStateRecord {
+                state: WorkState::InProgress,
+                changed_at,
+                summary: None,
+                run_id: Some(run_id.clone()),
+                current_run: Some(run),
+                last_run: last_run.or(work.last_run),
+            },
+        )
+        .await?;
+    Ok(run_id)
 }
 async fn proxy(
     Path(id): Path<String>,
@@ -993,7 +1342,25 @@ async fn status(
         )
         .cloned()
         .unwrap_or(Value::Null);
-    Ok(Json(selected))
+    let execution_state = if status_is_busy(&v, x.opencode_session_id.as_deref().unwrap_or("")) {
+        "running"
+    } else if selected.get("error").is_some() {
+        "failed"
+    } else {
+        "idle"
+    };
+    Ok(Json(json!({
+        "environment_state": x.environment_state,
+        "execution_state": execution_state,
+        "work_state": x.work_state,
+        "work_state_changed_at": x.work_state_changed_at,
+        "work_state_summary": x.work_state_summary,
+        "work_state_run_id": x.work_state_run_id,
+        "current_run": x.current_run,
+        "last_run": x.last_run,
+        "last_activity_at": x.work_state_changed_at,
+        "opencode": selected,
+    })))
 }
 async fn diff(
     p: Path<String>,
@@ -1154,6 +1521,27 @@ fn status_is_busy(status: &Value, session_id: &str) -> bool {
         .and_then(|value| value.get("type"))
         .and_then(Value::as_str)
         == Some("busy")
+}
+
+fn execution_state(
+    status: &Value,
+    session_id: Option<&str>,
+    requests: &[SessionRequest],
+) -> &'static str {
+    if session_id.is_some_and(|id| status_is_busy(status, id))
+        || requests
+            .last()
+            .is_some_and(|request| request.state == "running")
+    {
+        "running"
+    } else if requests
+        .last()
+        .is_some_and(|request| request.state == "failed")
+    {
+        "failed"
+    } else {
+        "idle"
+    }
 }
 
 fn build_activity(
@@ -1320,6 +1708,9 @@ fn build_activity(
     });
 
     lifecycle.sort_by(|left, right| left.at.cmp(&right.at));
+    let environment_state = environment_state(Some(phase), operating_mode == Some("Suspended"));
+    let execution_state =
+        execution_state(&status, session.opencode_session_id.as_deref(), &requests);
     SessionActivity {
         session: session.clone(),
         state: state.into(),
@@ -1331,6 +1722,13 @@ fn build_activity(
         preview_url: None,
         opencode_url,
         attach_command: format!("anvilctl sessions attach {}", session.id),
+        environment_state: environment_state.into(),
+        execution_state: execution_state.into(),
+        work_state: session.work_state.clone(),
+        work_state_changed_at: session.work_state_changed_at.clone(),
+        work_state_summary: session.work_state_summary.clone(),
+        current_run: session.current_run.clone(),
+        last_run: session.last_run.clone(),
     }
 }
 
@@ -1836,12 +2234,17 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use httpmock::{Method::GET, MockServer};
+    use std::collections::BTreeMap;
     use tower::ServiceExt;
 
     struct FakeSandbox;
 
     struct ActivitySandbox {
         object: DynamicObject,
+    }
+
+    struct ReportSandbox {
+        object: Arc<Mutex<DynamicObject>>,
     }
 
     #[async_trait]
@@ -1896,6 +2299,84 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl SandboxApi for ReportSandbox {
+        async fn list(&self) -> Result<Vec<DynamicObject>, ServiceError> {
+            Ok(vec![self
+                .object
+                .lock()
+                .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?
+                .clone()])
+        }
+
+        async fn create(
+            &self,
+            _id: &str,
+            _request: &CreateRequest,
+            _sandbox_env: &[(String, String)],
+        ) -> Result<Session, ServiceError> {
+            Err(ServiceError::Invalid("not used in report tests".into()))
+        }
+
+        async fn suspend(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn resume(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn set_work_state(
+            &self,
+            _id: &str,
+            state: &WorkStateRecord,
+        ) -> Result<(), ServiceError> {
+            let mut object = self
+                .object
+                .lock()
+                .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?;
+            let annotations = object
+                .metadata
+                .annotations
+                .get_or_insert_with(BTreeMap::new);
+            annotations.insert(
+                "anvil.example/work-state".into(),
+                state.state.as_str().into(),
+            );
+            annotations.insert(
+                "anvil.example/work-state-changed-at".into(),
+                state.changed_at.clone(),
+            );
+            if let Some(summary) = &state.summary {
+                annotations.insert("anvil.example/work-state-summary".into(), summary.clone());
+            } else {
+                annotations.remove("anvil.example/work-state-summary");
+            }
+            if let Some(run_id) = &state.run_id {
+                annotations.insert("anvil.example/work-state-run-id".into(), run_id.clone());
+            }
+            if let Some(run) = &state.current_run {
+                annotations.insert(
+                    "anvil.example/run-current".into(),
+                    serde_json::to_string(run).unwrap(),
+                );
+            } else {
+                annotations.remove("anvil.example/run-current");
+            }
+            if let Some(run) = &state.last_run {
+                annotations.insert(
+                    "anvil.example/run-last".into(),
+                    serde_json::to_string(run).unwrap(),
+                );
+            }
+            Ok(())
+        }
+    }
+
     fn config(profile_opencode_url: String) -> Config {
         Config {
             bind_port: 8080,
@@ -1934,6 +2415,18 @@ mod tests {
             opencode_session_id: Some("ses_demo".into()),
             created_at: Some("2026-01-01T10:00:00Z".into()),
             ready_at: Some("2026-01-01T10:00:41Z".into()),
+            environment_state: "ready".into(),
+            work_state: "in_progress".into(),
+            work_state_changed_at: Some("2026-01-01T10:00:00Z".into()),
+            work_state_summary: None,
+            work_state_run_id: Some("run_test".into()),
+            current_run: Some(Run {
+                id: "run_test".into(),
+                state: "running".into(),
+                started_at: "2026-01-01T10:00:00Z".into(),
+                finished_at: None,
+            }),
+            last_run: None,
         }
     }
 
@@ -1988,6 +2481,98 @@ mod tests {
             response.headers()["content-type"],
             "text/html; charset=utf-8"
         );
+    }
+
+    #[tokio::test]
+    async fn worker_report_is_capability_and_run_bound_and_controller_completes() {
+        let object: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {
+                "name": "anvil-demo-12345678",
+                "annotations": {
+                    "anvil.example/project": "demo",
+                    "anvil.example/repository": "https://github.com/example/demo.git",
+                    "anvil.example/base-ref": "main",
+                    "anvil.example/work-branch": "anvil/demo-12345678",
+                    "anvil.example/created-at": "2026-01-01T10:00:00Z",
+                    "anvil.example/work-state": "in_progress",
+                    "anvil.example/work-state-changed-at": "2026-01-01T10:00:00Z",
+                    "anvil.example/work-state-run-id": "run_1",
+                    "anvil.example/run-current": "{\"id\":\"run_1\",\"state\":\"running\",\"started_at\":\"2026-01-01T10:00:00Z\"}"
+                }
+            },
+            "status": {"phase": "Ready", "serviceFQDN": "anvil-demo-12345678"}
+        }))
+        .unwrap();
+        let sandbox = ReportSandbox {
+            object: Arc::new(Mutex::new(object)),
+        };
+        let mut config = config("http://profile.test".into());
+        config.session_signing_secret = Some("x".repeat(32));
+        let token = github::CapabilitySigner::new("x".repeat(32), Duration::from_secs(60))
+            .unwrap()
+            .mint("demo-12345678", "https://github.com/example/demo.git")
+            .unwrap();
+        let app = router(AppState::new(config, sandbox));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/sessions/demo-12345678/report-context")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_response(response).await["run_id"], "run_1");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/sessions/demo-12345678/report")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"run_id":"run_1","disposition":"ready_for_review","summary":"  validated  "}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_response(response).await["work_state"],
+            "ready_for_review"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/sessions/demo-12345678/complete")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_response(response).await["work_state"], "completed");
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/sessions/demo-12345678/report")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"run_id":"run_1","disposition":"awaiting_input"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[test]

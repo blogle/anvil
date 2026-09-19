@@ -46,6 +46,8 @@
           (builtins.readFile ./runtime/sandbox-entrypoint);
         credentialHelper = pkgs.writeShellScriptBin "anvil-credential"
           (builtins.readFile ./runtime/anvil-credential);
+        anvilReportPlugin = pkgs.writeTextDir "share/anvil/anvil-report.ts"
+          (builtins.readFile ./runtime/anvil-report.ts);
         ghWrapper = pkgs.writeShellScriptBin "gh" ''
           set -euo pipefail
           : "''${ANVIL_SESSION_ID:?ANVIL_SESSION_ID is required}"
@@ -109,6 +111,7 @@
             pkgs.findutils pkgs.gnugrep pkgs.gnused pkgs.gawk pkgs.gzip pkgs.which pkgs.less
             pkgs.chromium pkgs.electron pkgs.xorg-server
             nixConf entrypoint credentialHelper ghWrapper
+            anvilReportPlugin
             opencodePackage
           ] ++ userFiles;
           extraCommands = ''

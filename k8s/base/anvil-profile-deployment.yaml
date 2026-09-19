@@ -28,7 +28,8 @@ spec:
               set -euo pipefail
               profile=/anvil/profile
               auth="$profile/auth/auth.json"
-              mkdir -p "$profile/config" "$profile/auth" "$HOME/.local/share/opencode"
+              mkdir -p "$profile/config" "$profile/auth" "$profile/plugins" "$HOME/.local/share/opencode"
+              cp -f /usr/share/anvil/anvil-report.ts "$profile/plugins/anvil-report.ts"
               if [ ! -e "$auth" ]; then (umask 077; : > "$auth"); fi
               chmod 600 "$auth"
               link="$HOME/.local/share/opencode/auth.json"
@@ -38,7 +39,11 @@ spec:
                 ln -s "$auth" "$link"
               fi
               if [ ! -e "$profile/config/opencode.jsonc" ]; then
-                printf '{"$schema":"https://opencode.ai/config.json","permission":"allow"}\n' > "$profile/config/opencode.jsonc"
+                printf '{"$schema":"https://opencode.ai/config.json","permission":"allow","plugin":["/anvil/profile/plugins/anvil-report.ts"]}\n' > "$profile/config/opencode.jsonc"
+              elif ! jq -e '.plugin // [] | index("/anvil/profile/plugins/anvil-report.ts")' "$profile/config/opencode.jsonc" >/dev/null 2>&1; then
+                tmp_config="$profile/config/opencode.jsonc.tmp"
+                jq '.plugin = ((.plugin // []) + ["/anvil/profile/plugins/anvil-report.ts"] | unique)' "$profile/config/opencode.jsonc" > "$tmp_config" \
+                  && mv "$tmp_config" "$profile/config/opencode.jsonc"
               fi
               exec opencode serve --hostname 0.0.0.0 --port 4096
           env:

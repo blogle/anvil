@@ -160,6 +160,20 @@ impl AnvilMcp {
         )
         .await
     }
+    #[rmcp::tool(
+        description = "Accept a session that is ready for review and mark its work completed."
+    )]
+    async fn anvil_complete_session(
+        &self,
+        Parameters(p): Parameters<Session>,
+    ) -> Result<String, ErrorData> {
+        self.call(
+            Method::POST,
+            &format!("v1/sessions/{}/complete", p.session_id),
+            None,
+        )
+        .await
+    }
     #[rmcp::tool(description = "Get the repository diff produced in a session.")]
     async fn anvil_get_diff(
         &self,
