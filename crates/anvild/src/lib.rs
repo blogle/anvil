@@ -984,6 +984,7 @@ pub fn router(state: AppState) -> Router {
             post(github_credentials),
         )
         .route("/assets/app.js", get(asset_js))
+        .route("/assets/ui-state.js", get(asset_ui_state_js))
         .route("/assets/styles.css", get(asset_css))
         .route("/", get(index))
         .route("/v1/providers", get(providers))
@@ -1014,6 +1015,17 @@ async fn asset_js() -> Response {
             "text/javascript; charset=utf-8",
         )],
         include_str!("../../../web/app.js"),
+    )
+        .into_response()
+}
+
+async fn asset_ui_state_js() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/javascript; charset=utf-8",
+        )],
+        include_str!("../../../web/ui-state.js"),
     )
         .into_response()
 }
@@ -2884,6 +2896,7 @@ mod tests {
         assert_eq!(body["lifecycle"][0]["kind"], "created");
 
         let response = app
+            .clone()
             .oneshot(Request::get("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -2891,6 +2904,20 @@ mod tests {
         assert_eq!(
             response.headers()["content-type"],
             "text/html; charset=utf-8"
+        );
+
+        let response = app
+            .oneshot(
+                Request::get("/assets/ui-state.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/javascript; charset=utf-8"
         );
     }
 
