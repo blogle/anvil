@@ -29,7 +29,12 @@ export function applyServerRefresh(state, sessions, activities) {
 }
 
 export function formatElapsedValue(value, now = Date.now()) {
-  const start = Date.parse(value || "")
+  const raw = String(value || "")
+  let start = Date.parse(raw)
+  if (!Number.isFinite(start)) {
+    const epoch = Number(raw.endsWith("Z") ? raw.slice(0, -1) : raw)
+    if (Number.isFinite(epoch)) start = epoch < 1e12 ? epoch * 1000 : epoch
+  }
   if (!Number.isFinite(start)) return "Unknown duration"
   let seconds = Math.max(0, Math.floor((now - start) / 1000))
   const hours = Math.floor(seconds / 3600)

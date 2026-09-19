@@ -41,6 +41,7 @@ test("a poll clears detail when the active filter excludes the selected session"
 test("fake clock updates elapsed time without changing the interaction model", () => {
   const now = Date.parse("2026-09-19T12:00:10Z")
   assert.equal(formatElapsedValue("2026-09-19T11:58:00Z", now), "2m 10s")
+  assert.equal(formatElapsedValue("1789819200Z", now), "10s")
   assert.equal(operatorState({ environment_state: "ready", execution_state: "idle", work_state: "in_progress", session_binding_state: "available" }), "working")
   assert.equal(parseRoute("#session/demo-12345678"), "demo-12345678")
   assert.equal(parseRoute("#settings"), null)
