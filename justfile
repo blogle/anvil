@@ -42,6 +42,10 @@ image-anvil:
 image-sandbox:
     nix build .#anvil-sandbox-image -o result-anvil-sandbox
 
+load-sandbox-k3s local_tag="local-anvil7-{{`git rev-parse --short=12 HEAD`}}":
+    nix build .#anvil-sandbox-image -o result-anvil-sandbox
+    ANVIL_KUBECONFIG="${ANVIL_KUBECONFIG:-/workspace/kube_config/config}" nix run .#import-sandbox-image-k3s -- result-anvil-sandbox "{{local_tag}}" ghcr.io/blogle/anvil-sandbox:anvil7-dev
+
 load-images:
     nix build .#anvil-image -o result-anvil
     nix build .#anvil-sandbox-image -o result-anvil-sandbox

@@ -5,13 +5,15 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     crane.url = "github:ipetkov/crane";
+    nix2container.url = "github:nlewo/nix2container";
     opencode.url = "github:anomalyco/opencode/v1.18.30";
   };
 
-  outputs = { self, nixpkgs, flake-utils, crane, opencode }:
+  outputs = { self, nixpkgs, flake-utils, crane, nix2container, opencode }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
+        nix2containerPkgs = nix2container.packages.${system};
         # nixpkgs is used here rather than rustup so evaluation remains
         # self-contained.  It is kept compatible with rust-toolchain.toml's
         # 1.82 pin through the workspace rust-version.
@@ -42,8 +44,6 @@
         anvilMcp = mkBinary "anvil-mcp";
         anvilRouter = mkBinary "anvil-router";
         anvilCtl = mkBinary "anvilctl";
-        entrypoint = pkgs.writeShellScriptBin "sandbox-entrypoint"
-          (builtins.readFile ./runtime/sandbox-entrypoint);
         credentialHelper = pkgs.writeShellScriptBin "anvil-credential"
           (builtins.readFile ./runtime/anvil-credential);
         anvilReportPlugin = pkgs.writeTextDir "usr/share/anvil/anvil-report.ts"
@@ -70,17 +70,26 @@
         nixConf = pkgs.writeTextDir "etc/nix/nix.conf" ''
           experimental-features = nix-command flakes
           sandbox = false
-          build-users-group =
+          build-users-group = nixbld
         '';
         userFiles = [
           (pkgs.writeTextDir "etc/passwd" ''
             root:x:0:0::/root:${pkgs.bash}/bin/bash
             anvil:x:1000:1000::/home/anvil:${pkgs.bash}/bin/bash
+            nixbld1:x:30001:30000:Nix build user 1:/var/empty:${pkgs.shadow}/bin/nologin
+            nixbld2:x:30002:30000:Nix build user 2:/var/empty:${pkgs.shadow}/bin/nologin
+            nixbld3:x:30003:30000:Nix build user 3:/var/empty:${pkgs.shadow}/bin/nologin
+            nixbld4:x:30004:30000:Nix build user 4:/var/empty:${pkgs.shadow}/bin/nologin
+            nixbld5:x:30005:30000:Nix build user 5:/var/empty:${pkgs.shadow}/bin/nologin
+            nixbld6:x:30006:30000:Nix build user 6:/var/empty:${pkgs.shadow}/bin/nologin
+            nixbld7:x:30007:30000:Nix build user 7:/var/empty:${pkgs.shadow}/bin/nologin
+            nixbld8:x:30008:30000:Nix build user 8:/var/empty:${pkgs.shadow}/bin/nologin
             nobody:x:65534:65534:nobody:/var/empty:${pkgs.coreutils}/bin/false
           '')
           (pkgs.writeTextDir "etc/group" ''
             root:x:0:
             anvil:x:1000:
+             nixbld:x:30000:nixbld1,nixbld2,nixbld3,nixbld4,nixbld5,nixbld6,nixbld7,nixbld8
             nobody:x:65534:
           '')
           (pkgs.writeTextDir "etc/shadow" ''
@@ -99,6 +108,110 @@
           chmod u+w "$out/share"
           rm -f "$out/share/man"
         '';
+        sandboxEntrypoint = pkgs.writeShellScriptBin "sandbox-entrypoint"
+          (builtins.readFile ./runtime/sandbox-entrypoint);
+        sandboxMutableHome = pkgs.runCommand "anvil-sandbox-home" {} ''
+          mkdir -p "$out/home/anvil"
+        '';
+        sandboxMutableTmp = pkgs.runCommand "anvil-sandbox-tmp" {} ''
+          mkdir -p "$out/tmp"
+        '';
+        sandboxMutableNixVar = pkgs.runCommand "anvil-sandbox-nix-var" {} ''
+          mkdir -p "$out/nix/var/nix/daemon-socket"
+        '';
+        sandboxUsrBin = pkgs.runCommand "anvil-sandbox-usr-bin" {} ''
+          mkdir -p "$out/usr/bin"
+          ln -s ${pkgs.coreutils}/bin/env "$out/usr/bin/env"
+        '';
+        sandboxBaseTools = [
+          pkgs.bash pkgs.coreutils pkgs.curl pkgs.cacert pkgs.gitMinimal
+          pkgs.openssh pkgs.jq pkgs.procps pkgs.psmisc pkgs.findutils
+          pkgs.gnugrep pkgs.gnused pkgs.gawk pkgs.gzip pkgs.which pkgs.less
+          pkgs.util-linux
+        ];
+        sandboxDeveloperTools = [ pkgs.nix pkgs.just pkgs.nodejs ];
+        # nix2container layers retain Nix store paths but do not create the
+        # conventional command symlinks expected by the Sandbox template.
+        sandboxBin = pkgs.buildEnv {
+          name = "anvil-sandbox-bin";
+          paths = sandboxBaseTools ++ sandboxDeveloperTools ++ [ opencodePackage chromiumForImage pkgs.xorg-server ];
+          pathsToLink = [ "/bin" ];
+        };
+        sandboxRuntimeFiles = [
+          nixConf credentialHelper ghWrapper anvilReportPlugin sandboxUsrBin sandboxBin
+        ] ++ userFiles ++ [ sandboxMutableHome sandboxMutableTmp sandboxMutableNixVar ];
+        sandboxBaseLayer = nix2containerPkgs.nix2container.buildLayer {
+          deps = sandboxBaseTools;
+          metadata = { created_by = "anvil sandbox: base/runtime Unix tools"; };
+        };
+        sandboxDeveloperLayer = nix2containerPkgs.nix2container.buildLayer {
+          deps = sandboxDeveloperTools;
+          layers = [ sandboxBaseLayer ];
+          metadata = { created_by = "anvil sandbox: Nix/developer tooling"; };
+        };
+        sandboxConfig = {
+          Cmd = [ "/bin/sandbox-entrypoint" ];
+          User = "0:0";
+          Env = [
+            "HOME=/root"
+            "NIX_REMOTE=daemon"
+            "NIX_CONFIG=experimental-features = nix-command flakes"
+            "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+          ];
+        };
+        sandboxPerms = [
+          {
+            path = sandboxMutableHome;
+            regex = ".*";
+            mode = "0755";
+            uid = 1000;
+            gid = 1000;
+            uname = "anvil";
+            gname = "anvil";
+          }
+          {
+            path = sandboxMutableTmp;
+            regex = ".*";
+            mode = "1777";
+          }
+          {
+            path = sandboxMutableNixVar;
+            regex = ".*";
+            mode = "0755";
+          }
+        ];
+        mkSandboxImage = {
+          tag ? "main",
+          config ? sandboxConfig,
+          entrypointPackage ? sandboxEntrypoint,
+          opencode ? opencodePackage,
+          chromium ? chromiumForImage
+        }:
+          let
+            browserLayer = nix2containerPkgs.nix2container.buildLayer {
+              deps = [ chromium pkgs.xorg-server ];
+              layers = [ sandboxBaseLayer sandboxDeveloperLayer ];
+              metadata = { created_by = "anvil sandbox: Chromium/Xvfb"; };
+            };
+            openCodeLayer = nix2containerPkgs.nix2container.buildLayer {
+              deps = [ opencode ];
+              layers = [ sandboxBaseLayer sandboxDeveloperLayer browserLayer ];
+              metadata = { created_by = "anvil sandbox: OpenCode"; };
+            };
+          in
+          nix2containerPkgs.nix2container.buildImage {
+            name = "ghcr.io/blogle/anvil-sandbox";
+            inherit tag config;
+            copyToRoot = sandboxRuntimeFiles ++ [ entrypointPackage ];
+            initializeNixDatabase = true;
+            perms = sandboxPerms;
+            layers = [
+              sandboxBaseLayer
+              sandboxDeveloperLayer
+              browserLayer
+              openCodeLayer
+            ];
+          };
         anvilImage = pkgs.dockerTools.buildLayeredImage {
           name = "anvil";
           tag = "dev";
@@ -108,52 +221,51 @@
             Env = [ "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt" ];
           };
         };
-        sandboxImage = pkgs.dockerTools.buildLayeredImage {
-          name = "anvil-sandbox";
-          tag = "dev";
-          contents = [
-            pkgs.bash pkgs.coreutils pkgs.curl pkgs.cacert pkgs.gitMinimal pkgs.nix
-            pkgs.openssh pkgs.jq pkgs.procps pkgs.psmisc
-            pkgs.findutils pkgs.gnugrep pkgs.gnused pkgs.gawk pkgs.gzip pkgs.which pkgs.less
-            chromiumForImage pkgs.xorg-server
-            nixConf entrypoint credentialHelper ghWrapper
-            anvilReportPlugin
-            opencodePackage
-          ] ++ userFiles;
-          enableFakechroot = true;
-          extraCommands = ''
-            mkdir -p ./usr/bin ./tmp ./home/anvil ./nix/store ./nix/var
-            ln -sfn ${pkgs.coreutils}/bin/env ./usr/bin/env
-            chmod 1777 ./tmp
-          '';
-          fakeRootCommands = ''
-            chown -R 1000:1000 ./home/anvil
-            find ./nix/store ./nix/var ! -perm /6000 -exec chown -h 1000:1000 {} +
-            find ./nix/store ./nix/var ! -type l ! -perm /6000 -exec chmod u+rwX {} +
-            store_path="$(find ./nix/store -mindepth 1 -maxdepth 1 -print -quit)"
-            test -n "$store_path"
-            test "$(stat -c '%u:%g' "$store_path")" = 1000:1000
-            test -n "$(find "$store_path" -maxdepth 0 -perm -u+w -print -quit)"
-            test "$(stat -c '%u:%g' ./nix/var)" = 1000:1000
-            test -n "$(find ./nix/var -maxdepth 0 -perm -u+w -print -quit)"
-            test -z "$(find ./nix/store ./nix/var \
-              ! -perm /6000 \( ! -user 1000 -o ! -group 1000 -o ! -perm -u+w \) \
-              -print -quit)"
-            test -z "$(find ./nix/store ./nix/var -perm /6000 \
-              \( ! -user 0 -o ! -group 0 \) -print -quit)"
-            chmod 600 ./etc/shadow ./etc/gshadow
-            chmod 1777 ./tmp
-          '';
-          config = {
-            Cmd = [ "/bin/sandbox-entrypoint" ];
-            User = "1000:1000";
-            Env = [
-              "NIX_REMOTE=local"
-              "NIX_CONFIG=experimental-features = nix-command flakes\nsandbox = false\nbuild-users-group ="
-              "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
-            ];
+        sandboxImage = mkSandboxImage {};
+        sandboxImageEnvCmd = mkSandboxImage {
+          tag = "benchmark-env-cmd";
+          config = sandboxConfig // {
+            Cmd = [ "/bin/sandbox-entrypoint" "--benchmark-env-cmd" ];
+            Env = sandboxConfig.Env ++ [ "ANVIL_BENCHMARK=env-cmd" ];
           };
         };
+        sandboxImageEntrypoint = mkSandboxImage {
+          tag = "benchmark-entrypoint";
+          entrypointPackage = pkgs.writeShellScriptBin "sandbox-entrypoint" ''
+            exec ${sandboxEntrypoint}/bin/sandbox-entrypoint "$@"
+          '';
+        };
+        sandboxImageOpenCode = mkSandboxImage {
+          tag = "benchmark-opencode";
+          opencode = pkgs.runCommand "opencode-version-change" {} ''
+            cp -a ${opencodePackage}/. "$out/"
+            chmod -R u+w "$out"
+            mkdir -p "$out/share/anvil"
+            printf 'benchmark OpenCode version change\n' > "$out/share/anvil/version-change"
+          '';
+        };
+        sandboxImageChromium = mkSandboxImage {
+          tag = "benchmark-chromium";
+          chromium = pkgs.runCommand "chromium-version-change" {} ''
+            cp -a ${chromiumForImage}/. "$out/"
+            chmod -R u+w "$out"
+            mkdir -p "$out/share/anvil"
+            printf 'benchmark Chromium version change\n' > "$out/share/anvil/version-change"
+          '';
+        };
+         benchmarkSandboxImage = pkgs.writeShellApplication {
+           name = "benchmark-sandbox-image";
+           runtimeInputs = [ pkgs.coreutils pkgs.nix ];
+           text = builtins.readFile ./scripts/benchmark-sandbox-image.sh;
+         };
+         importSandboxImageK3s = pkgs.writeShellApplication {
+             name = "import-sandbox-image-k3s";
+             runtimeInputs = [
+             pkgs.coreutils pkgs.gawk pkgs.gnugrep pkgs.jq pkgs.kubectl
+             nix2containerPkgs.skopeo-nix2container pkgs.gnutar
+           ];
+           text = builtins.readFile ./scripts/import-sandbox-image-k3s.sh;
+         };
       in {
         devShells.default = pkgs.mkShell {
           # The shell provides tools only; it intentionally does not depend on
@@ -172,6 +284,13 @@
         packages.anvilctl = anvilCtl;
         packages.anvil-image = anvilImage;
         packages.anvil-sandbox-image = sandboxImage;
+        packages.anvil-sandbox-image-env-cmd = sandboxImageEnvCmd;
+        packages.anvil-sandbox-image-entrypoint = sandboxImageEntrypoint;
+        packages.anvil-sandbox-image-opencode = sandboxImageOpenCode;
+        packages.anvil-sandbox-image-chromium = sandboxImageChromium;
+         packages.anvil-sandbox-image-push = sandboxImage.copyToRegistry;
+         packages.benchmark-sandbox-image = benchmarkSandboxImage;
+         packages.import-sandbox-image-k3s = importSandboxImageK3s;
 
         checks = {
           fmt = craneLib.cargoFmt (commonArgs // { cargoFmtExtraArgs = "--all"; });

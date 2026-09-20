@@ -76,3 +76,53 @@ The opt-in acceptance harness checks the unprivileged user, XDG paths,
 ```sh
 ANVIL_SANDBOX_POD=... tests/sandbox-acceptance.sh
 ```
+
+## Sandbox image layers
+
+The sandbox image is built with `nix2container` and pushed without creating a
+Docker archive:
+
+```sh
+nix run .#anvil-sandbox-image-push
+```
+
+Its content-addressed layers are partitioned into base Unix tools, Nix and
+developer tooling, Chromium/Xvfb, OpenCode, and Anvil runtime/config files.
+The image starts a root `nix-daemon` and drops the agent process to UID 1000;
+the Nix store is intentionally immutable to the agent.
+
+For a local k3s validation image, avoid exporting the full Docker image. The
+import helper reuses matching compressed layers already present in containerd
+and transfers only new layer blobs:
+
+```sh
+just load-sandbox-k3s local-anvil7-<short-sha>
+```
+
+The helper creates a short-lived privileged loader pod when
+`ANVIL_K3S_LOADER_POD` is not set. It registers the image as
+`docker.io/library/anvil-sandbox:<local-tag>` in the k3s `k8s.io` containerd
+namespace and verifies the tag before returning.
+
+Warm-cache build and push timings for the five relevant change classes can be
+captured with:
+
+```sh
+nix run .#benchmark-sandbox-image
+ANVIL_IMAGE_BENCHMARK_MODE=push nix run .#benchmark-sandbox-image
+```
+
+The output reports no-op, Env/Cmd-only, entrypoint, OpenCode-version, and
+Chromium-version timings. The latter two benchmark packages add a marker to
+the corresponding input layer so layer invalidation can be measured without
+changing production versions.
+
+Example warm-cache build timings from this workspace are:
+
+| Change | Seconds |
+| --- | ---: |
+| No-op image build | 0.573 |
+| Env/Cmd-only change | 5.823 |
+| Entrypoint change | 5.885 |
+| OpenCode version change | 5.918 |
+| Chromium version change | 5.984 |

@@ -2,6 +2,25 @@
 # Runtime bootstrap only: /home/anvil is the persistent Sandbox PVC.
 set -euo pipefail
 
+if [ "$(id -u)" = 0 ] && [ "${1:-}" != --agent ]; then
+  NIX_REMOTE=local nix-store --init >/dev/null 2>&1 || true
+  env -u NIX_REMOTE nix-daemon --daemon &
+  nix_daemon_pid=$!
+  for _ in $(seq 1 50); do
+    if [ -S /nix/var/nix/daemon-socket/socket ] && kill -0 "$nix_daemon_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  kill -0 "$nix_daemon_pid"
+  test -S /nix/var/nix/daemon-socket/socket
+  exec setpriv --reuid=1000 --regid=1000 --init-groups -- "$0" --agent
+fi
+
+if [ "${1:-}" = --agent ]; then
+  shift
+fi
+
 : "${ANVIL_PROJECT:?ANVIL_PROJECT is required}"
 : "${ANVIL_REPOSITORY:?ANVIL_REPOSITORY is required}"
 : "${ANVIL_REF:?ANVIL_REF is required}"
@@ -21,10 +40,6 @@ mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" \
 mkdir -p "$XDG_DATA_HOME/opencode" "$HOME/workspace"
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
-
-if command -v nix-store >/dev/null 2>&1; then
-  nix-store --init >/dev/null 2>&1 || true
-fi
 
 if command -v Xvfb >/dev/null 2>&1 && ! pgrep -f "Xvfb ${DISPLAY}" >/dev/null 2>&1; then
   Xvfb "$DISPLAY" -screen 0 1280x1024x24 -nolisten tcp >/tmp/anvil-xvfb.log 2>&1 &
