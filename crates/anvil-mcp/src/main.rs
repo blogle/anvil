@@ -350,7 +350,7 @@ impl AnvilMcp {
         ))
     }
     #[rmcp::tool(
-        description = "Rebind a recovered Anvil workspace to a new OpenCode session when exact conversation recovery is unavailable. This loses conversation continuity and records that fact."
+        description = "Operator escape hatch: explicitly create a replacement OpenCode session. Normal session recovery is automatic; this loses conversation continuity and records that fact."
     )]
     async fn anvil_rebind_session(
         &self,

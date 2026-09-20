@@ -11,7 +11,7 @@ export function parseRoute(hash) {
 
 export function operatorState(activity) {
   if (!activity) return "starting"
-  if (activity.environment_state === "failed" || ["failed", "unavailable"].includes(activity.execution_state) || ["missing", "recovering"].includes(activity.session_binding_state)) return "problem"
+  if (activity.environment_state === "failed" || ["failed", "unavailable"].includes(activity.execution_state)) return "problem"
   if (activity.environment_state === "provisioning") return "starting"
   if (activity.work_state === "awaiting_input") return "needs-input"
   if (activity.execution_state === "running") return "working"

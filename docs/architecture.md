@@ -37,7 +37,7 @@ Anvil has one persistent OpenCode profile at `/anvil/profile`. The profile
 contains global OpenCode configuration and administrator-managed provider
 credentials, plus shared agents, commands, skills, and plugins. Individual
 session databases, conversations, logs, working trees, and project state remain
-on each Sandbox's private `/workspace` claim.
+on each Sandbox's private `/home/anvil` claim.
 
 ```text
 anvilctl -> anvild -> anvil-profile (singleton OpenCode server)
@@ -56,18 +56,26 @@ the profile pod has no Kubernetes service-account token. `anvild` is its only
 normal client. Workers receive
 `OPENCODE_CONFIG=/anvil/profile/config/opencode.jsonc` and
 `OPENCODE_CONFIG_DIR=/anvil/profile/config`. Their private
-`/workspace/home/.local/share/opencode/auth.json` is a symlink to the shared
+`/home/anvil/.local/share/opencode/auth.json` is a symlink to the shared
 profile auth file; no other OpenCode data directory is shared. Existing local
 worker auth files are preserved rather than overwritten. The current
 single-node RWO fallback necessarily gives worker pods access to the mounted
 profile contents so OpenCode can refresh credentials; treat Anvil sandboxes as
 trusted until a mediated profile distribution mechanism replaces this PoC.
 
-Each Sandbox also stores OpenCode's native database and XDG state under
-`/workspace/.anvil/opencode` on the workspace PVC. `anvild` verifies the
-durable OpenCode session ID after the server becomes reachable. A missing exact
-binding is reported as degraded rather than replaced; explicit rebind creates a
-new session and records that conversation continuity was lost.
+Each newly-created Sandbox mounts its workspace PVC at `/home/anvil`, checks out
+the repository at `/home/anvil/workspace/<project>`, and stores OpenCode's
+native database and XDG state in the standard paths below that PVC. The
+controller marks this runtime layout as `v2`; existing Agent Sandbox resources
+are immutable and retain their legacy layout until deleted.
+
+`anvild` verifies the durable OpenCode session ID after startup, resume, and
+before session operations. If the exact ID still exists, it is always retained.
+If OpenCode definitively returns 404 for the ID, Anvil automatically creates a
+replacement, records both IDs and lost continuity in annotations and history,
+and continues the operation without a user-facing rebind step. Transport or
+health failures remain errors and never trigger replacement. The explicit
+`rebind` route remains an operator escape hatch only.
 
 The profile also installs the small `anvil_report` OpenCode plugin. It injects a
 single end-of-turn instruction and reports only `ready_for_review` or

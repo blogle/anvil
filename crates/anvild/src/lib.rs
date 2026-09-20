@@ -41,6 +41,7 @@ use tracing::{info, warn};
 const MANAGED: &str = "app.kubernetes.io/managed-by";
 const APP: &str = "app.kubernetes.io/name";
 const LOGIN_TTL: Duration = Duration::from_secs(10 * 60);
+const RUNTIME_LAYOUT: &str = "v2";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -799,6 +800,10 @@ impl SandboxApi for KubeSandboxApi {
             Value::String(now.clone()),
         );
         annotations.insert(
+            annotation_key(&self.config, "runtime-layout"),
+            Value::String(RUNTIME_LAYOUT.into()),
+        );
+        annotations.insert(
             annotation_key(&self.config, "work-state"),
             Value::String(WorkState::InProgress.as_str().into()),
         );
@@ -844,10 +849,10 @@ impl SandboxApi for KubeSandboxApi {
             json!({"name":"OPENCODE_DISABLE_CHANNEL_DB","value":"1"}),
             json!({"name":"HOME","value":"/home/anvil"}),
             json!({"name":"XDG_CONFIG_HOME","value":"/home/anvil/.config"}),
-            json!({"name":"XDG_CACHE_HOME","value":"/workspace/.anvil/opencode/cache"}),
-            json!({"name":"XDG_DATA_HOME","value":"/workspace/.anvil/opencode/data"}),
-            json!({"name":"XDG_STATE_HOME","value":"/workspace/.anvil/opencode/state"}),
-            json!({"name":"XDG_RUNTIME_DIR","value":"/workspace/.anvil/opencode/runtime"}),
+            json!({"name":"XDG_CACHE_HOME","value":"/home/anvil/.cache"}),
+            json!({"name":"XDG_DATA_HOME","value":"/home/anvil/.local/share"}),
+            json!({"name":"XDG_STATE_HOME","value":"/home/anvil/.local/state"}),
+            json!({"name":"XDG_RUNTIME_DIR","value":"/home/anvil/.local/state/runtime"}),
             json!({"name":"DISPLAY","value":":99"}),
         ];
         env.extend(
@@ -860,13 +865,13 @@ impl SandboxApi for KubeSandboxApi {
             "image": self.config.image,
             "command": ["/bin/bash", "-c"],
             "args": [
-                 "set -euo pipefail\nmkdir -p /workspace/.anvil/opencode/{cache,data,state,runtime} \"/workspace/$ANVIL_PROJECT\"\nchown -R 1000:1000 /workspace/.anvil \"/workspace/$ANVIL_PROJECT\""
+                  "set -euo pipefail\nmkdir -p /home/anvil/workspace/\"$ANVIL_PROJECT\" /home/anvil/.config /home/anvil/.cache /home/anvil/.local/share /home/anvil/.local/state/runtime\nchown -R 1000:1000 /home/anvil"
             ],
             "env": [{"name": "ANVIL_PROJECT", "value": r.project}],
             "securityContext": {"runAsUser": 0, "runAsGroup": 0},
-            "volumeMounts": [{"name": "workspace", "mountPath": "/workspace"}]
+            "volumeMounts": [{"name": "workspace", "mountPath": "/home/anvil"}]
         });
-        let container = json!({"name":"sandbox","image":self.config.image,"ports":[{"name":"opencode","containerPort":self.config.opencode_port}],"env":env,"volumeMounts":[{"name":"workspace","mountPath":"/workspace"},{"name":"shared-profile","mountPath":"/anvil/profile"}]});
+        let container = json!({"name":"sandbox","image":self.config.image,"ports":[{"name":"opencode","containerPort":self.config.opencode_port}],"env":env,"volumeMounts":[{"name":"workspace","mountPath":"/home/anvil"},{"name":"shared-profile","mountPath":"/anvil/profile"}]});
         let obj = json!({"apiVersion":"agents.x-k8s.io/v1beta1","kind":"Sandbox","metadata":{"name":name,"namespace":ns,"labels":l,"annotations":annotations},"spec":{"service":true,"podTemplate":{"spec":{"securityContext":{"runAsUser":1000,"runAsGroup":1000,"fsGroup":1000},"initContainers":[workspace_init],"containers":[container],"volumes":[{"name":"shared-profile","persistentVolumeClaim":{"claimName":self.config.profile_pvc}}]}},"volumeClaimTemplates":[{"metadata":{"name":"workspace"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":self.config.workspace_size}}}}]}});
         Api::<DynamicObject>::namespaced_with(self.client.clone(), ns, &sandbox_resource())
             .create(
@@ -1075,6 +1080,7 @@ pub struct AppState {
     history: HistoryStore,
     profile: ProfileClient,
     pending_logins: Arc<Mutex<HashMap<String, PendingLogin>>>,
+    binding_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     capability_signer: Option<github::CapabilitySigner>,
     github: Option<github::GithubBroker>,
 }
@@ -1107,9 +1113,19 @@ impl AppState {
             kube: Arc::new(kube),
             profile,
             pending_logins: Arc::new(Mutex::new(HashMap::new())),
+            binding_locks: Arc::new(Mutex::new(HashMap::new())),
             capability_signer,
             github,
         }
+    }
+
+    fn binding_lock(&self, id: &str) -> Arc<AsyncMutex<()>> {
+        self.binding_locks
+            .lock()
+            .expect("binding lock map poisoned")
+            .entry(id.to_owned())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 }
 pub fn router(state: AppState) -> Router {
@@ -1320,7 +1336,7 @@ async fn create(
             Some("Anvil controller"),
             None,
             Some(error.to_string()),
-            None,
+            model.as_ref().map(|model| model.qualified_id()),
         )
         .await;
         return Err(error);
@@ -1436,6 +1452,8 @@ fn binding_is_usable(session: &Session) -> bool {
 }
 
 async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceError> {
+    let lock = s.binding_lock(id);
+    let _guard = lock.lock().await;
     let object = s.kube.get(id).await?;
     let session = session_from(&object, &s.config)?;
     let Some(opencode_id) = session.opencode_session_id.as_deref() else {
@@ -1483,19 +1501,37 @@ async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceErr
                 .await?;
         }
         Ok(false) => {
+            let new_id = op.create_session().await?;
+            s.kube.set_opencode_session(id, &new_id).await?;
+            let recovery_event = format!(
+                "OpenCode session {opencode_id} was unavailable; automatically created replacement {new_id}; conversation continuity was lost"
+            );
             s.kube
                 .set_binding_state(
                     id,
                     &BindingStateRecord {
-                        state: "missing".into(),
-                        continuity: previous.continuity,
+                        state: "rebound".into(),
+                        continuity: "lost".into(),
                         checked_at,
-                        error: Some(format!("OpenCode session {opencode_id} was not found")),
-                        previous_session_id: previous.previous_session_id,
-                        recovery_event: previous.recovery_event,
+                        error: None,
+                        previous_session_id: Some(opencode_id.to_owned()),
+                        recovery_event: Some(recovery_event.clone()),
                     },
                 )
                 .await?;
+            record_history(
+                s,
+                id,
+                "conversation_rebound",
+                chrono_like_now(),
+                None,
+                None,
+                Some("Anvil controller"),
+                None,
+                Some(recovery_event),
+                session.model.clone(),
+            )
+            .await;
         }
         Err(error) => {
             s.kube
@@ -1526,28 +1562,37 @@ async fn rebind(
         .as_deref()
         .map(|prompt| Prompt::new(prompt).map_err(|error| ServiceError::Invalid(error.to_string())))
         .transpose()?;
-    let session = session_from(&s.kube.get(&id).await?, &s.config)?;
-    let old_id = session.opencode_session_id.clone();
-    let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
-    wait_opencode(&op, s.config.request_timeout).await?;
-    let new_id = op.create_session().await?;
-    s.kube.set_opencode_session(&id, &new_id).await?;
-    let checked_at = chrono_like_now();
-    s.kube
-        .set_binding_state(
-            &id,
-            &BindingStateRecord {
-                state: "rebound".into(),
-                continuity: "lost".into(),
-                checked_at: checked_at.clone(),
-                error: None,
-                previous_session_id: old_id,
-                recovery_event: Some(
-                    "OpenCode session rebound; conversation continuity was lost".into(),
-                ),
-            },
-        )
-        .await?;
+    let lock = s.binding_lock(&id);
+    let (new_id, model, checked_at) = {
+        let _guard = lock.lock().await;
+        let session = session_from(&s.kube.get(&id).await?, &s.config)?;
+        let old_id = session.opencode_session_id.clone();
+        let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
+        wait_opencode(&op, s.config.request_timeout).await?;
+        let model = match session.model.as_deref() {
+            Some(requested) => Some(op.resolve_model(requested).await?),
+            None => None,
+        };
+        let new_id = op.create_session().await?;
+        s.kube.set_opencode_session(&id, &new_id).await?;
+        let checked_at = chrono_like_now();
+        s.kube
+            .set_binding_state(
+                &id,
+                &BindingStateRecord {
+                    state: "rebound".into(),
+                    continuity: "lost".into(),
+                    checked_at: checked_at.clone(),
+                    error: None,
+                    previous_session_id: old_id,
+                    recovery_event: Some(
+                        "OpenCode session rebound; conversation continuity was lost".into(),
+                    ),
+                },
+            )
+            .await?;
+        (new_id, model, checked_at)
+    };
     record_history(
         &s,
         &id,
@@ -1558,10 +1603,12 @@ async fn rebind(
         Some("Anvil controller"),
         None,
         Some("OpenCode conversation rebound; continuity was lost".into()),
-        None,
+        model.as_ref().map(|model| model.qualified_id()),
     )
     .await;
     if let Some(prompt) = prompt {
+        let session = session_from(&s.kube.get(&id).await?, &s.config)?;
+        let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
         let request_id = new_request_id();
         record_history(
             &s,
@@ -1573,10 +1620,13 @@ async fn rebind(
             Some("Anvil controller"),
             None,
             None,
-            None,
+            model.as_ref().map(|model| model.qualified_id()),
         )
         .await;
-        if let Err(error) = op.prompt_async(&new_id, prompt.as_str(), None).await {
+        if let Err(error) = op
+            .prompt_async(&new_id, prompt.as_str(), model.as_ref())
+            .await
+        {
             record_history(
                 &s,
                 &id,
@@ -1587,7 +1637,7 @@ async fn rebind(
                 Some("Anvil controller"),
                 None,
                 Some(error.to_string()),
-                None,
+                model.as_ref().map(|model| model.qualified_id()),
             )
             .await;
             return Err(error);
@@ -1795,7 +1845,7 @@ async fn prompt(
                 Some("Anvil controller"),
                 None,
                 Some(error.to_string()),
-                None,
+                model.as_ref().map(|model| model.qualified_id()),
             )
             .await;
             Err(error)
@@ -3019,13 +3069,7 @@ impl OpenCode {
             .await
         {
             Ok(_) => Ok(true),
-            Err(ServiceError::OpenCode(error))
-                if error.contains("404")
-                    || error.to_ascii_lowercase().contains("not found")
-                    || error.contains("NotFoundError") =>
-            {
-                Ok(false)
-            }
+            Err(ServiceError::OpenCode(error)) if error.starts_with("HTTP 404 ") => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -3126,7 +3170,7 @@ impl OpenCode {
         };
         if !st.is_success() {
             warn!(%st,"OpenCode request failed");
-            return Err(ServiceError::OpenCode(v.to_string()));
+            return Err(ServiceError::OpenCode(format!("HTTP {st}: {v}")));
         }
         Ok(v)
     }
@@ -3141,6 +3185,10 @@ mod tests {
     use tower::ServiceExt;
 
     struct FakeSandbox;
+
+    struct BindingSandbox {
+        object: Arc<Mutex<DynamicObject>>,
+    }
 
     struct ActivitySandbox {
         object: DynamicObject,
@@ -3170,6 +3218,93 @@ mod tests {
             Ok(())
         }
         async fn delete(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SandboxApi for BindingSandbox {
+        async fn list(&self) -> Result<Vec<DynamicObject>, ServiceError> {
+            Ok(vec![self
+                .object
+                .lock()
+                .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?
+                .clone()])
+        }
+
+        async fn create(
+            &self,
+            _id: &str,
+            _request: &CreateRequest,
+            _sandbox_env: &[(String, String)],
+        ) -> Result<Session, ServiceError> {
+            Err(ServiceError::Invalid("not used in binding tests".into()))
+        }
+
+        async fn suspend(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn resume(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn set_opencode_session(
+            &self,
+            _id: &str,
+            session_id: &str,
+        ) -> Result<(), ServiceError> {
+            let mut object = self
+                .object
+                .lock()
+                .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?;
+            object
+                .metadata
+                .annotations
+                .get_or_insert_with(BTreeMap::new)
+                .insert(
+                    "anvil.example/opencode-session-id".into(),
+                    session_id.into(),
+                );
+            Ok(())
+        }
+
+        async fn set_binding_state(
+            &self,
+            _id: &str,
+            state: &BindingStateRecord,
+        ) -> Result<(), ServiceError> {
+            let mut object = self
+                .object
+                .lock()
+                .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?;
+            let annotations = object
+                .metadata
+                .annotations
+                .get_or_insert_with(BTreeMap::new);
+            annotations.insert("anvil.example/binding-state".into(), state.state.clone());
+            annotations.insert(
+                "anvil.example/binding-continuity".into(),
+                state.continuity.clone(),
+            );
+            if let Some(error) = &state.error {
+                annotations.insert("anvil.example/binding-error".into(), error.clone());
+            } else {
+                annotations.remove("anvil.example/binding-error");
+            }
+            if let Some(previous) = &state.previous_session_id {
+                annotations.insert(
+                    "anvil.example/binding-previous-session-id".into(),
+                    previous.clone(),
+                );
+            }
+            if let Some(event) = &state.recovery_event {
+                annotations.insert("anvil.example/binding-recovery-event".into(), event.clone());
+            }
             Ok(())
         }
     }
@@ -3815,6 +3950,79 @@ mod tests {
         });
         let op = OpenCode::new(server.base_url(), Duration::from_secs(5));
         assert!(!op.session_exists("ses_missing").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn automatically_replaces_a_missing_binding_once_and_records_continuity_loss() {
+        let server = MockServer::start();
+        let server_url = Url::parse(&server.base_url()).unwrap();
+        let missing = server.mock(|when, then| {
+            when.method(GET).path("/session/ses_old");
+            then.status(404)
+                .json_body(json!({"name":"NotFoundError","message":"Session not found"}));
+        });
+        let replacement = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/session");
+            then.status(200).json_body(json!({"id":"ses_new"}));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/session/ses_new");
+            then.status(200).json_body(json!({"id":"ses_new"}));
+        });
+        let object: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {
+                "name": "anvil-demo-12345678",
+                "annotations": {
+                    "anvil.example/project": "demo",
+                    "anvil.example/repository": "https://github.com/example/demo.git",
+                    "anvil.example/base-ref": "main",
+                    "anvil.example/work-branch": "anvil/demo-12345678",
+                    "anvil.example/created-at": "2026-01-01T10:00:00Z",
+                    "anvil.example/model": "openai/gpt-5.6-luna",
+                    "anvil.example/opencode-session-id": "ses_old",
+                    "anvil.example/binding-state": "available",
+                    "anvil.example/binding-continuity": "exact"
+                }
+            },
+            "status": {
+                "phase": "Ready",
+                "serviceFQDN": "127.0.0.1"
+            }
+        }))
+        .unwrap();
+        let object = Arc::new(Mutex::new(object));
+        let mut test_config = config(format!("{}/", server.base_url()));
+        test_config.opencode_port = server_url.port().unwrap();
+        let state = AppState::new(
+            test_config,
+            BindingSandbox {
+                object: object.clone(),
+            },
+        );
+
+        let (first, second) = tokio::join!(
+            reconcile_binding(&state, "demo-12345678"),
+            reconcile_binding(&state, "demo-12345678")
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.opencode_session_id.as_deref(), Some("ses_new"));
+        assert_eq!(second.opencode_session_id.as_deref(), Some("ses_new"));
+        assert_eq!(first.session_binding_state, "rebound");
+        assert_eq!(first.session_binding_continuity, "lost");
+        missing.assert_hits(1);
+        replacement.assert_hits(1);
+        let annotations = object.lock().unwrap().annotations().clone();
+        assert_eq!(
+            annotations.get("anvil.example/opencode-session-id"),
+            Some(&"ses_new".to_owned())
+        );
+        assert_eq!(
+            annotations.get("anvil.example/binding-previous-session-id"),
+            Some(&"ses_old".to_owned())
+        );
     }
 
     async fn json_response(response: axum::response::Response) -> Value {

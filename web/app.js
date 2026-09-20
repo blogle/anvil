@@ -195,9 +195,7 @@ function renderDetail(activity, session) {
   return `<div class="detail-inner">
     <a class="back-link" href="${location.pathname}" data-clear-selection>All sessions</a>
      <div class="detail-header"><div><div class="eyebrow">Session overview</div><h2>${escapeHtml(titleFor(session))}</h2><div class="detail-subtitle"><span>${escapeHtml(session.project)}</span><span>·</span><code>${escapeHtml(session.work_branch)}</code></div><div class="detail-status state-${escapeHtml(status)}"><span class="status-dot"></span><strong>${stateLabel(status)}</strong><span>${activity?.work_state_changed_at ? `· <span data-live-state-elapsed="${escapeHtml(activity.work_state_changed_at)}">${formatStateElapsed(activity)}</span>` : ""}</span></div></div></div>
-     ${(activity?.environment_error || session.environment_error) ? `<div class="recovery-card"><strong>Environment problem</strong><span>${escapeHtml(activity?.environment_error || session.environment_error)}</span></div>` : ""}
-     ${activity?.session_binding_error || activity?.session_binding_recovery_event ? `<div class="recovery-card"><strong>${activity.session_binding_recovery_event ? "Conversation rebound" : "OpenCode conversation unavailable"}</strong><span>${escapeHtml(activity.session_binding_error || activity.session_binding_recovery_event)}</span>${activity.session_binding_state === "missing" ? `<button class="button" data-focus-key="rebind" data-rebind="${escapeHtml(session.id)}">Rebind workspace</button>` : ""}</div>` : ""}
-    ${activity?.work_state_summary ? `<div class="work-summary"><div class="eyebrow">Work summary</div>${escapeHtml(activity.work_state_summary)}</div>` : ""}
+     ${activity?.work_state_summary ? `<div class="work-summary"><div class="eyebrow">Work summary</div>${escapeHtml(activity.work_state_summary)}</div>` : ""}
      ${renderActions(activity, session, attachCommand)}
      <div class="tabs" role="tablist" aria-label="Session detail"><button id="logs-tab" class="tab" data-tab="logs" data-focus-key="tab-logs" role="tab" aria-controls="logs-panel">Logs</button><button id="runtime-tab" class="tab" data-tab="runtime" data-focus-key="tab-runtime" role="tab" aria-controls="runtime-panel">Runtime</button></div>
      <div id="logs-panel" role="tabpanel" tabindex="0" aria-labelledby="logs-tab">${renderLogs(activity)}</div><div id="runtime-panel" role="tabpanel" tabindex="0" aria-labelledby="runtime-tab">${renderRuntime(activity, session)}</div>
@@ -256,7 +254,7 @@ function renderRequest(request) {
 }
 
 function renderRuntime(activity, session) {
-  return `<div class="content-section"><div class="section-heading"><h3>Runtime details</h3><span>Technical information</span></div>${activity?.environment_error || session.environment_error ? `<div class="failure">${escapeHtml(activity?.environment_error || session.environment_error)}</div>` : ""}<div class="runtime-grid"><div class="runtime-item"><label>Environment</label><span>${escapeHtml(activity?.environment_state || session.environment_state)}</span></div><div class="runtime-item"><label>Execution</label><span>${escapeHtml(activity?.execution_state || "idle")}</span></div><div class="runtime-item"><label>Work state</label><span>${escapeHtml(activity?.work_state || session.work_state)}</span></div><div class="runtime-item"><label>Conversation binding</label><span>${escapeHtml(activity?.session_binding_state || session.session_binding_state || "unknown")}</span></div><div class="runtime-item"><label>Continuity</label><span>${escapeHtml(activity?.session_binding_continuity || session.session_binding_continuity || "unknown")}</span></div><div class="runtime-item"><label>Created</label><span>${escapeHtml(formatDate(session.created_at))}</span></div><div class="runtime-item"><label>Sandbox</label><span>${escapeHtml(session.sandbox)}</span></div><div class="runtime-item"><label>OpenCode session</label><span>${escapeHtml(session.opencode_session_id || "Not assigned")}</span></div><div class="runtime-item"><label>Repository</label><span>${escapeHtml(session.repository)}</span></div><div class="runtime-item"><label>Base ref</label><span>${escapeHtml(session.base_ref)}</span></div></div><p class="muted" style="font-size:12px;line-height:1.5;margin-top:18px">Environment, execution, work state, and conversation binding are reported independently. Rebinding creates a new conversation and loses exact continuity.</p></div>`
+  return `<div class="content-section"><div class="section-heading"><h3>Runtime details</h3><span>Technical information</span></div>${activity?.environment_error || session.environment_error ? `<div class="failure">${escapeHtml(activity?.environment_error || session.environment_error)}</div>` : ""}<div class="runtime-grid"><div class="runtime-item"><label>Environment</label><span>${escapeHtml(activity?.environment_state || session.environment_state)}</span></div><div class="runtime-item"><label>Execution</label><span>${escapeHtml(activity?.execution_state || "idle")}</span></div><div class="runtime-item"><label>Work state</label><span>${escapeHtml(activity?.work_state || session.work_state)}</span></div><div class="runtime-item"><label>Created</label><span>${escapeHtml(formatDate(session.created_at))}</span></div><div class="runtime-item"><label>Sandbox</label><span>${escapeHtml(session.sandbox)}</span></div><div class="runtime-item"><label>Repository</label><span>${escapeHtml(session.repository)}</span></div><div class="runtime-item"><label>Base ref</label><span>${escapeHtml(session.base_ref)}</span></div></div></div>`
 }
 
 async function handleClick(event) {
@@ -333,18 +331,6 @@ async function handleClick(event) {
       stop.disabled = false
     }
     return
-  }
-  const rebind = event.target.closest("[data-rebind]")
-  if (rebind) {
-    if (!confirm("Create a new OpenCode conversation for this workspace? Exact conversation continuity is unavailable and will be lost.")) return
-    rebind.disabled = true
-    try {
-      await api(`/v1/sessions/${encodeURIComponent(rebind.dataset.rebind)}/rebind`, { method: "POST", body: JSON.stringify({ prompt: null }) })
-      await refresh()
-    } catch (error) {
-      alert(error.message)
-      rebind.disabled = false
-    }
   }
   const complete = event.target.closest("[data-complete]")
   if (complete) {

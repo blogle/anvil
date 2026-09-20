@@ -60,13 +60,27 @@ current `run_id`. Summaries are trimmed and limited to 500 characters. Run and
 work metadata are stored with the Sandbox annotations, so they survive service
 restarts and Sandbox suspension.
 
-OpenCode conversation data is stored in the Sandbox workspace PVC under the
-native OpenCode XDG data/state paths. Session reads reconcile the durable
-`opencode_session_id` against the running server and expose
-`session_binding_state` (`pending`, `recovering`, `available`, `missing`, or
-`rebound`) plus continuity and recovery error fields. A missing binding is not
-silently replaced. Use `rebind` only as an explicit fallback; it records lost
-conversation continuity and optionally accepts a recovery prompt.
+New Sandboxes mount their workspace PVC at `/home/anvil`, check out the
+repository under `/home/anvil/workspace/<project>`, and store OpenCode's native
+conversation database and XDG data/state paths there. The controller records
+the runtime layout as `v2`; legacy immutable Sandboxes retain their original
+layout and are handled by automatic replacement recovery if their ephemeral
+OpenCode state is gone.
+
+Session reads, resume, and message/proxy operations reconcile the durable
+`opencode_session_id` against the running server. An existing exact ID is
+always retained. A definitive 404 causes Anvil to create one replacement under
+a per-session lock, record the old and new IDs plus lost continuity in
+annotations and append-only history, and continue transparently. Network,
+startup, and other health failures do not trigger replacement. The API still
+exposes `session_binding_state` (`pending`, `recovering`, `available`, or
+`rebound`) and continuity fields for operators, while the explicit `rebind`
+route remains an exceptional operator escape hatch.
+
+When a model is selected at session creation, Anvil resolves and persists its
+qualified provider/model ID. Every generated prompt, including a manual rebind
+prompt and prompts sent after automatic recovery, uses that exact resolved
+model; there is no silent model fallback.
 
 The MCP server projects these controller routes as structured JSON tool
 results. Mutations include `accepted`, `session_id`, the authoritative result,
