@@ -93,6 +93,12 @@
           '')
         ];
         opencodePackage = opencode.packages.${system}.default;
+        chromiumForImage = pkgs.runCommand "anvil-chromium" {} ''
+          mkdir -p "$out"
+          cp -a ${pkgs.chromium}/. "$out/"
+          chmod u+w "$out/share"
+          rm -f "$out/share/man"
+        '';
         anvilImage = pkgs.dockerTools.buildLayeredImage {
           name = "anvil";
           tag = "dev";
@@ -106,22 +112,35 @@
           name = "anvil-sandbox";
           tag = "dev";
           contents = [
-            pkgs.bash pkgs.coreutils pkgs.curl pkgs.cacert pkgs.git pkgs.nix
-            pkgs.openssh pkgs.jq pkgs.procps pkgs.psmisc pkgs.util-linux
+            pkgs.bash pkgs.coreutils pkgs.curl pkgs.cacert pkgs.gitMinimal pkgs.nix
+            pkgs.openssh pkgs.jq pkgs.procps pkgs.psmisc
             pkgs.findutils pkgs.gnugrep pkgs.gnused pkgs.gawk pkgs.gzip pkgs.which pkgs.less
-            pkgs.chromium pkgs.electron pkgs.xorg-server
+            chromiumForImage pkgs.xorg-server
             nixConf entrypoint credentialHelper ghWrapper
             anvilReportPlugin
             opencodePackage
           ] ++ userFiles;
+          enableFakechroot = true;
           extraCommands = ''
             mkdir -p ./usr/bin ./tmp ./home/anvil ./nix/store ./nix/var
             ln -sfn ${pkgs.coreutils}/bin/env ./usr/bin/env
             chmod 1777 ./tmp
           '';
           fakeRootCommands = ''
-            chown -R 1000:1000 ./home/anvil ./nix/var
-            chown 1000:1000 ./nix/store
+            chown -R 1000:1000 ./home/anvil
+            find ./nix/store ./nix/var ! -perm /6000 -exec chown -h 1000:1000 {} +
+            find ./nix/store ./nix/var ! -type l ! -perm /6000 -exec chmod u+rwX {} +
+            store_path="$(find ./nix/store -mindepth 1 -maxdepth 1 -print -quit)"
+            test -n "$store_path"
+            test "$(stat -c '%u:%g' "$store_path")" = 1000:1000
+            test -n "$(find "$store_path" -maxdepth 0 -perm -u+w -print -quit)"
+            test "$(stat -c '%u:%g' ./nix/var)" = 1000:1000
+            test -n "$(find ./nix/var -maxdepth 0 -perm -u+w -print -quit)"
+            test -z "$(find ./nix/store ./nix/var \
+              ! -perm /6000 \( ! -user 1000 -o ! -group 1000 -o ! -perm -u+w \) \
+              -print -quit)"
+            test -z "$(find ./nix/store ./nix/var -perm /6000 \
+              \( ! -user 0 -o ! -group 0 \) -print -quit)"
             chmod 600 ./etc/shadow ./etc/gshadow
             chmod 1777 ./tmp
           '';

@@ -19,6 +19,7 @@ exec_in_sandbox 'test -d "/home/anvil/workspace/$ANVIL_PROJECT" && test "$(readl
 exec_in_sandbox 'printf "#!/usr/bin/env bash\nprintf env-ok\n" >/tmp/anvil-env-test && chmod +x /tmp/anvil-env-test && test "$('/tmp/anvil-env-test')" = env-ok'
 exec_in_sandbox 'test "$DISPLAY" = :99 && test -n "$(pgrep -f "Xvfb :99")"'
 exec_in_sandbox 'chromium --headless --disable-gpu --dump-dom about:blank >/dev/null'
+exec_in_sandbox 'store_path="$(find /nix/store -mindepth 1 -maxdepth 1 -print -quit)" && test -n "$store_path" && test "$(stat -c "%u:%g" "$store_path")" = 1000:1000 && test -w "$store_path" && test "$(stat -c "%u:%g" /nix/var)" = 1000:1000 && test -w /nix/var && touch /nix/var/.anvil-writable && rm /nix/var/.anvil-writable'
 exec_in_sandbox 'nix develop --command just check'
 exec_in_sandbox 'test "$(git config --global user.name)" = Anvil && tr "\0" "\n" </proc/1/environ | grep -qx "GIT_COMMITTER_NAME=Anvil"'
 
