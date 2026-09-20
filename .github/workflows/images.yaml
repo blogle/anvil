@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v19
-      - uses: DeterminateSystems/magic-nix-cache-action@v8
+       - uses: DeterminateSystems/magic-nix-cache-action@v8
        - name: Build images
          run: |
            nix build .#anvil-image -o result-anvil
@@ -93,4 +93,4 @@ jobs:
                docker tag "${source}" "${target}:${tag}"
                docker push "${target}:${tag}"
              done
-          done
+           done
