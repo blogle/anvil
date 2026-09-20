@@ -34,15 +34,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v19
-       - uses: DeterminateSystems/magic-nix-cache-action@v8
-       - name: Build images
-         run: |
-           nix build .#anvil-image -o result-anvil
-           docker load < result-anvil
-           nix run .#anvil-sandbox-image.copyToDockerDaemon
-           docker image inspect anvil:dev >/dev/null
-           docker image inspect ghcr.io/blogle/anvil-sandbox:main >/dev/null
-           docker save anvil:dev ghcr.io/blogle/anvil-sandbox:main -o anvil-images.tar
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
+      - name: Build images
+        run: |
+          nix build .#anvil-image -o result-anvil
+          docker load < result-anvil
+          nix run .#anvil-sandbox-image.copyToDockerDaemon
+          docker image inspect anvil:dev >/dev/null
+          docker image inspect ghcr.io/blogle/anvil-sandbox:main >/dev/null
+          docker save anvil:dev ghcr.io/blogle/anvil-sandbox:main -o anvil-images.tar
       - uses: actions/upload-artifact@v4
         with:
           name: anvil-images
