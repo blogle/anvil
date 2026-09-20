@@ -14,7 +14,7 @@ exec_in_sandbox 'test "$XDG_CONFIG_HOME" = /home/anvil/.config && test -w "$XDG_
 exec_in_sandbox 'test "$XDG_CACHE_HOME" = /home/anvil/.cache && test -w "$XDG_CACHE_HOME"'
 exec_in_sandbox 'test "$XDG_DATA_HOME" = /home/anvil/.local/share && test -w "$XDG_DATA_HOME"'
 exec_in_sandbox 'test "$XDG_STATE_HOME" = /home/anvil/.local/state && test -w "$XDG_STATE_HOME"'
-exec_in_sandbox 'test -d "/home/anvil/workspace/$ANVIL_PROJECT" && test "$(pwd)" = "/home/anvil/workspace/$ANVIL_PROJECT"'
+exec_in_sandbox 'test -d "/home/anvil/workspace/$ANVIL_PROJECT" && test "$(readlink /proc/1/cwd)" = "/home/anvil/workspace/$ANVIL_PROJECT"'
 exec_in_sandbox 'printf "#!/usr/bin/env bash\nprintf env-ok\n" >/tmp/anvil-env-test && chmod +x /tmp/anvil-env-test && test "$('/tmp/anvil-env-test')" = env-ok'
 exec_in_sandbox 'test "$DISPLAY" = :99 && test -n "$(pgrep -f "Xvfb :99")"'
 exec_in_sandbox 'chromium --headless --disable-gpu --dump-dom about:blank >/dev/null'
