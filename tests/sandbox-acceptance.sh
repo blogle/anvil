@@ -5,7 +5,8 @@ set -euo pipefail
 namespace="${ANVIL_NAMESPACE:-anvil}"
 
 exec_in_sandbox() {
-  kubectl exec -n "$namespace" "$ANVIL_SANDBOX_POD" -- bash -lc "$1"
+  kubectl exec -n "$namespace" "$ANVIL_SANDBOX_POD" -- bash -lc \
+    'cd "$(readlink /proc/1/cwd)" && '"$1"
 }
 
 exec_in_sandbox 'test "$(id -u)" = 1000 && test "$(id -g)" = 1000'
