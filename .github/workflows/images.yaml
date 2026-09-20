@@ -35,15 +35,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v19
       - uses: DeterminateSystems/magic-nix-cache-action@v8
-      - name: Build OCI archives
-        run: |
-          nix build .#anvil-image -o result-anvil
-          nix build .#anvil-sandbox-image -o result-anvil-sandbox
-          docker load < result-anvil
-          docker load < result-anvil-sandbox
-          docker image inspect anvil:dev >/dev/null
-          docker image inspect anvil-sandbox:dev >/dev/null
-          docker save anvil:dev anvil-sandbox:dev -o anvil-images.tar
+       - name: Build images
+         run: |
+           nix build .#anvil-image -o result-anvil
+           docker load < result-anvil
+           nix run .#anvil-sandbox-image.copyToDockerDaemon
+           docker image inspect anvil:dev >/dev/null
+           docker image inspect ghcr.io/blogle/anvil-sandbox:main >/dev/null
+           docker save anvil:dev ghcr.io/blogle/anvil-sandbox:main -o anvil-images.tar
       - uses: actions/upload-artifact@v4
         with:
           name: anvil-images
@@ -82,14 +81,16 @@ jobs:
           elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             tags+=("${GITHUB_REF_NAME}")
           fi
-          for image in anvil anvil-sandbox; do
-            if [[ "${image}" == anvil ]]; then
-              target="${prefix}"
-            else
-              target="ghcr.io/${owner,,}/anvil-sandbox"
-            fi
-            for tag in "${tags[@]}"; do
-              docker tag "${image}:dev" "${target}:${tag}"
-              docker push "${target}:${tag}"
-            done
+           for image in anvil anvil-sandbox; do
+             if [[ "${image}" == anvil ]]; then
+               target="${prefix}"
+               source="anvil:dev"
+             else
+               target="ghcr.io/${owner,,}/anvil-sandbox"
+               source="ghcr.io/${owner,,}/anvil-sandbox:main"
+             fi
+             for tag in "${tags[@]}"; do
+               docker tag "${source}" "${target}:${tag}"
+               docker push "${target}:${tag}"
+             done
           done
