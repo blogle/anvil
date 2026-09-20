@@ -20,7 +20,7 @@ exec_in_sandbox 'printf "#!/usr/bin/env bash\nprintf env-ok\n" >/tmp/anvil-env-t
 exec_in_sandbox 'test "$DISPLAY" = :99 && test -n "$(pgrep -f "Xvfb :99")"'
 exec_in_sandbox 'chromium --headless --disable-gpu --dump-dom about:blank >/dev/null'
 exec_in_sandbox 'nix develop --command just check'
-exec_in_sandbox 'test "$(git config --global user.name)" = Anvil && test "${GIT_COMMITTER_NAME}" = Anvil'
+exec_in_sandbox 'test "$(git config --global user.name)" = Anvil && tr "\0" "\n" </proc/1/environ | grep -qx "GIT_COMMITTER_NAME=Anvil"'
 
 if [ "${ANVIL_ACCEPTANCE_GITHUB:-}" = 1 ]; then
   : "${ANVIL_GITHUB_REPOSITORY:?set ANVIL_GITHUB_REPOSITORY for the GitHub acceptance path}"
