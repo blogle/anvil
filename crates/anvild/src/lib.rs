@@ -152,10 +152,24 @@ pub enum ServiceError {
     Recovery(String),
     #[error("invalid request: {0}")]
     Invalid(String),
+    #[error("GitHub credential broker error: {0}")]
+    Github(#[from] github::GithubError),
 }
 impl IntoResponse for ServiceError {
     fn into_response(self) -> axum::response::Response {
-        let status = match self {
+        if let ServiceError::Github(error) = &self {
+            let status = match error {
+                github::GithubError::Transport(_) => StatusCode::SERVICE_UNAVAILABLE,
+                github::GithubError::Configuration(_)
+                | github::GithubError::Jwt(_)
+                | github::GithubError::Cache => StatusCode::INTERNAL_SERVER_ERROR,
+                github::GithubError::Repository(_)
+                | github::GithubError::Upstream { .. }
+                | github::GithubError::MalformedResponse { .. } => StatusCode::BAD_GATEWAY,
+            };
+            return (status, Json(json!({"error": error.diagnostic()}))).into_response();
+        }
+        let status = match &self {
             ServiceError::NotFound => StatusCode::NOT_FOUND,
             ServiceError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServiceError::Forbidden(_) => StatusCode::FORBIDDEN,
@@ -229,6 +243,12 @@ pub struct ProviderLoginRequest {
 pub struct ProviderCompleteRequest {
     pub code: Option<String>,
     pub key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct GithubCredentialRequest {
+    #[serde(default)]
+    purpose: github::GithubCredentialPurpose,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1355,6 +1375,7 @@ async fn github_credentials(
     Path(id): Path<String>,
     State(s): State<AppState>,
     headers: HeaderMap,
+    request: Option<Json<GithubCredentialRequest>>,
 ) -> Result<Json<github::GithubCredential>, ServiceError> {
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -1385,10 +1406,15 @@ async fn github_credentials(
         .as_ref()
         .ok_or_else(|| ServiceError::Config("GitHub App credentials are not configured".into()))?;
     broker
-        .credential(&session.repository)
+        .credential(
+            &session.repository,
+            request
+                .map(|Json(request)| request.purpose)
+                .unwrap_or_default(),
+        )
         .await
         .map(Json)
-        .map_err(ServiceError::Config)
+        .map_err(ServiceError::Github)
 }
 async fn wait_ready(s: &AppState, id: &str) -> Result<DynamicObject, ServiceError> {
     let end = tokio::time::Instant::now() + s.config.request_timeout;
@@ -3743,6 +3769,134 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn github_credential_endpoint_separates_capability_and_upstream_failures() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/app/installations/42/access_tokens")
+                .json_body(json!({
+                    "repositories": ["demo"],
+                    "permissions": github::GithubCredentialPurpose::Legacy.permissions()
+                }));
+            then.status(201).json_body(json!({
+                "token": "ghs_legacy",
+                "expires_at": "2099-01-01T00:00:00Z"
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/app/installations/42/access_tokens")
+                .json_body(json!({
+                    "repositories": ["demo"],
+                    "permissions": github::GithubCredentialPurpose::Git.permissions()
+                }));
+            then.status(422)
+                .header("x-github-request-id", "safe-request-id")
+                .json_body(json!({
+                    "message": "requested permissions are not available",
+                    "documentation_url": "https://docs.github.com/safe"
+                }));
+        });
+        let object: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {
+                "name": "anvil-demo-12345678",
+                "annotations": {
+                    "anvil.example/project": "demo",
+                    "anvil.example/repository": "https://github.com/acme/demo.git",
+                    "anvil.example/base-ref": "main",
+                    "anvil.example/work-branch": "anvil/demo-12345678"
+                }
+            },
+            "status": {"phase": "Ready"}
+        }))
+        .unwrap();
+        let sandbox = ReportSandbox {
+            object: Arc::new(Mutex::new(object)),
+        };
+        let mut test_config = config(server.base_url());
+        test_config.session_signing_secret = Some("x".repeat(32));
+        let signer =
+            github::CapabilitySigner::new("x".repeat(32), Duration::from_secs(60)).unwrap();
+        let valid_token = signer
+            .mint("demo-12345678", "https://github.com/acme/demo.git")
+            .unwrap();
+        let mismatch_token = signer
+            .mint("demo-12345678", "https://github.com/acme/other.git")
+            .unwrap();
+        let mut state = AppState::new(test_config, sandbox);
+        state.github = Some(
+            github::GithubBroker::new(github::GithubConfig {
+                app_id: "1".into(),
+                installation_id: 42,
+                private_key: "not-used-in-test".into(),
+                api_url: Url::parse(&server.base_url()).unwrap(),
+            })
+            .with_jwt("test-jwt"),
+        );
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/sessions/demo-12345678/credentials/github")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/sessions/demo-12345678/credentials/github")
+                    .header("authorization", format!("Bearer {mismatch_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/sessions/demo-12345678/credentials/github")
+                    .header("authorization", format!("Bearer {valid_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let legacy = json_response(response).await;
+        assert_eq!(legacy["permissions"]["contents"], "write");
+        assert_eq!(legacy["permissions"].as_object().unwrap().len(), 7);
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/sessions/demo-12345678/credentials/github")
+                    .header("authorization", format!("Bearer {valid_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"purpose":"git"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = json_response(response).await;
+        assert_eq!(body["error"]["code"], "github_token_scope_rejected");
+        assert_eq!(body["error"]["upstream_status"], 422);
+        assert_eq!(body["error"]["github_request_id"], "safe-request-id");
+        assert_eq!(
+            body["error"]["documentation_url"],
+            "https://docs.github.com/safe"
+        );
     }
 
     #[test]

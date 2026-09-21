@@ -121,3 +121,12 @@ SHA tags. No secret, token, or kubeconfig belongs in the ConfigMap.
 
 Ingress accepts the configured preview wildcard; routing and authentication at
 that boundary are the router/Traefik responsibility.
+
+The `POST /v1/sessions/:id/credentials/github` route accepts an optional JSON
+body with a server-defined `purpose`: `git` or `gh_read`. `git` requests
+Contents write access for HTTPS Git; `gh_read` requests only read permissions
+for supported inspection commands. Clients cannot supply arbitrary GitHub
+permissions. An omitted body deliberately selects the legacy pre-purpose
+profile for persistent old sandbox helpers during rollout. The route continues
+to require the session capability bound to the requested session and
+repository.

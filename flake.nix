@@ -57,14 +57,35 @@
           trap 'rm -f "$curl_config"' EXIT
           (umask 077; printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/json"\n' \
             "$ANVIL_SESSION_CREDENTIAL" > "$curl_config")
-          token="$(${pkgs.curl}/bin/curl --config "$curl_config" --fail-with-body --silent --show-error \
-            --request POST \
-            "''${ANVIL_CREDENTIAL_URL%/}/v1/sessions/''${ANVIL_SESSION_ID}/credentials/github" \
-            | ${pkgs.jq}/bin/jq --raw-output '.token // empty')"
-          if [ -z "$token" ]; then
-            echo "gh: Anvil could not mint a GitHub credential; check the session and broker" >&2
-            exit 1
-          fi
+           response="$(${pkgs.curl}/bin/curl --config "$curl_config" --silent --show-error \
+             --request POST \
+             --header 'content-type: application/json' \
+             --data '{"purpose":"gh_read"}' \
+             --write-out $'\n%{http_code}' \
+             "''${ANVIL_CREDENTIAL_URL%/}/v1/sessions/''${ANVIL_SESSION_ID}/credentials/github")" || {
+             echo "gh: broker request failed (no HTTP response)" >&2
+             exit 1
+           }
+           http_status="''${response##*$'\n'}"
+           response_body="''${response%$'\n'*}"
+           if [[ "$http_status" != 2?? ]]; then
+             error_code="$(${pkgs.jq}/bin/jq --raw-output '.error.code // empty' 2>/dev/null <<<"$response_body" || true)"
+             error_message="$(${pkgs.jq}/bin/jq --raw-output '.error.message // empty' 2>/dev/null <<<"$response_body" || true)"
+             upstream_status="$(${pkgs.jq}/bin/jq --raw-output '.error.upstream_status // empty' 2>/dev/null <<<"$response_body" || true)"
+             request_id="$(${pkgs.jq}/bin/jq --raw-output '.error.github_request_id // empty' 2>/dev/null <<<"$response_body" || true)"
+             detail="broker request failed (HTTP $http_status)"
+             [ -n "$error_code" ] && detail="$detail: $error_code"
+             [ -n "$error_message" ] && detail="$detail: $error_message"
+             [ -n "$upstream_status" ] && detail="$detail (GitHub HTTP $upstream_status)"
+             [ -n "$request_id" ] && detail="$detail [request $request_id]"
+             echo "gh: $detail" >&2
+             exit 1
+           fi
+           token="$(${pkgs.jq}/bin/jq --raw-output '.token // empty' <<<"$response_body")"
+           if [ -z "$token" ]; then
+             echo "gh: broker returned no GitHub token" >&2
+             exit 1
+           fi
           exec env GH_TOKEN="$token" ${pkgs.gh}/bin/gh "$@"
         '';
         nixConf = pkgs.writeTextDir "etc/nix/nix.conf" ''
