@@ -113,6 +113,7 @@ pub enum GithubCredentialPurpose {
     Legacy,
     Git,
     GhRead,
+    Gh,
 }
 
 impl GithubCredentialPurpose {
@@ -125,6 +126,13 @@ impl GithubCredentialPurpose {
                 ("contents", "read"),
                 ("metadata", "read"),
                 ("pull_requests", "read"),
+            ]),
+            Self::Gh => HashMap::from([
+                ("actions", "read"),
+                ("checks", "read"),
+                ("contents", "read"),
+                ("metadata", "read"),
+                ("pull_requests", "write"),
             ]),
             Self::Legacy => HashMap::from([
                 ("actions", "read"),
@@ -537,6 +545,12 @@ mod tests {
             BTreeSet::from(["actions", "checks", "contents", "metadata", "pull_requests",])
         );
 
+        let gh = GithubCredentialPurpose::Gh.permissions();
+        assert_eq!(gh.get("contents"), Some(&"read"));
+        assert_eq!(gh.get("pull_requests"), Some(&"write"));
+        assert_eq!(gh.len(), 5);
+        assert_eq!(gh.get("issues"), None);
+
         assert_eq!(
             GithubCredentialPurpose::default(),
             GithubCredentialPurpose::Legacy
@@ -608,10 +622,22 @@ mod tests {
                 .path("/app/installations/42/access_tokens")
                 .json_body(serde_json::json!({
                     "repositories": ["demo"],
-                    "permissions": GithubCredentialPurpose::GhRead.permissions()
+                    "permissions": GithubCredentialPurpose::Gh.permissions()
                 }));
             then.status(201).json_body(serde_json::json!({
                 "token": "ghs_gh",
+                "expires_at": expires_at
+            }));
+        });
+        let gh_read = server.mock(|when, then| {
+            when.method(POST)
+                .path("/app/installations/42/access_tokens")
+                .json_body(serde_json::json!({
+                    "repositories": ["demo"],
+                    "permissions": GithubCredentialPurpose::GhRead.permissions()
+                }));
+            then.status(201).json_body(serde_json::json!({
+                "token": "ghs_gh_read",
                 "expires_at": expires_at
             }));
         });
@@ -633,16 +659,31 @@ mod tests {
         let gh_credential = broker
             .credential(
                 "https://github.com/acme/demo.git",
+                GithubCredentialPurpose::Gh,
+            )
+            .await
+            .unwrap();
+        let gh_read_credential = broker
+            .credential(
+                "https://github.com/acme/demo.git",
                 GithubCredentialPurpose::GhRead,
             )
             .await
             .unwrap();
         assert_eq!(git_credential.token, "ghs_git");
         assert_eq!(gh_credential.token, "ghs_gh");
+        assert_eq!(gh_read_credential.token, "ghs_gh_read");
         broker
             .credential(
                 "https://github.com/acme/demo.git",
                 GithubCredentialPurpose::Git,
+            )
+            .await
+            .unwrap();
+        broker
+            .credential(
+                "https://github.com/acme/demo.git",
+                GithubCredentialPurpose::Gh,
             )
             .await
             .unwrap();
@@ -655,6 +696,7 @@ mod tests {
             .unwrap();
         git.assert_hits(1);
         gh.assert_hits(1);
+        gh_read.assert_hits(1);
     }
 
     #[tokio::test]
