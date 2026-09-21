@@ -3776,7 +3776,23 @@ mod tests {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(httpmock::Method::POST)
-                .path("/app/installations/42/access_tokens");
+                .path("/app/installations/42/access_tokens")
+                .json_body(json!({
+                    "repositories": ["demo"],
+                    "permissions": github::GithubCredentialPurpose::Legacy.permissions()
+                }));
+            then.status(201).json_body(json!({
+                "token": "ghs_legacy",
+                "expires_at": "2099-01-01T00:00:00Z"
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/app/installations/42/access_tokens")
+                .json_body(json!({
+                    "repositories": ["demo"],
+                    "permissions": github::GithubCredentialPurpose::Git.permissions()
+                }));
             then.status(422)
                 .header("x-github-request-id", "safe-request-id")
                 .json_body(json!({
@@ -3846,6 +3862,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/sessions/demo-12345678/credentials/github")
+                    .header("authorization", format!("Bearer {valid_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let legacy = json_response(response).await;
+        assert_eq!(legacy["permissions"]["contents"], "write");
+        assert_eq!(legacy["permissions"].as_object().unwrap().len(), 7);
 
         let response = app
             .oneshot(

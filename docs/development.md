@@ -68,10 +68,14 @@ The Secret is referenced only by `anvild`. Sandboxes receive a signed,
 session-bound capability and the internal broker URL, never the App private
 key. Git and `gh` use the sandbox-provided `anvil-credential` helper and `gh`
 wrapper to obtain short-lived repository-scoped installation tokens.
-The broker accepts only the server-defined `git` and `gh_read` credential
-purposes; the Git helper requests `git`, which is limited to Contents write
-access, while `gh` requests its separate read-oriented profile. GitHub API
-failures retain their status, safe message, request ID, and documentation URL.
+The broker accepts the server-defined `git` and `gh_read` credential purposes;
+the Git helper requests `git`, which is limited to Contents write access, while
+`gh` requests its separate read-only profile. Requests without a purpose use an
+explicit legacy profile matching the pre-purpose authority so old Git and `gh`
+clients continue to work during rollout. New sandbox images must be rolled out
+before removing or changing that compatibility behavior.
+GitHub API failures retain their status, safe message, request ID, and
+documentation URL.
 
 The opt-in acceptance harness checks the unprivileged user, XDG paths,
 `/usr/bin/env`, Nix development loop, Xvfb, Chromium, Git identity, and (when

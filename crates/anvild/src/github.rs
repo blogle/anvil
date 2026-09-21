@@ -110,15 +110,23 @@ pub struct GithubCredential {
 #[serde(rename_all = "snake_case")]
 pub enum GithubCredentialPurpose {
     #[default]
+    Legacy,
     Git,
     GhRead,
 }
 
 impl GithubCredentialPurpose {
-    fn permissions(self) -> HashMap<&'static str, &'static str> {
+    pub(crate) fn permissions(self) -> HashMap<&'static str, &'static str> {
         match self {
             Self::Git => HashMap::from([("contents", "write")]),
             Self::GhRead => HashMap::from([
+                ("actions", "read"),
+                ("checks", "read"),
+                ("contents", "read"),
+                ("metadata", "read"),
+                ("pull_requests", "read"),
+            ]),
+            Self::Legacy => HashMap::from([
                 ("actions", "read"),
                 ("checks", "read"),
                 ("contents", "write"),
@@ -479,6 +487,7 @@ pub fn github_repository(repository: &str) -> Result<(String, String), String> {
 mod tests {
     use super::*;
     use httpmock::{Method::POST, MockServer};
+    use std::collections::BTreeSet;
 
     #[test]
     fn capabilities_bind_session_and_repository() {
@@ -513,6 +522,28 @@ mod tests {
         );
         assert!(github_repository("https://github.com/Acme/demo/issues").is_err());
         assert!(github_repository("https://example.com/Acme/demo").is_err());
+    }
+
+    #[test]
+    fn credential_profiles_are_explicit_and_least_privilege() {
+        let git = GithubCredentialPurpose::Git.permissions();
+        assert_eq!(git, HashMap::from([("contents", "write")]));
+
+        let gh_read = GithubCredentialPurpose::GhRead.permissions();
+        assert_eq!(gh_read.get("contents"), Some(&"read"));
+        assert!(gh_read.values().all(|permission| *permission == "read"));
+        assert_eq!(
+            gh_read.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["actions", "checks", "contents", "metadata", "pull_requests",])
+        );
+
+        assert_eq!(
+            GithubCredentialPurpose::default(),
+            GithubCredentialPurpose::Legacy
+        );
+        let legacy = GithubCredentialPurpose::Legacy.permissions();
+        assert_eq!(legacy.get("contents"), Some(&"write"));
+        assert_eq!(legacy.len(), 7);
     }
 
     #[tokio::test]
