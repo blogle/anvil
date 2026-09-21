@@ -60,7 +60,7 @@
            response="$(${pkgs.curl}/bin/curl --config "$curl_config" --silent --show-error \
              --request POST \
              --header 'content-type: application/json' \
-             --data '{"purpose":"gh_read"}' \
+             --data '{"purpose":"gh"}' \
              --write-out $'\n%{http_code}' \
              "''${ANVIL_CREDENTIAL_URL%/}/v1/sessions/''${ANVIL_SESSION_ID}/credentials/github")" || {
              echo "gh: broker request failed (no HTTP response)" >&2

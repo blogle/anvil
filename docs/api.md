@@ -123,10 +123,12 @@ Ingress accepts the configured preview wildcard; routing and authentication at
 that boundary are the router/Traefik responsibility.
 
 The `POST /v1/sessions/:id/credentials/github` route accepts an optional JSON
-body with a server-defined `purpose`: `git` or `gh_read`. `git` requests
+body with a server-defined `purpose`: `git`, `gh_read`, or `gh`. `git` requests
 Contents write access for HTTPS Git; `gh_read` requests only read permissions
-for supported inspection commands. Clients cannot supply arbitrary GitHub
-permissions. An omitted body deliberately selects the legacy pre-purpose
-profile for persistent old sandbox helpers during rollout. The route continues
-to require the session capability bound to the requested session and
-repository.
+for supported inspection commands; and `gh` adds pull-request write access for
+the sandbox `gh` wrapper. Clients cannot supply arbitrary GitHub permissions.
+The GitHub App installation must grant Pull requests: write before `gh` can
+use that profile; otherwise GitHub rejects the token request with HTTP 422.
+An omitted body deliberately selects the legacy pre-purpose profile for
+persistent old sandbox helpers during rollout. The route continues to require
+the session capability bound to the requested session and repository.
