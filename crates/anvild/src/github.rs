@@ -119,7 +119,7 @@ pub enum GithubCredentialPurpose {
 impl GithubCredentialPurpose {
     pub(crate) fn permissions(self) -> HashMap<&'static str, &'static str> {
         match self {
-            Self::Git => HashMap::from([("contents", "write")]),
+            Self::Git => HashMap::from([("contents", "write"), ("workflows", "write")]),
             Self::GhRead => HashMap::from([
                 ("actions", "read"),
                 ("checks", "read"),
@@ -535,7 +535,10 @@ mod tests {
     #[test]
     fn credential_profiles_are_explicit_and_least_privilege() {
         let git = GithubCredentialPurpose::Git.permissions();
-        assert_eq!(git, HashMap::from([("contents", "write")]));
+        assert_eq!(
+            git,
+            HashMap::from([("contents", "write"), ("workflows", "write")])
+        );
 
         let gh_read = GithubCredentialPurpose::GhRead.permissions();
         assert_eq!(gh_read.get("contents"), Some(&"read"));
@@ -570,7 +573,10 @@ mod tests {
                 .header("user-agent", "anvil-github-broker/0.1")
                 .json_body(serde_json::json!({
                     "repositories": ["demo"],
-                    "permissions": GithubCredentialPurpose::Git.permissions()
+                    "permissions": {
+                        "contents": "write",
+                        "workflows": "write"
+                    }
                 }));
             then.status(201).json_body(serde_json::json!({
                 "token": "ghs_test",
