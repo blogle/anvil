@@ -29,46 +29,41 @@ jobs:
           grep -En 'ANVIL_SANDBOX_IMAGE: ghcr.io/blogle/anvil-sandbox:main' /tmp/anvil-rendered.yaml
 
   build:
-    name: Build images
+    name: Validate and build images
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v19
       - uses: DeterminateSystems/magic-nix-cache-action@v8
-      - name: Build images
+      - name: Run Nix checks
+        run: nix flake check
+      - name: Build fast PR images
+        if: github.event_name == 'pull_request'
+        run: |
+          nix build .#anvil-image-ci -o result-anvil-ci
+          docker load < result-anvil-ci
+          nix run .#anvil-sandbox-image.copyToDockerDaemon
+          docker image inspect anvil-ci:dev >/dev/null
+          docker image inspect ghcr.io/blogle/anvil-sandbox:main >/dev/null
+      - name: Build production images
+        if: github.event_name != 'pull_request'
         run: |
           nix build .#anvil-image -o result-anvil
           docker load < result-anvil
           nix run .#anvil-sandbox-image.copyToDockerDaemon
           docker image inspect anvil:dev >/dev/null
           docker image inspect ghcr.io/blogle/anvil-sandbox:main >/dev/null
-          docker save anvil:dev ghcr.io/blogle/anvil-sandbox:main -o anvil-images.tar
-      - uses: actions/upload-artifact@v4
-        with:
-          name: anvil-images
-          path: anvil-images.tar
-          compression-level: 0
-
-  publish:
-    name: Publish images
-    if: github.event_name != 'pull_request'
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: anvil-images
-      - name: Load images
-        run: docker load -i anvil-images.tar
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Publish to GHCR
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -81,16 +76,16 @@ jobs:
           elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             tags+=("${GITHUB_REF_NAME}")
           fi
-           for image in anvil anvil-sandbox; do
-             if [[ "${image}" == anvil ]]; then
-               target="${prefix}"
-               source="anvil:dev"
-             else
-               target="ghcr.io/${owner,,}/anvil-sandbox"
-               source="ghcr.io/${owner,,}/anvil-sandbox:main"
-             fi
-             for tag in "${tags[@]}"; do
-               docker tag "${source}" "${target}:${tag}"
-               docker push "${target}:${tag}"
-             done
-           done
+          for image in anvil anvil-sandbox; do
+            if [[ "${image}" == anvil ]]; then
+              target="${prefix}"
+              source="anvil:dev"
+            else
+              target="ghcr.io/${owner,,}/anvil-sandbox"
+              source="ghcr.io/${owner,,}/anvil-sandbox:main"
+            fi
+            for tag in "${tags[@]}"; do
+              docker tag "${source}" "${target}:${tag}"
+              docker push "${target}:${tag}"
+            done
+          done

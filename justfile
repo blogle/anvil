@@ -23,6 +23,9 @@ lint:
 build:
     cargo build --workspace
 
+build-ci-release:
+    cargo build --workspace --profile ci-release
+
 build-release:
     cargo build --workspace --release
 
@@ -79,4 +82,4 @@ smoke-clean:
 ci:
     just check
     just nix-check
-    just build-release
+    just build-ci-release
