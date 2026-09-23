@@ -28,8 +28,29 @@ jobs:
           grep -En 'image: ghcr.io/blogle/anvil-sandbox:main' /tmp/anvil-rendered.yaml
           grep -En 'ANVIL_SANDBOX_IMAGE: ghcr.io/blogle/anvil-sandbox:main' /tmp/anvil-rendered.yaml
 
-  build:
-    name: Validate and build images
+  pr-build:
+    name: Build and inspect PR images
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v19
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
+      - name: Run Nix checks
+        run: nix flake check
+      - name: Build and inspect PR images
+        run: |
+          nix build .#anvil-image-ci -o result-anvil-ci
+          docker load < result-anvil-ci
+          nix run .#anvil-sandbox-image.copyToDockerDaemon
+          docker image inspect anvil-ci:dev >/dev/null
+          docker image inspect ghcr.io/blogle/anvil-sandbox:main >/dev/null
+
+  publish:
+    name: Build, inspect, and publish images
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -40,16 +61,7 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@v8
       - name: Run Nix checks
         run: nix flake check
-      - name: Build fast PR images
-        if: github.event_name == 'pull_request'
-        run: |
-          nix build .#anvil-image-ci -o result-anvil-ci
-          docker load < result-anvil-ci
-          nix run .#anvil-sandbox-image.copyToDockerDaemon
-          docker image inspect anvil-ci:dev >/dev/null
-          docker image inspect ghcr.io/blogle/anvil-sandbox:main >/dev/null
       - name: Build production images
-        if: github.event_name != 'pull_request'
         run: |
           nix build .#anvil-image -o result-anvil
           docker load < result-anvil
@@ -57,13 +69,11 @@ jobs:
           docker image inspect anvil:dev >/dev/null
           docker image inspect ghcr.io/blogle/anvil-sandbox:main >/dev/null
       - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Publish to GHCR
-        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

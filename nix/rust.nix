@@ -18,8 +18,8 @@ let
     strictDeps = true;
     nativeBuildInputs = [ pkgs.pkg-config ];
   };
-  vendorCargoDir = craneLib.vendorCargoDeps baseArgs;
-  commonArgs = baseArgs // { inherit vendorCargoDir; };
+  cargoVendorDir = craneLib.vendorCargoDeps baseArgs;
+  commonArgs = baseArgs // { inherit cargoVendorDir; };
 
   # Dependency artifacts are profile-specific because Cargo profile metadata
   # is part of the fingerprint used when deciding whether an artifact is fresh.
@@ -120,7 +120,6 @@ let
       pkgs.gh pkgs.curl pkgs.jq pkgs.kubectl pkgs.kustomize pkgs.nix pkgs.nodejs
     ];
     shellHook = ''
-      set -euo pipefail
       export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$PWD/target}"
       if [ -z "''${CARGO_HOME:-}" ]; then
         export CARGO_HOME="$CARGO_TARGET_DIR/.cargo-home"
@@ -128,7 +127,7 @@ let
         # Use the same vendored source path that produced the seeded
         # artifacts, otherwise Cargo invalidates every external dependency.
         chmod u+w "$CARGO_HOME/config.toml" 2>/dev/null || true
-        cp "${vendorCargoDir}/config.toml" "$CARGO_HOME/config.toml"
+        cp "${cargoVendorDir}/config.toml" "$CARGO_HOME/config.toml"
         chmod u+w "$CARGO_HOME/config.toml"
       fi
       seed_marker="$CARGO_TARGET_DIR/.anvil-crane-seed"
@@ -139,7 +138,12 @@ let
       else
         mkdir -p "$CARGO_TARGET_DIR"
         export doNotLinkInheritedArtifacts=1
-        inheritCargoArtifacts "${devCargoArtifacts}" "$CARGO_TARGET_DIR"
+        if ! inheritCargoArtifacts "$seed_artifacts" "$CARGO_TARGET_DIR"; then
+          echo "failed to seed Cargo dependency artifacts" >&2
+          unset doNotLinkInheritedArtifacts
+          exit 1
+        fi
+        unset doNotLinkInheritedArtifacts
 
         marker_tmp="$(mktemp "$seed_marker.XXXXXX")"
         printf '%s\n' "$seed_artifacts" > "$marker_tmp"
