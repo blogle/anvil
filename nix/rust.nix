@@ -34,6 +34,9 @@ let
     # Match the interactive dev profile instead of Crane's non-incremental
     # default, so seeded dependencies remain reusable by ordinary Cargo.
     CARGO_INCREMENTAL = "1";
+    # The default buildDepsOnly check uses --all-targets, which pulls test and
+    # benchmark features into the fingerprints used by normal cargo build.
+    doCheck = false;
   };
   ciCargoArtifacts = mkCargoArtifacts "ci" { };
   ciReleaseCargoArtifacts = mkCargoArtifacts "ci-release" { };
@@ -119,7 +122,7 @@ let
     shellHook = ''
       set -euo pipefail
       export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$PWD/target}"
-      if [ -z "''${CARGO_HOME+x}" ]; then
+      if [ -z "''${CARGO_HOME:-}" ]; then
         export CARGO_HOME="$CARGO_TARGET_DIR/.cargo-home"
         mkdir -p "$CARGO_HOME"
         # Use the same vendored source path that produced the seeded
@@ -136,7 +139,7 @@ let
       else
         mkdir -p "$CARGO_TARGET_DIR"
         export doNotLinkInheritedArtifacts=1
-        inheritCargoArtifacts "$seed_artifacts" "$CARGO_TARGET_DIR"
+        inheritCargoArtifacts "${devCargoArtifacts}" "$CARGO_TARGET_DIR"
 
         marker_tmp="$(mktemp "$seed_marker.XXXXXX")"
         printf '%s\n' "$seed_artifacts" > "$marker_tmp"
