@@ -70,20 +70,27 @@ key. Git and `gh` use the sandbox-provided `anvil-credential` helper and `gh`
 wrapper to obtain short-lived repository-scoped installation tokens.
 The broker accepts the server-defined `git`, `gh_read`, and `gh` credential
 purposes; the Git helper requests `git`, which is limited to Contents write
-access, while the new `gh` wrapper requests `gh`, which adds pull-request write
-access to its otherwise read-only profile. `gh_read` remains available for
-older read-only wrappers. Requests without a purpose use an explicit legacy
+and Workflows write access (the minimum GitHub App installation-token
+permissions needed for ordinary Git pushes and workflow-file changes), while
+the new `gh` wrapper requests `gh`, which adds pull-request write access to its
+otherwise read-only profile. `gh_read` remains available for older read-only
+wrappers. Requests without a purpose use an explicit legacy
 profile matching the pre-purpose authority so old Git and `gh` clients continue
 to work during rollout. New sandbox images must be rolled out before removing
 or changing that compatibility behavior. The GitHub App installation must grant
-Pull requests: write for the `gh` profile; GitHub returns HTTP 422 when that
-installation permission has not been approved.
+Workflows: write for the `git` profile and Pull requests: write for the `gh`
+profile; GitHub returns HTTP 422 when the corresponding installation permission
+has not been approved.
 GitHub API failures retain their status, safe message, request ID, and
 documentation URL.
 
 The opt-in acceptance harness checks the unprivileged user, XDG paths,
 `/usr/bin/env`, Nix development loop, Xvfb, Chromium, Git identity, and (when
-`ANVIL_ACCEPTANCE_GITHUB=1`) GitHub access:
+`ANVIL_ACCEPTANCE_GITHUB=1`) GitHub access. With
+`ANVIL_ACCEPTANCE_GITHUB_PUSH=1`, it also creates an isolated temporary branch,
+pushes an ordinary file and a harmless manual-only workflow through the
+standard Git credential helper, verifies both on GitHub, then deletes the
+remote branch:
 
 ```sh
 ANVIL_SANDBOX_POD=... tests/sandbox-acceptance.sh
