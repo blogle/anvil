@@ -294,15 +294,18 @@ impl HistoryStore {
         let mut line = serde_json::to_vec(&event)
             .map_err(|error| ServiceError::Config(format!("history serialization: {error}")))?;
         line.push(b'\n');
-        tokio::fs::OpenOptions::new()
+        let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
             .await
-            .map_err(|error| ServiceError::Kubernetes(format!("history open: {error}")))?
-            .write_all(&line)
+            .map_err(|error| ServiceError::Kubernetes(format!("history open: {error}")))?;
+        file.write_all(&line)
             .await
-            .map_err(|error| ServiceError::Kubernetes(format!("history append: {error}")))
+            .map_err(|error| ServiceError::Kubernetes(format!("history append: {error}")))?;
+        file.flush()
+            .await
+            .map_err(|error| ServiceError::Kubernetes(format!("history flush: {error}")))
     }
 
     async fn for_session(&self, session_id: &str) -> Vec<HistoryEvent> {
