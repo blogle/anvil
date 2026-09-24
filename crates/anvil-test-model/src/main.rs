@@ -1,6 +1,7 @@
 use axum::{
     extract::State,
     http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -26,6 +27,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/models", get(models))
         .route("/models", get(models))
         .route("/v1/chat/completions", post(completion))
+        .route("/chat/completions", post(completion))
+        .route("/v1/responses", post(responses))
+        .fallback(unknown_route)
         .with_state(state);
     axum::serve(
         tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?,
@@ -33,6 +37,18 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     Ok(())
+}
+
+async fn unknown_route(request: axum::http::Request<axum::body::Body>) -> (StatusCode, String) {
+    eprintln!(
+        "unsupported model fixture request: {} {}",
+        request.method(),
+        request.uri()
+    );
+    (
+        StatusCode::NOT_FOUND,
+        "unsupported local test-model endpoint".into(),
+    )
 }
 
 async fn models() -> Json<Value> {
@@ -76,6 +92,10 @@ async fn completion(
             "edit",
             json!({"filePath":"target.txt","oldString":"before\n","newString":"after\n"}),
         ),
+        2 => (
+            "anvil_report",
+            json!({"disposition":"ready_for_review","summary":"Applied the deterministic fixture edit."}),
+        ),
         _ => {
             return (
                 StatusCode::OK,
@@ -90,6 +110,180 @@ async fn completion(
             json!({"id":format!("chatcmpl-anvil-{index}"),"object":"chat.completion","created":0,"model":"anvil-scripted","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[tool_call]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}),
         ),
     )
+}
+
+async fn responses(
+    State(state): State<std::sync::Arc<AppState>>,
+    Json(request): Json<Value>,
+) -> axum::response::Response {
+    let input = request.get("input").cloned().unwrap_or(Value::Null);
+    let stream = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let tool_count = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let mut prompt = String::new();
+    let mut tool_responses = 0usize;
+    if let Some(items) = input.as_array() {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
+                tool_responses += 1;
+            }
+            if item.get("role").and_then(Value::as_str) == Some("user") {
+                if let Some(text) = item.get("content").and_then(Value::as_str) {
+                    prompt.push_str(text);
+                }
+                if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                    for part in parts {
+                        if let Some(text) = part.get("text").and_then(Value::as_str) {
+                            prompt.push_str(text);
+                        }
+                    }
+                }
+            }
+        }
+    } else if let Some(text) = input.as_str() {
+        prompt.push_str(text);
+    }
+    if !prompt.contains("ANVIL-E2E:edit-file") {
+        return Json(response_text(
+            "TEST_FAILURE: explicit ANVIL-E2E:edit-file scenario marker is required",
+            &request,
+        ))
+        .into_response();
+    }
+    if tool_count == 0 {
+        let value = response_text("I will inspect and update the fixture file.", &request);
+        return if stream {
+            response_sse(&value)
+        } else {
+            Json(value).into_response()
+        };
+    }
+    let scripted = match tool_responses {
+        0 => Some(("read", json!({"filePath":"target.txt"}))),
+        1 => Some((
+            "edit",
+            json!({"filePath":"target.txt","oldString":"before\n","newString":"after\n"}),
+        )),
+        2 => Some((
+            "anvil_report",
+            json!({"disposition":"ready_for_review","summary":"Applied the deterministic fixture edit."}),
+        )),
+        _ => None,
+    };
+    if let Some((name, arguments)) = scripted {
+        let call_id = format!(
+            "call_anvil_{}",
+            state.completion.fetch_add(1, Ordering::SeqCst)
+        );
+        let output = json!({"id":format!("fc_{call_id}"),"type":"function_call","call_id":call_id,"name":name,"arguments":arguments.to_string(),"status":"completed"});
+        let value = json!({"id":format!("resp_{call_id}"),"object":"response","created_at":0,"status":"completed","model":"anvil-scripted","output":[output],"output_text":"","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}});
+        if stream {
+            response_sse(&value)
+        } else {
+            Json(value).into_response()
+        }
+    } else {
+        let value = response_text("Deterministic fixture edit completed.", &request);
+        if stream {
+            response_sse(&value)
+        } else {
+            Json(value).into_response()
+        }
+    }
+}
+
+fn response_sse(value: &Value) -> axum::response::Response {
+    let mut body = String::new();
+    let output = value
+        .get("output")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    let response_id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("resp_anvil");
+    let mut emit = |event: &str, data: Value| {
+        body.push_str(&format!("event: {event}\ndata: {}\n\n", data));
+    };
+    emit(
+        "response.created",
+        json!({"type":"response.created","response":{"id":response_id,"object":"response","created_at":0,"status":"in_progress","output":[]}}),
+    );
+    if output.get("type").and_then(Value::as_str) == Some("function_call") {
+        let mut pending = output.clone();
+        pending["status"] = json!("in_progress");
+        pending["arguments"] = json!("");
+        emit(
+            "response.output_item.added",
+            json!({"type":"response.output_item.added","output_index":0,"item":pending}),
+        );
+        let args = output
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        emit(
+            "response.function_call_arguments.delta",
+            json!({"type":"response.function_call_arguments.delta","item_id":output.get("id"),"output_index":0,"delta":args}),
+        );
+        emit(
+            "response.function_call_arguments.done",
+            json!({"type":"response.function_call_arguments.done","item_id":output.get("id"),"output_index":0,"arguments":args}),
+        );
+        emit(
+            "response.output_item.done",
+            json!({"type":"response.output_item.done","output_index":0,"item":output}),
+        );
+    } else if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+        let message = json!({"id":"msg_anvil_text","type":"message","role":"assistant","status":"in_progress","content":[]});
+        emit(
+            "response.output_item.added",
+            json!({"type":"response.output_item.added","output_index":0,"item":message}),
+        );
+        emit(
+            "response.content_part.added",
+            json!({"type":"response.content_part.added","item_id":"msg_anvil_text","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
+        );
+        emit(
+            "response.output_text.delta",
+            json!({"type":"response.output_text.delta","item_id":"msg_anvil_text","output_index":0,"content_index":0,"delta":text}),
+        );
+        emit(
+            "response.output_text.done",
+            json!({"type":"response.output_text.done","item_id":"msg_anvil_text","output_index":0,"content_index":0,"text":text}),
+        );
+        emit(
+            "response.content_part.done",
+            json!({"type":"response.content_part.done","item_id":"msg_anvil_text","output_index":0,"content_index":0,"part":{"type":"output_text","text":text,"annotations":[]}}),
+        );
+        emit(
+            "response.output_item.done",
+            json!({"type":"response.output_item.done","output_index":0,"item":output}),
+        );
+    }
+    emit(
+        "response.completed",
+        json!({"type":"response.completed","response":value}),
+    );
+    body.push_str("data: [DONE]\n\n");
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/event-stream"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn response_text(text: &str, request: &Value) -> Value {
+    json!({"id":"resp_anvil_text","object":"response","created_at":0,"status":"completed","model":request.get("model").and_then(Value::as_str).unwrap_or("anvil-scripted"),"output":[{"id":"msg_anvil_text","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text,"annotations":[]}]}],"output_text":text})
 }
 
 fn finish(content: &str, request: &Value) -> Value {
