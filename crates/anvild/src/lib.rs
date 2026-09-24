@@ -1,6 +1,8 @@
 //! HTTP control plane for Anvil Kubernetes sandboxes.
 
 mod github;
+mod local;
+pub use local::LocalSandboxApi;
 
 use anvil_core::{
     branch_name, normalize_summary, preview_hostname, validate_worker_transition, GitRef,
@@ -73,33 +75,62 @@ impl Config {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| d.into())
         };
-        let required = |key: &str| {
-            env::var(key)
-                .ok()
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| ServiceError::Config(format!("{key} is required")))
+        let sandbox_backend = match get("ANVIL_SANDBOX_BACKEND", "kubernetes").as_str() {
+            "kubernetes" => SandboxBackend::Kubernetes,
+            "local" => SandboxBackend::Local,
+            value => {
+                return Err(ServiceError::Config(format!(
+                    "unsupported ANVIL_SANDBOX_BACKEND={value}; expected kubernetes or local"
+                )))
+            }
         };
-        let session_signing_secret = required("ANVIL_SESSION_SIGNING_SECRET")?;
-        if session_signing_secret.len() < 32 {
+        let production = sandbox_backend == SandboxBackend::Kubernetes;
+        let session_signing_secret = env::var("ANVIL_SESSION_SIGNING_SECRET")
+            .ok()
+            .filter(|value| !value.is_empty());
+        if production
+            && session_signing_secret
+                .as_ref()
+                .is_none_or(|value| value.len() < 32)
+        {
             return Err(ServiceError::Config(
                 "ANVIL_SESSION_SIGNING_SECRET must be at least 32 bytes".into(),
             ));
         }
-        let github_app_id = required("ANVIL_GITHUB_APP_ID")?;
-        let github_private_key = required("ANVIL_GITHUB_PRIVATE_KEY")?;
-        let github_installation_id = required("ANVIL_GITHUB_INSTALLATION_ID")?
-            .parse()
-            .map_err(|_| ServiceError::Config("ANVIL_GITHUB_INSTALLATION_ID".into()))?;
+        let github_app_id = env::var("ANVIL_GITHUB_APP_ID")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let github_private_key = env::var("ANVIL_GITHUB_PRIVATE_KEY")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let github_installation_id = env::var("ANVIL_GITHUB_INSTALLATION_ID")
+            .ok()
+            .and_then(|value| value.parse().ok());
+        if production
+            && (github_app_id.is_none()
+                || github_private_key.is_none()
+                || github_installation_id.is_none())
+        {
+            return Err(ServiceError::Config("ANVIL_GITHUB_APP_ID, ANVIL_GITHUB_PRIVATE_KEY and ANVIL_GITHUB_INSTALLATION_ID are required".into()));
+        }
+        if production
+            && [
+                "ANVIL_PREVIEW_DOMAIN",
+                "ANVIL_ANNOTATION_PREFIX",
+                "ANVIL_PROFILE_OPENCODE_URL",
+            ]
+            .iter()
+            .any(|key| {
+                env::var(key)
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+            })
+        {
+            return Err(ServiceError::Config("ANVIL_PREVIEW_DOMAIN, ANVIL_ANNOTATION_PREFIX and ANVIL_PROFILE_OPENCODE_URL are required".into()));
+        }
         Ok(Self {
-            sandbox_backend: match get("ANVIL_SANDBOX_BACKEND", "kubernetes").as_str() {
-                "kubernetes" => SandboxBackend::Kubernetes,
-                "local" => SandboxBackend::Local,
-                value => {
-                    return Err(ServiceError::Config(format!(
-                        "unsupported ANVIL_SANDBOX_BACKEND={value}; expected kubernetes or local"
-                    )))
-                }
-            },
+            sandbox_backend,
             bind_port: get("ANVIL_BIND_PORT", "8080")
                 .parse()
                 .map_err(|_| ServiceError::Config("ANVILD_PORT".into()))?,
@@ -114,21 +145,30 @@ impl Config {
                     .parse()
                     .map_err(|_| ServiceError::Config("ANVIL_PROVISION_TIMEOUT".into()))?,
             ),
-            preview_domain: env::var("ANVIL_PREVIEW_DOMAIN")
-                .map_err(|_| ServiceError::Config("ANVIL_PREVIEW_DOMAIN is required".into()))?,
-            annotation_prefix: env::var("ANVIL_ANNOTATION_PREFIX")
-                .map_err(|_| ServiceError::Config("ANVIL_ANNOTATION_PREFIX is required".into()))?
-                .trim_end_matches('/')
-                .to_owned(),
-            profile_opencode_url: env::var("ANVIL_PROFILE_OPENCODE_URL").map_err(|_| {
-                ServiceError::Config("ANVIL_PROFILE_OPENCODE_URL is required".into())
-            })?,
+            preview_domain: get(
+                "ANVIL_PREVIEW_DOMAIN",
+                if production { "" } else { "localhost" },
+            ),
+            annotation_prefix: get(
+                "ANVIL_ANNOTATION_PREFIX",
+                if production { "" } else { "anvil.local" },
+            )
+            .trim_end_matches('/')
+            .to_owned(),
+            profile_opencode_url: get(
+                "ANVIL_PROFILE_OPENCODE_URL",
+                if production {
+                    ""
+                } else {
+                    "http://127.0.0.1:4097"
+                },
+            ),
             profile_pvc: get("ANVIL_PROFILE_PVC", "anvil-opencode-profile"),
             credential_url: get("ANVIL_CREDENTIAL_URL", "http://anvild:8080"),
-            github_app_id: Some(github_app_id),
-            github_installation_id: Some(github_installation_id),
-            github_private_key: Some(github_private_key),
-            session_signing_secret: Some(session_signing_secret),
+            github_app_id,
+            github_installation_id,
+            github_private_key,
+            session_signing_secret,
             session_capability_ttl: Duration::from_secs(
                 get("ANVIL_SESSION_CAPABILITY_TTL", "86400")
                     .parse()
@@ -451,7 +491,7 @@ pub trait SandboxApi: Send + Sync + 'static {
 
 /// Backend-neutral view of one Anvil session. Kubernetes resource details are
 /// decoded by `KubeSandboxApi`; consumers only see Anvil's session semantics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxRecord {
     pub session: Session,
     pub work_state: WorkStateRecord,
@@ -460,7 +500,7 @@ pub struct SandboxRecord {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkStateRecord {
     pub state: WorkState,
     pub changed_at: String,
@@ -470,7 +510,7 @@ pub struct WorkStateRecord {
     pub last_run: Option<Run>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BindingStateRecord {
     pub state: String,
     pub continuity: String,
@@ -1293,7 +1333,18 @@ async fn create(
     Json(r): Json<CreateRequest>,
 ) -> Result<(StatusCode, Json<Session>), ServiceError> {
     let p = Project::new(&r.project).map_err(|e| ServiceError::Invalid(e.to_string()))?;
-    Repository::new(&r.repository).map_err(|e| ServiceError::Invalid(e.to_string()))?;
+    if s.config.sandbox_backend == SandboxBackend::Local && r.repository.starts_with("file://") {
+        let local_repository = reqwest::Url::parse(&r.repository)
+            .ok()
+            .filter(|url| url.scheme() == "file" && url.to_file_path().is_ok());
+        if local_repository.is_none() {
+            return Err(ServiceError::Invalid(
+                "local repository must be an absolute file:// URL".into(),
+            ));
+        }
+    } else {
+        Repository::new(&r.repository).map_err(|e| ServiceError::Invalid(e.to_string()))?;
+    }
     GitRef::new(&r.base_ref).map_err(|e| ServiceError::Invalid(e.to_string()))?;
     let prompt = Prompt::new(&r.prompt).map_err(|e| ServiceError::Invalid(e.to_string()))?;
     if r.model
