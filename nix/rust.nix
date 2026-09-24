@@ -1,4 +1,4 @@
-{ pkgs, craneLib, repoRoot }:
+{ pkgs, craneLib, opencode, repoRoot }:
 
 let
   # Keep the Cargo source filter here so the root flake only wires modules
@@ -118,6 +118,8 @@ let
       craneLib.inheritCargoArtifactsHook
       pkgs.cargo pkgs.rust-analyzer pkgs.cargo-nextest pkgs.just pkgs.git
       pkgs.gh pkgs.curl pkgs.jq pkgs.kubectl pkgs.kustomize pkgs.nix pkgs.nodejs
+      pkgs.process-compose pkgs.watchexec pkgs.skopeo pkgs.umoci pkgs.crun pkgs.kind
+      opencode.packages.${pkgs.system}.default
     ];
     shellHook = ''
       export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$PWD/target}"

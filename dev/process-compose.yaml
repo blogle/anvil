@@ -1,0 +1,69 @@
+version: "0.5"
+is_strict: true
+log_level: info
+processes:
+  anvil-test-model:
+    command: target/debug/anvil-test-model
+    environment: [ANVIL_TEST_MODEL_PORT=4098]
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: 4098
+        path: /healthz
+      initial_delay_seconds: 0
+      period_seconds: 1
+      timeout_seconds: 1
+      success_threshold: 1
+      failure_threshold: 30
+  opencode-profile:
+    command: opencode serve --hostname 127.0.0.1 --port 4097
+    environment:
+      - OPENCODE_CONFIG=.anvil/dev/profile/config/opencode.jsonc
+      - OPENCODE_CONFIG_DIR=.anvil/dev/profile/config
+      - HOME=.anvil/dev/profile/home
+      - XDG_CONFIG_HOME=.anvil/dev/profile/home/.config
+      - XDG_CACHE_HOME=.anvil/dev/profile/home/.cache
+      - XDG_DATA_HOME=.anvil/dev/profile/home/.local/share
+      - XDG_STATE_HOME=.anvil/dev/profile/home/.local/state
+      - OPENAI_API_KEY=local-anvil-test-only
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: 4097
+        path: /global/health
+      initial_delay_seconds: 0
+      period_seconds: 1
+      timeout_seconds: 1
+      success_threshold: 1
+      failure_threshold: 60
+  anvild:
+    command: watchexec --restart --watch crates/anvild --watch crates/anvil-core --watch web -- target/debug/anvild
+    depends_on:
+      anvil-test-model:
+        condition: process_healthy
+      opencode-profile:
+        condition: process_healthy
+    environment:
+      - ANVIL_BIND_PORT=8080
+      - ANVIL_SANDBOX_BACKEND=local
+      - ANVIL_LOCAL_RUNTIME_ROOT=.anvil/dev/sessions
+      - ANVIL_LOCAL_PROFILE_DIR=.anvil/dev/profile
+      - ANVIL_PREVIEW_DOMAIN=localhost
+      - ANVIL_ANNOTATION_PREFIX=anvil.local
+      - ANVIL_PROFILE_OPENCODE_URL=http://127.0.0.1:4097
+      - ANVIL_CREDENTIAL_URL=http://127.0.0.1:8080
+      - ANVIL_SESSION_SIGNING_SECRET=anvil-local-development-only-signing-secret
+      - ANVIL_HISTORY_PATH=.anvil/dev/history.jsonl
+      - ANVIL_OPENCODE_BIN=opencode
+      - OPENCODE_CONFIG=.anvil/dev/profile/config/opencode.jsonc
+      - OPENAI_API_KEY=local-anvil-test-only
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: 8080
+        path: /readyz
+      initial_delay_seconds: 0
+      period_seconds: 1
+      timeout_seconds: 1
+      success_threshold: 1
+      failure_threshold: 60
