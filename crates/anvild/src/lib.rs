@@ -45,6 +45,7 @@ const RUNTIME_LAYOUT: &str = "v2";
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub sandbox_backend: SandboxBackend,
     pub bind_port: u16,
     pub namespace: String,
     pub image: String,
@@ -90,6 +91,15 @@ impl Config {
             .parse()
             .map_err(|_| ServiceError::Config("ANVIL_GITHUB_INSTALLATION_ID".into()))?;
         Ok(Self {
+            sandbox_backend: match get("ANVIL_SANDBOX_BACKEND", "kubernetes").as_str() {
+                "kubernetes" => SandboxBackend::Kubernetes,
+                "local" => SandboxBackend::Local,
+                value => {
+                    return Err(ServiceError::Config(format!(
+                        "unsupported ANVIL_SANDBOX_BACKEND={value}; expected kubernetes or local"
+                    )))
+                }
+            },
             bind_port: get("ANVIL_BIND_PORT", "8080")
                 .parse()
                 .map_err(|_| ServiceError::Config("ANVILD_PORT".into()))?,
@@ -128,6 +138,12 @@ impl Config {
             history_path: PathBuf::from(get("ANVIL_HISTORY_PATH", "/var/lib/anvil/history.jsonl")),
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxBackend {
+    Kubernetes,
+    Local,
 }
 
 #[derive(Debug, Error)]
@@ -391,7 +407,7 @@ struct OpenCodeAuthorization {
 
 #[async_trait]
 pub trait SandboxApi: Send + Sync + 'static {
-    async fn list(&self) -> Result<Vec<DynamicObject>, ServiceError>;
+    async fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError>;
     async fn create(
         &self,
         id: &str,
@@ -401,11 +417,11 @@ pub trait SandboxApi: Send + Sync + 'static {
     async fn suspend(&self, id: &str) -> Result<(), ServiceError>;
     async fn resume(&self, id: &str) -> Result<(), ServiceError>;
     async fn delete(&self, id: &str) -> Result<(), ServiceError>;
-    async fn get(&self, id: &str) -> Result<DynamicObject, ServiceError> {
+    async fn get(&self, id: &str) -> Result<SandboxRecord, ServiceError> {
         self.list()
             .await?
             .into_iter()
-            .find(|o| o.name_any() == format!("anvil-{id}"))
+            .find(|record| record.session.id == id)
             .ok_or(ServiceError::NotFound)
     }
     async fn set_opencode_session(&self, _id: &str, _oc: &str) -> Result<(), ServiceError> {
@@ -431,6 +447,17 @@ pub trait SandboxApi: Send + Sync + 'static {
     ) -> Result<(), ServiceError> {
         Ok(())
     }
+}
+
+/// Backend-neutral view of one Anvil session. Kubernetes resource details are
+/// decoded by `KubeSandboxApi`; consumers only see Anvil's session semantics.
+#[derive(Debug, Clone)]
+pub struct SandboxRecord {
+    pub session: Session,
+    pub work_state: WorkStateRecord,
+    pub binding_state: BindingStateRecord,
+    pub operating_mode: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -770,9 +797,34 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
         session_binding_recovery_event: binding.recovery_event,
     })
 }
+
+fn sandbox_record_from(o: &DynamicObject, config: &Config) -> Result<SandboxRecord, ServiceError> {
+    let session = session_from(o, config)?;
+    let work_state = work_state_record(o, config);
+    let binding_state = binding_state_record(o, config);
+    let operating_mode = o
+        .data
+        .get("spec")
+        .and_then(|value| value.get("operatingMode"))
+        .and_then(Value::as_str)
+        .unwrap_or("Running")
+        .to_owned();
+    let created_at = o
+        .annotations()
+        .get(&annotation_key(config, "created-at"))
+        .cloned()
+        .unwrap_or_default();
+    Ok(SandboxRecord {
+        session,
+        work_state,
+        binding_state,
+        operating_mode,
+        created_at,
+    })
+}
 #[async_trait]
 impl SandboxApi for KubeSandboxApi {
-    async fn list(&self) -> Result<Vec<DynamicObject>, ServiceError> {
+    async fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError> {
         Api::<DynamicObject>::namespaced_with(
             self.client.clone(),
             &self.config.namespace,
@@ -780,7 +832,12 @@ impl SandboxApi for KubeSandboxApi {
         )
         .list(&ListParams::default().labels(&format!("{MANAGED}=anvil")))
         .await
-        .map(|x| x.items)
+        .map(|x| {
+            x.items
+                .into_iter()
+                .filter_map(|object| sandbox_record_from(&object, &self.config).ok())
+                .collect()
+        })
         .map_err(|e| ServiceError::Kubernetes(e.to_string()))
     }
     async fn create(
@@ -953,7 +1010,7 @@ impl SandboxApi for KubeSandboxApi {
         .map(|_| ())
         .map_err(|e| ServiceError::Kubernetes(e.to_string()))
     }
-    async fn get(&self, id: &str) -> Result<DynamicObject, ServiceError> {
+    async fn get(&self, id: &str) -> Result<SandboxRecord, ServiceError> {
         Api::<DynamicObject>::namespaced_with(
             self.client.clone(),
             &self.config.namespace,
@@ -962,6 +1019,7 @@ impl SandboxApi for KubeSandboxApi {
         .get(&format!("anvil-{id}"))
         .await
         .map_err(|e| ServiceError::Kubernetes(e.to_string()))
+        .and_then(|object| sandbox_record_from(&object, &self.config))
     }
     async fn set_opencode_session(&self, id: &str, oc: &str) -> Result<(), ServiceError> {
         let mut annotations = serde_json::Map::new();
@@ -1279,7 +1337,7 @@ async fn create(
     {
         sandbox_env.push(("ANVIL_GIT_AUTHOR_EMAIL".into(), email.to_owned()));
     }
-    let mut sess = s.kube.create(&id, &r, &sandbox_env).await?;
+    let created_session = s.kube.create(&id, &r, &sandbox_env).await?;
     record_history(
         &s,
         &id,
@@ -1309,7 +1367,8 @@ async fn create(
         r.model.clone(),
     )
     .await;
-    sess = session_from(&obj, &s.config).unwrap_or(sess);
+    let mut sess = obj.session.clone();
+    sess.current_run = created_session.current_run;
     sess.ready_at = Some(ready_at);
     let oc = OpenCode::new(service_url(&sess, &s.config), s.config.request_timeout);
     wait_opencode(&oc, s.config.request_timeout).await?;
@@ -1367,10 +1426,11 @@ async fn create(
     obj = s.kube.get(&id).await?;
     Ok((
         StatusCode::CREATED,
-        Json(session_from(&obj, &s.config).unwrap_or_else(|_| {
-            sess.opencode_session_id = Some(oc_id);
-            sess
-        })),
+        Json({
+            let mut session = obj.session;
+            session.opencode_session_id.get_or_insert(oc_id);
+            session
+        }),
     ))
 }
 
@@ -1397,8 +1457,8 @@ async fn github_credentials(
             "capability is not valid for this session".into(),
         ));
     }
-    let object = s.kube.get(&id).await?;
-    let session = session_from(&object, &s.config)?;
+    let record = s.kube.get(&id).await?;
+    let session = record.session;
     if session.repository != claims.repository {
         return Err(ServiceError::Forbidden(
             "capability repository does not match session".into(),
@@ -1419,22 +1479,11 @@ async fn github_credentials(
         .map(Json)
         .map_err(ServiceError::Github)
 }
-async fn wait_ready(s: &AppState, id: &str) -> Result<DynamicObject, ServiceError> {
+async fn wait_ready(s: &AppState, id: &str) -> Result<SandboxRecord, ServiceError> {
     let end = tokio::time::Instant::now() + s.config.request_timeout;
     loop {
         let o = s.kube.get(id).await?;
-        if o.data
-            .get("status")
-            .and_then(|v| v.get("conditions"))
-            .and_then(Value::as_array)
-            .map(|cs| {
-                cs.iter().any(|c| {
-                    c.get("type").and_then(Value::as_str) == Some("Ready")
-                        && c.get("status").and_then(Value::as_str) == Some("True")
-                })
-            })
-            .unwrap_or(false)
-        {
+        if o.session.environment_state == "ready" {
             return Ok(o);
         }
         if tokio::time::Instant::now() >= end {
@@ -1464,13 +1513,13 @@ async fn wait_opencode(opencode: &OpenCode, timeout: Duration) -> Result<(), Ser
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
-fn service_url(sess: &Session, c: &Config) -> String {
+fn service_url(sess: &Session, _c: &Config) -> String {
     let host = if sess.service.is_empty() {
         format!("anvil-{}", sess.id)
     } else {
         sess.service.clone()
     };
-    format!("http://{host}:{}", c.opencode_port)
+    format!("http://{host}:{}", sess.opencode_port)
 }
 
 fn binding_is_usable(session: &Session) -> bool {
@@ -1483,12 +1532,12 @@ fn binding_is_usable(session: &Session) -> bool {
 async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceError> {
     let lock = s.binding_lock(id);
     let _guard = lock.lock().await;
-    let object = s.kube.get(id).await?;
-    let session = session_from(&object, &s.config)?;
+    let record = s.kube.get(id).await?;
+    let session = record.session.clone();
     let Some(opencode_id) = session.opencode_session_id.as_deref() else {
         return Ok(session);
     };
-    let previous = binding_state_record(&object, &s.config);
+    let previous = record.binding_state;
     let checked_at = chrono_like_now();
     s.kube
         .set_binding_state(
@@ -1504,6 +1553,7 @@ async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceErr
         )
         .await?;
     let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
+    let mut rebound_session_id = None;
     match op.session_exists(opencode_id).await {
         Ok(true) => {
             let state = if previous.state == "rebound" {
@@ -1532,6 +1582,7 @@ async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceErr
         Ok(false) => {
             let new_id = op.create_session().await?;
             s.kube.set_opencode_session(id, &new_id).await?;
+            rebound_session_id = Some(new_id.clone());
             let recovery_event = format!(
                 "OpenCode session {opencode_id} was unavailable; automatically created replacement {new_id}; conversation continuity was lost"
             );
@@ -1578,7 +1629,11 @@ async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceErr
                 .await?;
         }
     }
-    session_from(&s.kube.get(id).await?, &s.config)
+    let mut session = s.kube.get(id).await?.session;
+    if let Some(new_id) = rebound_session_id {
+        session.opencode_session_id = Some(new_id);
+    }
+    Ok(session)
 }
 
 async fn rebind(
@@ -1594,7 +1649,7 @@ async fn rebind(
     let lock = s.binding_lock(&id);
     let (new_id, model, checked_at) = {
         let _guard = lock.lock().await;
-        let session = session_from(&s.kube.get(&id).await?, &s.config)?;
+        let session = s.kube.get(&id).await?.session;
         let old_id = session.opencode_session_id.clone();
         let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
         wait_opencode(&op, s.config.request_timeout).await?;
@@ -1636,7 +1691,7 @@ async fn rebind(
     )
     .await;
     if let Some(prompt) = prompt {
-        let session = session_from(&s.kube.get(&id).await?, &s.config)?;
+        let session = s.kube.get(&id).await?.session;
         let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
         let request_id = new_request_id();
         record_history(
@@ -1679,9 +1734,8 @@ async fn enumerate(State(s): State<AppState>) -> Result<Json<Vec<Session>>, Serv
     let objects = s.kube.list().await?;
     let mut sessions = Vec::with_capacity(objects.len());
     for object in objects {
-        if let Ok(session) = session_from(&object, &s.config) {
-            sessions.push(reconcile_binding(&s, &session.id).await.unwrap_or(session));
-        }
+        let session = object.session;
+        sessions.push(reconcile_binding(&s, &session.id).await.unwrap_or(session));
     }
     Ok(Json(sessions))
 }
@@ -1698,11 +1752,7 @@ async fn activity(
 ) -> Result<Json<SessionActivity>, ServiceError> {
     let object = s.kube.get(&id).await?;
     let session = reconcile_binding(&s, &id).await?;
-    let operating_mode = object
-        .data
-        .get("spec")
-        .and_then(|value| value.get("operatingMode"))
-        .and_then(Value::as_str);
+    let operating_mode = Some(object.operating_mode.as_str());
     let messages = if binding_is_usable(&session) {
         let opencode_id = session.opencode_session_id.as_deref().unwrap();
         let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
@@ -1765,7 +1815,7 @@ async fn resume(
 ) -> Result<Json<Session>, ServiceError> {
     s.kube.resume(&id).await?;
     let object = wait_ready(&s, &id).await?;
-    let session = session_from(&object, &s.config)?;
+    let session = object.session;
     let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
     wait_opencode(&op, s.config.request_timeout).await?;
     let session = reconcile_binding(&s, &id).await?;
@@ -1826,7 +1876,7 @@ async fn prompt(
         ));
     }
     let run_id = begin_run(&s, &id).await?;
-    let x = session_from(&s.kube.get(&id).await?, &s.config)?;
+    let x = s.kube.get(&id).await?.session;
     if !binding_is_usable(&x) {
         return Err(ServiceError::Recovery(
             x.session_binding_error
@@ -1895,7 +1945,7 @@ async fn authorized_worker_session(
     s: &AppState,
     id: &str,
     headers: &HeaderMap,
-) -> Result<DynamicObject, ServiceError> {
+) -> Result<SandboxRecord, ServiceError> {
     let signer = s
         .capability_signer
         .as_ref()
@@ -1909,7 +1959,7 @@ async fn authorized_worker_session(
         ));
     }
     let object = s.kube.get(id).await?;
-    let session = session_from(&object, &s.config)?;
+    let session = &object.session;
     if session.repository != claims.repository {
         return Err(ServiceError::Forbidden(
             "capability repository does not match session".into(),
@@ -1924,7 +1974,7 @@ async fn report_context(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ServiceError> {
     let object = authorized_worker_session(&s, &id, &headers).await?;
-    let work = work_state_record(&object, &s.config);
+    let work = object.work_state;
     if work.state == WorkState::Completed {
         return Err(ServiceError::Conflict("session is completed".into()));
     }
@@ -1941,7 +1991,7 @@ async fn report(
     Json(request): Json<ReportRequest>,
 ) -> Result<Json<ReportResponse>, ServiceError> {
     let object = authorized_worker_session(&s, &id, &headers).await?;
-    let work = work_state_record(&object, &s.config);
+    let work = object.work_state;
     let disposition = match request.disposition.parse::<WorkerDisposition>() {
         Ok(disposition) => disposition,
         Err(_) => {
@@ -2005,7 +2055,7 @@ async fn complete(
     State(s): State<AppState>,
 ) -> Result<Json<ReportResponse>, ServiceError> {
     let object = s.kube.get(&id).await?;
-    let work = work_state_record(&object, &s.config);
+    let work = object.work_state;
     if work.state != WorkState::ReadyForReview {
         return Err(ServiceError::Conflict(
             "only ready_for_review sessions can be completed".into(),
@@ -2052,7 +2102,7 @@ async fn complete(
 
 async fn begin_run(s: &AppState, id: &str) -> Result<String, ServiceError> {
     let object = s.kube.get(id).await?;
-    let work = work_state_record(&object, &s.config);
+    let work = object.work_state;
     if work.state == WorkState::Completed {
         return Err(ServiceError::Conflict("session is completed".into()));
     }
@@ -3217,6 +3267,7 @@ mod tests {
 
     struct BindingSandbox {
         object: Arc<Mutex<DynamicObject>>,
+        opencode_port: u16,
     }
 
     struct ActivitySandbox {
@@ -3229,7 +3280,7 @@ mod tests {
 
     #[async_trait]
     impl SandboxApi for FakeSandbox {
-        async fn list(&self) -> Result<Vec<DynamicObject>, ServiceError> {
+        async fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError> {
             Ok(Vec::new())
         }
         async fn create(
@@ -3253,12 +3304,17 @@ mod tests {
 
     #[async_trait]
     impl SandboxApi for BindingSandbox {
-        async fn list(&self) -> Result<Vec<DynamicObject>, ServiceError> {
-            Ok(vec![self
-                .object
-                .lock()
-                .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?
-                .clone()])
+        async fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError> {
+            let mut config = config("http://profile.test".into());
+            config.opencode_port = self.opencode_port;
+            Ok(vec![sandbox_record_from(
+                &self
+                    .object
+                    .lock()
+                    .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?
+                    .clone(),
+                &config,
+            )?])
         }
 
         async fn create(
@@ -3340,8 +3396,11 @@ mod tests {
 
     #[async_trait]
     impl SandboxApi for ActivitySandbox {
-        async fn list(&self) -> Result<Vec<DynamicObject>, ServiceError> {
-            Ok(vec![self.object.clone()])
+        async fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError> {
+            Ok(vec![sandbox_record_from(
+                &self.object,
+                &config("http://profile.test".into()),
+            )?])
         }
 
         async fn create(
@@ -3368,12 +3427,15 @@ mod tests {
 
     #[async_trait]
     impl SandboxApi for ReportSandbox {
-        async fn list(&self) -> Result<Vec<DynamicObject>, ServiceError> {
-            Ok(vec![self
-                .object
-                .lock()
-                .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?
-                .clone()])
+        async fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError> {
+            Ok(vec![sandbox_record_from(
+                &self
+                    .object
+                    .lock()
+                    .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?
+                    .clone(),
+                &config("http://profile.test".into()),
+            )?])
         }
 
         async fn create(
@@ -3446,6 +3508,7 @@ mod tests {
 
     fn config(profile_opencode_url: String) -> Config {
         Config {
+            sandbox_backend: SandboxBackend::Kubernetes,
             bind_port: 8080,
             namespace: "anvil".into(),
             image: "sandbox:dev".into(),
@@ -3983,9 +4046,16 @@ mod tests {
             }
         }))
         .unwrap();
-        let session = session_from(&object, &config("http://profile.test".into())).unwrap();
+        let config = config("http://profile.test".into());
+        let session = session_from(&object, &config).unwrap();
+        let record = sandbox_record_from(&object, &config).unwrap();
         assert_eq!(session.environment_state, "ready");
         assert_eq!(session.phase.as_deref(), Some("Ready"));
+        assert_eq!(record.session.id, session.id);
+        assert_eq!(record.session.environment_state, session.environment_state);
+        assert_eq!(record.session.service, session.service);
+        assert_eq!(record.session.work_state, session.work_state);
+        assert_eq!(record.operating_mode, "Running");
     }
 
     #[test]
@@ -4156,6 +4226,7 @@ mod tests {
             test_config,
             BindingSandbox {
                 object: object.clone(),
+                opencode_port: server_url.port().unwrap(),
             },
         );
 
