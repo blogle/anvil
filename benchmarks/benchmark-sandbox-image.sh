@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-flake_ref="${1:-.}"
+flake_ref="${1:-./benchmarks}"
 mode="${ANVIL_IMAGE_BENCHMARK_MODE:-build}"
 
 case "$mode" in

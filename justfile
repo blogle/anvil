@@ -20,8 +20,12 @@ test:
 lint:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+# Build all development binaries with the workspace-wide Nix dependency cache.
 build:
     cargo build --workspace
+
+build-ci-release:
+    cargo build --workspace --profile ci-release
 
 build-release:
     cargo build --workspace --release
@@ -79,4 +83,4 @@ smoke-clean:
 ci:
     just check
     just nix-check
-    just build-release
+    just build-ci-release
