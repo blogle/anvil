@@ -34,14 +34,16 @@ nix-check:
     nix flake check
 
 dev:
-    mkdir -p .anvil/dev/profile/config .anvil/dev/profile/home
-    cp dev/opencode-e2e.jsonc .anvil/dev/profile/config/opencode.jsonc
+    mkdir -p .anvil/dev/profile/config .anvil/dev/profile/home .anvil/dev/profile/plugins
+    cp runtime/anvil-report.ts .anvil/dev/profile/plugins/anvil-report.ts
+    jq --arg plugin "$(pwd)/.anvil/dev/profile/plugins/anvil-report.ts" '.plugin = [$plugin]' dev/opencode-e2e.jsonc > .anvil/dev/profile/config/opencode.jsonc
     cargo build -p anvild -p anvil-test-model
     PC_PORT_NUM=8090 process-compose -f dev/process-compose.yaml up
 
 dev-full:
-    mkdir -p .anvil/dev/profile/config .anvil/dev/profile/home
-    cp dev/opencode-e2e.jsonc .anvil/dev/profile/config/opencode.jsonc
+    mkdir -p .anvil/dev/profile/config .anvil/dev/profile/home .anvil/dev/profile/plugins
+    cp runtime/anvil-report.ts .anvil/dev/profile/plugins/anvil-report.ts
+    jq --arg plugin "$(pwd)/.anvil/dev/profile/plugins/anvil-report.ts" '.plugin = [$plugin]' dev/opencode-e2e.jsonc > .anvil/dev/profile/config/opencode.jsonc
     cargo build -p anvild -p anvil-test-model -p anvil-mcp -p anvil-router
     PC_PORT_NUM=8090 process-compose -f dev/process-compose.yaml -f dev/process-compose-full.yaml up
 

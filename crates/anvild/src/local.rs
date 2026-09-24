@@ -129,19 +129,27 @@ impl LocalSandboxApi {
             .env("OPENCODE_CONFIG_DIR", profile.join("config"))
             .env("OPENCODE_DISABLE_CHANNEL_DB", "1")
             .env("DISPLAY", ":99")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdin(Stdio::null());
+        let worker_log =
+            std::fs::File::create(state.directory.join("worker.log")).map_err(local_error)?;
+        command
+            .stdout(Stdio::from(worker_log.try_clone().map_err(local_error)?))
+            .stderr(Stdio::from(worker_log));
         for (key, value) in &state.record_environment {
             command.env(key, value);
         }
         let mut child = command
             .spawn()
             .map_err(|error| ServiceError::OpenCode(format!("start local opencode: {error}")))?;
-        let endpoint = format!("http://127.0.0.1:{port}");
         let deadline = tokio::time::Instant::now() + self.config.request_timeout;
         loop {
-            if health(&endpoint, port).await.is_ok() {
+            if health("127.0.0.1", port).await.is_ok() {
+                tokio::fs::write(
+                    state.directory.join("worker.pid"),
+                    child.id().unwrap_or_default().to_string(),
+                )
+                .await
+                .map_err(local_error)?;
                 state.child = Some(child);
                 state.record.session.environment_state = "ready".into();
                 state.record.session.service = "127.0.0.1".into();
@@ -374,6 +382,7 @@ impl SandboxApi for LocalSandboxApi {
             child.kill().await.map_err(local_error)?;
             let _ = child.wait().await;
         }
+        let _ = tokio::fs::remove_file(state.directory.join("worker.pid")).await;
         state.record.session.environment_state = "suspended".into();
         state.record.operating_mode = "Suspended".into();
         persist(&state.directory, &state.record).await
