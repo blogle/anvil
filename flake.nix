@@ -16,6 +16,7 @@
         craneLib = crane.mkLib pkgs;
         rust = import ./nix/rust.nix {
           inherit pkgs craneLib opencode;
+          nix2containerPkgs = nix2container.packages.${system};
           repoRoot = ./.;
         };
         sandbox = import ./nix/sandbox.nix {

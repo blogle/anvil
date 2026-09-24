@@ -9,6 +9,9 @@ exec_in_sandbox() {
     'cd "$HOME/workspace/$ANVIL_PROJECT" && exec setpriv --reuid=1000 --regid=1000 --init-groups -- bash -lc '"$(printf '%q' "$1")"
 }
 
+ANVIL_RUNTIME_EXEC=exec_in_sandbox
+source "$(dirname "$0")/sandbox-runtime-assertions.sh"
+
 exec_in_sandbox 'test "$(id -u)" = 1000 && test "$(id -g)" = 1000'
 exec_in_sandbox 'test "$HOME" = /home/anvil && test -w "$HOME" && test -w /tmp'
 exec_in_sandbox 'test "$XDG_CONFIG_HOME" = /home/anvil/.config && test -w "$XDG_CONFIG_HOME"'
