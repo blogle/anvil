@@ -3,8 +3,6 @@
 let
   credentialHelper = pkgs.writeShellScriptBin "anvil-credential"
     (builtins.readFile "${repoRoot}/runtime/anvil-credential");
-  anvilReportPlugin = pkgs.writeTextDir "usr/share/anvil/anvil-report.ts"
-    (builtins.readFile "${repoRoot}/runtime/anvil-report.ts");
   ghWrapper = pkgs.writeShellScriptBin "gh" ''
     set -euo pipefail
     : "''${ANVIL_SESSION_ID:?ANVIL_SESSION_ID is required}"
@@ -116,7 +114,7 @@ let
     pathsToLink = [ "/bin" ];
   };
   sandboxRuntimeFiles = [
-    nixConf credentialHelper ghWrapper anvilReportPlugin sandboxUsrBin sandboxBin
+    nixConf credentialHelper ghWrapper sandboxUsrBin sandboxBin
   ] ++ userFiles ++ [ sandboxMutableHome sandboxMutableTmp sandboxMutableNixVar ];
   sandboxBaseLayer = nix2containerPkgs.nix2container.buildLayer {
     deps = sandboxBaseTools;
@@ -205,7 +203,6 @@ in
 {
   inherit
     credentialHelper
-    anvilReportPlugin
     ghWrapper
     nixConf
     userFiles

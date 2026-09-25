@@ -11,6 +11,7 @@ async fn main() -> anyhow::Result<()> {
         }
         SandboxBackend::Local => AppState::new(config.clone(), LocalSandboxApi::new(config)?),
     };
+    state.initialize().await?;
     let listener =
         tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], state.config.bind_port)))
             .await?;

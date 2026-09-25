@@ -11,13 +11,16 @@ export function parseRoute(hash) {
 
 export function operatorState(activity) {
   if (!activity) return "starting"
-  if (activity.environment_state === "failed" || ["failed", "unavailable"].includes(activity.execution_state)) return "problem"
+  if (activity.environment_state === "failed") return "problem"
+  if (activity.environment_state === "suspended") return "stopped"
   if (activity.environment_state === "provisioning") return "starting"
-  if (activity.work_state === "awaiting_input") return "needs-input"
-  if (activity.execution_state === "running") return "working"
-  if (activity.work_state === "ready_for_review") return "ready-for-review"
+  if (["failed", "unavailable"].includes(activity.execution_state)) return "problem"
   if (activity.work_state === "completed") return "done"
-  return "working"
+  if (activity.work_state === "failed") return "problem"
+  if (activity.execution_state === "running") return "working"
+  if (activity.execution_state === "idle") return "ready-for-review"
+  if (activity.work_state === "ready_for_review") return "ready-for-review"
+  return "starting"
 }
 
 export function applyServerRefresh(state, sessions, activities) {

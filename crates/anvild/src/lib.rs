@@ -5,10 +5,9 @@ mod local;
 pub use local::LocalSandboxApi;
 
 use anvil_core::{
-    branch_name, normalize_summary, preview_hostname, validate_worker_transition, GitRef,
-    LifecycleEvent, LoginFlow, Port, Project, Prompt, ProviderAuthMethod, ProviderListResponse,
-    ProviderStatus, ProviderSummary, Repository, Run, Session, SessionActivity, SessionId,
-    SessionRequest, WorkState, WorkerDisposition,
+    branch_name, preview_hostname, GitRef, LifecycleEvent, LoginFlow, Port, Project, Prompt,
+    ProviderAuthMethod, ProviderListResponse, ProviderStatus, ProviderSummary, Repository, Run,
+    Session, SessionActivity, SessionId, SessionRequest, WorkState,
 };
 use async_trait::async_trait;
 use axum::{
@@ -37,7 +36,10 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use tokio::{io::AsyncWriteExt, sync::Mutex as AsyncMutex};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{watch, Mutex as AsyncMutex},
+};
 use tracing::{info, warn};
 
 const MANAGED: &str = "app.kubernetes.io/managed-by";
@@ -268,21 +270,6 @@ pub struct RecoveryRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ReportRequest {
-    pub run_id: String,
-    pub disposition: String,
-    pub summary: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ReportResponse {
-    pub accepted: bool,
-    pub session_id: String,
-    pub run_id: String,
-    pub work_state: String,
-    pub work_state_changed_at: String,
-}
-#[derive(Debug, Deserialize)]
 pub struct DiffQuery {
     #[serde(rename = "messageID")]
     pub message_id: Option<String>,
@@ -485,6 +472,9 @@ pub trait SandboxApi: Send + Sync + 'static {
         _id: &str,
         _state: &BindingStateRecord,
     ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn recover_startup(&self) -> Result<(), ServiceError> {
         Ok(())
     }
 }
@@ -1202,9 +1192,13 @@ pub struct AppState {
     profile: ProfileClient,
     pending_logins: Arc<Mutex<HashMap<String, PendingLogin>>>,
     binding_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    lifecycle_watchers: LifecycleWatchers,
     capability_signer: Option<github::CapabilitySigner>,
     github: Option<github::GithubBroker>,
 }
+
+type LifecycleWatchers = Arc<Mutex<HashMap<String, (uuid::Uuid, watch::Sender<bool>)>>>;
+
 impl AppState {
     pub fn new<K: SandboxApi>(config: Config, kube: K) -> Self {
         let profile = ProfileClient::new(&config.profile_opencode_url)
@@ -1235,6 +1229,7 @@ impl AppState {
             profile,
             pending_logins: Arc::new(Mutex::new(HashMap::new())),
             binding_locks: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle_watchers: Arc::new(Mutex::new(HashMap::new())),
             capability_signer,
             github,
         }
@@ -1248,6 +1243,70 @@ impl AppState {
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone()
     }
+
+    pub async fn initialize(&self) -> Result<(), ServiceError> {
+        self.kube.recover_startup().await?;
+        for record in self.kube.list().await? {
+            let id = record.session.id.clone();
+            if record.session.environment_state == "ready"
+                && record.session.opencode_session_id.is_some()
+            {
+                if let Ok(session) = reconcile_binding(self, &id).await {
+                    if binding_is_usable(&session) {
+                        self.ensure_lifecycle_watcher(&id).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_lifecycle_watcher(&self, id: &str) -> Result<(), ServiceError> {
+        let record = self.kube.get(id).await?;
+        if record.session.environment_state != "ready"
+            || record.session.opencode_session_id.is_none()
+            || record.work_state.state == WorkState::Completed
+        {
+            return Ok(());
+        }
+        let mut watchers = self
+            .lifecycle_watchers
+            .lock()
+            .expect("lifecycle watcher map poisoned");
+        if watchers.contains_key(id) {
+            return Ok(());
+        }
+        let (stop, receiver) = watch::channel(false);
+        let watcher_id = uuid::Uuid::new_v4();
+        watchers.insert(id.to_owned(), (watcher_id, stop));
+        let state = self.clone();
+        let session_id = id.to_owned();
+        tokio::spawn(async move {
+            lifecycle_watch_loop(state.clone(), session_id.clone(), receiver).await;
+            let mut watchers = state
+                .lifecycle_watchers
+                .lock()
+                .expect("lifecycle watcher map poisoned");
+            if watchers
+                .get(&session_id)
+                .is_some_and(|(current_id, _)| *current_id == watcher_id)
+            {
+                watchers.remove(&session_id);
+            }
+        });
+        Ok(())
+    }
+
+    async fn stop_lifecycle_watcher(&self, id: &str) {
+        if let Some(stop) = self
+            .lifecycle_watchers
+            .lock()
+            .expect("lifecycle watcher map poisoned")
+            .remove(id)
+        {
+            let _ = stop.1.send(true);
+        }
+    }
 }
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -1256,8 +1315,6 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sessions", post(create).get(enumerate))
         .route("/v1/sessions/:id", get(session).delete(remove))
         .route("/v1/sessions/:id/messages", post(prompt).get(messages))
-        .route("/v1/sessions/:id/report", post(report))
-        .route("/v1/sessions/:id/report-context", get(report_context))
         .route("/v1/sessions/:id/complete", post(complete))
         .route("/v1/sessions/:id/rebind", post(rebind))
         .route("/v1/sessions/:id/status", get(status))
@@ -1474,6 +1531,7 @@ async fn create(
         .await;
         return Err(error);
     }
+    s.ensure_lifecycle_watcher(&id).await?;
     obj = s.kube.get(&id).await?;
     Ok((
         StatusCode::CREATED,
@@ -1589,6 +1647,7 @@ async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceErr
         return Ok(session);
     };
     let previous = record.binding_state;
+    let original_session_id = Some(opencode_id.to_owned());
     let checked_at = chrono_like_now();
     s.kube
         .set_binding_state(
@@ -1684,6 +1743,10 @@ async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceErr
     if let Some(new_id) = rebound_session_id {
         session.opencode_session_id = Some(new_id);
     }
+    if session.opencode_session_id != original_session_id {
+        s.stop_lifecycle_watcher(id).await;
+        s.ensure_lifecycle_watcher(id).await?;
+    }
     Ok(session)
 }
 
@@ -1697,6 +1760,7 @@ async fn rebind(
         .as_deref()
         .map(|prompt| Prompt::new(prompt).map_err(|error| ServiceError::Invalid(error.to_string())))
         .transpose()?;
+    s.stop_lifecycle_watcher(&id).await;
     let lock = s.binding_lock(&id);
     let (new_id, model, checked_at) = {
         let _guard = lock.lock().await;
@@ -1744,6 +1808,7 @@ async fn rebind(
     if let Some(prompt) = prompt {
         let session = s.kube.get(&id).await?.session;
         let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
+        let run_id = begin_run(&s, &id).await?;
         let request_id = new_request_id();
         record_history(
             &s,
@@ -1753,7 +1818,7 @@ async fn rebind(
             Some(request_id.clone()),
             Some(prompt.as_str().into()),
             Some("Anvil controller"),
-            None,
+            Some(run_id),
             None,
             model.as_ref().map(|model| model.qualified_id()),
         )
@@ -1762,6 +1827,7 @@ async fn rebind(
             .prompt_async(&new_id, prompt.as_str(), model.as_ref())
             .await
         {
+            fail_run(&s, &id, error.to_string()).await?;
             record_history(
                 &s,
                 &id,
@@ -1778,7 +1844,9 @@ async fn rebind(
             return Err(error);
         }
     }
-    Ok(Json(reconcile_binding(&s, &id).await?))
+    let session = reconcile_binding(&s, &id).await?;
+    s.ensure_lifecycle_watcher(&id).await?;
+    Ok(Json(session))
 }
 
 async fn enumerate(State(s): State<AppState>) -> Result<Json<Vec<Session>>, ServiceError> {
@@ -1802,36 +1870,36 @@ async fn activity(
     State(s): State<AppState>,
 ) -> Result<Json<SessionActivity>, ServiceError> {
     let object = s.kube.get(&id).await?;
-    let session = reconcile_binding(&s, &id).await?;
+    let mut session = reconcile_binding(&s, &id).await?;
     let operating_mode = Some(object.operating_mode.as_str());
-    let messages = if binding_is_usable(&session) {
+    let (raw_messages, status) = if binding_is_usable(&session) {
         let opencode_id = session.opencode_session_id.as_deref().unwrap();
         let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
         let messages_path = format!("session/{opencode_id}/message");
         let (messages, status) = tokio::join!(
             op.request(&messages_path, reqwest::Method::GET, None),
-            op.request("session/status", reqwest::Method::GET, None),
+            op.status_snapshot(),
         );
-        let messages = messages.unwrap_or_else(|_| Value::Array(Vec::new()));
         let status = status.unwrap_or(Value::Null);
-        build_activity(
-            &session,
-            &session.environment_state,
-            operating_mode,
-            messages,
+        if !status.is_null() {
+            let _ = reconcile_lifecycle_snapshot(&s, &id, opencode_id, &status).await;
+            session = s.kube.get(&id).await?.session;
+        }
+        (
+            messages.unwrap_or_else(|_| Value::Array(Vec::new())),
             status,
-            &s.config,
         )
     } else {
-        build_activity(
-            &session,
-            &session.environment_state,
-            operating_mode,
-            Value::Array(Vec::new()),
-            Value::Null,
-            &s.config,
-        )
+        (Value::Array(Vec::new()), Value::Null)
     };
+    let messages = build_activity(
+        &session,
+        &session.environment_state,
+        operating_mode,
+        raw_messages,
+        status,
+        &s.config,
+    );
     let history = s.history.for_session(&id).await;
     let mut activity = merge_history(messages, &history);
     if !binding_is_usable(&session) && session.opencode_session_id.is_some() {
@@ -1844,7 +1912,11 @@ async fn suspend(
     Path(id): Path<String>,
     State(s): State<AppState>,
 ) -> Result<StatusCode, ServiceError> {
-    s.kube.suspend(&id).await?;
+    s.stop_lifecycle_watcher(&id).await;
+    if let Err(error) = s.kube.suspend(&id).await {
+        let _ = s.ensure_lifecycle_watcher(&id).await;
+        return Err(error);
+    }
     record_history(
         &s,
         &id,
@@ -1877,6 +1949,7 @@ async fn resume(
                 .unwrap_or_else(|| "exact OpenCode session recovery is unavailable".into()),
         ));
     }
+    s.ensure_lifecycle_watcher(&id).await?;
     record_history(
         &s,
         &id,
@@ -1896,7 +1969,11 @@ async fn remove(
     Path(id): Path<String>,
     State(s): State<AppState>,
 ) -> Result<StatusCode, ServiceError> {
-    s.kube.delete(&id).await?;
+    s.stop_lifecycle_watcher(&id).await;
+    if let Err(error) = s.kube.delete(&id).await {
+        let _ = s.ensure_lifecycle_watcher(&id).await;
+        return Err(error);
+    }
     record_history(
         &s,
         &id,
@@ -1926,7 +2003,6 @@ async fn prompt(
                 .unwrap_or_else(|| "exact OpenCode session recovery is unavailable".into()),
         ));
     }
-    let run_id = begin_run(&s, &id).await?;
     let x = s.kube.get(&id).await?.session;
     if !binding_is_usable(&x) {
         return Err(ServiceError::Recovery(
@@ -1939,6 +2015,7 @@ async fn prompt(
         Some(requested) => Some(oc.resolve_model(requested).await?),
         None => None,
     };
+    let run_id = begin_run(&s, &id).await?;
     let request_id = new_request_id();
     record_history(
         &s,
@@ -1963,8 +2040,12 @@ async fn prompt(
         )
         .await
     {
-        Ok(response) => Ok(Json(response)),
+        Ok(response) => {
+            s.ensure_lifecycle_watcher(&id).await?;
+            Ok(Json(response))
+        }
         Err(error) => {
+            fail_run(&s, &id, error.to_string()).await?;
             record_history(
                 &s,
                 &id,
@@ -1983,128 +2064,10 @@ async fn prompt(
     }
 }
 
-fn bearer_token(headers: &HeaderMap) -> Result<&str, ServiceError> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .filter(|value| !value.is_empty())
-        .ok_or(ServiceError::Unauthorized)
-}
-
-async fn authorized_worker_session(
-    s: &AppState,
-    id: &str,
-    headers: &HeaderMap,
-) -> Result<SandboxRecord, ServiceError> {
-    let signer = s
-        .capability_signer
-        .as_ref()
-        .ok_or_else(|| ServiceError::Config("session capabilities are not configured".into()))?;
-    let claims = signer
-        .verify(bearer_token(headers)?)
-        .map_err(|_| ServiceError::Unauthorized)?;
-    if claims.session_id != id || claims.capability != "github-repository" {
-        return Err(ServiceError::Forbidden(
-            "capability is not valid for this session".into(),
-        ));
-    }
-    let object = s.kube.get(id).await?;
-    let session = &object.session;
-    if session.repository != claims.repository {
-        return Err(ServiceError::Forbidden(
-            "capability repository does not match session".into(),
-        ));
-    }
-    Ok(object)
-}
-
-async fn report_context(
-    Path(id): Path<String>,
-    State(s): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ServiceError> {
-    let object = authorized_worker_session(&s, &id, &headers).await?;
-    let work = object.work_state;
-    if work.state == WorkState::Completed {
-        return Err(ServiceError::Conflict("session is completed".into()));
-    }
-    let run_id = work
-        .run_id
-        .ok_or_else(|| ServiceError::Conflict("session has no current run".into()))?;
-    Ok(Json(json!({"session_id":id,"run_id":run_id})))
-}
-
-async fn report(
-    Path(id): Path<String>,
-    State(s): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<ReportRequest>,
-) -> Result<Json<ReportResponse>, ServiceError> {
-    let object = authorized_worker_session(&s, &id, &headers).await?;
-    let work = object.work_state;
-    let disposition = match request.disposition.parse::<WorkerDisposition>() {
-        Ok(disposition) => disposition,
-        Err(_) => {
-            return Err(ServiceError::Invalid(
-                "disposition must be ready_for_review or awaiting_input".into(),
-            ))
-        }
-    };
-    if work.run_id.as_deref() != Some(request.run_id.as_str()) {
-        return Err(ServiceError::Conflict(
-            "report run is stale or is not current".into(),
-        ));
-    }
-    let state = validate_worker_transition(work.state, disposition)
-        .map_err(|error| ServiceError::Conflict(error.to_string()))?;
-    let summary = normalize_summary(request.summary.as_deref())
-        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-    let changed_at = chrono_like_now();
-    let finished = work.current_run.map(|mut run| {
-        run.state = "completed".into();
-        run.finished_at = Some(changed_at.clone());
-        run
-    });
-    s.kube
-        .set_work_state(
-            &id,
-            &WorkStateRecord {
-                state,
-                changed_at: changed_at.clone(),
-                summary,
-                run_id: Some(request.run_id.clone()),
-                current_run: None,
-                last_run: finished.or(work.last_run),
-            },
-        )
-        .await?;
-    record_history(
-        &s,
-        &id,
-        "worker_reported",
-        changed_at.clone(),
-        None,
-        None,
-        Some("Sandbox worker"),
-        Some(request.run_id.clone()),
-        Some(state.as_str().into()),
-        None,
-    )
-    .await;
-    Ok(Json(ReportResponse {
-        accepted: true,
-        session_id: id,
-        run_id: request.run_id,
-        work_state: state.as_str().into(),
-        work_state_changed_at: changed_at,
-    }))
-}
-
 async fn complete(
     Path(id): Path<String>,
     State(s): State<AppState>,
-) -> Result<Json<ReportResponse>, ServiceError> {
+) -> Result<Json<Value>, ServiceError> {
     let object = s.kube.get(&id).await?;
     let work = object.work_state;
     if work.state != WorkState::ReadyForReview {
@@ -2129,6 +2092,7 @@ async fn complete(
             },
         )
         .await?;
+    s.stop_lifecycle_watcher(&id).await;
     record_history(
         &s,
         &id,
@@ -2142,13 +2106,13 @@ async fn complete(
         None,
     )
     .await;
-    Ok(Json(ReportResponse {
-        accepted: true,
-        session_id: id,
-        run_id,
-        work_state: WorkState::Completed.as_str().into(),
-        work_state_changed_at: changed_at,
-    }))
+    Ok(Json(json!({
+        "accepted": true,
+        "session_id": id,
+        "run_id": run_id,
+        "work_state": WorkState::Completed.as_str(),
+        "work_state_changed_at": changed_at,
+    })))
 }
 
 async fn begin_run(s: &AppState, id: &str) -> Result<String, ServiceError> {
@@ -2198,6 +2162,322 @@ async fn begin_run(s: &AppState, id: &str) -> Result<String, ServiceError> {
     .await;
     Ok(run_id)
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenCodeLifecycleSignal {
+    Busy,
+    Idle,
+    Error(String),
+}
+
+fn transition_run(
+    current: &WorkStateRecord,
+    signal: OpenCodeLifecycleSignal,
+    at: &str,
+) -> WorkStateRecord {
+    if current.state == WorkState::Completed {
+        return current.clone();
+    }
+    match signal {
+        OpenCodeLifecycleSignal::Busy => {
+            let mut next = current.clone();
+            if next
+                .current_run
+                .as_ref()
+                .is_none_or(|run| run.state != "running")
+            {
+                let run = Run {
+                    id: new_run_id(),
+                    state: "running".into(),
+                    started_at: at.into(),
+                    finished_at: None,
+                };
+                next.run_id = Some(run.id.clone());
+                next.current_run = Some(run);
+                next.summary = None;
+            }
+            next.state = WorkState::InProgress;
+            next.changed_at = at.into();
+            next
+        }
+        OpenCodeLifecycleSignal::Idle => {
+            if current.current_run.is_none() && current.state != WorkState::InProgress {
+                return current.clone();
+            }
+            let mut next = current.clone();
+            if let Some(mut run) = next.current_run.take() {
+                run.state = "completed".into();
+                run.finished_at = Some(at.into());
+                next.last_run = Some(run);
+            }
+            next.state = WorkState::ReadyForReview;
+            next.changed_at = at.into();
+            next
+        }
+        OpenCodeLifecycleSignal::Error(detail) => {
+            let mut next = current.clone();
+            let mut run = next.current_run.take().unwrap_or_else(|| Run {
+                id: next.run_id.clone().unwrap_or_else(new_run_id),
+                state: "running".into(),
+                started_at: at.into(),
+                finished_at: None,
+            });
+            run.state = "failed".into();
+            run.finished_at = Some(at.into());
+            next.run_id = Some(run.id.clone());
+            next.last_run = Some(run);
+            next.state = WorkState::Failed;
+            next.changed_at = at.into();
+            next.summary = Some(detail);
+            next
+        }
+    }
+}
+
+fn lifecycle_event(value: &Value) -> Option<(String, OpenCodeLifecycleSignal)> {
+    let value = value.get("payload").unwrap_or(value);
+    let properties = value.get("properties")?;
+    let session_id = properties.get("sessionID")?.as_str()?.to_owned();
+    match value.get("type")?.as_str()? {
+        "session.status" => match properties
+            .get("status")
+            .and_then(|status| status.get("type"))
+            .and_then(Value::as_str)?
+        {
+            "busy" => Some((session_id, OpenCodeLifecycleSignal::Busy)),
+            "idle" => Some((session_id, OpenCodeLifecycleSignal::Idle)),
+            _ => None,
+        },
+        "session.idle" => Some((session_id, OpenCodeLifecycleSignal::Idle)),
+        "session.error" => {
+            let error = properties.get("error").unwrap_or(&Value::Null);
+            let detail = error
+                .get("data")
+                .and_then(|data| data.get("message"))
+                .and_then(Value::as_str)
+                .or_else(|| error.get("message").and_then(Value::as_str))
+                .map(str::to_owned)
+                .unwrap_or_else(|| error.to_string());
+            Some((session_id, OpenCodeLifecycleSignal::Error(detail)))
+        }
+        _ => None,
+    }
+}
+
+fn snapshot_signal(snapshot: &Value, session_id: &str) -> Option<OpenCodeLifecycleSignal> {
+    let Some(value) = snapshot.get(session_id) else {
+        // OpenCode's status endpoint omits idle sessions and only returns
+        // entries for sessions with active status. A successful snapshot for
+        // the bound session therefore reconciles a missing entry as idle.
+        return snapshot.as_object().map(|_| OpenCodeLifecycleSignal::Idle);
+    };
+    if value.get("error").is_some() {
+        return Some(OpenCodeLifecycleSignal::Error(
+            value.get("error")?.to_string(),
+        ));
+    }
+    match value.get("type")?.as_str()? {
+        "busy" => Some(OpenCodeLifecycleSignal::Busy),
+        "idle" => Some(OpenCodeLifecycleSignal::Idle),
+        _ => None,
+    }
+}
+
+async fn apply_lifecycle_signal(
+    state: &AppState,
+    anvil_session_id: &str,
+    opencode_session_id: &str,
+    signal: OpenCodeLifecycleSignal,
+) -> Result<(), ServiceError> {
+    let record = state.kube.get(anvil_session_id).await?;
+    if record.session.opencode_session_id.as_deref() != Some(opencode_session_id)
+        || record.session.environment_state != "ready"
+        || record.work_state.state == WorkState::Completed
+    {
+        return Ok(());
+    }
+    let at = chrono_like_now();
+    let previous_state = record.work_state.state;
+    let run_id = record.work_state.run_id.clone();
+    let next = transition_run(&record.work_state, signal.clone(), &at);
+    if previous_state == next.state
+        && run_id == next.run_id
+        && record.work_state.current_run == next.current_run
+        && record.work_state.summary == next.summary
+    {
+        return Ok(());
+    }
+    state.kube.set_work_state(anvil_session_id, &next).await?;
+    let (kind, detail) = match signal {
+        OpenCodeLifecycleSignal::Busy => ("run_started", None),
+        OpenCodeLifecycleSignal::Idle => ("opencode_idle", None),
+        OpenCodeLifecycleSignal::Error(detail) => ("opencode_error", Some(detail)),
+    };
+    record_history(
+        state,
+        anvil_session_id,
+        kind,
+        at,
+        None,
+        None,
+        Some("OpenCode lifecycle"),
+        next.run_id,
+        detail,
+        record.session.model,
+    )
+    .await;
+    Ok(())
+}
+
+async fn reconcile_lifecycle_snapshot(
+    state: &AppState,
+    anvil_session_id: &str,
+    opencode_session_id: &str,
+    snapshot: &Value,
+) -> Result<(), ServiceError> {
+    if let Some(signal) = snapshot_signal(snapshot, opencode_session_id) {
+        apply_lifecycle_signal(state, anvil_session_id, opencode_session_id, signal).await?;
+    }
+    Ok(())
+}
+
+async fn lifecycle_watch_loop(
+    state: AppState,
+    anvil_session_id: String,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut delay = Duration::from_millis(100);
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        let record = match state.kube.get(&anvil_session_id).await {
+            Ok(record) => record,
+            Err(_) => return,
+        };
+        if record.session.environment_state != "ready"
+            || record.work_state.state == WorkState::Completed
+        {
+            return;
+        }
+        let Some(opencode_session_id) = record.session.opencode_session_id.clone() else {
+            return;
+        };
+        let op = OpenCode::new(
+            service_url(&record.session, &state.config),
+            state.config.request_timeout,
+        );
+        let mut response = tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() { return; }
+                continue;
+            }
+            response = op.event_stream() => response,
+        };
+        if let Ok(stream) = response.as_mut() {
+            if let Ok(snapshot) = op.status_snapshot().await {
+                let _ = reconcile_lifecycle_snapshot(
+                    &state,
+                    &anvil_session_id,
+                    &opencode_session_id,
+                    &snapshot,
+                )
+                .await;
+            }
+            let mut buffer = Vec::new();
+            loop {
+                let chunk = tokio::select! {
+                    changed = stop.changed() => {
+                        if changed.is_err() || *stop.borrow() { return; }
+                        continue;
+                    }
+                    chunk = stream.chunk() => chunk,
+                };
+                match chunk {
+                    Ok(Some(bytes)) => {
+                        buffer.extend_from_slice(&bytes);
+                        while let Some((end, separator)) = sse_frame_boundary(&buffer) {
+                            let frame = buffer.drain(..end + separator).collect::<Vec<_>>();
+                            if let Some(value) = parse_sse_frame(&frame) {
+                                if let Some((event_session, signal)) = lifecycle_event(&value) {
+                                    if event_session == opencode_session_id {
+                                        let _ = apply_lifecycle_signal(
+                                            &state,
+                                            &anvil_session_id,
+                                            &event_session,
+                                            signal,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+        // A dropped SSE connection is only a transport interruption. Reconcile
+        // with the status endpoint before retrying; never synthesize failure.
+        if let Ok(snapshot) = op.status_snapshot().await {
+            let _ = reconcile_lifecycle_snapshot(
+                &state,
+                &anvil_session_id,
+                &opencode_session_id,
+                &snapshot,
+            )
+            .await;
+        }
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() { return; }
+            }
+            _ = tokio::time::sleep(delay) => {}
+        }
+        delay = (delay * 2).min(Duration::from_secs(5));
+    }
+}
+
+fn parse_sse_frame(frame: &[u8]) -> Option<Value> {
+    let text = String::from_utf8_lossy(frame);
+    let data = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.is_empty() || data == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str(&data).ok()
+}
+
+fn sse_frame_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| (index, 2));
+    let crlf = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| (index, 4));
+    match (lf, crlf) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(boundary), None) | (None, Some(boundary)) => Some(boundary),
+        (None, None) => None,
+    }
+}
+
+async fn fail_run(s: &AppState, id: &str, detail: String) -> Result<(), ServiceError> {
+    let record = s.kube.get(id).await?;
+    let next = transition_run(
+        &record.work_state,
+        OpenCodeLifecycleSignal::Error(detail),
+        &chrono_like_now(),
+    );
+    s.kube.set_work_state(id, &next).await
+}
+
 async fn proxy(
     Path(id): Path<String>,
     State(s): State<AppState>,
@@ -2257,9 +2537,17 @@ async fn status(
             "session_binding_recovery_event": x.session_binding_recovery_event,
         })));
     }
-    let v = OpenCode::new(service_url(&x, &s.config), s.config.request_timeout)
+    let op = OpenCode::new(service_url(&x, &s.config), s.config.request_timeout);
+    let v = op
         .request("session/status", reqwest::Method::GET, None)
         .await?;
+    let opencode_session_id = x
+        .opencode_session_id
+        .as_deref()
+        .ok_or(ServiceError::NotFound)?
+        .to_owned();
+    reconcile_lifecycle_snapshot(&s, &id, &opencode_session_id, &v).await?;
+    let x = s.kube.get(&id).await?.session;
     let selected = v
         .get(
             &x.opencode_session_id
@@ -2268,9 +2556,9 @@ async fn status(
         )
         .cloned()
         .unwrap_or(Value::Null);
-    let execution_state = if status_is_busy(&v, x.opencode_session_id.as_deref().unwrap_or("")) {
+    let execution_state = if status_is_busy(&v, &opencode_session_id) {
         "running"
-    } else if selected.get("error").is_some() {
+    } else if x.work_state == WorkState::Failed.as_str() || selected.get("error").is_some() {
         "failed"
     } else {
         "idle"
@@ -2296,11 +2584,59 @@ async fn status(
     })))
 }
 async fn diff(
-    p: Path<String>,
+    Path(id): Path<String>,
     Query(q): Query<DiffQuery>,
-    s: State<AppState>,
+    State(s): State<AppState>,
 ) -> Result<Json<Value>, ServiceError> {
-    proxy(p, s, "diff", reqwest::Method::GET, q.message_id.as_deref()).await
+    let session = reconcile_binding(&s, &id).await?;
+    if !binding_is_usable(&session) {
+        return Err(ServiceError::Recovery(
+            session
+                .session_binding_error
+                .unwrap_or_else(|| "exact OpenCode session recovery is unavailable".into()),
+        ));
+    }
+    let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
+    let opencode_session_id = session
+        .opencode_session_id
+        .as_deref()
+        .ok_or(ServiceError::NotFound)?;
+    let mut result = op
+        .request(
+            &format!(
+                "session/{opencode_session_id}/diff{}",
+                q.message_id
+                    .as_deref()
+                    .map(|id| format!("?messageID={id}"))
+                    .unwrap_or_default()
+            ),
+            reqwest::Method::GET,
+            None,
+        )
+        .await?;
+    if result.as_array().is_some_and(Vec::is_empty) {
+        let messages = op
+            .request(
+                &format!("session/{opencode_session_id}/message"),
+                reqwest::Method::GET,
+                None,
+            )
+            .await?;
+        let diffs = message_items(messages)
+            .into_iter()
+            .filter_map(|message| {
+                let info = message.get("info").unwrap_or(&message);
+                info.pointer("/summary/diffs")
+                    .and_then(Value::as_array)
+                    .cloned()
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        if !diffs.is_empty() {
+            result = Value::Array(diffs);
+        }
+    }
+    Ok(Json(result))
 }
 async fn abort(p: Path<String>, s: State<AppState>) -> Result<Json<Value>, ServiceError> {
     proxy(p, s, "abort", reqwest::Method::POST, None).await
@@ -2456,25 +2792,21 @@ fn status_is_busy(status: &Value, session_id: &str) -> bool {
         == Some("busy")
 }
 
-fn execution_state(
-    status: &Value,
-    session_id: Option<&str>,
-    requests: &[SessionRequest],
-) -> &'static str {
-    if session_id.is_some_and(|id| status_is_busy(status, id))
-        || requests
-            .last()
-            .is_some_and(|request| request.state == "running")
-    {
-        "running"
-    } else if requests
-        .last()
-        .is_some_and(|request| request.state == "failed")
-    {
-        "failed"
-    } else {
-        "idle"
+fn execution_state(status: &Value, session_id: Option<&str>) -> &'static str {
+    if !status.is_object() {
+        return "unavailable";
     }
+    if let Some(current) = session_id.and_then(|id| status.get(id)) {
+        if current.get("error").is_some() {
+            return "failed";
+        }
+        return match current.get("type").and_then(Value::as_str) {
+            Some("busy") => "running",
+            Some("idle") => "idle",
+            _ => "idle",
+        };
+    }
+    "idle"
 }
 
 fn build_activity(
@@ -2497,6 +2829,7 @@ fn build_activity(
         .opencode_session_id
         .as_deref()
         .is_some_and(|id| status_is_busy(&status, id));
+    let status_available = status.is_object();
     let mut requests = Vec::with_capacity(user_messages.len());
     let mut lifecycle = Vec::new();
 
@@ -2530,9 +2863,15 @@ fn build_activity(
                 .unwrap_or_else(|| session.created_at.clone().unwrap_or_default());
         let assistant = assistant_for(&messages, &id);
         let assistant_info = assistant.map(|value| value.get("info").unwrap_or(value));
-        let completed_at = assistant_info.and_then(|value| {
-            timestamp_from_value(value.get("time").and_then(|time| time.get("completed")))
-        });
+        let completed_at = assistant_info
+            .and_then(|value| {
+                timestamp_from_value(value.get("time").and_then(|time| time.get("completed")))
+            })
+            .or_else(|| {
+                (status_available && !busy)
+                    .then(|| session.work_state_changed_at.clone())
+                    .flatten()
+            });
         let started_ms = timestamp_millis(info.get("time").and_then(|time| time.get("created")));
         let completed_ms = assistant_info.and_then(|value| {
             timestamp_millis(value.get("time").and_then(|time| time.get("completed")))
@@ -2595,32 +2934,41 @@ fn build_activity(
         requests.push(request);
     }
 
-    let current = requests.last().filter(|request| request.state == "running");
-    let request_state = requests.last().map_or_else(
-        || "idle".into(),
-        |request| {
-            if request.state == "failed" {
-                "failed".into()
-            } else if request.state == "running" {
-                "running".into()
-            } else {
-                "idle".into()
-            }
-        },
-    );
+    let current = busy
+        .then(|| requests.last().filter(|request| request.state == "running"))
+        .flatten();
+    let request_state = if session.work_state == WorkState::Failed.as_str()
+        || requests
+            .last()
+            .is_some_and(|request| request.state == "failed")
+    {
+        "failed"
+    } else if busy {
+        "running"
+    } else if status_available {
+        "idle"
+    } else {
+        "unavailable"
+    }
+    .to_owned();
     let state = if operating_mode == Some("Suspended") {
         "stopped"
     } else if session.environment_state == "failed" {
         "failed"
     } else if session.environment_state != "ready" || session.opencode_session_id.is_none() {
         "starting"
-    } else if current.is_some() || busy {
-        "active"
-    } else if requests
-        .last()
-        .is_some_and(|request| request.state == "failed")
+    } else if session.work_state == WorkState::Completed.as_str() {
+        "done"
+    } else if session.work_state == WorkState::Failed.as_str()
+        || requests
+            .last()
+            .is_some_and(|request| request.state == "failed")
     {
         "failed"
+    } else if busy {
+        "active"
+    } else if !status_available {
+        "starting"
     } else {
         "idle"
     };
@@ -2646,8 +2994,11 @@ fn build_activity(
     } else {
         session.environment_state.as_str()
     };
-    let execution_state =
-        execution_state(&status, session.opencode_session_id.as_deref(), &requests);
+    let execution_state = if session.work_state == WorkState::Failed.as_str() && !busy {
+        "failed"
+    } else {
+        execution_state(&status, session.opencode_session_id.as_deref())
+    };
     SessionActivity {
         session: session.clone(),
         state: state.into(),
@@ -3193,6 +3544,33 @@ impl OpenCode {
             .await
             .map(|_| ())
     }
+    async fn status_snapshot(&self) -> Result<Value, ServiceError> {
+        self.request("session/status", reqwest::Method::GET, None)
+            .await
+    }
+    async fn event_stream(&self) -> Result<reqwest::Response, ServiceError> {
+        let url = self
+            .base
+            .join("event")
+            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+        let response = client
+            .get(url)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .send()
+            .await
+            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(ServiceError::OpenCode(format!(
+                "OpenCode event stream returned HTTP {}",
+                response.status()
+            )));
+        }
+        Ok(response)
+    }
     async fn session_exists(&self, id: &str) -> Result<bool, ServiceError> {
         match self
             .request(&format!("session/{id}"), reqwest::Method::GET, None)
@@ -3325,8 +3703,33 @@ mod tests {
         object: DynamicObject,
     }
 
-    struct ReportSandbox {
-        object: Arc<Mutex<DynamicObject>>,
+    struct LifecycleSandbox {
+        record: Arc<Mutex<SandboxRecord>>,
+    }
+
+    async fn fixture_session_exists() -> Json<Value> {
+        Json(json!({"id":"ses_demo"}))
+    }
+
+    async fn fixture_session_status(
+        State(calls): State<Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> Json<Value> {
+        let snapshot = if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            json!({"ses_demo":{"type":"busy"}})
+        } else {
+            json!({})
+        };
+        Json(snapshot)
+    }
+
+    async fn fixture_events() -> Response {
+        let body =
+            "data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"other-session\",\"status\":{\"type\":\"busy\"}}}\n\n";
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            body,
+        )
+            .into_response()
     }
 
     #[async_trait]
@@ -3477,16 +3880,13 @@ mod tests {
     }
 
     #[async_trait]
-    impl SandboxApi for ReportSandbox {
+    impl SandboxApi for LifecycleSandbox {
         async fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError> {
-            Ok(vec![sandbox_record_from(
-                &self
-                    .object
-                    .lock()
-                    .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?
-                    .clone(),
-                &config("http://profile.test".into()),
-            )?])
+            Ok(vec![self
+                .record
+                .lock()
+                .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?
+                .clone()])
         }
 
         async fn create(
@@ -3495,14 +3895,24 @@ mod tests {
             _request: &CreateRequest,
             _sandbox_env: &[(String, String)],
         ) -> Result<Session, ServiceError> {
-            Err(ServiceError::Invalid("not used in report tests".into()))
+            Err(ServiceError::Invalid("not used in lifecycle tests".into()))
         }
 
         async fn suspend(&self, _id: &str) -> Result<(), ServiceError> {
+            self.record
+                .lock()
+                .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?
+                .session
+                .environment_state = "suspended".into();
             Ok(())
         }
 
         async fn resume(&self, _id: &str) -> Result<(), ServiceError> {
+            self.record
+                .lock()
+                .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?
+                .session
+                .environment_state = "ready".into();
             Ok(())
         }
 
@@ -3513,46 +3923,38 @@ mod tests {
         async fn set_work_state(
             &self,
             _id: &str,
-            state: &WorkStateRecord,
+            value: &WorkStateRecord,
         ) -> Result<(), ServiceError> {
-            let mut object = self
-                .object
+            let mut record = self
+                .record
                 .lock()
                 .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?;
-            let annotations = object
-                .metadata
-                .annotations
-                .get_or_insert_with(BTreeMap::new);
-            annotations.insert(
-                "anvil.example/work-state".into(),
-                state.state.as_str().into(),
-            );
-            annotations.insert(
-                "anvil.example/work-state-changed-at".into(),
-                state.changed_at.clone(),
-            );
-            if let Some(summary) = &state.summary {
-                annotations.insert("anvil.example/work-state-summary".into(), summary.clone());
-            } else {
-                annotations.remove("anvil.example/work-state-summary");
-            }
-            if let Some(run_id) = &state.run_id {
-                annotations.insert("anvil.example/work-state-run-id".into(), run_id.clone());
-            }
-            if let Some(run) = &state.current_run {
-                annotations.insert(
-                    "anvil.example/run-current".into(),
-                    serde_json::to_string(run).unwrap(),
-                );
-            } else {
-                annotations.remove("anvil.example/run-current");
-            }
-            if let Some(run) = &state.last_run {
-                annotations.insert(
-                    "anvil.example/run-last".into(),
-                    serde_json::to_string(run).unwrap(),
-                );
-            }
+            record.work_state = value.clone();
+            record.session.work_state = value.state.as_str().into();
+            record.session.work_state_changed_at = Some(value.changed_at.clone());
+            record.session.work_state_summary = value.summary.clone();
+            record.session.work_state_run_id = value.run_id.clone();
+            record.session.current_run = value.current_run.clone();
+            record.session.last_run = value.last_run.clone();
+            Ok(())
+        }
+
+        async fn set_binding_state(
+            &self,
+            _id: &str,
+            value: &BindingStateRecord,
+        ) -> Result<(), ServiceError> {
+            let mut record = self
+                .record
+                .lock()
+                .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?;
+            record.binding_state = value.clone();
+            record.session.session_binding_state = value.state.clone();
+            record.session.session_binding_continuity = value.continuity.clone();
+            record.session.session_binding_error = value.error.clone();
+            record.session.previous_opencode_session_id = value.previous_session_id.clone();
+            record.session.session_binding_recovery_event = value.recovery_event.clone();
+            record.session.session_binding_checked_at = Some(value.checked_at.clone());
             Ok(())
         }
     }
@@ -3617,6 +4019,388 @@ mod tests {
             previous_opencode_session_id: None,
             session_binding_recovery_event: None,
         }
+    }
+
+    fn active_work_record(session: Session) -> SandboxRecord {
+        let changed_at = "2026-01-01T10:00:00Z".to_owned();
+        let run = Run {
+            id: "run_test".into(),
+            state: "running".into(),
+            started_at: changed_at.clone(),
+            finished_at: None,
+        };
+        let mut session = session;
+        session.environment_state = "ready".into();
+        session.work_state = WorkState::InProgress.as_str().into();
+        session.work_state_changed_at = Some(changed_at.clone());
+        session.work_state_run_id = Some(run.id.clone());
+        session.current_run = Some(run.clone());
+        session.session_binding_state = "available".into();
+        SandboxRecord {
+            session,
+            work_state: WorkStateRecord {
+                state: WorkState::InProgress,
+                changed_at,
+                summary: None,
+                run_id: Some(run.id.clone()),
+                current_run: Some(run),
+                last_run: None,
+            },
+            binding_state: BindingStateRecord {
+                state: "available".into(),
+                continuity: "exact".into(),
+                checked_at: "2026-01-01T10:00:00Z".into(),
+                error: None,
+                previous_session_id: None,
+                recovery_event: None,
+            },
+            operating_mode: "Running".into(),
+            created_at: "2026-01-01T10:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn lifecycle_runs_start_work_idle_finalize_follow_up_and_error() {
+        let record = active_work_record(activity_session());
+        let busy = transition_run(
+            &record.work_state,
+            OpenCodeLifecycleSignal::Busy,
+            "2026-01-01T10:01:00Z",
+        );
+        assert_eq!(busy.state, WorkState::InProgress);
+        assert_eq!(busy.current_run.as_ref().unwrap().state, "running");
+
+        let idle = transition_run(&busy, OpenCodeLifecycleSignal::Idle, "2026-01-01T10:02:00Z");
+        assert_eq!(idle.state, WorkState::ReadyForReview);
+        assert!(idle.current_run.is_none());
+        assert_eq!(idle.last_run.as_ref().unwrap().state, "completed");
+        assert_eq!(
+            idle.last_run.as_ref().unwrap().finished_at.as_deref(),
+            Some("2026-01-01T10:02:00Z")
+        );
+
+        let follow_up =
+            transition_run(&idle, OpenCodeLifecycleSignal::Busy, "2026-01-01T10:03:00Z");
+        assert_eq!(follow_up.state, WorkState::InProgress);
+        assert!(follow_up.current_run.as_ref().unwrap().state == "running");
+        assert_ne!(follow_up.run_id, idle.run_id);
+
+        let failed = transition_run(
+            &follow_up,
+            OpenCodeLifecycleSignal::Error("model worker failed".into()),
+            "2026-01-01T10:04:00Z",
+        );
+        assert_eq!(failed.state, WorkState::Failed);
+        assert!(failed.current_run.is_none());
+        assert_eq!(failed.last_run.as_ref().unwrap().state, "failed");
+        assert_eq!(failed.summary.as_deref(), Some("model worker failed"));
+        assert!(failed.last_run.as_ref().unwrap().finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn bound_lifecycle_events_drive_submitted_runs_without_model_reporting() {
+        let mut test_config = config("http://profile.test".into());
+        test_config.history_path =
+            std::env::temp_dir().join(format!("anvil-lifecycle-{}.jsonl", uuid::Uuid::new_v4()));
+        let record = Arc::new(Mutex::new(active_work_record(activity_session())));
+        let state = AppState::new(
+            test_config,
+            LifecycleSandbox {
+                record: record.clone(),
+            },
+        );
+
+        let run_id = begin_run(&state, "demo-12345678").await.unwrap();
+        {
+            let active = record.lock().unwrap();
+            assert_eq!(active.work_state.state, WorkState::InProgress);
+            assert_eq!(active.work_state.current_run.as_ref().unwrap().id, run_id);
+        }
+
+        let (session_id, busy) = lifecycle_event(&json!({
+            "type":"session.status",
+            "properties":{"sessionID":"ses_demo","status":{"type":"busy"}}
+        }))
+        .unwrap();
+        apply_lifecycle_signal(&state, "demo-12345678", &session_id, busy)
+            .await
+            .unwrap();
+        assert_eq!(
+            record.lock().unwrap().work_state.state,
+            WorkState::InProgress
+        );
+
+        let (session_id, idle) = lifecycle_event(&json!({
+            "type":"session.status",
+            "properties":{"sessionID":"ses_demo","status":{"type":"idle"}}
+        }))
+        .unwrap();
+        apply_lifecycle_signal(&state, "demo-12345678", &session_id, idle)
+            .await
+            .unwrap();
+        {
+            let finished = record.lock().unwrap();
+            assert_eq!(finished.work_state.state, WorkState::ReadyForReview);
+            assert!(finished.work_state.current_run.is_none());
+            assert_eq!(
+                finished.work_state.last_run.as_ref().unwrap().state,
+                "completed"
+            );
+        }
+
+        let follow_up = begin_run(&state, "demo-12345678").await.unwrap();
+        assert_ne!(follow_up, run_id);
+        let (session_id, legacy_idle) = lifecycle_event(&json!({
+            "type":"session.idle",
+            "properties":{"sessionID":"ses_demo"}
+        }))
+        .unwrap();
+        apply_lifecycle_signal(&state, "demo-12345678", &session_id, legacy_idle)
+            .await
+            .unwrap();
+        assert_eq!(
+            record.lock().unwrap().work_state.state,
+            WorkState::ReadyForReview
+        );
+
+        begin_run(&state, "demo-12345678").await.unwrap();
+        let (session_id, error) = lifecycle_event(&json!({
+            "type":"session.error",
+            "properties":{"sessionID":"ses_demo","error":{"data":{"message":"worker error"}}}
+        }))
+        .unwrap();
+        apply_lifecycle_signal(&state, "demo-12345678", &session_id, error)
+            .await
+            .unwrap();
+        let failed = record.lock().unwrap();
+        assert_eq!(failed.work_state.state, WorkState::Failed);
+        assert_eq!(failed.work_state.last_run.as_ref().unwrap().state, "failed");
+        assert_eq!(failed.work_state.summary.as_deref(), Some("worker error"));
+    }
+
+    #[test]
+    fn lifecycle_parser_accepts_status_legacy_idle_error_and_nested_payload() {
+        let (id, busy) = lifecycle_event(&json!({
+            "payload": {
+                "type":"session.status",
+                "properties":{"sessionID":"ses_demo","status":{"type":"busy"}}
+            }
+        }))
+        .unwrap();
+        assert_eq!(id, "ses_demo");
+        assert_eq!(busy, OpenCodeLifecycleSignal::Busy);
+        assert_eq!(
+            lifecycle_event(&json!({
+                "type":"session.status",
+                "properties":{"sessionID":"ses_demo","status":{"type":"idle"}}
+            }))
+            .unwrap()
+            .1,
+            OpenCodeLifecycleSignal::Idle
+        );
+        assert_eq!(
+            lifecycle_event(&json!({
+                "type":"session.idle",
+                "properties":{"sessionID":"ses_demo"}
+            }))
+            .unwrap()
+            .1,
+            OpenCodeLifecycleSignal::Idle
+        );
+        assert_eq!(
+            lifecycle_event(&json!({
+                "type":"session.error",
+                "properties":{"sessionID":"ses_demo","error":{"data":{"message":"failed"}}}
+            }))
+            .unwrap()
+            .1,
+            OpenCodeLifecycleSignal::Error("failed".into())
+        );
+        let crlf_frame = b"event: message\r\ndata: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_demo\"}}\r\n\r\n";
+        let (session_id, signal) = lifecycle_event(&parse_sse_frame(crlf_frame).unwrap()).unwrap();
+        assert_eq!(session_id, "ses_demo");
+        assert_eq!(signal, OpenCodeLifecycleSignal::Idle);
+    }
+
+    #[tokio::test]
+    async fn status_snapshot_repairs_missed_idle_and_unrelated_session_events_are_ignored() {
+        let mock = MockServer::start();
+        mock.mock(|when, then| {
+            when.method(GET).path("/session/ses_demo");
+            then.status(200).json_body(json!({"id":"ses_demo"}));
+        });
+        mock.mock(|when, then| {
+            when.method(GET).path("/session/status");
+            then.status(200).json_body(json!({}));
+        });
+        let mut test_config = config("http://profile.test".into());
+        test_config.opencode_port = mock.port();
+        let mut session = activity_session();
+        session.service = "127.0.0.1".into();
+        session.opencode_port = mock.port();
+        let record = Arc::new(Mutex::new(active_work_record(session)));
+        let state = AppState::new(
+            test_config,
+            LifecycleSandbox {
+                record: record.clone(),
+            },
+        );
+
+        apply_lifecycle_signal(
+            &state,
+            "demo-12345678",
+            "another-session",
+            OpenCodeLifecycleSignal::Idle,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            record.lock().unwrap().work_state.state,
+            WorkState::InProgress
+        );
+
+        let session = record.lock().unwrap().session.clone();
+        reconcile_binding(&state, &session.id).await.unwrap();
+        let snapshot = OpenCode::new(service_url(&session, &state.config), Duration::from_secs(3))
+            .status_snapshot()
+            .await
+            .unwrap();
+        reconcile_lifecycle_snapshot(&state, &session.id, "ses_demo", &snapshot)
+            .await
+            .unwrap();
+        let record = record.lock().unwrap();
+        assert_eq!(record.work_state.state, WorkState::ReadyForReview);
+        assert!(record.work_state.current_run.is_none());
+        assert_eq!(
+            record.work_state.last_run.as_ref().unwrap().state,
+            "completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_watcher_is_unique_and_stops_on_suspend_then_restarts_on_resume() {
+        let mut test_config = config("http://profile.test".into());
+        test_config.opencode_port = 1;
+        let mut session = activity_session();
+        session.service = "127.0.0.1".into();
+        session.opencode_port = 1;
+        let record = Arc::new(Mutex::new(active_work_record(session)));
+        let sandbox = LifecycleSandbox {
+            record: record.clone(),
+        };
+        let state = AppState::new(test_config, sandbox);
+        state
+            .ensure_lifecycle_watcher("demo-12345678")
+            .await
+            .unwrap();
+        state
+            .ensure_lifecycle_watcher("demo-12345678")
+            .await
+            .unwrap();
+        assert_eq!(state.lifecycle_watchers.lock().unwrap().len(), 1);
+
+        state.stop_lifecycle_watcher("demo-12345678").await;
+        record.lock().unwrap().session.environment_state = "suspended".into();
+        state
+            .ensure_lifecycle_watcher("demo-12345678")
+            .await
+            .unwrap();
+        assert!(state.lifecycle_watchers.lock().unwrap().is_empty());
+
+        record.lock().unwrap().session.environment_state = "ready".into();
+        state
+            .ensure_lifecycle_watcher("demo-12345678")
+            .await
+            .unwrap();
+        assert_eq!(state.lifecycle_watchers.lock().unwrap().len(), 1);
+        state.stop_lifecycle_watcher("demo-12345678").await;
+        assert!(state.lifecycle_watchers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn public_status_returns_idle_with_finalized_current_run() {
+        let mock = MockServer::start();
+        mock.mock(|when, then| {
+            when.method(GET).path("/session/ses_demo");
+            then.status(200).json_body(json!({"id":"ses_demo"}));
+        });
+        mock.mock(|when, then| {
+            when.method(GET).path("/session/status");
+            then.status(200).json_body(json!({}));
+        });
+        let mut test_config = config("http://profile.test".into());
+        test_config.opencode_port = mock.port();
+        let mut session = activity_session();
+        session.service = "127.0.0.1".into();
+        session.opencode_port = mock.port();
+        let record = Arc::new(Mutex::new(active_work_record(session)));
+        let app = router(AppState::new(
+            test_config,
+            LifecycleSandbox {
+                record: record.clone(),
+            },
+        ));
+        let response = app
+            .oneshot(
+                Request::get("/v1/sessions/demo-12345678/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_response(response).await;
+        assert_eq!(body["execution_state"], "idle");
+        assert_eq!(body["work_state"], "ready_for_review");
+        assert!(body["current_run"].is_null());
+        assert_eq!(body["last_run"]["state"], "completed");
+    }
+
+    #[tokio::test]
+    async fn sse_reconnect_snapshot_repairs_missed_idle_and_ignores_other_conversations() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/session/:id", get(fixture_session_exists))
+            .route("/session/status", get(fixture_session_status))
+            .route("/event", get(fixture_events))
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let test_config = config("http://profile.test".into());
+        let mut session = activity_session();
+        session.service = "127.0.0.1".into();
+        session.opencode_port = port;
+        let record = Arc::new(Mutex::new(active_work_record(session)));
+        let state = AppState::new(
+            test_config,
+            LifecycleSandbox {
+                record: record.clone(),
+            },
+        );
+        state
+            .ensure_lifecycle_watcher("demo-12345678")
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if record.lock().unwrap().work_state.state == WorkState::ReadyForReview {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "watcher did not reconcile idle snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        assert!(record.lock().unwrap().work_state.current_run.is_none());
+        state.stop_lifecycle_watcher("demo-12345678").await;
+        server.abort();
     }
 
     #[tokio::test]
@@ -3797,98 +4581,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_report_is_capability_and_run_bound_and_controller_completes() {
-        let object: DynamicObject = serde_json::from_value(json!({
-            "apiVersion": "agents.x-k8s.io/v1beta1",
-            "kind": "Sandbox",
-            "metadata": {
-                "name": "anvil-demo-12345678",
-                "annotations": {
-                    "anvil.example/project": "demo",
-                    "anvil.example/repository": "https://github.com/example/demo.git",
-                    "anvil.example/base-ref": "main",
-                    "anvil.example/work-branch": "anvil/demo-12345678",
-                    "anvil.example/created-at": "2026-01-01T10:00:00Z",
-                    "anvil.example/work-state": "in_progress",
-                    "anvil.example/work-state-changed-at": "2026-01-01T10:00:00Z",
-                    "anvil.example/work-state-run-id": "run_1",
-                    "anvil.example/run-current": "{\"id\":\"run_1\",\"state\":\"running\",\"started_at\":\"2026-01-01T10:00:00Z\"}"
-                }
-            },
-            "status": {"phase": "Ready", "serviceFQDN": "anvil-demo-12345678"}
-        }))
-        .unwrap();
-        let sandbox = ReportSandbox {
-            object: Arc::new(Mutex::new(object)),
-        };
-        let mut config = config("http://profile.test".into());
-        config.session_signing_secret = Some("x".repeat(32));
-        let token = github::CapabilitySigner::new("x".repeat(32), Duration::from_secs(60))
-            .unwrap()
-            .mint("demo-12345678", "https://github.com/example/demo.git")
-            .unwrap();
-        let app = router(AppState::new(config, sandbox));
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::get("/v1/sessions/demo-12345678/report-context")
-                    .header("authorization", format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(json_response(response).await["run_id"], "run_1");
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::post("/v1/sessions/demo-12345678/report")
-                    .header("authorization", format!("Bearer {token}"))
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"run_id":"run_1","disposition":"ready_for_review","summary":"  validated  "}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            json_response(response).await["work_state"],
-            "ready_for_review"
-        );
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::post("/v1/sessions/demo-12345678/complete")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(json_response(response).await["work_state"], "completed");
-
-        let response = app
-            .oneshot(
-                Request::post("/v1/sessions/demo-12345678/report")
-                    .header("authorization", format!("Bearer {token}"))
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"run_id":"run_1","disposition":"awaiting_input"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
     async fn github_credential_endpoint_separates_capability_and_upstream_failures() {
         let server = MockServer::start();
         server.mock(|when, then| {
@@ -3932,9 +4624,7 @@ mod tests {
             "status": {"phase": "Ready"}
         }))
         .unwrap();
-        let sandbox = ReportSandbox {
-            object: Arc::new(Mutex::new(object)),
-        };
+        let sandbox = ActivitySandbox { object };
         let mut test_config = config(server.base_url());
         test_config.session_signing_secret = Some("x".repeat(32));
         let signer =

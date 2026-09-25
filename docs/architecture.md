@@ -77,10 +77,10 @@ and continues the operation without a user-facing rebind step. Transport or
 health failures remain errors and never trigger replacement. The explicit
 `rebind` route remains an operator escape hatch only.
 
-The profile also installs the small `anvil_report` OpenCode plugin. It injects a
-single end-of-turn instruction and reports only `ready_for_review` or
-`awaiting_input` through the Sandbox's existing session capability. It cannot set
-environment or execution state, complete a session, or choose an arbitrary state.
+`anvild` subscribes to the bound OpenCode conversation's lifecycle event stream.
+Busy, idle, and error events drive the active run and operator-facing task state;
+transport reconnects reconcile against OpenCode's current status snapshot. No
+plugin or model-authored progress report is installed in worker profiles.
 
 ## Storage access decision
 
