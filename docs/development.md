@@ -6,7 +6,7 @@ The normal local edit loop runs without Kubernetes, an image build, registry,
 or external model credentials:
 
 ```sh
-nix --option build-users-group "" develop
+nix develop
 just dev
 ```
 

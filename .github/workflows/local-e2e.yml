@@ -14,13 +14,13 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Rust checks
-        run: nix --option build-users-group "" develop --command just check
+        run: nix develop --command just check
       - name: Deterministic process E2E (repeat for determinism)
         run: |
-          nix --option build-users-group "" develop --command just e2e
-          nix --option build-users-group "" develop --command just e2e
+          nix develop --command just e2e
+          nix develop --command just e2e
       - name: Actual sandbox OCI acceptance
-        run: nix --option build-users-group "" develop --command just e2e-sandbox-image
+        run: nix develop --command just e2e-sandbox-image
 
   kind-fidelity:
     runs-on: ubuntu-latest
@@ -30,4 +30,4 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Isolated Agent Sandbox Kubernetes lane
-        run: nix --option build-users-group "" develop --command just e2e-k8s
+        run: nix develop --command just e2e-k8s
