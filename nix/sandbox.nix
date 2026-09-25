@@ -163,17 +163,30 @@ let
     config ? sandboxConfig,
     entrypointPackage ? sandboxEntrypoint,
     opencode ? opencodePackage,
-    chromium ? chromiumForImage
+    chromium ? chromiumForImage,
+    chromiumSandbox ? pkgs.chromium.browser.sandbox
   }:
     let
       browserLayer = nix2containerPkgs.nix2container.buildLayer {
-        deps = [ chromium pkgs.xorg-server ];
+        deps = [ chromium chromiumSandbox pkgs.xorg-server ];
         layers = [ sandboxBaseLayer sandboxDeveloperLayer ];
         metadata = { created_by = "anvil sandbox: Chromium/Xvfb"; };
       };
       openCodeLayer = nix2containerPkgs.nix2container.buildLayer {
-        deps = [ opencode ];
+        deps = [ opencode chromiumSandbox ];
         layers = [ sandboxBaseLayer sandboxDeveloperLayer browserLayer ];
+        # A dependency of the later OpenCode closure can re-introduce the
+        # helper after the browser layer. Restore the required root-owned mode
+        # in this final closure layer, narrowly for the helper executable.
+        perms = [
+          {
+            path = chromiumSandbox;
+            regex = ".*/bin/__chromium-suid-sandbox$";
+            mode = "04755";
+            uid = 0;
+            gid = 0;
+          }
+        ];
         metadata = { created_by = "anvil sandbox: OpenCode"; };
       };
     in

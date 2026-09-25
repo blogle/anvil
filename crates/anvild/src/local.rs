@@ -473,7 +473,7 @@ impl SandboxApi for LocalSandboxApi {
             let now = chrono::Utc::now().to_rfc3339();
             let run = Run {
                 id: format!("run_{}", uuid::Uuid::new_v4().simple()),
-                state: "running".into(),
+                state: "submitted".into(),
                 started_at: now.clone(),
                 finished_at: None,
             };

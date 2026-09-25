@@ -18,16 +18,38 @@ umoci unpack --rootless --image "$oci:anvil-sandbox" "$bundle"
 
 config="$(skopeo inspect --config "oci:$oci:anvil-sandbox")"
 jq -e '.config.User == "0:0" and (.config.Cmd | index("/bin/sandbox-entrypoint"))' <<<"$config" >/dev/null
+manifest_digest="$(jq -r '.manifests[0].digest' "$oci/index.json")"
+manifest="$oci/blobs/sha256/${manifest_digest#sha256:}"
+if ! jq -r '.layers[].digest' "$manifest" |
+  while IFS= read -r digest; do
+    tar --numeric-owner -tvzf "$oci/blobs/sha256/${digest#sha256:}" 2>/dev/null || true
+  done |
+  awk '
+    $NF ~ /\/__chromium-suid-sandbox$/ {
+      found = 1
+      mode = $1
+      owner = $2
+    }
+    END { exit !(found && mode == "-rwsr-xr-x" && owner == "0/0") }
+  '; then
+  printf 'OCI layers must carry Chromium sandbox helper as root:root mode 4755\n' >&2
+  exit 1
+fi
 rootfs="$bundle/rootfs"
 ANVIL_ROOTFS="$rootfs" bash "$root/tests/sandbox-runtime-assertions.sh"
 printf 'OCI export, unpack, config and static filesystem contract passed\n'
 
 worktree="$tmp/workspace"
 git clone --local --no-hardlinks "$root" "$worktree" >/dev/null
-git -C "$root" diff --binary | git -C "$worktree" apply
-git -C "$root" ls-files --others --exclude-standard | while IFS= read -r path; do
+patch="$tmp/working-tree.patch"
+git -C "$root" diff HEAD --binary >"$patch"
+if [ -s "$patch" ]; then
+  git -C "$worktree" apply "$patch"
+fi
+git -C "$root" ls-files --others --exclude-standard -z | while IFS= read -r -d '' path; do
   mkdir -p "$worktree/$(dirname "$path")"
   cp -a "$root/$path" "$worktree/$path"
+  test -e "$worktree/$path" || test -L "$worktree/$path"
 done
 git -C "$worktree" switch -c anvil/sandbox-acceptance >/dev/null
 

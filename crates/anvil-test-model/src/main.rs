@@ -77,6 +77,7 @@ async fn completion(
     State(state): State<std::sync::Arc<AppState>>,
     Json(request): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    eprintln!("deterministic chat completion request: {}", request);
     let messages = request
         .get("messages")
         .and_then(Value::as_array)
@@ -137,6 +138,7 @@ async fn responses(
     State(state): State<std::sync::Arc<AppState>>,
     Json(request): Json<Value>,
 ) -> axum::response::Response {
+    eprintln!("deterministic responses request: {}", request);
     let input = request.get("input").cloned().unwrap_or(Value::Null);
     let stream = request
         .get("stream")

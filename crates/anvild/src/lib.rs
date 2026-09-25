@@ -882,7 +882,7 @@ impl SandboxApi for KubeSandboxApi {
         let run_id = new_run_id();
         let initial_run = Run {
             id: run_id.clone(),
-            state: "running".into(),
+            state: "submitted".into(),
             started_at: now.clone(),
             finished_at: None,
         };
@@ -2124,7 +2124,7 @@ async fn begin_run(s: &AppState, id: &str) -> Result<String, ServiceError> {
     let changed_at = chrono_like_now();
     let run = Run {
         id: new_run_id(),
-        state: "running".into(),
+        state: "submitted".into(),
         started_at: changed_at.clone(),
         finished_at: None,
     };
@@ -2175,17 +2175,15 @@ fn transition_run(
     signal: OpenCodeLifecycleSignal,
     at: &str,
 ) -> WorkStateRecord {
-    if current.state == WorkState::Completed {
+    if matches!(current.state, WorkState::Completed | WorkState::Failed) {
         return current.clone();
     }
     match signal {
         OpenCodeLifecycleSignal::Busy => {
             let mut next = current.clone();
-            if next
-                .current_run
-                .as_ref()
-                .is_none_or(|run| run.state != "running")
-            {
+            if let Some(run) = next.current_run.as_mut() {
+                run.state = "running".into();
+            } else {
                 let run = Run {
                     id: new_run_id(),
                     state: "running".into(),
@@ -2201,7 +2199,15 @@ fn transition_run(
             next
         }
         OpenCodeLifecycleSignal::Idle => {
-            if current.current_run.is_none() && current.state != WorkState::InProgress {
+            // A new Anvil run is recorded before its prompt reaches OpenCode.
+            // Ignore idle snapshots/events until OpenCode has reported this
+            // turn busy; otherwise a delayed idle from the previous turn can
+            // incorrectly finalize the newly submitted run.
+            if current
+                .current_run
+                .as_ref()
+                .is_none_or(|run| run.state != "running")
+            {
                 return current.clone();
             }
             let mut next = current.clone();
@@ -4160,8 +4166,30 @@ mod tests {
             .unwrap();
         assert_eq!(
             record.lock().unwrap().work_state.state,
-            WorkState::ReadyForReview
+            WorkState::InProgress,
+            "an idle event received before this run reports busy is stale"
         );
+        apply_lifecycle_signal(
+            &state,
+            "demo-12345678",
+            "ses_demo",
+            OpenCodeLifecycleSignal::Busy,
+        )
+        .await
+        .unwrap();
+        apply_lifecycle_signal(
+            &state,
+            "demo-12345678",
+            "ses_demo",
+            OpenCodeLifecycleSignal::Idle,
+        )
+        .await
+        .unwrap();
+        {
+            let finished = record.lock().unwrap();
+            assert_eq!(finished.work_state.state, WorkState::ReadyForReview);
+            assert!(finished.work_state.current_run.is_none());
+        }
 
         begin_run(&state, "demo-12345678").await.unwrap();
         let (session_id, error) = lifecycle_event(&json!({

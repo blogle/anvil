@@ -15,6 +15,18 @@ start_time=$SECONDS
 cleanup() {
   local status=$?
   if [ "$status" -ne 0 ]; then
+    printf '\n--- session diagnostics ---\n' >&2
+    local ids id
+    ids="$(curl -fsS http://127.0.0.1:8080/v1/sessions 2>/dev/null | jq -r '.[].id' 2>/dev/null || true)"
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      printf '\nstatus for %s:\n' "$id" >&2
+      curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/status" >&2 || true
+      printf '\nmessages for %s:\n' "$id" >&2
+      curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages" >&2 || true
+      printf '\nworker log for %s:\n' "$id" >&2
+      cat "$runtime/$id/worker.log" >&2 2>/dev/null || true
+    done <<<"$ids"
     for log in "$tmp"/*.log; do
       [ -f "$log" ] && { printf '\n--- %s ---\n' "$log" >&2; cat "$log" >&2; }
     done
