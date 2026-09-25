@@ -10,10 +10,13 @@ use std::{
     net::SocketAddr,
     sync::atomic::{AtomicU64, Ordering},
 };
+use tokio::sync::Notify;
 
 #[derive(Default)]
 struct AppState {
     completion: AtomicU64,
+    released: std::sync::atomic::AtomicBool,
+    release: Notify,
 }
 
 #[tokio::main]
@@ -29,6 +32,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/chat/completions", post(completion))
         .route("/chat/completions", post(completion))
         .route("/v1/responses", post(responses))
+        .route("/__test/release", post(release_gate))
+        .route("/__test/hold", post(hold_gate))
         .fallback(unknown_route)
         .with_state(state);
     axum::serve(
@@ -57,6 +62,17 @@ async fn models() -> Json<Value> {
     )
 }
 
+async fn release_gate(State(state): State<std::sync::Arc<AppState>>) -> StatusCode {
+    state.released.store(true, Ordering::SeqCst);
+    state.release.notify_waiters();
+    StatusCode::NO_CONTENT
+}
+
+async fn hold_gate(State(state): State<std::sync::Arc<AppState>>) -> StatusCode {
+    state.released.store(false, Ordering::SeqCst);
+    StatusCode::NO_CONTENT
+}
+
 async fn completion(
     State(state): State<std::sync::Arc<AppState>>,
     Json(request): Json<Value>,
@@ -73,6 +89,15 @@ async fn completion(
         .collect::<Vec<_>>()
         .join("\n");
     if !prompt.contains("ANVIL-E2E:edit-file") {
+        if prompt.contains("ANVIL-E2E:followup") {
+            return (
+                StatusCode::OK,
+                Json(finish(
+                    "Confirmed: this is the same OpenCode conversation.",
+                    &request,
+                )),
+            );
+        }
         return (
             StatusCode::OK,
             Json(finish(
@@ -91,10 +116,6 @@ async fn completion(
         1 => (
             "edit",
             json!({"filePath":"target.txt","oldString":"before\n","newString":"after\n"}),
-        ),
-        2 => (
-            "anvil_report",
-            json!({"disposition":"ready_for_review","summary":"Applied the deterministic fixture edit."}),
         ),
         _ => {
             return (
@@ -148,12 +169,36 @@ async fn responses(
     } else if let Some(text) = input.as_str() {
         prompt.push_str(text);
     }
-    if !prompt.contains("ANVIL-E2E:edit-file") {
+    let is_follow_up = prompt.contains("ANVIL-E2E:followup");
+    if !is_follow_up && !prompt.contains("ANVIL-E2E:edit-file") {
         return Json(response_text(
             "TEST_FAILURE: explicit ANVIL-E2E:edit-file scenario marker is required",
             &request,
         ))
         .into_response();
+    }
+    if prompt.contains("ANVIL-E2E:wait-for-release")
+        && std::env::var("ANVIL_TEST_MODEL_GATE").as_deref() == Ok("1")
+        && !state.released.load(Ordering::SeqCst)
+    {
+        loop {
+            let notified = state.release.notified();
+            if state.released.load(Ordering::SeqCst) {
+                break;
+            }
+            notified.await;
+        }
+    }
+    if is_follow_up {
+        let value = response_text(
+            "Confirmed: this is the same OpenCode conversation.",
+            &request,
+        );
+        return if stream {
+            response_sse(&value)
+        } else {
+            Json(value).into_response()
+        };
     }
     if tool_count == 0 {
         let value = response_text("I will inspect and update the fixture file.", &request);
@@ -168,10 +213,6 @@ async fn responses(
         1 => Some((
             "edit",
             json!({"filePath":"target.txt","oldString":"before\n","newString":"after\n"}),
-        )),
-        2 => Some((
-            "anvil_report",
-            json!({"disposition":"ready_for_review","summary":"Applied the deterministic fixture edit."}),
         )),
         _ => None,
     };
@@ -283,7 +324,7 @@ fn response_sse(value: &Value) -> axum::response::Response {
 }
 
 fn response_text(text: &str, request: &Value) -> Value {
-    json!({"id":"resp_anvil_text","object":"response","created_at":0,"status":"completed","model":request.get("model").and_then(Value::as_str).unwrap_or("anvil-scripted"),"output":[{"id":"msg_anvil_text","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text,"annotations":[]}]}],"output_text":text})
+    json!({"id":"resp_anvil_text","object":"response","created_at":0,"status":"completed","incomplete_details":null,"model":request.get("model").and_then(Value::as_str).unwrap_or("anvil-scripted"),"output":[{"id":"msg_anvil_text","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text,"annotations":[]}]}],"output_text":text,"usage":{"input_tokens":0,"input_tokens_details":null,"output_tokens":0,"output_tokens_details":null,"total_tokens":0}})
 }
 
 fn finish(content: &str, request: &Value) -> Value {
@@ -329,5 +370,57 @@ mod tests {
             second.0["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
             "edit"
         );
+    }
+
+    #[tokio::test]
+    async fn responses_turn_finishes_after_the_file_edit_without_anvil_tools() {
+        let state = std::sync::Arc::new(AppState::default());
+        let request = json!({
+            "stream":false,
+            "model":"anvil-scripted",
+            "input":[{"role":"user","content":"ANVIL-E2E:edit-file"}],
+            "tools":[{"type":"function","name":"read"},{"type":"function","name":"edit"}]
+        });
+        let first = responses(State(state.clone()), Json(request.clone())).await;
+        let body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(first["output"][0]["name"], "read");
+
+        let request = json!({
+            "stream":false,
+            "model":"anvil-scripted",
+            "input":[
+                {"role":"user","content":"ANVIL-E2E:edit-file"},
+                {"type":"function_call_output","output":"before"}
+            ],
+            "tools":[{"type":"function","name":"read"},{"type":"function","name":"edit"}]
+        });
+        let second = responses(State(state.clone()), Json(request.clone())).await;
+        let body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let second: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(second["output"][0]["name"], "edit");
+
+        let request = json!({
+            "stream":false,
+            "model":"anvil-scripted",
+            "input":[
+                {"role":"user","content":"ANVIL-E2E:edit-file"},
+                {"type":"function_call_output","output":"before"},
+                {"type":"function_call_output","output":"edited"}
+            ],
+            "tools":[{"type":"function","name":"read"},{"type":"function","name":"edit"}]
+        });
+        let final_response = responses(State(state), Json(request)).await;
+        let body = axum::body::to_bytes(final_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let final_response: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(final_response["status"], "completed");
+        assert_eq!(final_response["output"][0]["type"], "message");
+        assert!(!final_response.to_string().contains("anvil_report"));
     }
 }
