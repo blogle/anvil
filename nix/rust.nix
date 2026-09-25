@@ -16,7 +16,7 @@ let
     pname = "anvil";
     version = "0.1.0";
     strictDeps = true;
-    nativeBuildInputs = [ pkgs.pkg-config ];
+    nativeBuildInputs = [ pkgs.pkg-config pkgs.git ];
   };
   cargoVendorDir = craneLib.vendorCargoDeps baseArgs;
   commonArgs = baseArgs // { inherit cargoVendorDir; };
