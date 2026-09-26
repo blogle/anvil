@@ -36,7 +36,7 @@ if [ -n "${ANVIL_RUNTIME_EXEC:-}" ]; then
   runtime_exec 'test "$XDG_STATE_HOME" = /home/anvil/.local/state && test -w "$XDG_STATE_HOME"'
   runtime_exec 'test "$XDG_RUNTIME_DIR" = /home/anvil/.local/state/runtime && test -d "$XDG_RUNTIME_DIR"'
   runtime_exec 'printf "#!/usr/bin/env bash\nprintf env-ok\n" >/tmp/anvil-env-test && chmod +x /tmp/anvil-env-test && test "$(/tmp/anvil-env-test)" = env-ok'
-  runtime_exec 'test "$DISPLAY" = :99 && pgrep -f "Xvfb :99" >/dev/null && chromium --headless --disable-gpu --dump-dom "data:text/html,<title>anvil-browser-ok</title>" | grep -q anvil-browser-ok'
+  runtime_exec 'test "$DISPLAY" = :99 && pgrep -f "Xvfb :99" >/dev/null && dom="$(chromium --headless --disable-gpu --dump-dom "data:text/html,<title>anvil-browser-ok</title>")" && [[ "$dom" == *anvil-browser-ok* ]]'
   runtime_exec 'test "$(git config --global user.name)" = Anvil && test -n "$(git config --global user.email)"'
   runtime_exec 'test "$(stat -c %u /nix/store)" = 0 && test ! -w /nix/store && test "$(stat -c %u:%g /nix/var)" = 0:0 && test ! -w /nix/var'
   runtime_exec 'pgrep -x nix-daemon >/dev/null && nix store info >/dev/null && nix develop --command just check'
