@@ -77,10 +77,21 @@ and continues the operation without a user-facing rebind step. Transport or
 health failures remain errors and never trigger replacement. The explicit
 `rebind` route remains an operator escape hatch only.
 
-The profile also installs the small `anvil_report` OpenCode plugin. It injects a
-single end-of-turn instruction and reports only `ready_for_review` or
-`awaiting_input` through the Sandbox's existing session capability. It cannot set
-environment or execution state, complete a session, or choose an arbitrary state.
+Each Anvil run persists its caller-assigned OpenCode user-message ID before
+submitting `prompt_async`. OpenCode assistant messages are correlated by
+`parentID`; only the matching assistant message's completion time or error can
+complete or fail that run. Session-level busy, idle, and error events trigger
+message reconciliation but are never assigned directly to whichever run is
+current. Lifecycle transitions are serialized per Anvil session, and another
+prompt in the same conversation is accepted only after the preceding run is
+terminal. Independent sessions remain concurrent. No plugin or model-authored
+progress report is installed in worker profiles.
+
+Chromium is wrapped at the sandbox-image command boundary to pass
+`--no-sandbox`. Its nested Linux namespace/SUID sandbox is disabled because the
+browser already runs inside the surrounding Agent Sandbox/container isolation
+boundary. Sandboxed workloads do not receive broad host/kernel capabilities to
+restore Chromium's nested sandbox.
 
 ## Storage access decision
 

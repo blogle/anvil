@@ -1,4 +1,63 @@
 # Development Deployment
+
+## Local-first development and validation ladder
+
+The normal local edit loop runs without Kubernetes, an image build, registry,
+or external model credentials:
+
+```sh
+nix develop
+just dev
+```
+
+`just dev-full` adds the optional MCP and router processes. Both use plain
+process-compose and Cargo's working-tree debug/incremental artifacts. The
+singleton profile and deterministic local model stay up while `watchexec`
+restarts only `anvild`; LocalSandboxApi starts real OpenCode workers in durable
+directories under `.anvil/dev/sessions`. `ANVIL_LOCAL_RUNTIME_ROOT` and
+`ANVIL_LOCAL_PROFILE_DIR` can override those paths. The same commands work in
+an Anvil sandbox; local model requests are served by `anvil-test-model` and
+never fall through to a hosted provider.
+
+The validation ownership ladder is:
+
+```text
+Rust unit/integration
+        |
+        v
+local process E2E                process-compose + LocalSandboxApi
+        |
+        v
+nested actual OCI artifact        nix2container + skopeo + umoci + crun probe
+        |
+        v
+isolated Kind Kubernetes fidelity Agent Sandbox/controller/RBAC/router
+        |
+        v
+production deployment smoke      platform-owned real-cluster rollout
+```
+
+Run the explicit tiers with `just e2e`, `just e2e-sandbox-image`, and
+`just e2e-k8s`. `just e2e-ui` is the local embedded-frontend/API smoke. The
+fast E2E prints total and per-scenario elapsed seconds for cold/warm comparison;
+there are no timing gates. The nested OCI test reports whether the current
+kernel supports the exact root-to-agent UID mapping; static image checks still
+run when that execution mapping is unavailable. The Kind lane owns a temporary
+kubeconfig and cluster and is intentionally absent from `just check`, `just
+dev`, and `just e2e`.
+
+Ownership boundaries are explicit: process-compose and LocalSandboxApi own
+normal development; nested OCI acceptance owns sandbox image/runtime
+construction; isolated Kind owns Kubernetes-only fidelity. The production k3s
+cluster is not a development harness.
+
+CI's pre-merge lanes run Rust checks, deterministic local E2E, actual sandbox
+image acceptance, and isolated Kind fidelity as independent jobs. A Kind pass
+in CI or on a developer laptop is still required before merge; this Anvil
+sandbox must not run Kind nested.
+
+## Production deployment
+
 Render without contacting a cluster:
 
 ```sh
@@ -109,6 +168,10 @@ Its content-addressed layers are partitioned into base Unix tools, Nix and
 developer tooling, Chromium/Xvfb, OpenCode, and Anvil runtime/config files.
 The image starts a root `nix-daemon` and drops the agent process to UID 1000;
 the Nix store is intentionally immutable to the agent.
+Repository-owned image files are passed to the sandbox Nix module as explicit
+path dependencies. Chromium's packaged command wrapper runs the browser with
+`--no-sandbox`; browser isolation is provided by the surrounding Agent Sandbox
+container boundary, without granting the workload broad kernel capabilities.
 
 For a local k3s validation image, avoid exporting the full Docker image. The
 import helper reuses matching compressed layers already present in containerd

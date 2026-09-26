@@ -66,19 +66,8 @@ pub enum SessionsSubcommand {
     Delete { session: String },
     Preview { session: String, port: u16 },
     Attach { session: String },
-    Report(ReportArgs),
     Complete { session: String },
     Rebind(RebindArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct ReportArgs {
-    pub session: String,
-    pub disposition: String,
-    #[arg(long)]
-    pub summary: Option<String>,
-    #[arg(long, env = "ANVIL_SESSION_CREDENTIAL")]
-    pub capability: String,
 }
 
 #[derive(Debug, Args, Serialize)]
@@ -194,74 +183,6 @@ impl ApiClient {
             Some(serde_json::json!({"code":code,"key":key})),
         )
         .await
-    }
-
-    async fn report(&self, args: &ReportArgs) -> Result<Value> {
-        if !matches!(
-            args.disposition.as_str(),
-            "ready-for-review" | "ready_for_review" | "awaiting-input" | "awaiting_input"
-        ) {
-            return Err(anyhow!(
-                "disposition must be ready-for-review or awaiting-input"
-            ));
-        }
-        let disposition = args.disposition.replace('-', "_");
-        let context_url = self
-            .base
-            .join(&format!("v1/sessions/{}/report-context", args.session))
-            .context("invalid Anvil API path")?;
-        let context_response = self
-            .client
-            .get(context_url)
-            .bearer_auth(&args.capability)
-            .send()
-            .await
-            .context("request to Anvil failed")?;
-        let context_status = context_response.status();
-        let context_bytes = context_response
-            .bytes()
-            .await
-            .context("reading Anvil response failed")?;
-        if !context_status.is_success() {
-            return Err(anyhow!(
-                "Anvil returned {context_status}: {}",
-                String::from_utf8_lossy(&context_bytes)
-            ));
-        }
-        let context: Value =
-            serde_json::from_slice(&context_bytes).context("invalid JSON response from Anvil")?;
-        let run_id = context
-            .get("run_id")
-            .and_then(Value::as_str)
-            .context("Anvil report context has no run ID")?;
-        let url = self
-            .base
-            .join(&format!("v1/sessions/{}/report", args.session))
-            .context("invalid Anvil API path")?;
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(&args.capability)
-            .json(&serde_json::json!({
-                "run_id": run_id,
-                "disposition": disposition,
-                "summary": args.summary,
-            }))
-            .send()
-            .await
-            .context("request to Anvil failed")?;
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .context("reading Anvil response failed")?;
-        if !status.is_success() {
-            return Err(anyhow!(
-                "Anvil returned {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            ));
-        }
-        serde_json::from_slice(&bytes).context("invalid JSON response from Anvil")
     }
 }
 
@@ -539,11 +460,6 @@ async fn run_sessions(client: ApiClient, command: SessionsSubcommand, json: bool
             .await
         }
         SessionsSubcommand::Attach { session } => attach(client, &session).await,
-        SessionsSubcommand::Report(args) => {
-            let result = client.report(&args).await?;
-            print_value(result, json);
-            Ok(())
-        }
         SessionsSubcommand::Complete { session } => {
             print_response(
                 &client,

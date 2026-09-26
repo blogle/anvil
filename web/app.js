@@ -238,13 +238,13 @@ function relativeTime(value) {
 
 function renderLogs(activity) {
   if (!activity) return `<div class="content-section"><div class="loading">Loading activity...</div></div>`
-  if (!activity.requests.length && !activity.lifecycle.length) return `<div class="content-section"><div class="empty"><strong>No activity recorded</strong>OpenCode has not reported any requests for this session yet.</div></div>`
+  if (!activity.requests.length && !activity.lifecycle.length) return `<div class="content-section"><div class="empty"><strong>No activity recorded</strong>OpenCode has not recorded any requests for this session yet.</div></div>`
   const lifecycle = activity.lifecycle.map((event) => `<div class="timeline-event event-${escapeHtml(event.kind)}"><div class="event-time">${formatClock(event.at)}</div><div class="event-body"><span class="event-marker"></span><div class="event-title">${escapeHtml(eventTitle(event.kind))}</div>${event.detail ? `<div class="event-detail">${escapeHtml(event.detail)}</div>` : ""}</div></div>`).join("")
   return `<div class="content-section"><div class="section-heading"><h3>Lifecycle & requests</h3><span>${activity.requests.length} request${activity.requests.length === 1 ? "" : "s"}</span></div><div class="timeline">${lifecycle}${activity.requests.map(renderRequest).join("")}</div></div>`
 }
 
 function eventTitle(kind) {
-  return { created: "Session created by controller", session_created: "Session created by controller", ready: "Sandbox ready", environment_ready: "Sandbox ready", request_started: "Request started", request_completed: "Request completed", request_failed: "Request failed", run_started: "Work run started", worker_reported: "Worker reported state", conversation_rebound: "Conversation rebound", session_suspended: "Session suspended", session_resumed: "Session resumed", session_completed: "Session completed", session_deleted: "Session deleted" }[kind] || "Session activity"
+  return { created: "Session created by controller", session_created: "Session created by controller", ready: "Sandbox ready", environment_ready: "Sandbox ready", request_started: "Request started", request_completed: "Request completed", request_failed: "Request failed", run_started: "Work run started", opencode_idle: "OpenCode turn finished", opencode_error: "OpenCode turn failed", conversation_rebound: "Conversation rebound", session_suspended: "Session suspended", session_resumed: "Session resumed", session_completed: "Session completed", session_deleted: "Session deleted" }[kind] || "Session activity"
 }
 
 function renderRequest(request) {
