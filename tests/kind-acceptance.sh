@@ -145,12 +145,17 @@ test "$(kubectl --kubeconfig "$kubeconfig" auth can-i --as=system:serviceaccount
 test "$(kubectl --kubeconfig "$kubeconfig" auth can-i --as=system:serviceaccount:anvil:anvild get secrets -n anvil)" = no
 
 run_id="run_kind_acceptance"
-current_run="{\"id\":\"$run_id\",\"state\":\"running\",\"started_at\":\"2026-01-01T00:00:00Z\"}"
+started_at="2026-01-01T00:00:00Z"
+finished_at="2026-01-01T00:01:00Z"
+work_state_record="$(jq -cn --arg run_id "$run_id" --arg started_at "$started_at" --arg finished_at "$finished_at" '{changed_at:$finished_at,state:{state:"ready_for_review",details:{run:{run_id:$run_id,assistant_message_id:"assistant_kind_acceptance",started_at:$started_at,finished_at:$finished_at},previous_run:null}}}')"
+last_run="$(jq -cn --arg run_id "$run_id" --arg started_at "$started_at" --arg finished_at "$finished_at" '{id:$run_id,state:"completed",started_at:$started_at,finished_at:$finished_at}')"
 jq -n \
   --arg repository "$source_repo" \
   --arg source_ref "$source_ref" \
   --arg run_id "$run_id" \
-  --arg current_run "$current_run" \
+  --arg finished_at "$finished_at" \
+  --arg work_state_record "$work_state_record" \
+  --arg last_run "$last_run" \
   --arg image "ghcr.io/blogle/anvil-sandbox:kind-e2e" \
   '{
     apiVersion:"agents.x-k8s.io/v1beta1",
@@ -166,10 +171,11 @@ jq -n \
         "anvil.example/work-branch":"anvil/fixture-12345678",
         "anvil.example/runtime-layout":"v2",
         "anvil.example/created-at":"2026-01-01T00:00:00Z",
-        "anvil.example/work-state":"in_progress",
-        "anvil.example/work-state-changed-at":"2026-01-01T00:00:00Z",
+        "anvil.example/work-state":"ready_for_review",
+        "anvil.example/work-state-changed-at":$finished_at,
         "anvil.example/work-state-run-id":$run_id,
-        "anvil.example/run-current":$current_run,
+        "anvil.example/work-state-record":$work_state_record,
+        "anvil.example/run-last":$last_run,
         "anvil.example/binding-state":"pending",
         "anvil.example/binding-continuity":"exact",
         "anvil.example/binding-checked-at":"2026-01-01T00:00:00Z"

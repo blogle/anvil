@@ -22,7 +22,9 @@
         sandbox = import ./nix/sandbox.nix {
           inherit pkgs opencode;
           nix2containerPkgs = nix2container.packages.${system};
-          repoRoot = ./.;
+          credentialHelperSource = ./runtime/anvil-credential;
+          sandboxEntrypointSource = ./runtime/sandbox-entrypoint;
+          importSandboxImageK3sSource = ./scripts/import-sandbox-image-k3s.sh;
         };
         images = import ./nix/images.nix {
           inherit pkgs rust;

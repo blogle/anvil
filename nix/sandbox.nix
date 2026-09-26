@@ -1,8 +1,14 @@
-{ pkgs, nix2containerPkgs, opencode, repoRoot }:
+{ pkgs
+, nix2containerPkgs
+, opencode
+, credentialHelperSource
+, sandboxEntrypointSource
+, importSandboxImageK3sSource
+}:
 
 let
   credentialHelper = pkgs.writeShellScriptBin "anvil-credential"
-    (builtins.readFile "${repoRoot}/runtime/anvil-credential");
+    (builtins.readFile credentialHelperSource);
   ghWrapper = pkgs.writeShellScriptBin "gh" ''
     set -euo pipefail
     : "''${ANVIL_SESSION_ID:?ANVIL_SESSION_ID is required}"
@@ -81,11 +87,18 @@ let
   chromiumForImage = pkgs.runCommand "anvil-chromium" {} ''
     mkdir -p "$out"
     cp -a ${pkgs.chromium}/. "$out/"
+    chmod u+w "$out/bin/chromium"
+    cat > "$out/bin/chromium" <<'EOF'
+    #!/bin/sh
+    # The surrounding Agent Sandbox/container is this workload's isolation boundary.
+    exec ${pkgs.coreutils}/bin/env -u CHROME_DEVEL_SANDBOX ${pkgs.chromium}/bin/chromium --no-sandbox "$@"
+    EOF
+    chmod 0755 "$out/bin/chromium"
     chmod u+w "$out/share"
     rm -f "$out/share/man"
   '';
   sandboxEntrypoint = pkgs.writeShellScriptBin "sandbox-entrypoint"
-    (builtins.readFile "${repoRoot}/runtime/sandbox-entrypoint");
+    (builtins.readFile sandboxEntrypointSource);
   sandboxMutableHome = pkgs.runCommand "anvil-sandbox-home" {} ''
     mkdir -p "$out/home/anvil"
   '';
@@ -163,30 +176,17 @@ let
     config ? sandboxConfig,
     entrypointPackage ? sandboxEntrypoint,
     opencode ? opencodePackage,
-    chromium ? chromiumForImage,
-    chromiumSandbox ? pkgs.chromium.browser.sandbox
+    chromium ? chromiumForImage
   }:
     let
       browserLayer = nix2containerPkgs.nix2container.buildLayer {
-        deps = [ chromium chromiumSandbox pkgs.xorg-server ];
+        deps = [ chromium pkgs.xorg-server ];
         layers = [ sandboxBaseLayer sandboxDeveloperLayer ];
         metadata = { created_by = "anvil sandbox: Chromium/Xvfb"; };
       };
       openCodeLayer = nix2containerPkgs.nix2container.buildLayer {
-        deps = [ opencode chromiumSandbox ];
+        deps = [ opencode ];
         layers = [ sandboxBaseLayer sandboxDeveloperLayer browserLayer ];
-        # A dependency of the later OpenCode closure can re-introduce the
-        # helper after the browser layer. Restore the required root-owned mode
-        # in this final closure layer, narrowly for the helper executable.
-        perms = [
-          {
-            path = chromiumSandbox;
-            regex = ".*/bin/__chromium-suid-sandbox$";
-            mode = "04755";
-            uid = 0;
-            gid = 0;
-          }
-        ];
         metadata = { created_by = "anvil sandbox: OpenCode"; };
       };
     in
@@ -210,7 +210,7 @@ let
       pkgs.coreutils pkgs.gawk pkgs.gnugrep pkgs.jq pkgs.kubectl
       nix2containerPkgs.skopeo-nix2container pkgs.gnutar
     ];
-    text = builtins.readFile "${repoRoot}/scripts/import-sandbox-image-k3s.sh";
+    text = builtins.readFile importSandboxImageK3sSource;
   };
 in
 {

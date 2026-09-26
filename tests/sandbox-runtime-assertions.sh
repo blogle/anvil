@@ -7,9 +7,7 @@ if [ -n "${ANVIL_ROOTFS:-}" ]; then
   mapped_gid="$(id -g)"
   test -x "$rootfs/usr/bin/env"
   test -x "$rootfs/bin/sandbox-entrypoint"
-  chromium_sandbox="$(awk -F'"' '/CHROME_DEVEL_SANDBOX=.*nix\/store/ { print $2; exit }' "$rootfs/bin/chromium")"
-  test -n "$chromium_sandbox"
-  test -x "$rootfs$chromium_sandbox"
+  grep -q -- '--no-sandbox' "$rootfs/bin/chromium"
   for binary in bash git nix just opencode chromium Xvfb nix-daemon; do
     test -x "$rootfs/bin/$binary" || test -x "$rootfs/usr/bin/$binary"
   done

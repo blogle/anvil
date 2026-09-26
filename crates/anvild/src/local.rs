@@ -2,7 +2,7 @@ use super::{
     BindingStateRecord, Config, CreateRequest, SandboxApi, SandboxRecord, ServiceError,
     WorkStateRecord,
 };
-use anvil_core::{branch_name, Run, Session, SessionId, WorkState};
+use anvil_core::{branch_name, Session, SessionId};
 use async_trait::async_trait;
 use std::{
     collections::HashMap, net::TcpListener, os::unix::fs::PermissionsExt, path::PathBuf,
@@ -180,12 +180,7 @@ impl LocalSandboxApi {
             .env("ANVIL_WORK_BRANCH", &state.record.session.work_branch)
             .env(
                 "ANVIL_RUN_ID",
-                state
-                    .record
-                    .work_state
-                    .run_id
-                    .as_deref()
-                    .unwrap_or_default(),
+                state.record.work_state.run_id().unwrap_or_default(),
             )
             .env("ANVIL_SESSION_ID", id)
             .env("OPENCODE_CONFIG", profile.join("config/opencode.jsonc"))
@@ -407,6 +402,7 @@ impl SandboxApi for LocalSandboxApi {
         id: &str,
         request: &CreateRequest,
         sandbox_env: &[(String, String)],
+        initial_work_state: &WorkStateRecord,
     ) -> Result<Session, ServiceError> {
         let directory = self.root.join(id);
         if directory.exists() {
@@ -471,12 +467,6 @@ impl SandboxApi for LocalSandboxApi {
             }
             let port = allocate_loopback_port()?;
             let now = chrono::Utc::now().to_rfc3339();
-            let run = Run {
-                id: format!("run_{}", uuid::Uuid::new_v4().simple()),
-                state: "submitted".into(),
-                started_at: now.clone(),
-                finished_at: None,
-            };
             let session = Session {
                 id: id.into(),
                 sandbox: format!("anvil-{id}"),
@@ -494,12 +484,12 @@ impl SandboxApi for LocalSandboxApi {
                 ready_at: None,
                 environment_state: "provisioning".into(),
                 environment_error: None,
-                work_state: WorkState::InProgress.as_str().into(),
-                work_state_changed_at: Some(now.clone()),
-                work_state_summary: None,
-                work_state_run_id: Some(run.id.clone()),
-                current_run: Some(run.clone()),
-                last_run: None,
+                work_state: initial_work_state.api_state().as_str().into(),
+                work_state_changed_at: Some(initial_work_state.changed_at.clone()),
+                work_state_summary: initial_work_state.summary(),
+                work_state_run_id: initial_work_state.run_id(),
+                current_run: initial_work_state.current_run(),
+                last_run: initial_work_state.last_run(),
                 session_binding_state: "pending".into(),
                 session_binding_continuity: "exact".into(),
                 session_binding_error: None,
@@ -509,14 +499,7 @@ impl SandboxApi for LocalSandboxApi {
             };
             let state = SandboxRecord {
                 session: session.clone(),
-                work_state: WorkStateRecord {
-                    state: WorkState::InProgress,
-                    changed_at: now.clone(),
-                    summary: None,
-                    run_id: Some(run.id.clone()),
-                    current_run: Some(run),
-                    last_run: None,
-                },
+                work_state: initial_work_state.clone(),
                 binding_state: BindingStateRecord {
                     state: "pending".into(),
                     continuity: "exact".into(),
@@ -631,12 +614,12 @@ impl SandboxApi for LocalSandboxApi {
         let mut sessions = self.sessions.lock().await;
         let state = sessions.get_mut(id).ok_or(ServiceError::NotFound)?;
         state.record.work_state = value.clone();
-        state.record.session.work_state = value.state.as_str().into();
+        state.record.session.work_state = value.api_state().as_str().into();
         state.record.session.work_state_changed_at = Some(value.changed_at.clone());
-        state.record.session.work_state_summary = value.summary.clone();
-        state.record.session.work_state_run_id = value.run_id.clone();
-        state.record.session.current_run = value.current_run.clone();
-        state.record.session.last_run = value.last_run.clone();
+        state.record.session.work_state_summary = value.summary();
+        state.record.session.work_state_run_id = value.run_id();
+        state.record.session.current_run = value.current_run();
+        state.record.session.last_run = value.last_run();
         persist(&state.directory, &state.record).await
     }
     async fn set_binding_state(
@@ -853,6 +836,14 @@ mod tests {
         std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
 
+    fn initial_work_state() -> WorkStateRecord {
+        WorkStateRecord::submitted(
+            super::super::RunId(format!("run_{}", uuid::Uuid::new_v4().simple())),
+            super::super::OpenCodeMessageId(format!("msg_{}", uuid::Uuid::new_v4().simple())),
+            chrono::Utc::now().to_rfc3339(),
+        )
+    }
+
     #[test]
     fn allocates_distinct_loopback_ports_for_concurrent_workers() {
         let ports: Vec<_> = (0..8).map(|_| allocate_loopback_port().unwrap()).collect();
@@ -865,11 +856,13 @@ mod tests {
     {
         let fixture = Fixture::new();
         let api = fixture.api();
+        let initial_work_state = initial_work_state();
         let session = api
             .create(
                 "demo-12345678",
                 &fixture.request("demo"),
                 &[("ANVIL_TEST_ENV".into(), "retained".into())],
+                &initial_work_state,
             )
             .await
             .unwrap();
@@ -969,14 +962,20 @@ mod tests {
         let api = fixture.api();
         let mut invalid = fixture.request("failed");
         invalid.base_ref = "missing-ref".into();
-        assert!(api.create("failed-12345678", &invalid, &[]).await.is_err());
+        let invalid_work_state = initial_work_state();
+        assert!(api
+            .create("failed-12345678", &invalid, &[], &invalid_work_state)
+            .await
+            .is_err());
         assert!(!fixture.runtime.join("failed-12345678").exists());
 
         let first_request = fixture.request("demo");
         let second_request = fixture.request("other");
+        let first_work_state = initial_work_state();
+        let second_work_state = initial_work_state();
         let (first, second) = tokio::join!(
-            api.create("demo-12345678", &first_request, &[]),
-            api.create("other-12345679", &second_request, &[]),
+            api.create("demo-12345678", &first_request, &[], &first_work_state),
+            api.create("other-12345679", &second_request, &[], &second_work_state),
         );
         let first = first.unwrap();
         let second = second.unwrap();

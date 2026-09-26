@@ -168,6 +168,10 @@ Its content-addressed layers are partitioned into base Unix tools, Nix and
 developer tooling, Chromium/Xvfb, OpenCode, and Anvil runtime/config files.
 The image starts a root `nix-daemon` and drops the agent process to UID 1000;
 the Nix store is intentionally immutable to the agent.
+Repository-owned image files are passed to the sandbox Nix module as explicit
+path dependencies. Chromium's packaged command wrapper runs the browser with
+`--no-sandbox`; browser isolation is provided by the surrounding Agent Sandbox
+container boundary, without granting the workload broad kernel capabilities.
 
 For a local k3s validation image, avoid exporting the full Docker image. The
 import helper reuses matching compressed layers already present in containerd
