@@ -251,7 +251,8 @@ while (( SECONDS < deadline )); do
   sleep 0.2
 done
 test -n "$pod_name"
-kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- mount | grep -q '/home/anvil'
+mount_output="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- mount)"
+[[ "$mount_output" == *"/home/anvil"* ]]
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- curl -fsS "http://$service_fqdn:4096/global/health" >/dev/null
 opencode_session="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- \
   curl -fsS -X POST http://127.0.0.1:4096/session -H 'content-type: application/json' -d '{}' | jq -r .id)"
