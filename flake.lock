@@ -38,16 +38,17 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1788758950,
-        "narHash": "sha256-b3zONUcYXZHeoeYwDZdSDCzMj0s6ubmD6NT3D7sS+jU=",
-        "owner": "nlewo",
+        "lastModified": 1780987858,
+        "narHash": "sha256-uSu2Txmm3F0jattUSzuUoRcvA8CxBf3j9WkH538Tq24=",
+        "owner": "Dauliac",
         "repo": "nix2container",
-        "rev": "b6ac40ef110c12ab1651fce5ea563f7837236439",
+        "rev": "8fd02c842686a528fd37508283853de0ed1462b1",
         "type": "github"
       },
       "original": {
-        "owner": "nlewo",
+        "owner": "Dauliac",
         "repo": "nix2container",
+        "rev": "8fd02c842686a528fd37508283853de0ed1462b1",
         "type": "github"
       }
     },
@@ -122,6 +123,10 @@
         "crane": "crane",
         "flake-utils": "flake-utils",
         "nix2container": "nix2container",
+        "nix2containerNixpkgs": [
+          "nix2container",
+          "nixpkgs"
+        ],
         "nixpkgs": "nixpkgs_2",
         "opencode": "opencode"
       }

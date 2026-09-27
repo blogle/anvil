@@ -40,6 +40,7 @@ if [ -n "${ANVIL_RUNTIME_EXEC:-}" ]; then
   runtime_exec 'test "$(git config --global user.name)" = Anvil && test -n "$(git config --global user.email)"'
   runtime_exec 'test "$(stat -c %u /nix/store)" = 0 && test ! -w /nix/store && test "$(stat -c %u:%g /nix/var)" = 0:0 && test ! -w /nix/var'
   runtime_exec 'pgrep -x nix-daemon >/dev/null && nix store info >/dev/null && nix develop --command just check'
+  runtime_exec 'printf "Building Anvil sandbox image from inside the runtime sandbox\n" && nix build --no-link .#anvil-sandbox-image'
   runtime_exec 'command -v opencode >/dev/null && command -v nix >/dev/null && command -v just >/dev/null && command -v git >/dev/null'
 fi
 

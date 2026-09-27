@@ -33,6 +33,7 @@ if [ "$runtime_supported" = 1 ]; then
   cat >"$rootfs/tmp/anvil-runtime-acceptance.sh" <<'EOF'
 #!/bin/bash
 set -euo pipefail
+mkdir -p /nix/var/nix/daemon-socket
 NIX_REMOTE=local nix-store --init >/dev/null 2>&1 || true
 env -u NIX_REMOTE nix-daemon --daemon &
 nix_daemon_pid=$!

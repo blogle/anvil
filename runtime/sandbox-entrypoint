@@ -3,6 +3,7 @@
 set -euo pipefail
 
 if [ "$(id -u)" = 0 ] && [ "${1:-}" != --agent ]; then
+  mkdir -p /nix/var/nix/daemon-socket
   NIX_REMOTE=local nix-store --init >/dev/null 2>&1 || true
   env -u NIX_REMOTE nix-daemon --daemon &
   nix_daemon_pid=$!

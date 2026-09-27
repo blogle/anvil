@@ -5,11 +5,14 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     crane.url = "github:ipetkov/crane";
-    nix2container.url = "github:nlewo/nix2container";
+    # Temporary pin for nlewo/nix2container#199 / issue #192.
+    # Remove this fork pin after the upstream fix lands in nlewo/nix2container.
+    nix2container.url = "github:Dauliac/nix2container/8fd02c842686a528fd37508283853de0ed1462b1";
+    nix2containerNixpkgs.follows = "nix2container/nixpkgs";
     opencode.url = "github:anomalyco/opencode/v1.18.30";
   };
 
-  outputs = { self, nixpkgs, flake-utils, crane, nix2container, opencode }:
+  outputs = { self, nixpkgs, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
@@ -22,6 +25,7 @@
         sandbox = import ./nix/sandbox.nix {
           inherit pkgs opencode;
           nix2containerPkgs = nix2container.packages.${system};
+          nix2containerBuildPkgs = nix2containerNixpkgs.legacyPackages.${system};
           credentialHelperSource = ./runtime/anvil-credential;
           sandboxEntrypointSource = ./runtime/sandbox-entrypoint;
           importSandboxImageK3sSource = ./scripts/import-sandbox-image-k3s.sh;

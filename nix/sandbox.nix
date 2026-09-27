@@ -1,5 +1,6 @@
 { pkgs
 , nix2containerPkgs
+, nix2containerBuildPkgs
 , opencode
 , credentialHelperSource
 , sandboxEntrypointSource
@@ -105,9 +106,6 @@ let
   sandboxMutableTmp = pkgs.runCommand "anvil-sandbox-tmp" {} ''
     mkdir -p "$out/tmp"
   '';
-  sandboxMutableNixVar = pkgs.runCommand "anvil-sandbox-nix-var" {} ''
-    mkdir -p "$out/nix/var/nix/daemon-socket"
-  '';
   sandboxUsrBin = pkgs.runCommand "anvil-sandbox-usr-bin" {} ''
     mkdir -p "$out/usr/bin"
     ln -s ${pkgs.coreutils}/bin/env "$out/usr/bin/env"
@@ -128,7 +126,7 @@ let
   };
   sandboxRuntimeFiles = [
     nixConf credentialHelper ghWrapper sandboxUsrBin sandboxBin
-  ] ++ userFiles ++ [ sandboxMutableHome sandboxMutableTmp sandboxMutableNixVar ];
+  ] ++ userFiles ++ [ sandboxMutableHome sandboxMutableTmp ];
   sandboxBaseLayer = nix2containerPkgs.nix2container.buildLayer {
     deps = sandboxBaseTools;
     metadata = { created_by = "anvil sandbox: base/runtime Unix tools"; };
@@ -148,27 +146,6 @@ let
       "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
     ];
   };
-  sandboxPerms = [
-    {
-      path = sandboxMutableHome;
-      regex = ".*";
-      mode = "0755";
-      uid = 1000;
-      gid = 1000;
-      uname = "anvil";
-      gname = "anvil";
-    }
-    {
-      path = sandboxMutableTmp;
-      regex = ".*";
-      mode = "1777";
-    }
-    {
-      path = sandboxMutableNixVar;
-      regex = ".*";
-      mode = "0755";
-    }
-  ];
   # Keep this construction behaviorally unchanged while it lives in its own
   # module: sandbox image identity is intentionally independent of the Rust build.
   mkSandboxImage = {
@@ -179,6 +156,30 @@ let
     chromium ? chromiumForImage
   }:
     let
+      copyToRoot = sandboxRuntimeFiles ++ [ entrypointPackage ];
+      # buildImage turns copyToRoot into this same symlinkJoin when Nix DB
+      # initialization is enabled. Target its merged root paths for image
+      # permissions, since the original source derivations are now symlinked.
+      copyToRootSymlinks = nix2containerBuildPkgs.symlinkJoin {
+        name = "copyToRoot-symlinks";
+        paths = copyToRoot;
+      };
+      sandboxPerms = [
+        {
+          path = copyToRootSymlinks;
+          regex = "/home/anvil(/.*)?$";
+          mode = "0755";
+          uid = 1000;
+          gid = 1000;
+          uname = "anvil";
+          gname = "anvil";
+        }
+        {
+          path = copyToRootSymlinks;
+          regex = "/tmp$";
+          mode = "1777";
+        }
+      ];
       browserLayer = nix2containerPkgs.nix2container.buildLayer {
         deps = [ chromium pkgs.xorg-server ];
         layers = [ sandboxBaseLayer sandboxDeveloperLayer ];
@@ -193,7 +194,7 @@ let
     nix2containerPkgs.nix2container.buildImage {
       name = "ghcr.io/blogle/anvil-sandbox";
       inherit tag config;
-      copyToRoot = sandboxRuntimeFiles ++ [ entrypointPackage ];
+      inherit copyToRoot;
       initializeNixDatabase = true;
       perms = sandboxPerms;
       layers = [
