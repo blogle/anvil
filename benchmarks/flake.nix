@@ -4,16 +4,18 @@
     nixpkgs.follows = "root/nixpkgs";
     flake-utils.follows = "root/flake-utils";
     nix2container.follows = "root/nix2container";
+    nix2containerNixpkgs.follows = "root/nix2containerNixpkgs";
     opencode.follows = "root/opencode";
   };
 
-  outputs = { self, nixpkgs, flake-utils, nix2container, opencode, ... }:
+  outputs = { self, nixpkgs, flake-utils, nix2container, nix2containerNixpkgs, opencode, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
         sandbox = import ../nix/sandbox.nix {
           inherit pkgs opencode;
           nix2containerPkgs = nix2container.packages.${system};
+          nix2containerBuildPkgs = nix2containerNixpkgs.legacyPackages.${system};
           credentialHelperSource = ../runtime/anvil-credential;
           sandboxEntrypointSource = ../runtime/sandbox-entrypoint;
           importSandboxImageK3sSource = ../scripts/import-sandbox-image-k3s.sh;
