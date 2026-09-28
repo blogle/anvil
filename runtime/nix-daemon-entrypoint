@@ -5,18 +5,43 @@ if [ "${1:-}" = --bootstrap ]; then
   # Kind's local-path provisioner creates volume roots world-writable; Nix
   # refuses to execute builds unless every component of /nix is secure.
   chmod 0755 /shared-nix
-  # The image's initialized Nix DB and complete sandbox closure live in /nix.
-  # The PVC is mounted elsewhere in this init container, leaving that seed visible.
+  # The image's initialized DB and complete sandbox closure live in /nix;
+  # mounting the PVC at /shared-nix leaves this baseline visible for import.
+  mkdir -p /shared-nix/store /shared-nix/var/nix
   if [ ! -e /shared-nix/var/nix/db/db.sqlite ]; then
-    mkdir -p /shared-nix/store /shared-nix/var/nix
     cp -a /nix/store/. /shared-nix/store/
     cp -a /nix/var/nix/. /shared-nix/var/nix/
+  else
+    # Never replace the live DB or paths built by sandboxes. A pending dump
+    # survives an interrupted import and is retried on the next startup.
+    pending=/shared-nix/var/nix/.anvil-baseline-pending
+    missing=0
+    for path in /nix/store/*; do
+      if [ ! -e "/shared-nix/store/${path##*/}" ]; then
+        missing=1
+        break
+      fi
+    done
+    if [ "$missing" = 1 ] || [ -e "$pending" ]; then
+      if [ "$missing" = 1 ]; then
+        NIX_REMOTE=local nix-store --dump-db > "${pending}.tmp"
+        mv "${pending}.tmp" "$pending"
+      fi
+      for path in /nix/store/*; do
+        if [ ! -e "/shared-nix/store/${path##*/}" ]; then
+          cp -a "$path" /shared-nix/store/
+        fi
+      done
+      NIX_REMOTE=local NIX_STATE_DIR=/shared-nix/var/nix nix-store --load-db < "$pending"
+      rm "$pending"
+    fi
   fi
   # Keep all baseline image paths alive, including the tools needed to start
   # future containers, even if other sandboxes run nix store gc.
   mkdir -p /shared-nix/var/nix/gcroots/anvil-baseline
   for path in /nix/store/*; do
     name="${path##*/}"
+    test -e "/shared-nix/store/$name"
     ln -sfn "/nix/store/$name" "/shared-nix/var/nix/gcroots/anvil-baseline/$name"
   done
   test -s /shared-nix/var/nix/db/db.sqlite

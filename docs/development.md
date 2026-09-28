@@ -122,9 +122,11 @@ not RWX; do not schedule this PoC across multiple nodes.
 `anvil-nix-daemon` is the sole writer of the dedicated `anvil-nix` PVC. Its
 init container seeds the image's complete runtime store and Nix database on a
 fresh PVC and pins the baseline with GC roots; subsequent restarts preserve the
-database and builds. `anvild` uses `ANVIL_NIX_PVC` to mount only `/nix/store`
-and the Unix daemon socket into sandboxes, both read-only. Agents are UID 1000
-untrusted Nix clients (`NIX_REMOTE=daemon`); `nix develop` and downloads/builds
+database and builds. New daemon images merge any added runtime store paths and
+their Nix database records into an existing volume before starting the daemon;
+they do not replace existing builds. `anvild` uses `ANVIL_NIX_PVC` to mount only
+`/nix/store` and the Unix daemon socket into sandboxes, both read-only. Agents
+are UID 1000 untrusted Nix clients (`NIX_REMOTE=daemon`); `nix develop` and downloads/builds
 are reused immediately across sandboxes. The daemon performs builds with its
 own `nixbld` users. This is single-node/RWO; multi-node distribution is future
 work.

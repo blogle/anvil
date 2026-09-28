@@ -44,6 +44,8 @@
         packages.anvil-image-ci = images.anvilImageCi;
         packages.anvil-sandbox-image = sandbox.sandboxImage;
         packages.anvil-nix-daemon-image = sandbox.daemonImage;
+        packages.anvil-nix-daemon-upgrade-test-image = sandbox.daemonUpgradeImage;
+        packages.anvil-nix-daemon-upgrade-test-canary = sandbox.daemonUpgradeCanary;
         packages.anvil-nix-daemon-image-push = sandbox.daemonImagePush;
         packages.anvil-sandbox-image-push = sandbox.sandboxImagePush;
         packages.import-sandbox-image-k3s = sandbox.importSandboxImageK3s;

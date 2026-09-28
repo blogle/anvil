@@ -218,9 +218,10 @@ let
   };
   # Include the same explicit sandbox layers so the initialized image DB
   # contains the entire runtime closure before a PVC is ever mounted.
-  daemonImage = nix2containerPkgs.nix2container.buildImage {
+  mkDaemonImage = { tag ? "main", extraStorePaths ? [] }:
+    nix2containerPkgs.nix2container.buildImage {
     name = "ghcr.io/blogle/anvil-nix-daemon";
-    tag = "main";
+    inherit tag;
     copyToRoot = [ daemonBin daemonConf ] ++ daemonUsers ++ [
       (pkgs.writeShellScriptBin "anvil-nix-daemon" (builtins.readFile ./../runtime/nix-daemon-entrypoint))
     ];
@@ -228,7 +229,7 @@ let
     layers = [ sandboxBaseLayer sandboxDeveloperLayer
       (nix2containerPkgs.nix2container.buildLayer {
         deps = [ chromiumForImage pkgs.xorg-server opencodePackage ]
-          ++ sandboxRuntimeFiles ++ [ sandboxEntrypoint ];
+          ++ sandboxRuntimeFiles ++ [ sandboxEntrypoint ] ++ extraStorePaths;
         layers = [ sandboxBaseLayer sandboxDeveloperLayer ];
       }) ];
     config = {
@@ -237,6 +238,12 @@ let
       Env = [ "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" ];
     };
+  };
+  daemonImage = mkDaemonImage {};
+  daemonUpgradeCanary = pkgs.writeText "anvil-nix-upgrade-baseline-canary" "new baseline closure after daemon upgrade\n";
+  daemonUpgradeImage = mkDaemonImage {
+    tag = "kind-upgrade";
+    extraStorePaths = [ daemonUpgradeCanary ];
   };
   importSandboxImageK3s = pkgs.writeShellApplication {
     name = "import-sandbox-image-k3s";
@@ -260,6 +267,8 @@ in
     mkSandboxImage
     sandboxImage
     daemonImage
+    daemonUpgradeImage
+    daemonUpgradeCanary
     importSandboxImageK3s;
 
   sandboxImagePush = sandboxImage.copyToRegistry;

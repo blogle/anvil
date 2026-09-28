@@ -59,10 +59,13 @@ created=1
 anvil_image="$(nix build --no-link --print-out-paths .#anvil-image)"
 sandbox_image="$(nix build --no-link --print-out-paths .#anvil-sandbox-image)"
 daemon_image="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-image)"
+upgrade_image="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-image)"
+upgrade_canary="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-canary)"
 skopeo --tmpdir "$tmp" --insecure-policy copy "docker-archive:$anvil_image" docker-daemon:ghcr.io/blogle/anvil:kind-e2e >/dev/null
 skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$sandbox_image" docker-daemon:ghcr.io/blogle/anvil-sandbox:kind-e2e >/dev/null
 skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$daemon_image" docker-daemon:ghcr.io/blogle/anvil-nix-daemon:kind-e2e >/dev/null
-kind load docker-image ghcr.io/blogle/anvil:kind-e2e ghcr.io/blogle/anvil-sandbox:kind-e2e ghcr.io/blogle/anvil-nix-daemon:kind-e2e --name "$cluster"
+skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$upgrade_image" docker-daemon:ghcr.io/blogle/anvil-nix-daemon:kind-upgrade >/dev/null
+kind load docker-image ghcr.io/blogle/anvil:kind-e2e ghcr.io/blogle/anvil-sandbox:kind-e2e ghcr.io/blogle/anvil-nix-daemon:kind-e2e ghcr.io/blogle/anvil-nix-daemon:kind-upgrade --name "$cluster"
 
 kubectl --kubeconfig "$kubeconfig" cluster-info
 kubectl --kubeconfig "$kubeconfig" apply -f "$root/k8s/vendor/agent-sandbox/v1.0.2/sandbox.yaml"
@@ -282,31 +285,57 @@ test -n "$pod_name"
 mount_output="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- mount)"
 [[ "$mount_output" == *"/home/anvil"* ]]
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- curl -fsS "http://$service_fqdn:4096/global/health" >/dev/null
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" port-forward service/anvild 18080:8080 >"$tmp/anvild-port-forward.log" 2>&1 & api_forward_pid=$!
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" port-forward service/anvil-router 18082:8082 >"$tmp/router-port-forward.log" 2>&1 & router_forward_pid=$!
+poll http://127.0.0.1:18080/readyz
+poll http://127.0.0.1:18082/readyz
+
+create_anvil_session() {
+  local response
+  response="$(curl --max-time 300 -fsS -H 'content-type: application/json' \
+    -d "$(jq -cn --arg repository "$source_repo" --arg ref "$source_ref" '{project:"anvil",repository:$repository,ref:$ref,prompt:"Kind shared Nix store acceptance: no edits.",model:null}')" \
+    http://127.0.0.1:18080/v1/sessions)"
+  jq -er '.id' <<<"$response"
+}
+api_a_id="$(create_anvil_session)"
+api_b_id="$(create_anvil_session)"
+api_a_name="anvil-$api_a_id"
+api_b_name="anvil-$api_b_id"
+for name in "$api_a_name" "$api_b_name"; do
+  kubectl --kubeconfig "$kubeconfig" -n "$namespace" get sandbox "$name" -o json | jq -e '
+    .spec.podTemplate.spec as $pod |
+    any($pod.volumes[]; .name == "shared-nix" and .persistentVolumeClaim.claimName == "anvil-nix" and .persistentVolumeClaim.readOnly == true) and
+    ([$pod.containers[] | select(.name == "sandbox") | .volumeMounts[] | select(.name == "shared-nix")] | length == 2 and
+      all(.[]; .readOnly == true and ((.mountPath == "/nix/store" and .subPath == "store") or (.mountPath == "/nix/var/nix/daemon-socket" and .subPath == "var/nix/daemon-socket"))))' >/dev/null
+done
+api_a_pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$api_a_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
+api_b_pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$api_b_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
+test -n "$api_a_pod" && test -n "$api_b_pod"
 agent_exec() {
   local pod="$1"
   shift
   kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod" -c sandbox -- \
     setpriv --reuid=1000 --regid=1000 --init-groups -- env HOME=/home/anvil "$@"
 }
-agent_exec "$pod_name" /bin/bash -c '
+agent_exec "$api_a_pod" /bin/bash -c '
   test "$(id -u):$(id -g)" = 1000:1000
   ! touch /nix/store/anvil-must-not-write
   ! pgrep -x nix-daemon
   nix store info >/dev/null
 '
-bash_path="$(agent_exec "$pod_name" readlink -f /bin/bash)"
-shared_path="$(agent_exec "$pod_name" nix build --no-link --print-out-paths --impure --expr "derivation { name = \"anvil-shared-${cluster}\"; system = builtins.currentSystem; builder = \"$bash_path\"; args = [ \"-c\" \"printf kind-shared > \$out\" ]; }")"
+bash_path="$(agent_exec "$api_a_pod" readlink -f /bin/bash)"
+shared_path="$(agent_exec "$api_a_pod" nix build --no-link --print-out-paths --impure --expr "derivation { name = \"anvil-shared-${cluster}\"; system = builtins.currentSystem; builder = \"$bash_path\"; args = [ \"-c\" \"printf kind-shared > \$out\" ]; }")"
 [[ "$shared_path" = /nix/store/* ]]
-agent_exec "$pod_name" /bin/bash -c 'test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null' -- "$shared_path"
-# A second real Agent Sandbox uses the same production mount layout, its own workspace,
-# and no transfer from A's workspace.
-jq '.metadata.name = "anvil-fixture-87654321" | .metadata.annotations["anvil.example/work-branch"] = "anvil/fixture-87654321" | .spec.podTemplate.spec.initContainers[0].args = ["set -euo pipefail; mkdir -p /home/anvil/workspace/anvil; chown -R 1000:1000 /home/anvil"] | (.spec.podTemplate.spec.containers[0].env[] | select(.name == "ANVIL_WORK_BRANCH")).value = "anvil/fixture-87654321" | (.spec.podTemplate.spec.containers[0].env[] | select(.name == "ANVIL_SESSION_ID")).value = "fixture-87654321"' "$tmp/kind-sandbox.json" >"$tmp/kind-sandbox-b.json"
-kubectl --kubeconfig "$kubeconfig" apply -f "$tmp/kind-sandbox-b.json"
-kubectl --kubeconfig "$kubeconfig" -n "$namespace" wait --for=condition=Ready sandbox/anvil-fixture-87654321 --timeout=300s
-pod_b="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints anvil-fixture-87654321 -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
-test -n "$pod_b"
-agent_exec "$pod_b" /bin/bash -c 'test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null' -- "$shared_path"
-agent_exec "$pod_name" /bin/bash -lc 'cd /home/anvil/workspace/anvil && nix develop --command just check'
+agent_exec "$api_a_pod" /bin/bash -c 'test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null' -- "$shared_path"
+agent_exec "$api_b_pod" /bin/bash -c 'test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null' -- "$shared_path"
+if agent_exec "$api_b_pod" nix path-info "$upgrade_canary" >/dev/null 2>&1; then
+  printf 'upgrade canary was unexpectedly present in the original baseline\n' >&2
+  exit 1
+fi
+curl -fsS -X DELETE "http://127.0.0.1:18080/v1/sessions/$api_a_id" >/dev/null
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" wait --for=delete "sandbox/$api_a_name" --timeout=120s
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" wait --for=delete "pod/$api_a_pod" --timeout=120s
+agent_exec "$api_b_pod" nix path-info "$shared_path" >/dev/null
 opencode_session="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- \
   curl -fsS -X POST http://127.0.0.1:4096/session -H 'content-type: application/json' -d '{}' | jq -r .id)"
 test -n "$opencode_session"
@@ -314,11 +343,6 @@ kubectl --kubeconfig "$kubeconfig" -n "$namespace" annotate sandbox "$sandbox_na
   "anvil.example/opencode-session-id=$opencode_session" \
   anvil.example/binding-state=available \
   anvil.example/binding-checked-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
-
-kubectl --kubeconfig "$kubeconfig" -n "$namespace" port-forward service/anvild 18080:8080 >"$tmp/anvild-port-forward.log" 2>&1 & api_forward_pid=$!
-kubectl --kubeconfig "$kubeconfig" -n "$namespace" port-forward service/anvil-router 18082:8082 >"$tmp/router-port-forward.log" 2>&1 & router_forward_pid=$!
-poll http://127.0.0.1:18080/readyz
-poll http://127.0.0.1:18082/readyz
 
 session="$(curl -fsS http://127.0.0.1:18080/v1/sessions/fixture-12345678)"
 test "$(jq -r .opencode_session_id <<<"$session")" = "$opencode_session"
@@ -346,7 +370,7 @@ while (( SECONDS < deadline )); do
   sleep 0.2
 done
 test "$mode" = Suspended
-agent_exec "$pod_b" nix path-info "$shared_path" >/dev/null
+agent_exec "$api_b_pod" nix path-info "$shared_path" >/dev/null
 curl -fsS -X POST http://127.0.0.1:18080/v1/sessions/fixture-12345678/resume >/dev/null
 session_after_resume="$(curl -fsS http://127.0.0.1:18080/v1/sessions/fixture-12345678)"
 test "$(jq -r .opencode_session_id <<<"$session_after_resume")" = "$opencode_session"
@@ -362,12 +386,27 @@ test -n "$pod_name"
 
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout restart deployment/anvil-nix-daemon
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-nix-daemon --timeout=300s
-agent_exec "$pod_b" /bin/bash -c 'nix store info >/dev/null && test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null' -- "$shared_path"
+agent_exec "$api_b_pod" /bin/bash -c 'nix store info >/dev/null && test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null' -- "$shared_path"
+
+# Upgrade the baseline on the populated PVC; registration must merge into the
+# existing DB without losing the derivation previously built by sandbox A.
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" set image deployment/anvil-nix-daemon \
+  bootstrap-store=ghcr.io/blogle/anvil-nix-daemon:kind-upgrade \
+  nix-daemon=ghcr.io/blogle/anvil-nix-daemon:kind-upgrade
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-nix-daemon --timeout=600s
+agent_exec "$api_b_pod" /bin/bash -c 'test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null && nix path-info "$2" >/dev/null && test -s "$2"' -- "$shared_path" "$upgrade_canary"
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c 'test -L "/nix/var/nix/gcroots/anvil-baseline/${1##*/}" && test ! -e /nix/var/nix/.anvil-baseline-pending' -- "$upgrade_canary"
+api_c_id="$(create_anvil_session)"
+api_c_name="anvil-$api_c_id"
+api_c_pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$api_c_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
+test -n "$api_c_pod"
+agent_exec "$api_c_pod" /bin/bash -c 'nix store info >/dev/null && nix path-info "$1" >/dev/null && nix path-info "$2" >/dev/null' -- "$shared_path" "$upgrade_canary"
+agent_exec "$api_b_pod" /bin/bash -lc 'cd /home/anvil/workspace/anvil && nix develop --command just check'
 
 ANVIL_KUBECONFIG="$kubeconfig" \
 ANVIL_SANDBOX_POD="$pod_name" \
 ANVIL_NAMESPACE="$namespace" \
-ANVIL_SHARED_NIX=1 \
+ANVIL_SHARED_NIX=0 \
   bash "$root/tests/sandbox-acceptance.sh"
 
 printf 'Kind Agent Sandbox reconciliation, PVC, suspend/resume, RBAC, router/preview and shared runtime acceptance passed\n'

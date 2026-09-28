@@ -20,13 +20,15 @@ jobs:
         run: |
           set -euo pipefail
           kubectl kustomize k8s/overlays/dev > /tmp/anvil-rendered.yaml
-          if grep -En 'image: (anvil(:|/)|anvil-sandbox:)|imagePullPolicy: Never' /tmp/anvil-rendered.yaml; then
+          if grep -En 'image: (anvil(:|/)|anvil-sandbox:|anvil-nix-daemon:)|imagePullPolicy: Never' /tmp/anvil-rendered.yaml; then
             echo 'rendered manifests contain a local image or Never pull policy'
             exit 1
           fi
           grep -En 'image: ghcr.io/blogle/anvil:main' /tmp/anvil-rendered.yaml
           grep -En 'image: ghcr.io/blogle/anvil-sandbox:main' /tmp/anvil-rendered.yaml
+          grep -En 'image: ghcr.io/blogle/anvil-nix-daemon:main' /tmp/anvil-rendered.yaml
           grep -En 'ANVIL_SANDBOX_IMAGE: ghcr.io/blogle/anvil-sandbox:main' /tmp/anvil-rendered.yaml
+          grep -En 'ANVIL_NIX_PVC: anvil-nix' /tmp/anvil-rendered.yaml
 
   pr-build:
     name: Build and inspect PR images
@@ -45,8 +47,10 @@ jobs:
           nix build .#anvil-image-ci -o result-anvil-ci
           docker load < result-anvil-ci
           nix run .#anvil-sandbox-image.copyToDockerDaemon
+          nix run .#anvil-nix-daemon-image.copyToDockerDaemon
           docker image inspect anvil-ci:dev >/dev/null
           docker image inspect ghcr.io/blogle/anvil-sandbox:main >/dev/null
+          docker image inspect ghcr.io/blogle/anvil-nix-daemon:main >/dev/null
 
   publish:
     name: Build, inspect, and publish images
@@ -66,8 +70,10 @@ jobs:
           nix build .#anvil-image -o result-anvil
           docker load < result-anvil
           nix run .#anvil-sandbox-image.copyToDockerDaemon
+          nix run .#anvil-nix-daemon-image.copyToDockerDaemon
           docker image inspect anvil:dev >/dev/null
           docker image inspect ghcr.io/blogle/anvil-sandbox:main >/dev/null
+          docker image inspect ghcr.io/blogle/anvil-nix-daemon:main >/dev/null
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -86,13 +92,13 @@ jobs:
           elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             tags+=("${GITHUB_REF_NAME}")
           fi
-          for image in anvil anvil-sandbox; do
+          for image in anvil anvil-sandbox anvil-nix-daemon; do
             if [[ "${image}" == anvil ]]; then
               target="${prefix}"
               source="anvil:dev"
             else
-              target="ghcr.io/${owner,,}/anvil-sandbox"
-              source="ghcr.io/${owner,,}/anvil-sandbox:main"
+              target="ghcr.io/${owner,,}/${image}"
+              source="${target}:main"
             fi
             for tag in "${tags[@]}"; do
               docker tag "${source}" "${target}:${tag}"

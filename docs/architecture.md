@@ -36,10 +36,11 @@ application base.
 `anvil-nix-daemon` runs a single root Nix daemon and eight build users against
 Anvil's dedicated RWO `anvil-nix` PVC. An init container automatically seeds a
 new volume with the sandbox runtime closure and Nix database and GC-roots the
-baseline. Existing volumes retain built and downloaded paths across daemon
-restarts. Every sandbox mounts the same `/nix/store` read-only and the standard
-Unix daemon socket; its UID 1000 agent is an untrusted daemon client, not a
-store writer. Builds performed for one sandbox are available by their exact
+baseline. Image upgrades merge new baseline paths into the existing database
+without replacing previously built paths. Every sandbox mounts the same
+`/nix/store` read-only and the standard Unix daemon socket; its UID 1000 agent
+is an untrusted daemon client, not a store writer. Builds performed for one
+sandbox are available by their exact
 store paths to all others, independently of sandbox workspaces and lifecycles.
 The current shared store is single-node/RWO; multi-node distribution remains
 future work.

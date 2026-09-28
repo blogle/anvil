@@ -1189,6 +1189,9 @@ impl SandboxApi for KubeSandboxApi {
             Value::String(RUNTIME_LAYOUT.into()),
         );
         annotations.extend(work_state_annotations(&self.config, initial_work_state));
+        // Kubernetes metadata annotations are strings; nulls are useful in
+        // patch payloads for clearing values but invalid during creation.
+        annotations.retain(|_, value| !value.is_null());
         annotations.insert(
             annotation_key(&self.config, "binding-state"),
             Value::String("pending".into()),
@@ -1242,11 +1245,11 @@ impl SandboxApi for KubeSandboxApi {
             "volumeMounts": [{"name": "workspace", "mountPath": "/home/anvil"}]
         });
         let obj = sandbox_manifest(&self.config, &name, l, annotations, workspace_init, env);
+        let manifest = serde_json::from_value(obj).map_err(|error| {
+            ServiceError::Kubernetes(format!("invalid generated Sandbox manifest: {error}"))
+        })?;
         Api::<DynamicObject>::namespaced_with(self.client.clone(), ns, &sandbox_resource())
-            .create(
-                &PostParams::default(),
-                &serde_json::from_value(obj).unwrap(),
-            )
+            .create(&PostParams::default(), &manifest)
             .await
             .map_err(|e| ServiceError::Kubernetes(e.to_string()))?;
         Ok(Session {
@@ -4396,14 +4399,27 @@ mod tests {
     fn generated_sandbox_uses_read_only_shared_nix() {
         let mut config = config("http://profile".into());
         config.nix_pvc = "configured-nix-pvc".into();
+        let state = WorkStateRecord::submitted(
+            RunId("run_example".into()),
+            OpenCodeMessageId("msg_example".into()),
+            "2026-01-01T00:00:00Z".into(),
+        );
+        let mut annotations = work_state_annotations(&config, &state);
+        annotations.retain(|_, value| !value.is_null());
         let manifest = sandbox_manifest(
             &config,
             "anvil-example",
             labels(),
-            serde_json::Map::new(),
+            annotations,
             json!({"name":"fix-workspace-permissions"}),
             vec![],
         );
+        let _: DynamicObject = serde_json::from_value(manifest.clone()).unwrap();
+        assert!(manifest["metadata"]["annotations"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(Value::is_string));
         let spec = &manifest["spec"]["podTemplate"]["spec"];
         assert_eq!(spec["volumes"][1], shared_nix_volume("configured-nix-pvc"));
         let mounts = spec["containers"][0]["volumeMounts"].as_array().unwrap();
