@@ -17,6 +17,13 @@ cleanup() {
     kubectl --kubeconfig "$kubeconfig" get pods,pvc,sandbox -A -o wide >&2 || true
     kubectl --kubeconfig "$kubeconfig" -n anvil logs deployment/anvild --all-containers=true >&2 || true
     kubectl --kubeconfig "$kubeconfig" -n anvil logs deployment/anvil-profile --all-containers=true >&2 || true
+    kubectl --kubeconfig "$kubeconfig" -n anvil describe deployment/anvil-nix-daemon >&2 || true
+    kubectl --kubeconfig "$kubeconfig" -n anvil logs deployment/anvil-nix-daemon -c bootstrap-store >&2 || true
+    kubectl --kubeconfig "$kubeconfig" -n anvil logs deployment/anvil-nix-daemon -c nix-daemon --tail=150 >&2 || true
+    kubectl --kubeconfig "$kubeconfig" -n anvil describe pod anvil-fixture-12345678 >&2 || true
+    kubectl --kubeconfig "$kubeconfig" -n anvil logs pod/anvil-fixture-12345678 -c sandbox --tail=80 >&2 || true
+    kubectl --kubeconfig "$kubeconfig" -n anvil logs pod/anvil-fixture-12345678 -c sandbox --previous --tail=80 >&2 || true
+    kubectl --kubeconfig "$kubeconfig" -n anvil exec pod/anvil-fixture-12345678 -c sandbox -- /bin/bash -c 'ls -ld /nix /nix/store /nix/var /nix/var/nix /nix/var/nix/daemon-socket /nix/var/nix/daemon-socket/socket; setpriv --reuid=1000 --regid=1000 --init-groups -- nix store info' >&2 || true
     if [ -n "$pod_name" ]; then kubectl --kubeconfig "$kubeconfig" -n anvil logs "$pod_name" --all-containers=true >&2 || true; fi
     for log in "$tmp"/*.log; do [ -f "$log" ] && { printf '\n--- %s ---\n' "$log" >&2; cat "$log" >&2; }; done
   fi
@@ -51,9 +58,11 @@ created=1
 
 anvil_image="$(nix build --no-link --print-out-paths .#anvil-image)"
 sandbox_image="$(nix build --no-link --print-out-paths .#anvil-sandbox-image)"
+daemon_image="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-image)"
 skopeo --tmpdir "$tmp" --insecure-policy copy "docker-archive:$anvil_image" docker-daemon:ghcr.io/blogle/anvil:kind-e2e >/dev/null
 skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$sandbox_image" docker-daemon:ghcr.io/blogle/anvil-sandbox:kind-e2e >/dev/null
-kind load docker-image ghcr.io/blogle/anvil:kind-e2e ghcr.io/blogle/anvil-sandbox:kind-e2e --name "$cluster"
+skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$daemon_image" docker-daemon:ghcr.io/blogle/anvil-nix-daemon:kind-e2e >/dev/null
+kind load docker-image ghcr.io/blogle/anvil:kind-e2e ghcr.io/blogle/anvil-sandbox:kind-e2e ghcr.io/blogle/anvil-nix-daemon:kind-e2e --name "$cluster"
 
 kubectl --kubeconfig "$kubeconfig" cluster-info
 kubectl --kubeconfig "$kubeconfig" apply -f "$root/k8s/vendor/agent-sandbox/v1.0.2/sandbox.yaml"
@@ -77,6 +86,8 @@ resources:
   - github-app-secret.yaml
   - opencode-profile-pvc.yaml
   - anvil-history-pvc.yaml
+  - anvil-nix-pvc.yaml
+  - anvil-nix-daemon.yaml
   - deployments.yaml
   - anvil-profile-deployment.yaml
   - services.yaml
@@ -86,7 +97,20 @@ images:
     newTag: kind-e2e
   - name: ghcr.io/blogle/anvil-sandbox
     newTag: kind-e2e
+  - name: ghcr.io/blogle/anvil-nix-daemon
+    newTag: kind-e2e
 patches:
+  - target:
+      version: v1
+      kind: Deployment
+      name: anvil-nix-daemon
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/initContainers/0/imagePullPolicy
+        value: IfNotPresent
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
   - target:
       version: v1
       kind: Deployment
@@ -137,6 +161,8 @@ kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout restart deployment/an
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvild --timeout=180s
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-profile --timeout=180s
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-router --timeout=180s
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-nix-daemon --timeout=600s
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c 'test -s /nix/var/nix/db/db.sqlite && test -d /nix/var/nix/gcroots/anvil-baseline && nix store info >/dev/null'
 
 # Verify the Anvil service account can manage only its namespaced Sandbox API.
 test "$(kubectl --kubeconfig "$kubeconfig" auth can-i --as=system:serviceaccount:anvil:anvild create sandboxes.agents.x-k8s.io -n anvil)" = yes
@@ -223,10 +249,12 @@ jq -n \
             livenessProbe:{httpGet:{path:"/global/health",port:"opencode"},initialDelaySeconds:15,periodSeconds:10},
             volumeMounts:[
               {name:"workspace",mountPath:"/home/anvil"},
-              {name:"shared-profile",mountPath:"/anvil/profile"}
+              {name:"shared-profile",mountPath:"/anvil/profile"},
+              {name:"shared-nix",mountPath:"/nix/store",subPath:"store",readOnly:true},
+              {name:"shared-nix",mountPath:"/nix/var/nix/daemon-socket",subPath:"var/nix/daemon-socket",readOnly:true}
             ]
           }],
-          volumes:[{name:"shared-profile",persistentVolumeClaim:{claimName:"anvil-opencode-profile"}}]
+          volumes:[{name:"shared-profile",persistentVolumeClaim:{claimName:"anvil-opencode-profile"}},{name:"shared-nix",persistentVolumeClaim:{claimName:"anvil-nix",readOnly:true}}]
         }
       },
       volumeClaimTemplates:[{
@@ -237,7 +265,7 @@ jq -n \
   }' >"$tmp/kind-sandbox.json"
 kubectl --kubeconfig "$kubeconfig" apply -f "$tmp/kind-sandbox.json"
 sandbox_name=anvil-fixture-12345678
-kubectl --kubeconfig "$kubeconfig" -n "$namespace" wait --for=condition=Ready "sandbox/$sandbox_name" --timeout=300s
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" wait --for=condition=Ready "sandbox/$sandbox_name" --timeout=120s
 sandbox_pvc="workspace-$sandbox_name"
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" wait --for=jsonpath='{.status.phase}'=Bound "pvc/$sandbox_pvc" --timeout=120s
 service_fqdn="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get sandbox "$sandbox_name" -o json | jq -r '.status.serviceFQDN // empty')"
@@ -254,6 +282,31 @@ test -n "$pod_name"
 mount_output="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- mount)"
 [[ "$mount_output" == *"/home/anvil"* ]]
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- curl -fsS "http://$service_fqdn:4096/global/health" >/dev/null
+agent_exec() {
+  local pod="$1"
+  shift
+  kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod" -c sandbox -- \
+    setpriv --reuid=1000 --regid=1000 --init-groups -- env HOME=/home/anvil "$@"
+}
+agent_exec "$pod_name" /bin/bash -c '
+  test "$(id -u):$(id -g)" = 1000:1000
+  ! touch /nix/store/anvil-must-not-write
+  ! pgrep -x nix-daemon
+  nix store info >/dev/null
+'
+bash_path="$(agent_exec "$pod_name" readlink -f /bin/bash)"
+shared_path="$(agent_exec "$pod_name" nix build --no-link --print-out-paths --impure --expr "derivation { name = \"anvil-shared-${cluster}\"; system = builtins.currentSystem; builder = \"$bash_path\"; args = [ \"-c\" \"printf kind-shared > \$out\" ]; }")"
+[[ "$shared_path" = /nix/store/* ]]
+agent_exec "$pod_name" /bin/bash -c 'test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null' -- "$shared_path"
+# A second real Agent Sandbox uses the same production mount layout, its own workspace,
+# and no transfer from A's workspace.
+jq '.metadata.name = "anvil-fixture-87654321" | .metadata.annotations["anvil.example/work-branch"] = "anvil/fixture-87654321" | .spec.podTemplate.spec.initContainers[0].args = ["set -euo pipefail; mkdir -p /home/anvil/workspace/anvil; chown -R 1000:1000 /home/anvil"] | (.spec.podTemplate.spec.containers[0].env[] | select(.name == "ANVIL_WORK_BRANCH")).value = "anvil/fixture-87654321" | (.spec.podTemplate.spec.containers[0].env[] | select(.name == "ANVIL_SESSION_ID")).value = "fixture-87654321"' "$tmp/kind-sandbox.json" >"$tmp/kind-sandbox-b.json"
+kubectl --kubeconfig "$kubeconfig" apply -f "$tmp/kind-sandbox-b.json"
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" wait --for=condition=Ready sandbox/anvil-fixture-87654321 --timeout=300s
+pod_b="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints anvil-fixture-87654321 -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
+test -n "$pod_b"
+agent_exec "$pod_b" /bin/bash -c 'test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null' -- "$shared_path"
+agent_exec "$pod_name" /bin/bash -lc 'cd /home/anvil/workspace/anvil && nix develop --command just check'
 opencode_session="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- \
   curl -fsS -X POST http://127.0.0.1:4096/session -H 'content-type: application/json' -d '{}' | jq -r .id)"
 test -n "$opencode_session"
@@ -293,6 +346,7 @@ while (( SECONDS < deadline )); do
   sleep 0.2
 done
 test "$mode" = Suspended
+agent_exec "$pod_b" nix path-info "$shared_path" >/dev/null
 curl -fsS -X POST http://127.0.0.1:18080/v1/sessions/fixture-12345678/resume >/dev/null
 session_after_resume="$(curl -fsS http://127.0.0.1:18080/v1/sessions/fixture-12345678)"
 test "$(jq -r .opencode_session_id <<<"$session_after_resume")" = "$opencode_session"
@@ -306,9 +360,14 @@ while (( SECONDS < deadline )); do
 done
 test -n "$pod_name"
 
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout restart deployment/anvil-nix-daemon
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-nix-daemon --timeout=300s
+agent_exec "$pod_b" /bin/bash -c 'nix store info >/dev/null && test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null' -- "$shared_path"
+
 ANVIL_KUBECONFIG="$kubeconfig" \
 ANVIL_SANDBOX_POD="$pod_name" \
 ANVIL_NAMESPACE="$namespace" \
+ANVIL_SHARED_NIX=1 \
   bash "$root/tests/sandbox-acceptance.sh"
 
 printf 'Kind Agent Sandbox reconciliation, PVC, suspend/resume, RBAC, router/preview and shared runtime acceptance passed\n'

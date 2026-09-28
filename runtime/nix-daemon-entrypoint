@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${1:-}" = --bootstrap ]; then
+  # Kind's local-path provisioner creates volume roots world-writable; Nix
+  # refuses to execute builds unless every component of /nix is secure.
+  chmod 0755 /shared-nix
+  # The image's initialized Nix DB and complete sandbox closure live in /nix.
+  # The PVC is mounted elsewhere in this init container, leaving that seed visible.
+  if [ ! -e /shared-nix/var/nix/db/db.sqlite ]; then
+    mkdir -p /shared-nix/store /shared-nix/var/nix
+    cp -a /nix/store/. /shared-nix/store/
+    cp -a /nix/var/nix/. /shared-nix/var/nix/
+  fi
+  # Keep all baseline image paths alive, including the tools needed to start
+  # future containers, even if other sandboxes run nix store gc.
+  mkdir -p /shared-nix/var/nix/gcroots/anvil-baseline
+  for path in /nix/store/*; do
+    name="${path##*/}"
+    ln -sfn "/nix/store/$name" "/shared-nix/var/nix/gcroots/anvil-baseline/$name"
+  done
+  test -s /shared-nix/var/nix/db/db.sqlite
+  exit 0
+fi
+
+mkdir -p /nix/var/nix/daemon-socket
+exec env -u NIX_REMOTE nix-daemon --daemon

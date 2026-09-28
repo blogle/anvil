@@ -720,6 +720,7 @@ mod tests {
             annotation_prefix: "anvil.local".into(),
             profile_opencode_url: "http://127.0.0.1:4097".into(),
             profile_pvc: "unused".into(),
+            nix_pvc: "unused".into(),
             credential_url: "http://127.0.0.1:8080".into(),
             github_app_id: None,
             github_installation_id: None,

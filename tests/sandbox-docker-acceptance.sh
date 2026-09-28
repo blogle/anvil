@@ -19,18 +19,6 @@ docker run --name "$container_name" --rm --entrypoint /bin/bash \
   -v "$docker_canary_dir:/workspace" \
   "$ANVIL_SANDBOX_IMAGE" -lc '
     set -euo pipefail
-    NIX_REMOTE=local nix-store --init >/dev/null 2>&1 || true
-    env -u NIX_REMOTE nix-daemon --daemon &
-    nix_daemon_pid=$!
-    for _ in $(seq 1 50); do
-      if [ -S /nix/var/nix/daemon-socket/socket ] && kill -0 "$nix_daemon_pid" 2>/dev/null; then
-        break
-      fi
-      sleep 0.1
-    done
-    kill -0 "$nix_daemon_pid"
-    test -S /nix/var/nix/daemon-socket/socket
-
     agent_env=(env \
       HOME=/home/anvil \
       XDG_CONFIG_HOME=/home/anvil/.config \
@@ -42,7 +30,7 @@ docker run --name "$container_name" --rm --entrypoint /bin/bash \
     test "$(setpriv --reuid=1000 --regid=1000 --init-groups -- "${agent_env[@]}" stat -c %u /nix/store)" = 0
     setpriv --reuid=1000 --regid=1000 --init-groups -- "${agent_env[@]}" /bin/test ! -w /nix/store
     cd /workspace
-    setpriv --reuid=1000 --regid=1000 --init-groups -- "${agent_env[@]}" nix develop --command hello
-    setpriv --reuid=1000 --regid=1000 --init-groups -- "${agent_env[@]}" nix develop --command git --version
+    ! pgrep -x nix-daemon >/dev/null
+    setpriv --reuid=1000 --regid=1000 --init-groups -- "${agent_env[@]}" git --version
     setpriv --reuid=1000 --regid=1000 --init-groups -- "${agent_env[@]}" echo CANARY_OK
   '

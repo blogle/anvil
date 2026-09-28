@@ -56,11 +56,11 @@ image acceptance, and isolated Kind fidelity as independent jobs. A Kind pass
 in CI or on a developer laptop is still required before merge; this Anvil
 sandbox must not run Kind nested.
 
-Kind fidelity uses the freshly built Anvil sandbox image, starts a real
-workspace sandbox, verifies `nix develop --command just check`, and then runs
-`nix build --no-link .#anvil-sandbox-image` from inside that sandbox. This
-self-hosting build checks that the sandbox's own Nix daemon, embedded store,
-and Nix database can evaluate and build Anvil's sandbox image.
+Kind fidelity starts with an empty Nix PVC, bootstraps the shared daemon, and
+starts two sandboxes from the freshly built image. It builds a new derivation in
+sandbox A, checks that B sees the exact path after A is suspended and after the
+daemon restarts, and runs `nix develop --command just check` through the shared
+daemon from A.
 
 ## Production deployment
 
@@ -119,6 +119,16 @@ The shared profile is stored in `anvil-opencode-profile`, mounted at
 new Agent Sandboxes. The current ZFS storage is single-node `ReadWriteOnce`,
 not RWX; do not schedule this PoC across multiple nodes.
 
+`anvil-nix-daemon` is the sole writer of the dedicated `anvil-nix` PVC. Its
+init container seeds the image's complete runtime store and Nix database on a
+fresh PVC and pins the baseline with GC roots; subsequent restarts preserve the
+database and builds. `anvild` uses `ANVIL_NIX_PVC` to mount only `/nix/store`
+and the Unix daemon socket into sandboxes, both read-only. Agents are UID 1000
+untrusted Nix clients (`NIX_REMOTE=daemon`); `nix develop` and downloads/builds
+are reused immediately across sandboxes. The daemon performs builds with its
+own `nixbld` users. This is single-node/RWO; multi-node distribution is future
+work.
+
 ## GitHub broker setup
 
 Populate the `github-app-credentials` Secret through the deployment's secret
@@ -168,21 +178,22 @@ Docker archive:
 
 ```sh
 nix run .#anvil-sandbox-image-push
+nix run .#anvil-nix-daemon-image-push
 ```
 
 Its content-addressed layers are partitioned into base Unix tools, Nix and
 developer tooling, Chromium/Xvfb, OpenCode, and Anvil runtime/config files.
-These explicit nix2container layer boundaries are intentional. While sandboxes
-carry local Nix, `initializeNixDatabase = true` is required. nix2container
+These explicit nix2container layer boundaries are intentional. The sandbox
+image contains no usable private Nix database; the dedicated daemon image
+includes the same runtime closure. `initializeNixDatabase = true` on the daemon
+image seeds its bootstrap database. nix2container
 issue [#192](https://github.com/nlewo/nix2container/issues/192) causes nested
 Nix builds to fail when `copyToRoot` paths are registered in the embedded Nix
 database but are absent from `/nix/store`. Anvil temporarily pins the fix from
 [PR #199](https://github.com/nlewo/nix2container/pull/199) until it lands in
 the normal upstream revision; replace the fork pin with that upstream revision
-after the fix is released. Shared or central Nix infrastructure is separate
-future work.
-The image starts a root `nix-daemon` and drops the agent process to UID 1000;
-the Nix store is intentionally immutable to the agent.
+after the fix is released. The sandbox image keeps the Nix CLI but starts no
+daemon; its bootstrap drops the agent process to UID 1000.
 Repository-owned image files are passed to the sandbox Nix module as explicit
 path dependencies. Chromium's packaged command wrapper runs the browser with
 `--no-sandbox`; browser isolation is provided by the surrounding Agent Sandbox

@@ -52,27 +52,16 @@ let
   '';
   nixConf = pkgs.writeTextDir "etc/nix/nix.conf" ''
     experimental-features = nix-command flakes
-    sandbox = false
-    build-users-group = nixbld
   '';
   userFiles = [
     (pkgs.writeTextDir "etc/passwd" ''
       root:x:0:0::/root:${pkgs.bash}/bin/bash
       anvil:x:1000:1000::/home/anvil:${pkgs.bash}/bin/bash
-      nixbld1:x:30001:30000:Nix build user 1:/var/empty:${pkgs.shadow}/bin/nologin
-      nixbld2:x:30002:30000:Nix build user 2:/var/empty:${pkgs.shadow}/bin/nologin
-      nixbld3:x:30003:30000:Nix build user 3:/var/empty:${pkgs.shadow}/bin/nologin
-      nixbld4:x:30004:30000:Nix build user 4:/var/empty:${pkgs.shadow}/bin/nologin
-      nixbld5:x:30005:30000:Nix build user 5:/var/empty:${pkgs.shadow}/bin/nologin
-      nixbld6:x:30006:30000:Nix build user 6:/var/empty:${pkgs.shadow}/bin/nologin
-      nixbld7:x:30007:30000:Nix build user 7:/var/empty:${pkgs.shadow}/bin/nologin
-      nixbld8:x:30008:30000:Nix build user 8:/var/empty:${pkgs.shadow}/bin/nologin
       nobody:x:65534:65534:nobody:/var/empty:${pkgs.coreutils}/bin/false
     '')
     (pkgs.writeTextDir "etc/group" ''
       root:x:0:
       anvil:x:1000:
-       nixbld:x:30000:nixbld1,nixbld2,nixbld3,nixbld4,nixbld5,nixbld6,nixbld7,nixbld8
       nobody:x:65534:
     '')
     (pkgs.writeTextDir "etc/shadow" ''
@@ -157,9 +146,8 @@ let
   }:
     let
       copyToRoot = sandboxRuntimeFiles ++ [ entrypointPackage ];
-      # buildImage turns copyToRoot into this same symlinkJoin when Nix DB
-      # initialization is enabled. Target its merged root paths for image
-      # permissions, since the original source derivations are now symlinked.
+      # Target the merged root paths for image permissions, since the
+      # original source derivations are symlinked into copyToRoot.
       copyToRootSymlinks = nix2containerBuildPkgs.symlinkJoin {
         name = "copyToRoot-symlinks";
         paths = copyToRoot;
@@ -194,8 +182,8 @@ let
     nix2containerPkgs.nix2container.buildImage {
       name = "ghcr.io/blogle/anvil-sandbox";
       inherit tag config;
-      inherit copyToRoot;
-      initializeNixDatabase = true;
+      copyToRoot = copyToRootSymlinks;
+      initializeNixDatabase = false;
       perms = sandboxPerms;
       layers = [
         sandboxBaseLayer
@@ -205,6 +193,51 @@ let
       ];
     };
   sandboxImage = mkSandboxImage {};
+  daemonUsers = [
+    (pkgs.writeTextDir "etc/passwd" (''
+      root:x:0:0::/root:${pkgs.bash}/bin/bash
+      anvil:x:1000:1000::/home/anvil:${pkgs.bash}/bin/bash
+    '' + pkgs.lib.concatMapStrings (i: "nixbld${toString i}:x:${toString (30000 + i)}:30000::/var/empty:${pkgs.shadow}/bin/nologin\n") (pkgs.lib.range 1 8)))
+    (pkgs.writeTextDir "etc/group" ''
+      root:x:0:
+      anvil:x:1000:
+      nixbld:x:30000:${pkgs.lib.concatStringsSep "," (map (i: "nixbld${toString i}") (pkgs.lib.range 1 8))}
+    '')
+  ];
+  daemonConf = pkgs.writeTextDir "etc/nix/nix.conf" ''
+    experimental-features = nix-command flakes
+    sandbox = false
+    build-users-group = nixbld
+    trusted-users = root
+    allowed-users = root anvil
+  '';
+  daemonBin = pkgs.buildEnv {
+    name = "anvil-nix-daemon-bin";
+    paths = [ pkgs.bash pkgs.coreutils pkgs.nix pkgs.gnutar pkgs.findutils ];
+    pathsToLink = [ "/bin" ];
+  };
+  # Include the same explicit sandbox layers so the initialized image DB
+  # contains the entire runtime closure before a PVC is ever mounted.
+  daemonImage = nix2containerPkgs.nix2container.buildImage {
+    name = "ghcr.io/blogle/anvil-nix-daemon";
+    tag = "main";
+    copyToRoot = [ daemonBin daemonConf ] ++ daemonUsers ++ [
+      (pkgs.writeShellScriptBin "anvil-nix-daemon" (builtins.readFile ./../runtime/nix-daemon-entrypoint))
+    ];
+    initializeNixDatabase = true;
+    layers = [ sandboxBaseLayer sandboxDeveloperLayer
+      (nix2containerPkgs.nix2container.buildLayer {
+        deps = [ chromiumForImage pkgs.xorg-server opencodePackage ]
+          ++ sandboxRuntimeFiles ++ [ sandboxEntrypoint ];
+        layers = [ sandboxBaseLayer sandboxDeveloperLayer ];
+      }) ];
+    config = {
+      Cmd = [ "/bin/anvil-nix-daemon" ];
+      User = "0:0";
+      Env = [ "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+        "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" ];
+    };
+  };
   importSandboxImageK3s = pkgs.writeShellApplication {
     name = "import-sandbox-image-k3s";
     runtimeInputs = [
@@ -226,7 +259,9 @@ in
     sandboxConfig
     mkSandboxImage
     sandboxImage
+    daemonImage
     importSandboxImageK3s;
 
   sandboxImagePush = sandboxImage.copyToRegistry;
+  daemonImagePush = daemonImage.copyToRegistry;
 }

@@ -60,6 +60,7 @@ e2e-k8s:
 image:
     nix build .#anvil-image -o result-anvil
     nix build .#anvil-sandbox-image -o result-anvil-sandbox
+    nix build .#anvil-nix-daemon-image -o result-anvil-nix-daemon
 
 image-anvil:
     nix build .#anvil-image -o result-anvil
@@ -79,6 +80,7 @@ load-images:
 
 deploy:
     kubectl apply -k k8s/overlays/dev
+    kubectl rollout status deployment/anvil-nix-daemon -n anvil
     kubectl rollout status deployment/anvild -n anvil
     kubectl rollout status deployment/anvil-profile -n anvil
     kubectl rollout status deployment/anvil-mcp -n anvil

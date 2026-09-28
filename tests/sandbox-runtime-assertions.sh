@@ -8,16 +8,18 @@ if [ -n "${ANVIL_ROOTFS:-}" ]; then
   test -x "$rootfs/usr/bin/env"
   test -x "$rootfs/bin/sandbox-entrypoint"
   grep -q -- '--no-sandbox' "$rootfs/bin/chromium"
-  for binary in bash git nix just opencode chromium Xvfb nix-daemon; do
+  for binary in bash git nix just opencode chromium Xvfb; do
     test -x "$rootfs/bin/$binary" || test -x "$rootfs/usr/bin/$binary"
   done
   test "$(stat -c %u "$rootfs/nix/store")" = "$mapped_uid"
-  test "$(stat -c %u:%g "$rootfs/nix/var")" = "$mapped_uid:$mapped_gid"
   store_mode="$(stat -c %a "$rootfs/nix/store")"
   (( (8#$store_mode & 022) == 0 ))
   test "$(stat -c %a "$rootfs/tmp")" = 1777
   test -d "$rootfs/home/anvil" && test -x "$rootfs/home/anvil"
   test ! -e "$rootfs/usr/share/anvil/anvil-report.ts"
+  test ! -e "$rootfs/nix/var/nix/db/db.sqlite"
+  ! grep -q '^nixbld' "$rootfs/etc/passwd"
+  ! grep -q '^build-users-group' "$rootfs/etc/nix/nix.conf"
 fi
 
 if [ -n "${ANVIL_RUNTIME_EXEC:-}" ]; then
@@ -38,9 +40,10 @@ if [ -n "${ANVIL_RUNTIME_EXEC:-}" ]; then
   runtime_exec 'printf "#!/usr/bin/env bash\nprintf env-ok\n" >/tmp/anvil-env-test && chmod +x /tmp/anvil-env-test && test "$(/tmp/anvil-env-test)" = env-ok'
   runtime_exec 'test "$DISPLAY" = :99 && pgrep -f "Xvfb :99" >/dev/null && dom="$(chromium --headless --disable-gpu --dump-dom "data:text/html,<title>anvil-browser-ok</title>")" && [[ "$dom" == *anvil-browser-ok* ]]'
   runtime_exec 'test "$(git config --global user.name)" = Anvil && test -n "$(git config --global user.email)"'
-  runtime_exec 'test "$(stat -c %u /nix/store)" = 0 && test ! -w /nix/store && test "$(stat -c %u:%g /nix/var)" = 0:0 && test ! -w /nix/var'
-  runtime_exec 'pgrep -x nix-daemon >/dev/null && nix store info >/dev/null && nix develop --command just check'
-  runtime_exec 'printf "Building Anvil sandbox image from inside the runtime sandbox\n" && nix build --no-link .#anvil-sandbox-image'
+  runtime_exec 'test "$(stat -c %u /nix/store)" = 0 && test ! -w /nix/store && test ! -w /nix/var && ! pgrep -x nix-daemon >/dev/null'
+  if [ "${ANVIL_SHARED_NIX:-0}" = 1 ]; then
+    runtime_exec 'test -S /nix/var/nix/daemon-socket/socket && nix store info >/dev/null && nix develop --command just check'
+  fi
   runtime_exec 'command -v opencode >/dev/null && command -v nix >/dev/null && command -v just >/dev/null && command -v git >/dev/null'
 fi
 
