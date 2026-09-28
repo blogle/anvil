@@ -6,7 +6,7 @@ test("poll payload preserves local interaction state and selected session", () =
   const activities = new Map([["demo-12345678", {
     environment_state: "ready",
     execution_state: "idle",
-    work_state: "in_progress",
+    work_state: "ready_for_review",
     session_binding_state: "available",
   }]])
   const state = {
@@ -32,7 +32,7 @@ test("a poll clears detail when the active filter excludes the selected session"
   const activities = new Map([["demo-12345678", {
     environment_state: "ready",
     execution_state: "idle",
-    work_state: "in_progress",
+    work_state: "ready_for_review",
     session_binding_state: "available",
   }]])
   assert.equal(applyServerRefresh(state, [{ id: "demo-12345678" }], activities).selected, null)
@@ -42,7 +42,11 @@ test("fake clock updates elapsed time without changing the interaction model", (
   const now = Date.parse("2026-09-19T12:00:10Z")
   assert.equal(formatElapsedValue("2026-09-19T11:58:00Z", now), "2m 10s")
   assert.equal(formatElapsedValue("1789819200Z", now), "10s")
-  assert.equal(operatorState({ environment_state: "ready", execution_state: "idle", work_state: "in_progress", session_binding_state: "available" }), "working")
+  assert.equal(operatorState({ environment_state: "ready", execution_state: "idle", work_state: "in_progress", session_binding_state: "available" }), "ready-for-review")
+  assert.equal(operatorState({ environment_state: "ready", execution_state: "running", work_state: "ready_for_review" }), "working")
+  assert.equal(operatorState({ environment_state: "ready", execution_state: "failed", work_state: "failed" }), "problem")
+  assert.equal(operatorState({ environment_state: "provisioning", execution_state: "unavailable", work_state: "in_progress" }), "starting")
+  assert.equal(operatorState({ environment_state: "suspended", execution_state: "recovering", work_state: "in_progress" }), "stopped")
   assert.equal(parseRoute("#session/demo-12345678"), "demo-12345678")
   assert.equal(parseRoute("#settings"), null)
 })

@@ -4,6 +4,7 @@ members = [
   "crates/anvil-core",
   # Reserved for the service crates owned by the other delegates.
   "crates/anvild",
+  "crates/anvil-test-model",
   "crates/anvil-mcp",
   "crates/anvil-router",
   "crates/anvilctl",

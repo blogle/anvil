@@ -1,0 +1,22 @@
+version: "0.5"
+processes:
+  anvil-mcp:
+    command: target/debug/anvil-mcp
+    environment: [ANVIL_API_URL=http://127.0.0.1:8080/]
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: 8081
+        path: /healthz
+      initial_delay_seconds: 0
+      period_seconds: 1
+      timeout_seconds: 1
+      success_threshold: 1
+      failure_threshold: 30
+  anvil-router:
+    command: target/debug/anvil-router
+    environment:
+      - LISTEN_ADDR=127.0.0.1:8082
+      - BASE_DOMAIN=localhost.test
+      - ANVIL_NAMESPACE=local
+      - AGENT_SANDBOX_ROUTER_URL=http://127.0.0.1:8083

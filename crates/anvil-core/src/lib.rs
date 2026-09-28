@@ -28,8 +28,8 @@ pub enum AnvilError {
 #[serde(rename_all = "snake_case")]
 pub enum WorkState {
     InProgress,
-    AwaitingInput,
     ReadyForReview,
+    Failed,
     Completed,
 }
 
@@ -37,8 +37,8 @@ impl WorkState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::InProgress => "in_progress",
-            Self::AwaitingInput => "awaiting_input",
             Self::ReadyForReview => "ready_for_review",
+            Self::Failed => "failed",
             Self::Completed => "completed",
         }
     }
@@ -50,8 +50,8 @@ impl std::str::FromStr for WorkState {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "in_progress" => Ok(Self::InProgress),
-            "awaiting_input" => Ok(Self::AwaitingInput),
             "ready_for_review" => Ok(Self::ReadyForReview),
+            "failed" => Ok(Self::Failed),
             "completed" => Ok(Self::Completed),
             _ => Err(ValidationError::Invalid {
                 field: "work_state",
@@ -59,58 +59,6 @@ impl std::str::FromStr for WorkState {
             }),
         }
     }
-}
-
-/// The only dispositions an OpenCode worker may report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkerDisposition {
-    AwaitingInput,
-    ReadyForReview,
-}
-
-impl WorkerDisposition {
-    pub fn work_state(self) -> WorkState {
-        match self {
-            Self::AwaitingInput => WorkState::AwaitingInput,
-            Self::ReadyForReview => WorkState::ReadyForReview,
-        }
-    }
-}
-
-impl std::str::FromStr for WorkerDisposition {
-    type Err = ValidationError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "awaiting_input" => Ok(Self::AwaitingInput),
-            "ready_for_review" => Ok(Self::ReadyForReview),
-            _ => Err(ValidationError::Invalid {
-                field: "disposition",
-                reason: "unknown worker disposition".into(),
-            }),
-        }
-    }
-}
-
-pub fn validate_worker_transition(
-    current: WorkState,
-    disposition: WorkerDisposition,
-) -> Result<WorkState, ValidationError> {
-    if current != WorkState::InProgress {
-        return Err(ValidationError::Invalid {
-            field: "work_state",
-            reason: format!("worker cannot transition from {}", current.as_str()),
-        });
-    }
-    Ok(disposition.work_state())
-}
-
-pub fn normalize_summary(summary: Option<&str>) -> Result<Option<String>, ValidationError> {
-    let Some(summary) = summary.map(str::trim).filter(|summary| !summary.is_empty()) else {
-        return Ok(None);
-    };
-    Ok(Some(summary.chars().take(500).collect()))
 }
 
 // ── Project ──────────────────────────────────────────────────────────
@@ -347,10 +295,39 @@ pub struct Session {
     pub session_binding_recovery_event: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RunId(pub String);
+
+impl fmt::Display for RunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OpenCodeMessageId(pub String);
+
+impl fmt::Display for OpenCodeMessageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunState {
+    Submitted,
+    Running,
+    Completed,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Run {
-    pub id: String,
-    pub state: String,
+    pub id: RunId,
+    pub state: RunState,
     pub started_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
@@ -843,40 +820,5 @@ mod tests {
     #[test]
     fn session_id_deserialize_rejects_invalid() {
         assert!(serde_json::from_str::<SessionId>("\"not-valid\"").is_err());
-    }
-
-    #[test]
-    fn worker_transitions_are_limited_to_review_or_input() {
-        assert_eq!(
-            validate_worker_transition(WorkState::InProgress, WorkerDisposition::ReadyForReview)
-                .unwrap(),
-            WorkState::ReadyForReview
-        );
-        assert!(validate_worker_transition(
-            WorkState::ReadyForReview,
-            WorkerDisposition::AwaitingInput
-        )
-        .is_err());
-        assert!(validate_worker_transition(
-            WorkState::Completed,
-            WorkerDisposition::ReadyForReview
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn summaries_are_trimmed_and_capped() {
-        assert_eq!(
-            normalize_summary(Some("  finished  ")).unwrap(),
-            Some("finished".into())
-        );
-        assert_eq!(normalize_summary(Some("  ")).unwrap(), None);
-        assert_eq!(
-            normalize_summary(Some(&"x".repeat(501)))
-                .unwrap()
-                .unwrap()
-                .len(),
-            500
-        );
     }
 }

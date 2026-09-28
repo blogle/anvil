@@ -1,0 +1,33 @@
+name: Local-first E2E harness
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  fast-and-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Rust checks
+        run: nix develop --command just check
+      - name: Deterministic process E2E (repeat for determinism)
+        run: |
+          nix develop --command just e2e
+          nix develop --command just e2e
+      - name: Actual sandbox OCI acceptance
+        run: nix develop --command just e2e-sandbox-image
+
+  kind-fidelity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Isolated Agent Sandbox Kubernetes lane
+        run: nix develop --command just e2e-k8s

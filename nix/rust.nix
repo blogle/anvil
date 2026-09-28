@@ -1,4 +1,4 @@
-{ pkgs, craneLib, repoRoot }:
+{ pkgs, craneLib, opencode, nix2containerPkgs, repoRoot }:
 
 let
   # Keep the Cargo source filter here so the root flake only wires modules
@@ -16,7 +16,7 @@ let
     pname = "anvil";
     version = "0.1.0";
     strictDeps = true;
-    nativeBuildInputs = [ pkgs.pkg-config ];
+    nativeBuildInputs = [ pkgs.pkg-config pkgs.git ];
   };
   cargoVendorDir = craneLib.vendorCargoDeps baseArgs;
   commonArgs = baseArgs // { inherit cargoVendorDir; };
@@ -118,6 +118,8 @@ let
       craneLib.inheritCargoArtifactsHook
       pkgs.cargo pkgs.rust-analyzer pkgs.cargo-nextest pkgs.just pkgs.git
       pkgs.gh pkgs.curl pkgs.jq pkgs.kubectl pkgs.kustomize pkgs.nix pkgs.nodejs
+      pkgs.process-compose pkgs.watchexec nix2containerPkgs.skopeo-nix2container pkgs.umoci pkgs.crun pkgs.kind pkgs.util-linux
+      opencode.packages.${pkgs.system}.default
     ];
     shellHook = ''
       export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$PWD/target}"

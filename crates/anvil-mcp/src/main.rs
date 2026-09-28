@@ -546,7 +546,7 @@ mod tests {
             then.status(200).json_body(json!({
                 "environment_state": "ready",
                 "execution_state": "idle",
-                "work_state": "in_progress"
+                "work_state": "ready_for_review"
             }));
         });
         let mcp = AnvilMcp::new(reqwest::Url::parse(&format!("{}/", server.base_url())).unwrap())

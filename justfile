@@ -34,7 +34,28 @@ nix-check:
     nix flake check
 
 dev:
-    cargo run -p anvild
+    mkdir -p .anvil/dev/profile/config .anvil/dev/profile/home
+    cp dev/opencode-e2e.jsonc .anvil/dev/profile/config/opencode.jsonc
+    cargo build -p anvild -p anvil-test-model
+    PC_PORT_NUM=8090 process-compose -f dev/process-compose.yaml up
+
+dev-full:
+    mkdir -p .anvil/dev/profile/config .anvil/dev/profile/home
+    cp dev/opencode-e2e.jsonc .anvil/dev/profile/config/opencode.jsonc
+    cargo build -p anvild -p anvil-test-model -p anvil-mcp -p anvil-router
+    PC_PORT_NUM=8090 process-compose -f dev/process-compose.yaml -f dev/process-compose-full.yaml up
+
+e2e:
+    bash tests/local-e2e.sh
+
+e2e-ui:
+    bash tests/local-e2e.sh --ui
+
+e2e-sandbox-image:
+    bash tests/sandbox-oci-acceptance.sh
+
+e2e-k8s:
+    bash tests/kind-acceptance.sh
 
 image:
     nix build .#anvil-image -o result-anvil

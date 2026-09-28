@@ -44,21 +44,20 @@ credentials remain on the profile PVC.
 
 ## Session work state
 
-Session responses expose independent `environment_state`, `execution_state`, and
-`work_state` fields. Environment state is derived from Sandbox lifecycle,
-execution state from OpenCode status, and work state is durable Anvil metadata.
+Session responses expose `environment_state`, `execution_state`, and `work_state`
+fields derived from environment and OpenCode lifecycle facts. OpenCode busy maps
+to `running` / `in_progress`; idle finalizes the current run and maps to
+`idle` / `ready_for_review`; OpenCode errors map to `failed`. Suspended and
+completed remain explicit Anvil operations.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/v1/sessions/{id}/report-context` | Return the current worker run ID |
-| `POST` | `/v1/sessions/{id}/report` | Report `ready_for_review` or `awaiting_input` |
 | `POST` | `/v1/sessions/{id}/complete` | Controller acceptance into `completed` |
 | `POST` | `/v1/sessions/{id}/rebind` | Explicitly create a replacement OpenCode session |
 
-Reports require `Authorization: Bearer <session capability>` and include the
-current `run_id`. Summaries are trimmed and limited to 500 characters. Run and
-work metadata are stored with the Sandbox annotations, so they survive service
-restarts and Sandbox suspension.
+Run and work metadata are stored with Sandbox annotations, so they survive
+service restarts and Sandbox suspension. No model tool call is required for
+lifecycle transitions.
 
 New Sandboxes mount their workspace PVC at `/home/anvil`, check out the
 repository under `/home/anvil/workspace/<project>`, and store OpenCode's native
@@ -94,9 +93,8 @@ returned as structured MCP error data containing the HTTP status and Anvil's
 HTTP. `just` remains a development/build/deployment workflow and does not
 provide provider-login or session-administration commands.
 
-Manual diagnostics use `anvilctl session report <session> <disposition>` with
-`ANVIL_SESSION_CREDENTIAL` (or `--capability`); controller acceptance uses
-`anvilctl session complete <session>`.
+Controller acceptance uses `anvilctl session complete <session>`. Task lifecycle
+is derived from the bound OpenCode conversation and has no model-report command.
 
 Anvil uses the Agent Sandbox `agents.x-k8s.io/v1beta1` `Sandbox` resource. The
 `anvild` process is configured with `ANVIL_NAMESPACE` and is the sole component
