@@ -63,7 +63,7 @@ jobs:
           mkdir -p "$cache_dir"
           if [ -s "$cache_dir/paths" ]; then
             cache_start=$SECONDS
-            nix --option build-users-group "" --option require-sigs false copy --from "file://$cache_dir" $(<"$cache_dir/paths")
+            nix --option build-users-group "" copy --no-check-sigs --from "file://$cache_dir" $(<"$cache_dir/paths")
             printf 'anvil-cache-import-seconds=%s\n' "$((SECONDS - cache_start))" | tee -a image-build-timings.txt
           else
             printf '%s\n' 'anvil-cache-import-seconds=0 (miss)' | tee -a image-build-timings.txt
@@ -131,7 +131,7 @@ jobs:
           ' | tee image-report.txt
           nix --option build-users-group "" path-info --recursive \
             .#anvil-image-ci .#anvil-ci-release-cargo-artifacts > "$cache_dir/paths.new"
-          nix --option build-users-group "" --option require-sigs false copy --to "file://$cache_dir" $(<"$cache_dir/paths.new")
+          nix --option build-users-group "" copy --no-check-sigs --to "file://$cache_dir" $(<"$cache_dir/paths.new")
           mv "$cache_dir/paths.new" "$cache_dir/paths"
           (cd image-artifacts && sha256sum *.tar > SHA256SUMS)
       - uses: actions/upload-artifact@v4
