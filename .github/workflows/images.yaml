@@ -61,8 +61,8 @@ jobs:
           upgrade_pid=$!
           wait "$anvil_pid" "$sandbox_pid" "$daemon_pid" "$upgrade_pid"
           nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "docker-archive:$(<paths/anvil)" docker-archive:image-artifacts/anvil-image.tar:ghcr.io/blogle/anvil:kind-e2e
-          nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/sandbox)" docker-archive:image-artifacts/anvil-sandbox-image.tar:ghcr.io/blogle/anvil-sandbox:main
-          nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/daemon)" docker-archive:image-artifacts/anvil-nix-daemon-image.tar:ghcr.io/blogle/anvil-nix-daemon:main
+          nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/sandbox)" docker-archive:image-artifacts/anvil-sandbox-image.tar:ghcr.io/blogle/anvil-sandbox:kind-e2e
+          nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/daemon)" docker-archive:image-artifacts/anvil-nix-daemon-image.tar:ghcr.io/blogle/anvil-nix-daemon:kind-e2e
           nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/upgrade)" docker-archive:image-artifacts/anvil-nix-daemon-upgrade-test-image.tar:ghcr.io/blogle/anvil-nix-daemon:kind-upgrade
           (cd image-artifacts && sha256sum *.tar > SHA256SUMS)
       - uses: actions/upload-artifact@v4
@@ -91,8 +91,8 @@ jobs:
           (cd image-artifacts && sha256sum -c SHA256SUMS)
           for archive in image-artifacts/*.tar; do docker load < "$archive"; done
           docker image inspect anvil-ci:dev >/dev/null
-          docker image inspect ghcr.io/blogle/anvil-sandbox:main >/dev/null
-          docker image inspect ghcr.io/blogle/anvil-nix-daemon:main >/dev/null
+          docker image inspect ghcr.io/blogle/anvil-sandbox:kind-e2e >/dev/null
+          docker image inspect ghcr.io/blogle/anvil-nix-daemon:kind-e2e >/dev/null
           docker image inspect ghcr.io/blogle/anvil-nix-daemon:kind-upgrade >/dev/null
           printf 'archive-consume-seconds=%s\n' "$((SECONDS - start))"
 
