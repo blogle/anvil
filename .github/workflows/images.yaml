@@ -90,7 +90,7 @@ jobs:
           start=$SECONDS
           (cd image-artifacts && sha256sum -c SHA256SUMS)
           for archive in image-artifacts/*.tar; do docker load < "$archive"; done
-          docker image inspect anvil-ci:dev >/dev/null
+          docker image inspect ghcr.io/blogle/anvil:kind-e2e >/dev/null
           docker image inspect ghcr.io/blogle/anvil-sandbox:kind-e2e >/dev/null
           docker image inspect ghcr.io/blogle/anvil-nix-daemon:kind-e2e >/dev/null
           docker image inspect ghcr.io/blogle/anvil-nix-daemon:kind-upgrade >/dev/null
