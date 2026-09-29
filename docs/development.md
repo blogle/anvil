@@ -62,7 +62,8 @@ sandbox A, checks that B sees the exact path after A is suspended and after the
 daemon restarts, and enters the dedicated `shared-nix-smoke` environment through
 that daemon from B. The full Rust check remains owned by the local-first CI
 lane; this smoke verifies the shared Nix development-environment contract
-without reseeding its Cargo artifacts.
+without reseeding its Cargo artifacts. CI enters a minimal `kind-ci` shell for
+this lane so the Rust devShell's Cargo artifact hook cannot run before Kind.
 
 ## Production deployment
 
