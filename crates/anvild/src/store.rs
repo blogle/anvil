@@ -1,7 +1,8 @@
 //! Controller-owned transactional orchestration storage.
 //!
-//! SQLite WAL permits concurrent readers while serializing writers. FULL synchronous
-//! commits make accepted idempotency results durable before callers begin provisioning.
+//! A store handle serializes its own operations with a mutex; separate handles/processes
+//! use SQLite WAL for reader/writer concurrency and SQLite's writer lock for arbitration.
+//! FULL synchronous commits make accepted results durable before provisioning begins.
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -20,6 +21,10 @@ pub enum StoreError {
     Conflict,
     #[error("unsupported canonicalization version {0}")]
     UnsupportedCanonicalization(i64),
+    #[error("idempotency record not found")]
+    NotFound,
+    #[error("invalid idempotency state {0}")]
+    InvalidState(String),
     #[error("store error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("store I/O error: {0}")]
@@ -35,8 +40,21 @@ pub struct AcceptedResult {
     pub scope: String,
     pub result_reference: String,
     pub result: Value,
+    pub state: IdempotencyState,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdempotencyState {
+    Accepted,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Acceptance {
+    Created(AcceptedResult),
+    Replayed(AcceptedResult),
 }
 
 #[derive(Clone)]
@@ -70,7 +88,7 @@ impl ControllerStore {
         request: &Value,
         result_reference: &str,
         result: &Value,
-    ) -> Result<AcceptedResult, StoreError> {
+    ) -> Result<Acceptance, StoreError> {
         let canonical = canonical_json(request);
         let hash = Sha256::digest(canonical.as_bytes())
             .iter()
@@ -82,7 +100,7 @@ impl ControllerStore {
             .lock()
             .expect("controller store lock poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing = tx.query_row("SELECT operation_kind, scope, request_hash, canonicalization_version, result_reference, result_json, created_at, updated_at FROM idempotency_records WHERE idempotency_key=?1", [key], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?))).optional()?;
+        let existing = tx.query_row("SELECT operation_kind, scope, request_hash, canonicalization_version, result_reference, result_json, state, created_at, updated_at FROM idempotency_records WHERE idempotency_key=?1", [key], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?))).optional()?;
         if let Some((
             kind,
             stored_scope,
@@ -90,6 +108,7 @@ impl ControllerStore {
             version,
             reference,
             json,
+            state,
             created_at,
             updated_at,
         )) = existing
@@ -102,27 +121,29 @@ impl ControllerStore {
             }
             let result = serde_json::from_str(&json)?;
             tx.commit()?;
-            return Ok(AcceptedResult {
+            return Ok(Acceptance::Replayed(AcceptedResult {
                 idempotency_key: key.into(),
                 operation_kind: kind,
                 scope: stored_scope,
                 result_reference: reference,
                 result,
+                state: parse_state(&state)?,
                 created_at,
                 updated_at,
-            });
+            }));
         }
         tx.execute("INSERT INTO idempotency_records (idempotency_key, operation_kind, scope, request_hash, canonicalization_version, result_reference, result_json, state, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'accepted',?8,?8)", params![key, operation_kind, scope, hash, CANONICALIZATION_VERSION, result_reference, serde_json::to_string(result)?, now])?;
         tx.commit()?;
-        Ok(AcceptedResult {
+        Ok(Acceptance::Created(AcceptedResult {
             idempotency_key: key.into(),
             operation_kind: operation_kind.into(),
             scope: scope.into(),
             result_reference: result_reference.into(),
             result: result.clone(),
+            state: IdempotencyState::Accepted,
             created_at: now.clone(),
             updated_at: now,
-        })
+        }))
     }
 
     pub fn get(&self, key: &str) -> Result<Option<AcceptedResult>, StoreError> {
@@ -130,15 +151,16 @@ impl ControllerStore {
             .connection
             .lock()
             .expect("controller store lock poisoned");
-        let row = connection.query_row("SELECT operation_kind, scope, result_reference, result_json, created_at, updated_at FROM idempotency_records WHERE idempotency_key=?1 AND state='accepted'", [key], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?))).optional()?;
+        let row = connection.query_row("SELECT operation_kind, scope, result_reference, result_json, state, created_at, updated_at FROM idempotency_records WHERE idempotency_key=?1", [key], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?))).optional()?;
         row.map(
-            |(operation_kind, scope, result_reference, result, created_at, updated_at)| {
+            |(operation_kind, scope, result_reference, result, state, created_at, updated_at)| {
                 Ok(AcceptedResult {
                     idempotency_key: key.into(),
                     operation_kind,
                     scope,
                     result_reference,
                     result: serde_json::from_str(&result)?,
+                    state: parse_state(&state)?,
                     created_at,
                     updated_at,
                 })
@@ -146,12 +168,64 @@ impl ControllerStore {
         )
         .transpose()
     }
+
+    /// Complete an accepted operation without changing its immutable request/result binding.
+    pub fn mark_completed(&self, key: &str) -> Result<AcceptedResult, StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute("UPDATE idempotency_records SET state='completed', updated_at=?2 WHERE idempotency_key=?1 AND state='accepted'", params![key, chrono::Utc::now().to_rfc3339()])?;
+        if changed == 0
+            && tx
+                .query_row(
+                    "SELECT state FROM idempotency_records WHERE idempotency_key=?1",
+                    [key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .is_none()
+        {
+            return Err(StoreError::NotFound);
+        }
+        let record = read_result(&tx, key)?.ok_or(StoreError::NotFound)?;
+        tx.commit()?;
+        Ok(record)
+    }
+}
+
+fn parse_state(state: &str) -> Result<IdempotencyState, StoreError> {
+    match state {
+        "accepted" => Ok(IdempotencyState::Accepted),
+        "completed" => Ok(IdempotencyState::Completed),
+        _ => Err(StoreError::InvalidState(state.to_owned())),
+    }
+}
+
+fn read_result(connection: &Connection, key: &str) -> Result<Option<AcceptedResult>, StoreError> {
+    let row = connection.query_row("SELECT operation_kind, scope, result_reference, result_json, state, created_at, updated_at FROM idempotency_records WHERE idempotency_key=?1", [key], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?))).optional()?;
+    row.map(
+        |(operation_kind, scope, result_reference, result, state, created_at, updated_at)| {
+            Ok(AcceptedResult {
+                idempotency_key: key.into(),
+                operation_kind,
+                scope,
+                result_reference,
+                result: serde_json::from_str(&result)?,
+                state: parse_state(&state)?,
+                created_at,
+                updated_at,
+            })
+        },
+    )
+    .transpose()
 }
 
 fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
     connection.execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);")?;
     let tx = connection.unchecked_transaction()?;
-    let version: i64 = tx.query_row(
+    let mut version: i64 = tx.query_row(
         "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
         [],
         |row| row.get(0),
@@ -166,6 +240,19 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX orchestration_by_attempt ON orchestration_resources(attempt_id);")?;
         tx.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?1)",
+            [chrono::Utc::now().to_rfc3339()],
+        )?;
+        version = 1;
+    }
+    if version < 2 {
+        // v1 allowed only accepted records. Rebuild transactionally to expand the state contract.
+        tx.execute_batch("CREATE TABLE idempotency_records_v2 (idempotency_key TEXT PRIMARY KEY, operation_kind TEXT NOT NULL, scope TEXT NOT NULL, request_hash TEXT NOT NULL, canonicalization_version INTEGER NOT NULL, result_reference TEXT NOT NULL, result_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('accepted','completed')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        INSERT INTO idempotency_records_v2 SELECT idempotency_key, operation_kind, scope, request_hash, canonicalization_version, result_reference, result_json, state, created_at, updated_at FROM idempotency_records;
+        DROP TABLE idempotency_records;
+        ALTER TABLE idempotency_records_v2 RENAME TO idempotency_records;
+        CREATE INDEX idempotency_by_scope ON idempotency_records(scope, operation_kind);")?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?1)",
             [chrono::Utc::now().to_rfc3339()],
         )?;
     }
@@ -229,7 +316,7 @@ mod tests {
     fn persists_replays_conflicts_and_restart() {
         let (dir, store) = store();
         let request = serde_json::json!({"b":2,"a":1});
-        let first = store
+        let Acceptance::Created(first) = store
             .accept(
                 "key",
                 "submit",
@@ -238,22 +325,26 @@ mod tests {
                 "resource-1",
                 &serde_json::json!({"id":"resource-1"}),
             )
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("expected initial creation")
+        };
         drop(store);
         let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
-        assert_eq!(
-            reopened
-                .accept(
-                    "key",
-                    "submit",
-                    "tenant",
-                    &serde_json::json!({"a":1,"b":2}),
-                    "ignored",
-                    &Value::Null
-                )
-                .unwrap(),
-            first
-        );
+        let Acceptance::Replayed(replayed) = reopened
+            .accept(
+                "key",
+                "submit",
+                "tenant",
+                &serde_json::json!({"a":1,"b":2}),
+                "ignored",
+                &Value::Null,
+            )
+            .unwrap()
+        else {
+            panic!("expected replay")
+        };
+        assert_eq!(replayed, first);
         assert!(matches!(
             reopened.accept(
                 "key",
@@ -268,12 +359,15 @@ mod tests {
         assert_eq!(reopened.get("key").unwrap(), Some(first));
     }
     #[test]
-    fn concurrent_same_key_converges_and_different_request_conflicts() {
+    fn concurrent_same_key_converges_to_one_created_and_rest_replayed() {
         let (_dir, store) = store();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
         let mut joins = vec![];
         for _ in 0..8 {
             let store = store.clone();
+            let barrier = barrier.clone();
             joins.push(std::thread::spawn(move || {
+                barrier.wait();
                 store
                     .accept(
                         "race",
@@ -287,22 +381,149 @@ mod tests {
             }));
         }
         let results: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
-        assert!(results.iter().all(|result| result == &results[0]));
-        let store = store.clone();
-        let conflict = std::thread::spawn(move || {
-            store.accept(
-                "race",
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Acceptance::Created(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Acceptance::Replayed(_)))
+                .count(),
+            7
+        );
+        assert!(results.iter().all(|result| match result {
+            Acceptance::Created(r) | Acceptance::Replayed(r) => r.result_reference == "one",
+        }));
+    }
+
+    #[test]
+    fn simultaneous_different_requests_have_one_winner_and_one_conflict() {
+        let (_dir, store) = store();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut joins = vec![];
+        for (body, reference) in [
+            (serde_json::json!({"request":"left"}), "left-result"),
+            (serde_json::json!({"request":"right"}), "right-result"),
+        ] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.accept(
+                    "competing",
+                    "create",
+                    "scope",
+                    &body,
+                    reference,
+                    &serde_json::json!({"ref":reference}),
+                )
+            }));
+        }
+        let outcomes: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|r| matches!(r, Ok(Acceptance::Created(_))))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|r| matches!(r, Err(StoreError::Conflict)))
+                .count(),
+            1
+        );
+        let winner = match outcomes.into_iter().find_map(Result::ok).unwrap() {
+            Acceptance::Created(result) => result,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(store.get("competing").unwrap(), Some(winner.clone()));
+        assert_eq!(winner.result["ref"], winner.result_reference);
+        let count: i64 = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM idempotency_records WHERE idempotency_key='competing'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn completion_survives_restart_and_replay_preserves_completed_state() {
+        let (dir, store) = store();
+        let Acceptance::Created(accepted) = store
+            .accept(
+                "complete-key",
                 "create",
                 "scope",
-                &serde_json::json!({"x":2}),
-                "two",
+                &serde_json::json!({"x":1}),
+                "ref",
+                &serde_json::json!({"id":"ref","full":true}),
+            )
+            .unwrap()
+        else {
+            panic!("expected creation")
+        };
+        let completed = store.mark_completed("complete-key").unwrap();
+        assert_eq!(completed.state, IdempotencyState::Completed);
+        assert_eq!(completed.result, accepted.result);
+        drop(store);
+        let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
+        assert_eq!(
+            reopened.get("complete-key").unwrap(),
+            Some(completed.clone())
+        );
+        let Acceptance::Replayed(replayed) = reopened
+            .accept(
+                "complete-key",
+                "create",
+                "scope",
+                &serde_json::json!({"x":1}),
+                "ignored",
                 &Value::Null,
             )
-        });
-        assert!(matches!(
-            conflict.join().unwrap(),
-            Err(StoreError::Conflict)
-        ));
+            .unwrap()
+        else {
+            panic!("expected replay")
+        };
+        assert_eq!(replayed, completed);
+        assert_eq!(reopened.mark_completed("complete-key").unwrap(), completed);
+    }
+
+    #[test]
+    fn migration_upgrades_v1_fixture_without_losing_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO schema_migrations VALUES (1, 'v1-time');
+            CREATE TABLE idempotency_records (idempotency_key TEXT PRIMARY KEY, operation_kind TEXT NOT NULL, scope TEXT NOT NULL, request_hash TEXT NOT NULL, canonicalization_version INTEGER NOT NULL, result_reference TEXT NOT NULL, result_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('accepted')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE INDEX idempotency_by_scope ON idempotency_records(scope, operation_kind);
+            INSERT INTO idempotency_records VALUES ('legacy','submit','scope','hash',1,'resource-v1','{\"payload\":true}','accepted','created-v1','updated-v1');") .unwrap();
+        drop(connection);
+        let store = ControllerStore::open(&path).unwrap();
+        let record = store.get("legacy").unwrap().unwrap();
+        assert_eq!(record.result_reference, "resource-v1");
+        assert_eq!(record.result, serde_json::json!({"payload":true}));
+        assert_eq!(record.state, IdempotencyState::Accepted);
+        let version: i64 = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 2);
     }
     #[test]
     fn migration_is_repeatable_and_indexed() {
@@ -317,6 +538,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(versions, 1);
+        let latest: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(latest, 2);
         let index: i64=connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='orchestration_by_attempt'",[],|row|row.get(0)).unwrap();
         assert_eq!(index, 1);
     }
