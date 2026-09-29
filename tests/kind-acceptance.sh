@@ -66,10 +66,6 @@ if [ -n "$artifact_dir" ]; then
   upgrade_image="$artifact_dir/anvil-nix-daemon-upgrade-test-image.tar"
   upgrade_canary="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-canary)"
   (cd "$artifact_dir" && sha256sum -c SHA256SUMS)
-  anvil_source="docker-archive:$anvil_image"
-  sandbox_source="docker-archive:$sandbox_image"
-  daemon_source="docker-archive:$daemon_image"
-  upgrade_source="docker-archive:$upgrade_image"
 else
   # The CI profile has the same runtime filesystem/configuration as the
   # production image; the image producer owns production-profile builds.
@@ -78,16 +74,19 @@ else
   daemon_image="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-image)"
   upgrade_image="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-image)"
   upgrade_canary="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-canary)"
-  anvil_source="docker-archive:$anvil_image"
-  sandbox_source="nix:$sandbox_image"
-  daemon_source="nix:$daemon_image"
-  upgrade_source="nix:$upgrade_image"
 fi
-skopeo --tmpdir "$tmp" --insecure-policy copy "$anvil_source" docker-daemon:ghcr.io/blogle/anvil:kind-e2e >/dev/null
-skopeo --tmpdir "$tmp" --insecure-policy copy "$sandbox_source" docker-daemon:ghcr.io/blogle/anvil-sandbox:kind-e2e >/dev/null
-skopeo --tmpdir "$tmp" --insecure-policy copy "$daemon_source" docker-daemon:ghcr.io/blogle/anvil-nix-daemon:kind-e2e >/dev/null
-skopeo --tmpdir "$tmp" --insecure-policy copy "$upgrade_source" docker-daemon:ghcr.io/blogle/anvil-nix-daemon:kind-upgrade >/dev/null
-kind load docker-image ghcr.io/blogle/anvil:kind-e2e ghcr.io/blogle/anvil-sandbox:kind-e2e ghcr.io/blogle/anvil-nix-daemon:kind-e2e ghcr.io/blogle/anvil-nix-daemon:kind-upgrade --name "$cluster"
+if [ -n "$artifact_dir" ]; then
+  kind load image-archive "$anvil_image" --name "$cluster"
+  kind load image-archive "$sandbox_image" --name "$cluster"
+  kind load image-archive "$daemon_image" --name "$cluster"
+  kind load image-archive "$upgrade_image" --name "$cluster"
+else
+  skopeo --tmpdir "$tmp" --insecure-policy copy "docker-archive:$anvil_image" docker-daemon:ghcr.io/blogle/anvil:kind-e2e >/dev/null
+  skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$sandbox_image" docker-daemon:ghcr.io/blogle/anvil-sandbox:kind-e2e >/dev/null
+  skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$daemon_image" docker-daemon:ghcr.io/blogle/anvil-nix-daemon:kind-e2e >/dev/null
+  skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$upgrade_image" docker-daemon:ghcr.io/blogle/anvil-nix-daemon:kind-upgrade >/dev/null
+  kind load docker-image ghcr.io/blogle/anvil:kind-e2e ghcr.io/blogle/anvil-sandbox:kind-e2e ghcr.io/blogle/anvil-nix-daemon:kind-e2e ghcr.io/blogle/anvil-nix-daemon:kind-upgrade --name "$cluster"
+fi
 
 kubectl --kubeconfig "$kubeconfig" cluster-info
 kubectl --kubeconfig "$kubeconfig" apply -f "$root/k8s/vendor/agent-sandbox/v1.0.2/sandbox.yaml"

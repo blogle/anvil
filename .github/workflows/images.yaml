@@ -60,7 +60,7 @@ jobs:
           nix --option build-users-group "" build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-image > paths/upgrade &
           upgrade_pid=$!
           wait "$anvil_pid" "$sandbox_pid" "$daemon_pid" "$upgrade_pid"
-          cp "$(<paths/anvil)" image-artifacts/anvil-image.tar
+          nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "docker-archive:$(<paths/anvil)" docker-archive:image-artifacts/anvil-image.tar:ghcr.io/blogle/anvil:kind-e2e
           nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/sandbox)" docker-archive:image-artifacts/anvil-sandbox-image.tar:ghcr.io/blogle/anvil-sandbox:main
           nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/daemon)" docker-archive:image-artifacts/anvil-nix-daemon-image.tar:ghcr.io/blogle/anvil-nix-daemon:main
           nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/upgrade)" docker-archive:image-artifacts/anvil-nix-daemon-upgrade-test-image.tar:ghcr.io/blogle/anvil-nix-daemon:kind-upgrade
