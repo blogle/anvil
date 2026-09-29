@@ -63,21 +63,23 @@ New Sandboxes mount their workspace PVC at `/home/anvil`, check out the
 repository under `/home/anvil/workspace/<project>`, and store OpenCode's native
 conversation database and XDG data/state paths there. The controller records
 the runtime layout as `v2`; legacy immutable Sandboxes retain their original
-layout. If their ephemeral OpenCode state is gone, explicit rebind is required
-to establish a new conversation.
+layout and are handled by automatic replacement recovery if their ephemeral
+OpenCode state is gone.
 
 Session reads, resume, and message/proxy operations reconcile the durable
 `opencode_session_id` against the running server. An existing exact ID is
-always retained. A definitive 404 leaves the binding `missing`, preserves the
-dangling ID, records the recovery requirement in append-only history, and
-returns a structured recovery failure for operations that require a usable
-conversation. Anvil never silently creates a replacement during ordinary
-reconciliation or resume. The explicit `rebind` route creates a new
-conversation and records the previous ID and continuity loss.
+always retained. A definitive 404 causes Anvil to create one replacement under
+a per-session lock, record the old and new IDs plus lost continuity in
+annotations and append-only history, and continue transparently. Network,
+startup, and other health failures do not trigger replacement. The API still
+exposes `session_binding_state` (`pending`, `recovering`, `available`, or
+`rebound`) and continuity fields for operators, while the explicit `rebind`
+route remains an exceptional operator escape hatch.
 
 When a model is selected at session creation, Anvil resolves and persists its
 qualified provider/model ID. Every generated prompt, including a manual rebind
-prompt, uses that exact resolved model; there is no silent model fallback.
+prompt and prompts sent after automatic recovery, uses that exact resolved
+model; there is no silent model fallback.
 
 The MCP server projects these controller routes as structured JSON tool
 results. Mutations include `accepted`, `session_id`, the authoritative result,

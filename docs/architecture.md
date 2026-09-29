@@ -91,11 +91,11 @@ Sandbox resources are immutable and retain their legacy layout until deleted.
 
 `anvild` verifies the durable OpenCode session ID after startup, resume, and
 before session operations. If the exact ID still exists, it is always retained.
-If OpenCode definitively returns 404 for the ID, Anvil preserves the stored ID,
-marks the binding missing, and requires explicit `rebind` before steering can
-continue. Ordinary reconciliation and resume never create a replacement
-conversation. Explicit rebind records the prior ID and continuity loss in
-annotations and durable history.
+If OpenCode definitively returns 404 for the ID, Anvil automatically creates a
+replacement, records both IDs and lost continuity in annotations and history,
+and continues the operation without a user-facing rebind step. Transport or
+health failures remain errors and never trigger replacement. The explicit
+`rebind` route remains an operator escape hatch only.
 
 Each Anvil run persists its caller-assigned OpenCode user-message ID before
 submitting `prompt_async`. OpenCode assistant messages are correlated by

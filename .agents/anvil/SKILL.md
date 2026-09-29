@@ -40,10 +40,10 @@ Anvil's shared profile; do not request or handle provider credentials.
 
 Anvil verifies the stored OpenCode conversation ID after startup, resume, and
 before session operations. If the native conversation still exists, the same
-ID is retained. If it is genuinely absent, Anvil marks the binding missing and
-does not silently create a replacement. Use the explicit rebind operation only
-when a new conversation is deliberately accepted, because exact continuity is
-then lost and recorded.
+ID is retained. If it is genuinely absent, Anvil automatically creates a
+replacement, preserves the old and new IDs in operator activity, and records
+that exact conversation continuity was lost. Do not expose or invent a routine
+rebind workflow for users.
 
 ## Monitoring And Control
 
@@ -58,9 +58,8 @@ then lost and recorded.
   conversation. Call `anvil_resume` before sending work that requires it to run.
 - Use `anvil_delete_session` only when the work is finished or explicitly
   discarded. Deletion permanently removes the workspace and conversation.
-- Do not call `anvil_rebind_session` during routine recovery. If the binding is
-  missing, report that recovery requires an explicit rebind; rebind creates a
-  new conversation and intentionally loses continuity.
+- Do not call `anvil_rebind_session` during routine recovery. It is an
+  exceptional operator escape hatch and intentionally loses continuity.
 
 ## Previews
 
