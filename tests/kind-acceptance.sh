@@ -56,16 +56,37 @@ poll() {
 kind create cluster --name "$cluster" --kubeconfig "$kubeconfig" --wait 120s
 created=1
 
-anvil_image="$(nix build --no-link --print-out-paths .#anvil-image)"
-sandbox_image="$(nix build --no-link --print-out-paths .#anvil-sandbox-image)"
-daemon_image="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-image)"
-upgrade_image="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-image)"
-upgrade_canary="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-canary)"
-skopeo --tmpdir "$tmp" --insecure-policy copy "docker-archive:$anvil_image" docker-daemon:ghcr.io/blogle/anvil:kind-e2e >/dev/null
-skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$sandbox_image" docker-daemon:ghcr.io/blogle/anvil-sandbox:kind-e2e >/dev/null
-skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$daemon_image" docker-daemon:ghcr.io/blogle/anvil-nix-daemon:kind-e2e >/dev/null
-skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$upgrade_image" docker-daemon:ghcr.io/blogle/anvil-nix-daemon:kind-upgrade >/dev/null
-kind load docker-image ghcr.io/blogle/anvil:kind-e2e ghcr.io/blogle/anvil-sandbox:kind-e2e ghcr.io/blogle/anvil-nix-daemon:kind-e2e ghcr.io/blogle/anvil-nix-daemon:kind-upgrade --name "$cluster"
+# PR CI supplies archives produced by the image producer job. The fallback
+# keeps this acceptance script runnable locally and preserves its old contract.
+artifact_dir="${ANVIL_KIND_ARTIFACT_DIR:-}"
+if [ -n "$artifact_dir" ]; then
+  anvil_image="$artifact_dir/anvil-image.tar"
+  sandbox_image="$artifact_dir/anvil-sandbox-image.tar"
+  daemon_image="$artifact_dir/anvil-nix-daemon-image.tar"
+  upgrade_image="$artifact_dir/anvil-nix-daemon-upgrade-test-image.tar"
+  upgrade_canary="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-canary)"
+  (cd "$artifact_dir" && sha256sum -c SHA256SUMS)
+else
+  # The CI profile has the same runtime filesystem/configuration as the
+  # production image; the image producer owns production-profile builds.
+  anvil_image="$(nix build --no-link --print-out-paths .#anvil-image-ci)"
+  sandbox_image="$(nix build --no-link --print-out-paths .#anvil-sandbox-image)"
+  daemon_image="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-image)"
+  upgrade_image="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-image)"
+  upgrade_canary="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-canary)"
+fi
+if [ -n "$artifact_dir" ]; then
+  kind load image-archive "$anvil_image" --name "$cluster"
+  kind load image-archive "$sandbox_image" --name "$cluster"
+  kind load image-archive "$daemon_image" --name "$cluster"
+  kind load image-archive "$upgrade_image" --name "$cluster"
+else
+  skopeo --tmpdir "$tmp" --insecure-policy copy "docker-archive:$anvil_image" docker-daemon:ghcr.io/blogle/anvil:kind-e2e >/dev/null
+  skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$sandbox_image" docker-daemon:ghcr.io/blogle/anvil-sandbox:kind-e2e >/dev/null
+  skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$daemon_image" docker-daemon:ghcr.io/blogle/anvil-nix-daemon:kind-e2e >/dev/null
+  skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$upgrade_image" docker-daemon:ghcr.io/blogle/anvil-nix-daemon:kind-upgrade >/dev/null
+  kind load docker-image ghcr.io/blogle/anvil:kind-e2e ghcr.io/blogle/anvil-sandbox:kind-e2e ghcr.io/blogle/anvil-nix-daemon:kind-e2e ghcr.io/blogle/anvil-nix-daemon:kind-upgrade --name "$cluster"
+fi
 
 kubectl --kubeconfig "$kubeconfig" cluster-info
 kubectl --kubeconfig "$kubeconfig" apply -f "$root/k8s/vendor/agent-sandbox/v1.0.2/sandbox.yaml"
@@ -407,10 +428,18 @@ api_c_name="anvil-$api_c_id"
 api_c_pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$api_c_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
 test -n "$api_c_pod"
 agent_exec "$api_c_pod" /bin/bash -c 'nix store info >/dev/null && nix path-info "$1" >/dev/null && nix path-info "$2" >/dev/null' -- "$shared_path" "$upgrade_canary"
-# The outer CI lane runs the full Rust checks. Here, prove the existing sandbox
-# can enter the repo dev shell and use its toolchain/workspace metadata after the
-# daemon upgrade without compiling the workspace into this sandbox's local target.
-agent_exec "$api_b_pod" /bin/bash -lc 'cd /home/anvil/workspace/anvil && nix develop --command bash -lc "rustc --version >/dev/null && cargo metadata --no-deps --format-version 1 >/dev/null"'
+# Rust checks are owned by the parallel local-first lane. Keep this narrowly
+# scoped smoke because it proves the sandbox can enter a Nix shell through the
+# shared daemon without reseeding the full Cargo development environment.
+agent_exec "$api_b_pod" /bin/bash -lc '
+  cd /home/anvil/workspace/anvil
+  test "${NIX_REMOTE:-}" = daemon
+  nix develop .#shared-nix-smoke --command bash -c '\''
+    test "$ANVIL_SHARED_NIX_SMOKE" = 1
+    nix store info >/dev/null
+    just --version >/dev/null
+  '\''
+'
 
 ANVIL_KUBECONFIG="$kubeconfig" \
 ANVIL_SANDBOX_POD="$pod_name" \

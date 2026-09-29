@@ -42,6 +42,7 @@
         packages.anvilctl = rust.releaseBinaries.anvilCtl;
         packages.anvil-image = images.anvilImage;
         packages.anvil-image-ci = images.anvilImageCi;
+        packages.anvil-ci-release-cargo-artifacts = rust.ciReleaseCargoArtifacts;
         packages.anvil-sandbox-image = sandbox.sandboxImage;
         packages.anvil-nix-daemon-image = sandbox.daemonImage;
         packages.anvil-nix-daemon-upgrade-test-image = sandbox.daemonUpgradeImage;
@@ -52,5 +53,24 @@
 
         checks = rust.checks;
         devShells.default = rust.devShell;
+        # Kind already validates Rust in the independent local-first job. This
+        # shell keeps the shared-daemon contract focused on environment entry
+        # instead of triggering the full Cargo artifact seed.
+        devShells.shared-nix-smoke = pkgs.mkShell {
+          packages = [ pkgs.bash pkgs.just pkgs.nix ];
+          shellHook = ''
+            export ANVIL_SHARED_NIX_SMOKE=1
+          '';
+        };
+        # Kind owns Kubernetes/image/runtime fidelity, not Cargo validation.
+        # Do not enter rust.devShell here: its hook seeds the full dependency
+        # artifact set before the acceptance script can start.
+        devShells.kind-ci = pkgs.mkShell {
+          packages = [
+            pkgs.bash pkgs.curl pkgs.gitMinimal pkgs.jq pkgs.just pkgs.kind
+            pkgs.kubectl pkgs.kustomize pkgs.nix pkgs.util-linux
+            nix2container.packages.${system}.skopeo-nix2container
+          ];
+        };
       });
 }
