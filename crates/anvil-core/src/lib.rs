@@ -380,6 +380,8 @@ pub struct SessionActivity {
     pub environment_state: String,
     pub environment_error: Option<String>,
     pub execution_state: String,
+    #[serde(default)]
+    pub telemetry: SessionTelemetry,
     pub work_state: String,
     pub work_state_changed_at: Option<String>,
     pub work_state_summary: Option<String>,
@@ -391,6 +393,61 @@ pub struct SessionActivity {
     pub session_binding_checked_at: Option<String>,
     pub previous_opencode_session_id: Option<String>,
     pub session_binding_recovery_event: Option<String>,
+}
+
+/// Anvil-owned, versioned projection of OpenCode execution telemetry.
+/// Upstream event payloads are adapted before entering this snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTelemetry {
+    pub schema_version: u32,
+    pub execution: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_error: Option<String>,
+    #[serde(default)]
+    pub observer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer_changed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_operation: Option<OperationTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_operation: Option<OperationTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<String>,
+    #[serde(default)]
+    pub requests: Vec<SessionRequest>,
+    /// Agent-authored planning data only; never interpreted as completion percent.
+    #[serde(default)]
+    pub todos: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub waits: Vec<serde_json::Value>,
+}
+
+impl Default for SessionTelemetry {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            execution: "unknown".into(),
+            execution_error: None,
+            observer: "recovering".into(),
+            observer_changed_at: None,
+            current_operation: None,
+            last_operation: None,
+            last_activity_at: None,
+            requests: Vec::new(),
+            todos: Vec::new(),
+            waits: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationTelemetry {
+    pub kind: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
