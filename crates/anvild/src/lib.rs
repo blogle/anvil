@@ -159,6 +159,14 @@ impl Config {
         {
             return Err(ServiceError::Config("ANVIL_PREVIEW_DOMAIN, ANVIL_ANNOTATION_PREFIX and ANVIL_PROFILE_OPENCODE_URL are required".into()));
         }
+        let history_path = PathBuf::from(get("ANVIL_HISTORY_PATH", "/var/lib/anvil/history.jsonl"));
+        let store_path = store_path_from_history(
+            &history_path,
+            env::var("ANVIL_STORE_PATH")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+        );
         Ok(Self {
             sandbox_backend,
             bind_port: get("ANVIL_BIND_PORT", "8080")
@@ -206,10 +214,22 @@ impl Config {
                     .map_err(|_| ServiceError::Config("ANVIL_SESSION_CAPABILITY_TTL".into()))?,
             ),
             github_api_url: get("ANVIL_GITHUB_API_URL", "https://api.github.com"),
-            history_path: PathBuf::from(get("ANVIL_HISTORY_PATH", "/var/lib/anvil/history.jsonl")),
-            store_path: PathBuf::from(get("ANVIL_STORE_PATH", "/var/lib/anvil/controller.sqlite3")),
+            history_path,
+            store_path,
         })
     }
+}
+
+fn store_path_from_history(
+    history_path: &std::path::Path,
+    override_path: Option<PathBuf>,
+) -> PathBuf {
+    override_path.unwrap_or_else(|| {
+        history_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("controller.sqlite3")
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +242,8 @@ pub enum SandboxBackend {
 pub enum ServiceError {
     #[error("configuration error: {0}")]
     Config(String),
+    #[error("controller store initialization failed: {0}")]
+    Store(String),
     #[error("kubernetes error: {0}")]
     Kubernetes(String),
     #[error("OpenCode error: {0}")]
@@ -1458,7 +1480,7 @@ pub struct AppState {
     pub config: Config,
     pub kube: Arc<dyn SandboxApi>,
     history: HistoryStore,
-    pub store: store::ControllerStore,
+    store: Arc<Result<store::ControllerStore, String>>,
     profile: ProfileClient,
     pending_logins: Arc<Mutex<HashMap<String, PendingLogin>>>,
     binding_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
@@ -1472,8 +1494,9 @@ type LifecycleWatchers = Arc<Mutex<HashMap<String, (uuid::Uuid, watch::Sender<bo
 
 impl AppState {
     pub fn new<K: SandboxApi>(config: Config, kube: K) -> Self {
-        let store = store::ControllerStore::open(&config.store_path)
-            .expect("controller store must initialize successfully");
+        let store = Arc::new(
+            store::ControllerStore::open(&config.store_path).map_err(|error| error.to_string()),
+        );
         let profile = ProfileClient::new(&config.profile_opencode_url)
             .expect("ANVIL_PROFILE_OPENCODE_URL must be a valid URL");
         let capability_signer = config.session_signing_secret.as_deref().and_then(|secret| {
@@ -1529,6 +1552,8 @@ impl AppState {
     }
 
     pub async fn initialize(&self) -> Result<(), ServiceError> {
+        self.store()
+            .map_err(|error| ServiceError::Store(error.to_string()))?;
         self.kube.recover_startup().await?;
         for record in self.kube.list().await? {
             let id = record.session.id.clone();
@@ -1543,6 +1568,10 @@ impl AppState {
             }
         }
         Ok(())
+    }
+
+    pub fn store(&self) -> Result<&store::ControllerStore, &str> {
+        self.store.as_ref().as_ref().map_err(String::as_str)
     }
 
     async fn ensure_lifecycle_watcher(&self, id: &str) -> Result<(), ServiceError> {
@@ -4401,6 +4430,37 @@ mod tests {
             history_path: PathBuf::from("/tmp/anvil-history.jsonl"),
             store_path: PathBuf::from(format!("/tmp/anvil-test-{}.sqlite3", uuid::Uuid::new_v4())),
         }
+    }
+
+    #[test]
+    fn store_path_defaults_beside_history_and_honors_override() {
+        assert_eq!(
+            store_path_from_history(std::path::Path::new("/tmp/anvil-e2e/history.jsonl"), None),
+            PathBuf::from("/tmp/anvil-e2e/controller.sqlite3")
+        );
+        assert_eq!(
+            store_path_from_history(std::path::Path::new("/var/lib/anvil/history.jsonl"), None),
+            PathBuf::from("/var/lib/anvil/controller.sqlite3")
+        );
+        assert_eq!(
+            store_path_from_history(
+                std::path::Path::new("/tmp/history.jsonl"),
+                Some(PathBuf::from("/custom/store.db"))
+            ),
+            PathBuf::from("/custom/store.db")
+        );
+    }
+
+    #[tokio::test]
+    async fn store_initialization_failure_is_returned_from_initialize() {
+        let mut config = config("http://profile".into());
+        let dir = tempfile::tempdir().unwrap();
+        config.store_path = dir.path().to_path_buf();
+        let state = AppState::new(config, FakeSandbox);
+        assert!(matches!(
+            state.initialize().await,
+            Err(ServiceError::Store(_))
+        ));
     }
 
     #[test]
