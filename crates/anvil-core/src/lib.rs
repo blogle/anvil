@@ -5,6 +5,8 @@ use std::{fmt, net::IpAddr};
 use thiserror::Error;
 use url::Url;
 
+pub mod controller_store;
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
     #[error("{field} must not be empty")]
