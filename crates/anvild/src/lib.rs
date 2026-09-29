@@ -50,7 +50,7 @@ const LOGIN_TTL: Duration = Duration::from_secs(10 * 60);
 const RUNTIME_LAYOUT: &str = "v2";
 
 fn shared_nix_volume(pvc: &str) -> Value {
-    json!({"name":"shared-nix","persistentVolumeClaim":{"claimName":pvc,"readOnly":true}})
+    json!({"name":"shared-nix","persistentVolumeClaim":{"claimName":pvc}})
 }
 
 fn shared_nix_store_mount() -> Value {
@@ -5050,7 +5050,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_sandbox_uses_read_only_shared_nix() {
+    fn generated_sandbox_publishes_shared_nix_rw_with_read_only_mounts() {
         let mut config = config("http://profile".into());
         config.nix_pvc = "configured-nix-pvc".into();
         let state = WorkStateRecord::submitted(
@@ -5084,10 +5084,9 @@ mod tests {
             .filter(|m| m["name"] == "shared-nix")
             .all(|m| m["readOnly"] == true));
         assert!(spec["initContainers"][0].get("volumeMounts").is_none());
-        assert_eq!(
-            spec["volumes"][1]["persistentVolumeClaim"]["readOnly"],
-            true
-        );
+        assert!(spec["volumes"][1]["persistentVolumeClaim"]
+            .get("readOnly")
+            .is_none());
     }
 
     fn activity_session() -> Session {
