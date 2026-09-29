@@ -1943,6 +1943,7 @@ async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceErr
         return Ok(session);
     };
     let previous = record.binding_state;
+    let original_session_id = Some(opencode_id.to_owned());
     let checked_at = chrono_like_now();
     s.kube
         .set_binding_state(
@@ -1958,7 +1959,7 @@ async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceErr
         )
         .await?;
     let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
-    let mut missing = false;
+    let mut rebound_session_id = None;
     match op.session_exists(opencode_id).await {
         Ok(true) => {
             let state = if previous.state == "rebound" {
@@ -1985,33 +1986,35 @@ async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceErr
                 .await?;
         }
         Ok(false) => {
-            missing = true;
-            let recovery_error = format!(
-                "OpenCode session {opencode_id} was not found; explicit rebind is required to continue"
+            let new_id = op.create_session().await?;
+            s.kube.set_opencode_session(id, &new_id).await?;
+            rebound_session_id = Some(new_id.clone());
+            let recovery_event = format!(
+                "OpenCode session {opencode_id} was unavailable; automatically created replacement {new_id}; conversation continuity was lost"
             );
             s.kube
                 .set_binding_state(
                     id,
                     &BindingStateRecord {
-                        state: "missing".into(),
-                        continuity: previous.continuity.clone(),
+                        state: "rebound".into(),
+                        continuity: "lost".into(),
                         checked_at,
-                        error: Some(recovery_error.clone()),
-                        previous_session_id: previous.previous_session_id,
-                        recovery_event: previous.recovery_event,
+                        error: None,
+                        previous_session_id: Some(opencode_id.to_owned()),
+                        recovery_event: Some(recovery_event.clone()),
                     },
                 )
                 .await?;
             record_history(
                 s,
                 id,
-                "session_recovery_required",
+                "conversation_rebound",
                 chrono_like_now(),
                 None,
                 None,
                 Some("Anvil controller"),
                 None,
-                Some(recovery_error),
+                Some(recovery_event),
                 session.model.clone(),
             )
             .await;
@@ -2032,9 +2035,13 @@ async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceErr
                 .await?;
         }
     }
-    let session = s.kube.get(id).await?.session;
-    if missing {
+    let mut session = s.kube.get(id).await?.session;
+    if let Some(new_id) = rebound_session_id {
+        session.opencode_session_id = Some(new_id);
+    }
+    if session.opencode_session_id != original_session_id {
         s.stop_lifecycle_watcher(id).await;
+        s.ensure_lifecycle_watcher(id).await?;
     }
     Ok(session)
 }
@@ -5389,7 +5396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_binding_stays_degraded_until_explicit_rebind() {
+    async fn automatically_replaces_a_missing_binding_once_and_records_continuity_loss() {
         let server = MockServer::start();
         let server_url = Url::parse(&server.base_url()).unwrap();
         let missing = server.mock(|when, then| {
@@ -5399,6 +5406,10 @@ mod tests {
         });
         let replacement = server.mock(|when, then| {
             when.method(httpmock::Method::POST).path("/session");
+            then.status(200).json_body(json!({"id":"ses_new"}));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/session/ses_new");
             then.status(200).json_body(json!({"id":"ses_new"}));
         });
         let object: DynamicObject = serde_json::from_value(json!({
@@ -5441,20 +5452,19 @@ mod tests {
         );
         let first = first.unwrap();
         let second = second.unwrap();
-        assert_eq!(first.opencode_session_id.as_deref(), Some("ses_old"));
-        assert_eq!(second.opencode_session_id.as_deref(), Some("ses_old"));
-        assert_eq!(first.session_binding_state, "missing");
-        assert_eq!(first.session_binding_continuity, "exact");
-        assert!(first
-            .session_binding_error
-            .as_deref()
-            .unwrap()
-            .contains("explicit rebind is required"));
-        missing.assert_hits(2);
-        replacement.assert_hits(0);
+        assert_eq!(first.opencode_session_id.as_deref(), Some("ses_new"));
+        assert_eq!(second.opencode_session_id.as_deref(), Some("ses_new"));
+        assert_eq!(first.session_binding_state, "rebound");
+        assert_eq!(first.session_binding_continuity, "lost");
+        missing.assert_hits(1);
+        replacement.assert_hits(1);
         let annotations = object.lock().unwrap().annotations().clone();
         assert_eq!(
             annotations.get("anvil.example/opencode-session-id"),
+            Some(&"ses_new".to_owned())
+        );
+        assert_eq!(
+            annotations.get("anvil.example/binding-previous-session-id"),
             Some(&"ses_old".to_owned())
         );
     }
