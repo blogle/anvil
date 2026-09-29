@@ -5,8 +5,13 @@ use super::{
 use anvil_core::{branch_name, Session, SessionId};
 use async_trait::async_trait;
 use std::{
-    collections::HashMap, net::TcpListener, os::unix::fs::PermissionsExt, path::PathBuf,
-    process::Stdio, sync::Arc, time::Duration,
+    collections::{HashMap, HashSet},
+    net::TcpListener,
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
+    process::Stdio,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -39,6 +44,46 @@ pub struct LocalSandboxApi {
     opencode_bin: PathBuf,
     profile_dir: PathBuf,
     sessions: Arc<Mutex<HashMap<String, LocalState>>>,
+    ports: Arc<LoopbackPortAllocator>,
+}
+
+#[derive(Default)]
+struct LoopbackPortAllocator {
+    reserved: StdMutex<HashSet<u16>>,
+}
+
+impl LoopbackPortAllocator {
+    fn with_reserved(reserved: HashSet<u16>) -> Self {
+        Self {
+            reserved: StdMutex::new(reserved),
+        }
+    }
+
+    fn allocate(&self) -> Result<u16, ServiceError> {
+        // The OS releases this temporary listener before OpenCode can bind.
+        // Retain a process-local lease across that gap so concurrent session
+        // creations cannot be assigned the same endpoint.
+        for _ in 0..128 {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(local_error)?;
+            let port = listener.local_addr().map_err(local_error)?.port();
+            let mut reserved = self.reserved.lock().map_err(|_| {
+                ServiceError::Kubernetes("local port allocator lock poisoned".into())
+            })?;
+            if reserved.insert(port) {
+                drop(listener);
+                return Ok(port);
+            }
+        }
+        Err(ServiceError::OpenCode(
+            "unable to reserve a unique local OpenCode port".into(),
+        ))
+    }
+
+    fn release(&self, port: u16) {
+        if let Ok(mut reserved) = self.reserved.lock() {
+            reserved.remove(&port);
+        }
+    }
 }
 
 impl LocalSandboxApi {
@@ -66,6 +111,7 @@ impl LocalSandboxApi {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
             .map_err(|error| ServiceError::Config(format!("local runtime permissions: {error}")))?;
         let mut sessions = HashMap::new();
+        let mut reserved_ports = HashSet::new();
         for entry in std::fs::read_dir(&root).map_err(local_error)? {
             let entry = entry.map_err(local_error)?;
             let path = entry.path();
@@ -75,6 +121,7 @@ impl LocalSandboxApi {
             let Ok(record) = serde_json::from_slice::<SandboxRecord>(&bytes) else {
                 continue;
             };
+            reserved_ports.insert(record.session.opencode_port);
             let record_environment = std::fs::read(path.join("sandbox-env.json"))
                 .ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -95,6 +142,7 @@ impl LocalSandboxApi {
             opencode_bin,
             profile_dir,
             sessions: Arc::new(Mutex::new(sessions)),
+            ports: Arc::new(LoopbackPortAllocator::with_reserved(reserved_ports)),
         })
     }
 
@@ -290,14 +338,6 @@ fn local_error(error: impl std::fmt::Display) -> ServiceError {
     ServiceError::Kubernetes(error.to_string())
 }
 
-fn allocate_loopback_port() -> Result<u16, ServiceError> {
-    TcpListener::bind(("127.0.0.1", 0))
-        .map_err(local_error)?
-        .local_addr()
-        .map(|address| address.port())
-        .map_err(local_error)
-}
-
 fn process_identity(pid: u32, port: u16) -> Option<WorkerProcessIdentity> {
     let proc = PathBuf::from(format!("/proc/{pid}"));
     let stat = std::fs::read_to_string(proc.join("stat")).ok()?;
@@ -419,6 +459,7 @@ impl SandboxApi for LocalSandboxApi {
             let _ = tokio::fs::remove_dir_all(&directory).await;
             return Err(local_error(error));
         }
+        let mut reserved_port = None;
         let result = async {
             let home = directory.join("home");
             let project = home.join("workspace").join(&request.project);
@@ -465,7 +506,8 @@ impl SandboxApi for LocalSandboxApi {
                     String::from_utf8_lossy(&output.stderr)
                 )));
             }
-            let port = allocate_loopback_port()?;
+            let port = self.ports.allocate()?;
+            reserved_port = Some(port);
             let now = chrono::Utc::now().to_rfc3339();
             let session = Session {
                 id: id.into(),
@@ -538,6 +580,7 @@ impl SandboxApi for LocalSandboxApi {
                     if let Some(mut child) = state.child.take() {
                         terminate_child(&mut child).await;
                     }
+                    self.ports.release(session.opencode_port);
                     let _ = tokio::fs::remove_dir_all(&directory).await;
                     return Err(error);
                 }
@@ -545,6 +588,9 @@ impl SandboxApi for LocalSandboxApi {
                 Ok(session)
             }
             Err(error) => {
+                if let Some(port) = reserved_port {
+                    self.ports.release(port);
+                }
                 let _ = tokio::fs::remove_dir_all(&directory).await;
                 Err(error)
             }
@@ -585,6 +631,7 @@ impl SandboxApi for LocalSandboxApi {
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
+        self.ports.release(state.record.session.opencode_port);
         tokio::fs::remove_dir_all(state.directory)
             .await
             .map_err(local_error)
@@ -847,8 +894,24 @@ mod tests {
 
     #[test]
     fn allocates_distinct_loopback_ports_for_concurrent_workers() {
-        let ports: Vec<_> = (0..8).map(|_| allocate_loopback_port().unwrap()).collect();
-        let unique: std::collections::HashSet<_> = ports.iter().collect();
+        let allocator = Arc::new(LoopbackPortAllocator::default());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let ports = std::thread::scope(|scope| {
+            (0..8)
+                .map(|_| {
+                    let allocator = allocator.clone();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        allocator.allocate().unwrap()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let unique: HashSet<_> = ports.iter().collect();
         assert_eq!(unique.len(), ports.len());
     }
 
