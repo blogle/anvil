@@ -144,7 +144,7 @@ jq -e '(.plugin // []) | length == 0' "$profile/config/opencode.jsonc" >/dev/nul
 test ! -e "$profile/plugins/anvil-report.ts"
 test ! -e "$runtime_dir/home/.config/opencode/plugins/anvil-report.ts"
 wait_for_state "$id" working
-curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/activity" | jq -e '.execution_state == "running" and .telemetry.execution == "busy" and .requests[-1].state == "running"' >/dev/null
+curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/activity" | jq -e '.execution_state == "running" and .telemetry.execution == "busy" and any(.telemetry.requests[]; (.prompt | contains("ANVIL-E2E:edit-file")) and .state == "running")' >/dev/null
 curl -fsS -X POST http://127.0.0.1:4098/__test/release >/dev/null
 wait_for_state "$id" ready_for_review
 state="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/status")"
@@ -194,7 +194,7 @@ wait "$api_pid" 2>/dev/null || true
 "$root/target/debug/anvild" >"$tmp/anvild-restarted.log" 2>&1 & api_pid=$!
 poll http://127.0.0.1:8080/readyz
 wait_for_state "$id" ready_for_review
-curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/activity" | jq -e '.telemetry.schema_version == 1 and (.requests | length > 0)' >/dev/null
+curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/activity" | jq -e '.telemetry.schema_version == 1 and any(.telemetry.requests[]; .prompt | contains("ANVIL-E2E:edit-file"))' >/dev/null
 printf 'anvild restart/materialized telemetry recovery: %ds\n' "$((SECONDS - scenario_start))"
 
 scenario_start=$SECONDS
