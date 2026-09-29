@@ -4676,6 +4676,7 @@ mod tests {
 
     struct ActivitySandbox {
         object: DynamicObject,
+        config: Config,
     }
 
     struct LifecycleSandbox {
@@ -4836,10 +4837,7 @@ mod tests {
     #[async_trait]
     impl SandboxApi for ActivitySandbox {
         async fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError> {
-            Ok(vec![sandbox_record_from(
-                &self.object,
-                &config("http://profile.test".into()),
-            )?])
+            Ok(vec![sandbox_record_from(&self.object, &self.config)?])
         }
 
         async fn create(
@@ -5639,7 +5637,13 @@ mod tests {
         .unwrap();
         let mut test_config = config("http://profile.test".into());
         test_config.opencode_port = opencode.port();
-        let app = router(AppState::new(test_config, ActivitySandbox { object }));
+        let app = router(AppState::new(
+            test_config.clone(),
+            ActivitySandbox {
+                object,
+                config: test_config,
+            },
+        ));
         let response = app
             .clone()
             .oneshot(
