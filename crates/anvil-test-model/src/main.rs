@@ -73,6 +73,50 @@ async fn hold_gate(State(state): State<std::sync::Arc<AppState>>) -> StatusCode 
     StatusCode::NO_CONTENT
 }
 
+fn continuity_response(request: &Value) -> Option<&'static str> {
+    let mut user_text = Vec::new();
+    for field in ["messages", "input"] {
+        match request.get(field) {
+            Some(Value::String(text)) if field == "input" => user_text.push(text.as_str()),
+            Some(Value::Array(items)) => {
+                for item in items {
+                    if item.get("role").and_then(Value::as_str) != Some("user") {
+                        continue;
+                    }
+                    match item.get("content") {
+                        Some(Value::String(text)) => user_text.push(text.as_str()),
+                        Some(Value::Array(parts)) => {
+                            for part in parts {
+                                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                    user_text.push(text);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let user_text = user_text.join("\n");
+    let has = |marker: &str| user_text.contains(marker);
+    if has("ANVIL-E2E:restart-two-followup") {
+        return (has("ANVIL-E2E:durable-context=amber-731")
+            && has("ANVIL-E2E:restart-one-followup"))
+        .then_some("Confirmed restart two: prior conversation context is present.");
+    }
+    if has("ANVIL-E2E:restart-one-followup") {
+        return has("ANVIL-E2E:durable-context=amber-731")
+            .then_some("Confirmed restart one: prior conversation context is present.");
+    }
+    if has("ANVIL-E2E:followup") {
+        return has("ANVIL-E2E:durable-context=amber-731")
+            .then_some("Confirmed: this is the same OpenCode conversation.");
+    }
+    None
+}
+
 async fn completion(
     State(state): State<std::sync::Arc<AppState>>,
     Json(request): Json<Value>,
@@ -89,20 +133,14 @@ async fn completion(
         .filter_map(|message| message.get("content").and_then(Value::as_str))
         .collect::<Vec<_>>()
         .join("\n");
+    if let Some(confirmation) = continuity_response(&request) {
+        return (StatusCode::OK, Json(finish(confirmation, &request)));
+    }
     if !prompt.contains("ANVIL-E2E:edit-file") {
-        if prompt.contains("ANVIL-E2E:followup") {
-            return (
-                StatusCode::OK,
-                Json(finish(
-                    "Confirmed: this is the same OpenCode conversation.",
-                    &request,
-                )),
-            );
-        }
         return (
             StatusCode::OK,
             Json(finish(
-                "TEST_FAILURE: include the explicit ANVIL-E2E:edit-file scenario marker",
+                "TEST_FAILURE: follow-up is missing required prior-turn context",
                 &request,
             )),
         );
@@ -171,10 +209,20 @@ async fn responses(
     } else if let Some(text) = input.as_str() {
         prompt.push_str(text);
     }
-    let is_follow_up = prompt.contains("ANVIL-E2E:followup");
+    if let Some(confirmation) = continuity_response(&request) {
+        let value = response_text(confirmation, &request);
+        return if stream {
+            response_sse(&value)
+        } else {
+            Json(value).into_response()
+        };
+    }
+    let is_follow_up = prompt.contains("ANVIL-E2E:followup")
+        || prompt.contains("ANVIL-E2E:restart-one-followup")
+        || prompt.contains("ANVIL-E2E:restart-two-followup");
     if !is_follow_up && !prompt.contains("ANVIL-E2E:edit-file") {
         return Json(response_text(
-            "TEST_FAILURE: explicit ANVIL-E2E:edit-file scenario marker is required",
+            "TEST_FAILURE: follow-up is missing required prior-turn context",
             &request,
         ))
         .into_response();
@@ -193,7 +241,7 @@ async fn responses(
     }
     if is_follow_up {
         let value = response_text(
-            "Confirmed: this is the same OpenCode conversation.",
+            "TEST_FAILURE: follow-up is missing required prior-turn context",
             &request,
         );
         return if stream {
@@ -355,6 +403,39 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("TEST_FAILURE:"));
+    }
+
+    #[test]
+    fn continuity_requires_prior_turn_in_chat_and_responses_payloads() {
+        let prior = "ANVIL-E2E:durable-context=amber-731";
+        assert_eq!(
+            continuity_response(
+                &json!({"messages":[{"role":"user","content":"ANVIL-E2E:restart-one-followup"}]})
+            ),
+            None
+        );
+        assert_eq!(
+            continuity_response(&json!({"messages":[
+                {"role":"user","content":prior},
+                {"role":"user","content":"ANVIL-E2E:restart-one-followup"}
+            ]})),
+            Some("Confirmed restart one: prior conversation context is present.")
+        );
+        assert_eq!(
+            continuity_response(&json!({"input":[
+                {"role":"user","content":[{"type":"input_text","text":prior}]},
+                {"role":"user","content":"ANVIL-E2E:restart-two-followup"}
+            ]})),
+            None
+        );
+        assert_eq!(
+            continuity_response(&json!({"input":[
+                {"role":"user","content":[{"type":"input_text","text":prior}]},
+                {"role":"user","content":"ANVIL-E2E:restart-one-followup"},
+                {"role":"user","content":"ANVIL-E2E:restart-two-followup"}
+            ]})),
+            Some("Confirmed restart two: prior conversation context is present.")
+        );
     }
 
     #[tokio::test]
