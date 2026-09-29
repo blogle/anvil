@@ -165,7 +165,7 @@ kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anv
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-profile --timeout=180s
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-router --timeout=180s
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-nix-daemon --timeout=600s
-kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c 'test -s /nix/var/nix/db/db.sqlite && test -d /nix/var/nix/gcroots/anvil-baseline && nix store info >/dev/null'
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c 'test -s /nix/var/nix/db/db.sqlite && test -f /nix/var/nix/.anvil-bootstrap-complete && test -d /nix/var/nix/gcroots/anvil-baseline && nix store info >/dev/null'
 
 # Verify the Anvil service account can manage only its namespaced Sandbox API.
 test "$(kubectl --kubeconfig "$kubeconfig" auth can-i --as=system:serviceaccount:anvil:anvild create sandboxes.agents.x-k8s.io -n anvil)" = yes
@@ -390,12 +390,18 @@ agent_exec "$api_b_pod" /bin/bash -c 'nix store info >/dev/null && test "$(cat "
 
 # Upgrade the baseline on the populated PVC; registration must merge into the
 # existing DB without losing the derivation previously built by sandbox A.
+# Simulate an interrupted staged copy. The upgraded init must discard it, copy
+# the real image path, and only then make that path visible in /nix/store.
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c '
+  mkdir -p "/nix/.anvil-import/${1##*/}"
+  printf incomplete > "/nix/.anvil-import/${1##*/}/partial"
+' -- "$upgrade_canary"
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" set image deployment/anvil-nix-daemon \
   bootstrap-store=ghcr.io/blogle/anvil-nix-daemon:kind-upgrade \
   nix-daemon=ghcr.io/blogle/anvil-nix-daemon:kind-upgrade
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-nix-daemon --timeout=600s
-agent_exec "$api_b_pod" /bin/bash -c 'test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null && nix path-info "$2" >/dev/null && test -s "$2"' -- "$shared_path" "$upgrade_canary"
-kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c 'test -L "/nix/var/nix/gcroots/anvil-baseline/${1##*/}" && test ! -e /nix/var/nix/.anvil-baseline-pending' -- "$upgrade_canary"
+agent_exec "$api_b_pod" /bin/bash -c 'test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null && nix path-info "$2" >/dev/null && test "$(cat "$2")" = "new baseline closure after daemon upgrade"' -- "$shared_path" "$upgrade_canary"
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c 'test -L "/nix/var/nix/gcroots/anvil-baseline/${1##*/}" && test -f /nix/var/nix/.anvil-bootstrap-complete && test ! -e /nix/var/nix/.anvil-baseline-pending && test ! -e "/nix/.anvil-import/${1##*/}"' -- "$upgrade_canary"
 api_c_id="$(create_anvil_session)"
 api_c_name="anvil-$api_c_id"
 api_c_pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$api_c_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
