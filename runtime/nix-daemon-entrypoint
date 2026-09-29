@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${1:-}" = --bootstrap ]; then
+  # Kind's local-path provisioner creates volume roots world-writable; Nix
+  # refuses to execute builds unless every component of /nix is secure.
+  chmod 0755 /shared-nix
+  # The image's initialized DB and complete sandbox closure live in /nix;
+  # mounting the PVC at /shared-nix leaves this baseline visible for import.
+  state=/shared-nix/var/nix
+  complete="$state/.anvil-bootstrap-complete"
+  cold_attempt="$state/.anvil-cold-in-progress"
+  staging_dir=/shared-nix/.anvil-import
+  mkdir -p /shared-nix/store "$state"
+  # A previous init may have been interrupted while copying a store path.
+  # This private staging area never contains authoritative store paths.
+  rm -rf "$staging_dir"
+  mkdir -p "$staging_dir"
+  copy_baseline_paths() {
+    for path in /nix/store/*; do
+      name="${path##*/}"
+      destination="/shared-nix/store/$name"
+      if [ ! -e "$destination" ]; then
+        cp -a "$path" "$staging_dir/$name"
+        mv -T "$staging_dir/$name" "$destination"
+      fi
+    done
+  }
+
+  # On an interrupted first bootstrap, the only DB is the incomplete image
+  # copy: the daemon has never started. Retain existing databases when there
+  # is no cold-attempt marker (including populated PVCs from older releases).
+  if [ -e "$cold_attempt" ] && [ ! -e "$complete" ]; then
+    rm -rf "$state/db"
+  fi
+  if [ -e "$complete" ] && [ ! -s "$state/db/db.sqlite" ]; then
+    echo 'Nix database missing from initialized shared store' >&2
+    exit 1
+  fi
+  if [ ! -e "$state/db/db.sqlite" ]; then
+    touch "$cold_attempt"
+    copy_baseline_paths
+    cp -a /nix/var/nix/. "$state/"
+  else
+    # Never replace the live DB or paths built by sandboxes. A pending dump
+    # survives an interrupted import and is retried on the next startup.
+    pending="$state/.anvil-baseline-pending"
+    missing=0
+    for path in /nix/store/*; do
+      if [ ! -e "/shared-nix/store/${path##*/}" ]; then
+        missing=1
+        break
+      fi
+    done
+    if [ "$missing" = 1 ] || [ -e "$pending" ]; then
+      if [ "$missing" = 1 ]; then
+        NIX_REMOTE=local nix-store --dump-db > "${pending}.tmp"
+        mv "${pending}.tmp" "$pending"
+      fi
+      copy_baseline_paths
+      NIX_REMOTE=local NIX_STATE_DIR="$state" nix-store --load-db < "$pending"
+      rm "$pending"
+    fi
+  fi
+  # Keep all baseline image paths alive, including the tools needed to start
+  # future containers, even if other sandboxes run nix store gc.
+  mkdir -p "$state/gcroots/anvil-baseline"
+  for path in /nix/store/*; do
+    name="${path##*/}"
+    test -e "/shared-nix/store/$name"
+    ln -sfn "/nix/store/$name" "$state/gcroots/anvil-baseline/$name"
+  done
+  test -s "$state/db/db.sqlite"
+  touch "$complete"
+  rm -f "$cold_attempt"
+  rm -rf "$staging_dir"
+  exit 0
+fi
+
+mkdir -p /nix/var/nix/daemon-socket
+exec env -u NIX_REMOTE nix-daemon --daemon

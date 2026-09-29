@@ -33,16 +33,6 @@ if [ "$runtime_supported" = 1 ]; then
   cat >"$rootfs/tmp/anvil-runtime-acceptance.sh" <<'EOF'
 #!/bin/bash
 set -euo pipefail
-mkdir -p /nix/var/nix/daemon-socket
-NIX_REMOTE=local nix-store --init >/dev/null 2>&1 || true
-env -u NIX_REMOTE nix-daemon --daemon &
-nix_daemon_pid=$!
-for _ in $(seq 1 50); do
-  if [ -S /nix/var/nix/daemon-socket/socket ] && kill -0 "$nix_daemon_pid" 2>/dev/null; then break; fi
-  sleep 0.1
-done
-kill -0 "$nix_daemon_pid"
-test -S /nix/var/nix/daemon-socket/socket
 export HOME=/home/anvil
 export XDG_CONFIG_HOME="$HOME/.config" XDG_CACHE_HOME="$HOME/.cache"
 export XDG_DATA_HOME="$HOME/.local/share" XDG_STATE_HOME="$HOME/.local/state"

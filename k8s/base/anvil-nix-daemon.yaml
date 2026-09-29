@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anvil-nix-daemon
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: anvil-nix-daemon
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: anvil-nix-daemon
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      initContainers:
+        - name: bootstrap-store
+          image: ghcr.io/blogle/anvil-nix-daemon:main
+          imagePullPolicy: Always
+          command: [/bin/anvil-nix-daemon, --bootstrap]
+          volumeMounts:
+            - name: nix
+              mountPath: /shared-nix
+      containers:
+        - name: nix-daemon
+          image: ghcr.io/blogle/anvil-nix-daemon:main
+          imagePullPolicy: Always
+          env:
+            - name: NIX_REMOTE
+              value: daemon
+          volumeMounts:
+            - name: nix
+              mountPath: /nix
+          readinessProbe:
+            exec:
+              command: [/bin/bash, -c, 'test -S /nix/var/nix/daemon-socket/socket && nix store info >/dev/null']
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: [/bin/bash, -c, 'test -S /nix/var/nix/daemon-socket/socket && nix store info >/dev/null']
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+      volumes:
+        - name: nix
+          persistentVolumeClaim:
+            claimName: anvil-nix

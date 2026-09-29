@@ -48,6 +48,30 @@ const APP: &str = "app.kubernetes.io/name";
 const LOGIN_TTL: Duration = Duration::from_secs(10 * 60);
 const RUNTIME_LAYOUT: &str = "v2";
 
+fn shared_nix_volume(pvc: &str) -> Value {
+    json!({"name":"shared-nix","persistentVolumeClaim":{"claimName":pvc,"readOnly":true}})
+}
+
+fn shared_nix_store_mount() -> Value {
+    json!({"name":"shared-nix","mountPath":"/nix/store","subPath":"store","readOnly":true})
+}
+
+fn shared_nix_socket_mount() -> Value {
+    json!({"name":"shared-nix","mountPath":"/nix/var/nix/daemon-socket","subPath":"var/nix/daemon-socket","readOnly":true})
+}
+
+fn sandbox_manifest(
+    config: &Config,
+    name: &str,
+    labels: Value,
+    annotations: serde_json::Map<String, Value>,
+    workspace_init: Value,
+    env: Vec<Value>,
+) -> Value {
+    let container = json!({"name":"sandbox","image":config.image,"ports":[{"name":"opencode","containerPort":config.opencode_port}],"env":env,"volumeMounts":[{"name":"workspace","mountPath":"/home/anvil"},{"name":"shared-profile","mountPath":"/anvil/profile"},shared_nix_store_mount(),shared_nix_socket_mount()]});
+    json!({"apiVersion":"agents.x-k8s.io/v1beta1","kind":"Sandbox","metadata":{"name":name,"namespace":config.namespace,"labels":labels,"annotations":annotations},"spec":{"service":true,"podTemplate":{"spec":{"securityContext":{"fsGroup":1000},"initContainers":[workspace_init],"containers":[container],"volumes":[{"name":"shared-profile","persistentVolumeClaim":{"claimName":config.profile_pvc}},shared_nix_volume(&config.nix_pvc)]}},"volumeClaimTemplates":[{"metadata":{"name":"workspace"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":config.workspace_size}}}}]}})
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub sandbox_backend: SandboxBackend,
@@ -61,6 +85,7 @@ pub struct Config {
     pub annotation_prefix: String,
     pub profile_opencode_url: String,
     pub profile_pvc: String,
+    pub nix_pvc: String,
     pub credential_url: String,
     pub github_app_id: Option<String>,
     pub github_installation_id: Option<u64>,
@@ -167,6 +192,7 @@ impl Config {
                 },
             ),
             profile_pvc: get("ANVIL_PROFILE_PVC", "anvil-opencode-profile"),
+            nix_pvc: get("ANVIL_NIX_PVC", "anvil-nix"),
             credential_url: get("ANVIL_CREDENTIAL_URL", "http://anvild:8080"),
             github_app_id,
             github_installation_id,
@@ -1163,6 +1189,9 @@ impl SandboxApi for KubeSandboxApi {
             Value::String(RUNTIME_LAYOUT.into()),
         );
         annotations.extend(work_state_annotations(&self.config, initial_work_state));
+        // Kubernetes metadata annotations are strings; nulls are useful in
+        // patch payloads for clearing values but invalid during creation.
+        annotations.retain(|_, value| !value.is_null());
         annotations.insert(
             annotation_key(&self.config, "binding-state"),
             Value::String("pending".into()),
@@ -1215,13 +1244,12 @@ impl SandboxApi for KubeSandboxApi {
             "securityContext": {"runAsUser": 0, "runAsGroup": 0},
             "volumeMounts": [{"name": "workspace", "mountPath": "/home/anvil"}]
         });
-        let container = json!({"name":"sandbox","image":self.config.image,"ports":[{"name":"opencode","containerPort":self.config.opencode_port}],"env":env,"volumeMounts":[{"name":"workspace","mountPath":"/home/anvil"},{"name":"shared-profile","mountPath":"/anvil/profile"}]});
-        let obj = json!({"apiVersion":"agents.x-k8s.io/v1beta1","kind":"Sandbox","metadata":{"name":name,"namespace":ns,"labels":l,"annotations":annotations},"spec":{"service":true,"podTemplate":{"spec":{"securityContext":{"fsGroup":1000},"initContainers":[workspace_init],"containers":[container],"volumes":[{"name":"shared-profile","persistentVolumeClaim":{"claimName":self.config.profile_pvc}}]}},"volumeClaimTemplates":[{"metadata":{"name":"workspace"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":self.config.workspace_size}}}}]}});
+        let obj = sandbox_manifest(&self.config, &name, l, annotations, workspace_init, env);
+        let manifest = serde_json::from_value(obj).map_err(|error| {
+            ServiceError::Kubernetes(format!("invalid generated Sandbox manifest: {error}"))
+        })?;
         Api::<DynamicObject>::namespaced_with(self.client.clone(), ns, &sandbox_resource())
-            .create(
-                &PostParams::default(),
-                &serde_json::from_value(obj).unwrap(),
-            )
+            .create(&PostParams::default(), &manifest)
             .await
             .map_err(|e| ServiceError::Kubernetes(e.to_string()))?;
         Ok(Session {
@@ -4355,6 +4383,7 @@ mod tests {
             annotation_prefix: "anvil.example".into(),
             profile_opencode_url,
             profile_pvc: "anvil-opencode-profile".into(),
+            nix_pvc: "anvil-nix".into(),
             credential_url: "http://anvild:8080".into(),
             github_app_id: None,
             github_installation_id: None,
@@ -4364,6 +4393,47 @@ mod tests {
             github_api_url: "https://api.github.com".into(),
             history_path: PathBuf::from("/tmp/anvil-history.jsonl"),
         }
+    }
+
+    #[test]
+    fn generated_sandbox_uses_read_only_shared_nix() {
+        let mut config = config("http://profile".into());
+        config.nix_pvc = "configured-nix-pvc".into();
+        let state = WorkStateRecord::submitted(
+            RunId("run_example".into()),
+            OpenCodeMessageId("msg_example".into()),
+            "2026-01-01T00:00:00Z".into(),
+        );
+        let mut annotations = work_state_annotations(&config, &state);
+        annotations.retain(|_, value| !value.is_null());
+        let manifest = sandbox_manifest(
+            &config,
+            "anvil-example",
+            labels(),
+            annotations,
+            json!({"name":"fix-workspace-permissions"}),
+            vec![],
+        );
+        let _: DynamicObject = serde_json::from_value(manifest.clone()).unwrap();
+        assert!(manifest["metadata"]["annotations"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(Value::is_string));
+        let spec = &manifest["spec"]["podTemplate"]["spec"];
+        assert_eq!(spec["volumes"][1], shared_nix_volume("configured-nix-pvc"));
+        let mounts = spec["containers"][0]["volumeMounts"].as_array().unwrap();
+        assert!(mounts.contains(&shared_nix_store_mount()));
+        assert!(mounts.contains(&shared_nix_socket_mount()));
+        assert!(mounts
+            .iter()
+            .filter(|m| m["name"] == "shared-nix")
+            .all(|m| m["readOnly"] == true));
+        assert!(spec["initContainers"][0].get("volumeMounts").is_none());
+        assert_eq!(
+            spec["volumes"][1]["persistentVolumeClaim"]["readOnly"],
+            true
+        );
     }
 
     fn activity_session() -> Session {
