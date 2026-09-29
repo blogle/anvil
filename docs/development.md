@@ -64,6 +64,9 @@ that daemon from B. The full Rust check remains owned by the local-first CI
 lane; this smoke verifies the shared Nix development-environment contract
 without reseeding its Cargo artifacts. CI enters a minimal `kind-ci` shell for
 this lane so the Rust devShell's Cargo artifact hook cannot run before Kind.
+On pull requests, the image workflow builds the Anvil, sandbox, baseline
+daemon, and upgrade daemon archives once; PR inspection and Kind download and
+verify those same archives before consuming them.
 
 ## Production deployment
 

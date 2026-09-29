@@ -36,8 +36,8 @@ jobs:
           grep -En 'ANVIL_NIX_PVC: anvil-nix' /tmp/anvil-rendered.yaml
           printf 'render-and-contract-seconds=%s\n' "$((SECONDS - start))"
 
-  pr-build:
-    name: Build and inspect PR images
+  pr-artifacts:
+    name: Build PR image artifacts
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -47,15 +47,73 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@v19
       - name: Run Nix checks
         run: time nix --option build-users-group "" flake check
-      - name: Build and inspect PR images
+      - name: Build OCI archives
         run: |
-          nix --option build-users-group "" build .#anvil-image-ci -o result-anvil-ci
-          docker load < result-anvil-ci
-          nix --option build-users-group "" run .#anvil-sandbox-image.copyToDockerDaemon
-          nix --option build-users-group "" run .#anvil-nix-daemon-image.copyToDockerDaemon
+          set -euo pipefail
+          mkdir -p image-artifacts paths
+          nix --option build-users-group "" build --no-link --print-out-paths .#anvil-image-ci > paths/anvil &
+          anvil_pid=$!
+          nix --option build-users-group "" build --no-link --print-out-paths .#anvil-sandbox-image > paths/sandbox &
+          sandbox_pid=$!
+          nix --option build-users-group "" build --no-link --print-out-paths .#anvil-nix-daemon-image > paths/daemon &
+          daemon_pid=$!
+          nix --option build-users-group "" build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-image > paths/upgrade &
+          upgrade_pid=$!
+          wait "$anvil_pid" "$sandbox_pid" "$daemon_pid" "$upgrade_pid"
+          cp "$(<paths/anvil)" image-artifacts/anvil-image.tar
+          nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/sandbox)" docker-archive:image-artifacts/anvil-sandbox-image.tar
+          nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/daemon)" docker-archive:image-artifacts/anvil-nix-daemon-image.tar
+          nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/upgrade)" docker-archive:image-artifacts/anvil-nix-daemon-upgrade-test-image.tar
+          (cd image-artifacts && sha256sum *.tar > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anvil-pr-image-archives
+          path: image-artifacts
+          compression-level: 0
+          if-no-files-found: error
+
+  pr-build:
+    name: Build and inspect PR images
+    if: github.event_name == 'pull_request'
+    needs: pr-artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: anvil-pr-image-archives
+          path: image-artifacts
+      - name: Inspect producer archives
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          (cd image-artifacts && sha256sum -c SHA256SUMS)
+          for archive in image-artifacts/*.tar; do docker load < "$archive"; done
           docker image inspect anvil-ci:dev >/dev/null
           docker image inspect ghcr.io/blogle/anvil-sandbox:main >/dev/null
           docker image inspect ghcr.io/blogle/anvil-nix-daemon:main >/dev/null
+          docker image inspect ghcr.io/blogle/anvil-nix-daemon:kind-upgrade >/dev/null
+          printf 'archive-consume-seconds=%s\n' "$((SECONDS - start))"
+
+  kind-fidelity:
+    name: Isolated Agent Sandbox Kubernetes lane
+    if: github.event_name == 'pull_request'
+    needs: pr-artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: anvil-pr-image-archives
+          path: image-artifacts
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Isolated Agent Sandbox Kubernetes lane
+        run: |
+          time ANVIL_KIND_ARTIFACT_DIR="$GITHUB_WORKSPACE/image-artifacts" \
+            nix --option build-users-group "" develop .#kind-ci --command just e2e-k8s
 
   publish:
     name: Build, inspect, and publish images
