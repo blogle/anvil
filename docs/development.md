@@ -59,8 +59,10 @@ sandbox must not run Kind nested.
 Kind fidelity starts with an empty Nix PVC, bootstraps the shared daemon, and
 starts two sandboxes from the freshly built image. It builds a new derivation in
 sandbox A, checks that B sees the exact path after A is suspended and after the
-daemon restarts, and runs `nix develop --command just check` through the shared
-daemon from A.
+daemon restarts, and enters the dedicated `shared-nix-smoke` environment through
+that daemon from B. The full Rust check remains owned by the local-first CI
+lane; this smoke verifies the shared Nix development-environment contract
+without reseeding its Cargo artifacts.
 
 ## Production deployment
 

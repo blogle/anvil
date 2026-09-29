@@ -7,6 +7,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -19,6 +23,7 @@ jobs:
       - name: Render and check image contract
         run: |
           set -euo pipefail
+          start=$SECONDS
           kubectl kustomize k8s/overlays/dev > /tmp/anvil-rendered.yaml
           if grep -En 'image: (anvil(:|/)|anvil-sandbox:|anvil-nix-daemon:)|imagePullPolicy: Never' /tmp/anvil-rendered.yaml; then
             echo 'rendered manifests contain a local image or Never pull policy'
@@ -29,6 +34,7 @@ jobs:
           grep -En 'image: ghcr.io/blogle/anvil-nix-daemon:main' /tmp/anvil-rendered.yaml
           grep -En 'ANVIL_SANDBOX_IMAGE: ghcr.io/blogle/anvil-sandbox:main' /tmp/anvil-rendered.yaml
           grep -En 'ANVIL_NIX_PVC: anvil-nix' /tmp/anvil-rendered.yaml
+          printf 'render-and-contract-seconds=%s\n' "$((SECONDS - start))"
 
   pr-build:
     name: Build and inspect PR images
@@ -39,15 +45,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v19
-      - uses: DeterminateSystems/magic-nix-cache-action@v8
       - name: Run Nix checks
-        run: nix flake check
+        run: time nix --option build-users-group "" flake check
       - name: Build and inspect PR images
         run: |
-          nix build .#anvil-image-ci -o result-anvil-ci
+          nix --option build-users-group "" build .#anvil-image-ci -o result-anvil-ci
           docker load < result-anvil-ci
-          nix run .#anvil-sandbox-image.copyToDockerDaemon
-          nix run .#anvil-nix-daemon-image.copyToDockerDaemon
+          nix --option build-users-group "" run .#anvil-sandbox-image.copyToDockerDaemon
+          nix --option build-users-group "" run .#anvil-nix-daemon-image.copyToDockerDaemon
           docker image inspect anvil-ci:dev >/dev/null
           docker image inspect ghcr.io/blogle/anvil-sandbox:main >/dev/null
           docker image inspect ghcr.io/blogle/anvil-nix-daemon:main >/dev/null
@@ -62,15 +67,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v19
-      - uses: DeterminateSystems/magic-nix-cache-action@v8
       - name: Run Nix checks
-        run: nix flake check
+        run: time nix --option build-users-group "" flake check
       - name: Build production images
         run: |
-          nix build .#anvil-image -o result-anvil
+          nix --option build-users-group "" build .#anvil-image -o result-anvil
           docker load < result-anvil
-          nix run .#anvil-sandbox-image.copyToDockerDaemon
-          nix run .#anvil-nix-daemon-image.copyToDockerDaemon
+          nix --option build-users-group "" run .#anvil-sandbox-image.copyToDockerDaemon
+          nix --option build-users-group "" run .#anvil-nix-daemon-image.copyToDockerDaemon
           docker image inspect anvil:dev >/dev/null
           docker image inspect ghcr.io/blogle/anvil-sandbox:main >/dev/null
           docker image inspect ghcr.io/blogle/anvil-nix-daemon:main >/dev/null

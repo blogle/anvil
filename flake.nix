@@ -52,5 +52,14 @@
 
         checks = rust.checks;
         devShells.default = rust.devShell;
+        # Kind already validates Rust in the independent local-first job. This
+        # shell keeps the shared-daemon contract focused on environment entry
+        # instead of triggering the full Cargo artifact seed.
+        devShells.shared-nix-smoke = pkgs.mkShell {
+          packages = [ pkgs.bash pkgs.just pkgs.nix ];
+          shellHook = ''
+            export ANVIL_SHARED_NIX_SMOKE=1
+          '';
+        };
       });
 }

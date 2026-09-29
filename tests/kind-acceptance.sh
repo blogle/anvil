@@ -56,7 +56,9 @@ poll() {
 kind create cluster --name "$cluster" --kubeconfig "$kubeconfig" --wait 120s
 created=1
 
-anvil_image="$(nix build --no-link --print-out-paths .#anvil-image)"
+# The CI profile has the same runtime filesystem/configuration as the
+# production image; the independent image job owns production-profile builds.
+anvil_image="$(nix build --no-link --print-out-paths .#anvil-image-ci)"
 sandbox_image="$(nix build --no-link --print-out-paths .#anvil-sandbox-image)"
 daemon_image="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-image)"
 upgrade_image="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-image)"
@@ -407,7 +409,18 @@ api_c_name="anvil-$api_c_id"
 api_c_pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$api_c_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
 test -n "$api_c_pod"
 agent_exec "$api_c_pod" /bin/bash -c 'nix store info >/dev/null && nix path-info "$1" >/dev/null && nix path-info "$2" >/dev/null' -- "$shared_path" "$upgrade_canary"
-agent_exec "$api_b_pod" /bin/bash -lc 'cd /home/anvil/workspace/anvil && nix develop --command just check'
+# Rust checks are owned by the parallel local-first lane. Keep this narrowly
+# scoped smoke because it proves the sandbox can enter a Nix shell through the
+# shared daemon without reseeding the full Cargo development environment.
+agent_exec "$api_b_pod" /bin/bash -lc '
+  cd /home/anvil/workspace/anvil
+  test "${NIX_REMOTE:-}" = daemon
+  nix develop .#shared-nix-smoke --command bash -c '\''
+    test "$ANVIL_SHARED_NIX_SMOKE" = 1
+    nix store info >/dev/null
+    just --version >/dev/null
+  '\''
+'
 
 ANVIL_KUBECONFIG="$kubeconfig" \
 ANVIL_SANDBOX_POD="$pod_name" \
