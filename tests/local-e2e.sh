@@ -67,6 +67,7 @@ export ANVIL_PREVIEW_DOMAIN=localhost ANVIL_ANNOTATION_PREFIX=anvil.local
 export ANVIL_PROFILE_OPENCODE_URL=http://127.0.0.1:4097 ANVIL_CREDENTIAL_URL=http://127.0.0.1:8080
 export ANVIL_SESSION_SIGNING_SECRET=anvil-local-development-only-signing-secret
 export ANVIL_HISTORY_PATH="$tmp/history.jsonl"
+unset ANVIL_STORE_PATH
 "$root/target/debug/anvild" >"$tmp/anvild.log" 2>&1 & api_pid=$!
 
 poll() {
@@ -115,6 +116,7 @@ worker_health() {
 poll http://127.0.0.1:4098/healthz
 poll http://127.0.0.1:4097/global/health
 poll http://127.0.0.1:8080/readyz
+[[ -f "$tmp/controller.sqlite3" ]] || { printf 'controller store was not created beside history\n' >&2; exit 1; }
 
 git -C "$fixture" init -b main >/dev/null
 git -C "$fixture" config user.name Fixture
@@ -135,7 +137,7 @@ if [ "$ui_only" = 1 ]; then
 fi
 
 scenario_start=$SECONDS
-created="$(create_session fixture 'ANVIL-E2E:edit-file ANVIL-E2E:wait-for-release inspect the fixture and change target.txt from before to after.')"
+created="$(create_session fixture 'ANVIL-E2E:durable-context=amber-731 ANVIL-E2E:edit-file ANVIL-E2E:wait-for-release inspect the fixture and change target.txt from before to after.')"
 jq -e '.id | strings' <<<"$created" >/dev/null
 id="$(jq -r .id <<<"$created")"
 runtime_dir="$runtime/$id"
@@ -144,6 +146,7 @@ jq -e '(.plugin // []) | length == 0' "$profile/config/opencode.jsonc" >/dev/nul
 test ! -e "$profile/plugins/anvil-report.ts"
 test ! -e "$runtime_dir/home/.config/opencode/plugins/anvil-report.ts"
 wait_for_state "$id" working
+curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/activity" | jq -e '.execution_state == "running" and .telemetry.execution == "busy" and any(.telemetry.requests[]; (.prompt | contains("ANVIL-E2E:edit-file")) and .state == "running")' >/dev/null
 curl -fsS -X POST http://127.0.0.1:4098/__test/release >/dev/null
 wait_for_state "$id" ready_for_review
 state="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/status")"
@@ -153,7 +156,9 @@ jq -e '.. | strings | select(contains("+after"))' <<<"$diff" >/dev/null
 printf 'create/edit/working/idle/diff: %ds\n' "$((SECONDS - scenario_start))"
 
 scenario_start=$SECONDS
+workspace="$runtime_dir/home/workspace/fixture"
 before_session="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id" | jq -r .opencode_session_id)"
+before_transcript="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages")"
 before_run="$(jq -r .work_state_run_id <<<"$state")"
 curl -fsS -X POST http://127.0.0.1:4098/__test/hold >/dev/null
 curl -fsS -H 'content-type: application/json' \
@@ -172,7 +177,8 @@ printf 'follow-up same conversation/working/idle: %ds\n' "$((SECONDS - scenario_
 scenario_start=$SECONDS
 workspace="$runtime_dir/home/workspace/fixture"
 test -f "$workspace/target.txt"
-test -f "$runtime_dir/home/.local/share/opencode/opencode.db"
+opencode_data="$runtime_dir/home/.local/share/opencode"
+test -s "$opencode_data/opencode.db"
 worker_pid="$(<"$runtime_dir/worker.pid")"
 curl -fsS -X POST "http://127.0.0.1:8080/v1/sessions/$id/suspend" >/dev/null
 test ! -e "$runtime_dir/worker.pid"
@@ -185,7 +191,47 @@ test "$worker_pid" != "$resumed_pid"
 worker_health "$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id")"
 test "$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id" | jq -r .opencode_session_id)" = "$before_session"
 wait_for_state "$id" ready_for_review
+after_transcript="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages")"
+jq -e --argjson before "$before_transcript" 'length >= ($before | length)' <<<"$after_transcript" >/dev/null
+jq -e '.. | strings | select(contains("ANVIL-E2E:edit-file"))' <<<"$after_transcript" >/dev/null
+test "$(<"$workspace/target.txt")" = after
+test "$(git -C "$workspace" status --porcelain)" = " M target.txt"
+curl -fsS -H 'content-type: application/json' -d '{"prompt":"ANVIL-E2E:restart-one-followup use the durable context from the first turn."}' \
+  "http://127.0.0.1:8080/v1/sessions/$id/messages" >/dev/null
+wait_for_state "$id" ready_for_review
+curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages" | jq -e '.. | strings | select(contains("Confirmed restart one: prior conversation context is present."))' >/dev/null
+
+# A second full OpenCode process recreation proves that reconciliation is
+# reading its native session store repeatedly, rather than relying on a warm
+# in-memory session or a one-off recovery path.
+worker_pid="$resumed_pid"
+curl -fsS -X POST "http://127.0.0.1:8080/v1/sessions/$id/suspend" >/dev/null
+test ! -e "$runtime_dir/worker.pid"
+! kill -0 "$worker_pid" 2>/dev/null
+curl -fsS -X POST "http://127.0.0.1:8080/v1/sessions/$id/resume" >/dev/null
+second_resumed_pid="$(<"$runtime_dir/worker.pid")"
+test "$worker_pid" != "$second_resumed_pid"
+worker_health "$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id")"
+test "$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id" | jq -r .opencode_session_id)" = "$before_session"
+wait_for_state "$id" ready_for_review
+second_transcript="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages")"
+jq -e --argjson before "$before_transcript" 'length >= ($before | length)' <<<"$second_transcript" >/dev/null
+test "$(<"$workspace/target.txt")" = after
+test "$(git -C "$workspace" status --porcelain)" = " M target.txt"
+curl -fsS -H 'content-type: application/json' -d '{"prompt":"ANVIL-E2E:restart-two-followup continue using the first-turn context."}' \
+  "http://127.0.0.1:8080/v1/sessions/$id/messages" >/dev/null
+wait_for_state "$id" ready_for_review
+curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages" | jq -e '.. | strings | select(contains("Confirmed restart two: prior conversation context is present."))' >/dev/null
 printf 'suspend/resume workspace, OpenCode binding, watcher reconciliation: %ds\n' "$((SECONDS - scenario_start))"
+
+scenario_start=$SECONDS
+kill "$api_pid"
+wait "$api_pid" 2>/dev/null || true
+"$root/target/debug/anvild" >"$tmp/anvild-restarted.log" 2>&1 & api_pid=$!
+poll http://127.0.0.1:8080/readyz
+wait_for_state "$id" ready_for_review
+curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/activity" | jq -e '.telemetry.schema_version == 1 and any(.telemetry.requests[]; .prompt | contains("ANVIL-E2E:edit-file"))' >/dev/null
+printf 'anvild restart/materialized telemetry recovery: %ds\n' "$((SECONDS - scenario_start))"
 
 scenario_start=$SECONDS
 worker_pid="$(<"$runtime_dir/worker.pid")"

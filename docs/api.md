@@ -46,18 +46,32 @@ credentials remain on the profile PVC.
 
 Session responses expose `environment_state`, `execution_state`, and `work_state`
 fields derived from environment and OpenCode lifecycle facts. OpenCode busy maps
-to `running` / `in_progress`; idle finalizes the current run and maps to
-`idle` / `ready_for_review`; OpenCode errors map to `failed`. Suspended and
-completed remain explicit Anvil operations.
+to execution `running`; OpenCode idle maps to execution `idle`, independently of
+the Anvil run identity/review state. A run becomes `ready_for_review` when the
+bound OpenCode conversation confirms completion for its correlated user turn.
+OpenCode errors map to execution `failed`, while observer transport degradation
+is reported separately in telemetry. Suspended and completed remain explicit
+Anvil administrative states.
+
+OpenCode v1.18.30 `session/status` lists only non-idle sessions, so an absent
+entry for the exact bound session is authoritative `idle`. Successful live
+status reads supersede persisted telemetry and clear stale execution errors.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/v1/sessions/{id}/complete` | Controller acceptance into `completed` |
 | `POST` | `/v1/sessions/{id}/rebind` | Explicitly create a replacement OpenCode session |
 
-Run and work metadata are stored with Sandbox annotations, so they survive
-service restarts and Sandbox suspension. No model tool call is required for
-lifecycle transitions.
+Run and work metadata plus the version-1 Anvil telemetry snapshot are stored
+with Sandbox annotations, so they survive service restarts and Sandbox
+suspension. `/activity` projects the persisted request/operation snapshot rather
+than rebuilding it from the full conversation on every read. The snapshot uses
+Anvil-owned `schema_version`, execution, observer-health, operation, timestamp,
+wait, and agent-authored todo fields; todo data is planning telemetry, never a
+completion estimate. Raw OpenCode event payloads are not part of this contract.
+The watcher reconciles OpenCode status and the exact bound current session on
+startup/reconnect and uses message identity only to correlate an active Anvil
+run. No model tool call is required for lifecycle transitions.
 
 New Sandboxes mount their workspace PVC at `/home/anvil`, check out the
 repository under `/home/anvil/workspace/<project>`, and store OpenCode's native
