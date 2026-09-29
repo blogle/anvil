@@ -79,9 +79,15 @@ trusted until a mediated profile distribution mechanism replaces this PoC.
 
 Each newly-created Sandbox mounts its workspace PVC at `/home/anvil`, checks out
 the repository at `/home/anvil/workspace/<project>`, and stores OpenCode's
-native database and XDG state in the standard paths below that PVC. The
-controller marks this runtime layout as `v2`; existing Agent Sandbox resources
-are immutable and retain their legacy layout until deleted.
+native state below that PVC. For the pinned OpenCode `v1.18.30`,
+`XDG_DATA_HOME=/home/anvil/.local/share` resolves its session/message/project
+database to `/home/anvil/.local/share/opencode/opencode.db` (SQLite); logs,
+repository metadata, and snapshots under the same OpenCode data directory are
+persisted with it. OpenCode resolves project identity from the repository
+working tree, so the checkout path is kept stable across worker recreation.
+The remaining XDG config, cache, state, and runtime paths are also beneath
+`/home/anvil`. The controller marks this runtime layout as `v2`; existing Agent
+Sandbox resources are immutable and retain their legacy layout until deleted.
 
 `anvild` verifies the durable OpenCode session ID after startup, resume, and
 before session operations. If the exact ID still exists, it is always retained.
