@@ -153,7 +153,9 @@ jq -e '.. | strings | select(contains("+after"))' <<<"$diff" >/dev/null
 printf 'create/edit/working/idle/diff: %ds\n' "$((SECONDS - scenario_start))"
 
 scenario_start=$SECONDS
+workspace="$runtime_dir/home/workspace/fixture"
 before_session="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id" | jq -r .opencode_session_id)"
+before_transcript="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages")"
 before_run="$(jq -r .work_state_run_id <<<"$state")"
 curl -fsS -X POST http://127.0.0.1:4098/__test/hold >/dev/null
 curl -fsS -H 'content-type: application/json' \
@@ -172,7 +174,8 @@ printf 'follow-up same conversation/working/idle: %ds\n' "$((SECONDS - scenario_
 scenario_start=$SECONDS
 workspace="$runtime_dir/home/workspace/fixture"
 test -f "$workspace/target.txt"
-test -f "$runtime_dir/home/.local/share/opencode/opencode.db"
+opencode_data="$runtime_dir/home/.local/share/opencode"
+test -s "$opencode_data/opencode.db"
 worker_pid="$(<"$runtime_dir/worker.pid")"
 curl -fsS -X POST "http://127.0.0.1:8080/v1/sessions/$id/suspend" >/dev/null
 test ! -e "$runtime_dir/worker.pid"
@@ -185,6 +188,37 @@ test "$worker_pid" != "$resumed_pid"
 worker_health "$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id")"
 test "$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id" | jq -r .opencode_session_id)" = "$before_session"
 wait_for_state "$id" ready_for_review
+after_transcript="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages")"
+jq -e --argjson before "$before_transcript" 'length >= ($before | length)' <<<"$after_transcript" >/dev/null
+jq -e '.. | strings | select(contains("ANVIL-E2E:edit-file"))' <<<"$after_transcript" >/dev/null
+test "$(<"$workspace/target.txt")" = after
+test "$(git -C "$workspace" status --porcelain)" = " M target.txt"
+curl -fsS -H 'content-type: application/json' -d '{"prompt":"ANVIL-E2E:followup after a destructive restart, use the existing conversation context."}' \
+  "http://127.0.0.1:8080/v1/sessions/$id/messages" >/dev/null
+wait_for_state "$id" ready_for_review
+curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages" | jq -e '.. | strings | select(contains("Confirmed: this is the same OpenCode conversation."))' >/dev/null
+
+# A second full OpenCode process recreation proves that reconciliation is
+# reading its native session store repeatedly, rather than relying on a warm
+# in-memory session or a one-off recovery path.
+worker_pid="$resumed_pid"
+curl -fsS -X POST "http://127.0.0.1:8080/v1/sessions/$id/suspend" >/dev/null
+test ! -e "$runtime_dir/worker.pid"
+! kill -0 "$worker_pid" 2>/dev/null
+curl -fsS -X POST "http://127.0.0.1:8080/v1/sessions/$id/resume" >/dev/null
+second_resumed_pid="$(<"$runtime_dir/worker.pid")"
+test "$worker_pid" != "$second_resumed_pid"
+worker_health "$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id")"
+test "$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id" | jq -r .opencode_session_id)" = "$before_session"
+wait_for_state "$id" ready_for_review
+second_transcript="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages")"
+jq -e --argjson before "$before_transcript" 'length >= ($before | length)' <<<"$second_transcript" >/dev/null
+test "$(<"$workspace/target.txt")" = after
+test "$(git -C "$workspace" status --porcelain)" = " M target.txt"
+curl -fsS -H 'content-type: application/json' -d '{"prompt":"ANVIL-E2E:followup after the second destructive restart, continue our existing conversation."}' \
+  "http://127.0.0.1:8080/v1/sessions/$id/messages" >/dev/null
+wait_for_state "$id" ready_for_review
+curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages" | jq -e '.. | strings | select(contains("Confirmed: this is the same OpenCode conversation."))' >/dev/null
 printf 'suspend/resume workspace, OpenCode binding, watcher reconciliation: %ds\n' "$((SECONDS - scenario_start))"
 
 scenario_start=$SECONDS
