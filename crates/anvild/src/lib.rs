@@ -1455,6 +1455,7 @@ pub struct AppState {
     pub config: Config,
     pub kube: Arc<dyn SandboxApi>,
     history: HistoryStore,
+    controller_store: Arc<Mutex<Option<anvil_core::controller_store::ControllerStore>>>,
     profile: ProfileClient,
     pending_logins: Arc<Mutex<HashMap<String, PendingLogin>>>,
     binding_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
@@ -1491,6 +1492,7 @@ impl AppState {
         };
         Self {
             history: HistoryStore::new(config.history_path.clone()),
+            controller_store: Arc::new(Mutex::new(None)),
             config,
             kube: Arc::new(kube),
             profile,
@@ -1522,6 +1524,18 @@ impl AppState {
     }
 
     pub async fn initialize(&self) -> Result<(), ServiceError> {
+        let database_path = self
+            .config
+            .history_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("controller-state.sqlite");
+        let store = anvil_core::controller_store::ControllerStore::open(database_path)
+            .map_err(|error| ServiceError::Config(format!("controller store: {error}")))?;
+        *self
+            .controller_store
+            .lock()
+            .expect("controller store lock poisoned") = Some(store);
         self.kube.recover_startup().await?;
         for record in self.kube.list().await? {
             let id = record.session.id.clone();
