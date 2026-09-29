@@ -1815,6 +1815,16 @@ async fn create(
                 .unwrap_or_else(|| "new OpenCode session could not be verified".into()),
         ));
     }
+    materialize_request(
+        &s,
+        &id,
+        initial_work_state
+            .user_message_id()
+            .expect("submitted run has a message id"),
+        prompt.as_str(),
+        model.as_ref().map(|value| value.qualified_id()),
+    )
+    .await?;
     let request_id = new_request_id();
     record_history(
         &s,
@@ -2133,7 +2143,15 @@ async fn rebind(
     if let Some(prompt) = prompt {
         let session = s.kube.get(&id).await?.session;
         let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
-        let submission = begin_run(&s, &id).await?;
+        let submission = begin_run(
+            &s,
+            &id,
+            Some((
+                prompt.as_str(),
+                model.as_ref().map(|value| value.qualified_id()),
+            )),
+        )
+        .await?;
         let request_id = new_request_id();
         record_history(
             &s,
@@ -2208,10 +2226,7 @@ async fn activity(
     } else {
         Value::Null
     };
-    let has_authoritative_session_status = session
-        .opencode_session_id
-        .as_deref()
-        .is_some_and(|opencode_id| status.get(opencode_id).is_some());
+    let has_authoritative_session_status = binding_is_usable(&session) && status.is_object();
     let mut messages = build_activity(
         &session,
         &session.environment_state,
@@ -2379,32 +2394,13 @@ async fn prompt(
         Some(requested) => Some(oc.resolve_model(requested).await?),
         None => None,
     };
-    let submission = begin_run(&s, &id).await?;
+    let submission = begin_run(
+        &s,
+        &id,
+        Some((p.as_str(), model.as_ref().map(|value| value.qualified_id()))),
+    )
+    .await?;
     let request_id = new_request_id();
-    let mut telemetry = s.kube.get(&id).await?.telemetry;
-    let request_number = telemetry
-        .requests
-        .last()
-        .map_or(1, |request| request.number + 1);
-    telemetry.requests.push(SessionRequest {
-        id: submission.user_message_id.to_string(),
-        number: request_number,
-        origin: "Anvil controller".into(),
-        prompt: p.as_str().into(),
-        state: "submitted".into(),
-        started_at: chrono_like_now(),
-        completed_at: None,
-        duration_ms: None,
-        last_activity_at: None,
-        current_operation: None,
-        provider: None,
-        model: model.as_ref().map(|value| value.qualified_id()),
-        error: None,
-    });
-    if telemetry.requests.len() > 4 {
-        telemetry.requests.drain(..telemetry.requests.len() - 4);
-    }
-    s.kube.set_telemetry(&id, &telemetry).await?;
     record_history(
         &s,
         &id,
@@ -2451,6 +2447,61 @@ async fn prompt(
             Err(error)
         }
     }
+}
+
+async fn materialize_request(
+    state: &AppState,
+    session_id: &str,
+    message_id: &OpenCodeMessageId,
+    prompt: &str,
+    model: Option<String>,
+) -> Result<(), ServiceError> {
+    update_telemetry(state, session_id, |telemetry| {
+        append_materialized_request(telemetry, message_id, prompt, model);
+    })
+    .await
+}
+
+fn append_materialized_request(
+    telemetry: &mut SessionTelemetry,
+    message_id: &OpenCodeMessageId,
+    prompt: &str,
+    model: Option<String>,
+) {
+    let number = telemetry
+        .requests
+        .last()
+        .map_or(1, |request| request.number.saturating_add(1));
+    telemetry.requests.push(SessionRequest {
+        id: message_id.to_string(),
+        number,
+        origin: "Anvil controller".into(),
+        prompt: prompt.into(),
+        state: "submitted".into(),
+        started_at: chrono_like_now(),
+        completed_at: None,
+        duration_ms: None,
+        last_activity_at: None,
+        current_operation: None,
+        provider: None,
+        model,
+        error: None,
+    });
+    if telemetry.requests.len() > 4 {
+        telemetry.requests.drain(..telemetry.requests.len() - 4);
+    }
+}
+
+async fn update_telemetry(
+    state: &AppState,
+    session_id: &str,
+    update: impl FnOnce(&mut SessionTelemetry),
+) -> Result<(), ServiceError> {
+    let lock = state.transition_lock(session_id);
+    let _guard = lock.lock().await;
+    let mut telemetry = state.kube.get(session_id).await?.telemetry;
+    update(&mut telemetry);
+    state.kube.set_telemetry(session_id, &telemetry).await
 }
 
 async fn complete(
@@ -2504,10 +2555,15 @@ struct RunSubmission {
     user_message_id: OpenCodeMessageId,
 }
 
-async fn begin_run(s: &AppState, id: &str) -> Result<RunSubmission, ServiceError> {
+async fn begin_run(
+    s: &AppState,
+    id: &str,
+    request: Option<(&str, Option<String>)>,
+) -> Result<RunSubmission, ServiceError> {
     let lock = s.transition_lock(id);
     let _guard = lock.lock().await;
     let object = s.kube.get(id).await?;
+    let mut telemetry = object.telemetry;
     let work = object.work_state;
     let last_run = match work.state {
         WorkLifecycleState::Active { .. } => {
@@ -2538,6 +2594,10 @@ async fn begin_run(s: &AppState, id: &str) -> Result<RunSubmission, ServiceError
         },
     };
     s.kube.set_work_state(id, &next).await?;
+    if let Some((prompt, model)) = request {
+        append_materialized_request(&mut telemetry, &submission.user_message_id, prompt, model);
+        s.kube.set_telemetry(id, &telemetry).await?;
+    }
     record_history(
         s,
         id,
@@ -2688,8 +2748,17 @@ fn transition_work_state(
 fn lifecycle_event(value: &Value) -> Option<(String, LifecycleObservation)> {
     let value = value.get("payload").unwrap_or(value);
     let properties = value.get("properties")?;
-    let session_id = properties.get("sessionID")?.as_str()?.to_owned();
-    match value.get("type")?.as_str()? {
+    let event_type = value.get("type")?.as_str()?;
+    let session_id = if event_type == "message.part.updated" {
+        properties
+            .get("part")?
+            .get("sessionID")?
+            .as_str()?
+            .to_owned()
+    } else {
+        properties.get("sessionID")?.as_str()?.to_owned()
+    };
+    match event_type {
         "message.updated" => Some((
             session_id,
             properties
@@ -2786,7 +2855,7 @@ fn lifecycle_event(value: &Value) -> Option<(String, LifecycleObservation)> {
                     schema_version: 1,
                     fact: TelemetryFact::Operation {
                         value: operation,
-                        active: status == "running",
+                        active: matches!(status, "pending" | "running"),
                     },
                 }),
             ))
@@ -2816,19 +2885,28 @@ fn lifecycle_event(value: &Value) -> Option<(String, LifecycleObservation)> {
                 )),
             }),
         )),
-        "question.asked" | "permission.asked" | "session.wait" => Some((
+        "permission.updated" => Some((
             session_id,
             LifecycleObservation::Telemetry(NormalizedTelemetryEvent {
                 schema_version: 1,
                 fact: TelemetryFact::Wait(json!({
-                    "kind": match value.get("type").and_then(Value::as_str) {
-                        Some("question.asked") => "question",
-                        Some("permission.asked") => "permission",
-                        _ => "wait",
-                    },
-                    "id": properties.get("id").or_else(|| properties.get("requestID")).or_else(|| properties.get("permissionID")),
-                    "at": properties.get("time").and_then(|time| timestamp_from_value(Some(time))),
-                    "questions": properties.get("questions"),
+                    "kind": "permission",
+                    "id": properties.get("id"),
+                    "title": properties.get("title"),
+                    "at": properties.get("time").and_then(|time| time.get("created")).and_then(|time| timestamp_from_value(Some(time))),
+                    "state": "updated",
+                })),
+            }),
+        )),
+        "permission.replied" => Some((
+            session_id,
+            LifecycleObservation::Telemetry(NormalizedTelemetryEvent {
+                schema_version: 1,
+                fact: TelemetryFact::Wait(json!({
+                    "kind": "permission",
+                    "id": properties.get("permissionID"),
+                    "response": properties.get("response"),
+                    "state": "replied",
                 })),
             }),
         )),
@@ -2886,28 +2964,39 @@ async fn apply_lifecycle_observation(
             let mut telemetry = record.telemetry.clone();
             match &event.fact {
                 TelemetryFact::Execution { state, error } => {
-                    telemetry.execution = state.clone();
-                    telemetry.execution_error = error.clone();
+                    let changed = telemetry.execution != *state
+                        || telemetry.execution_error != *error
+                        || ((state == "idle" || state == "error")
+                            && telemetry.current_operation.is_some());
                     if state == "idle" || state == "error" {
                         telemetry.current_operation = None;
                     }
-                    if let Some(request) = telemetry.requests.last_mut() {
-                        match state.as_str() {
-                            "busy" => request.state = "running".into(),
-                            "idle" if matches!(request.state.as_str(), "running" | "submitted") => {
-                                request.state = "completed".into();
-                                request.completed_at = Some(at.clone());
+                    if changed {
+                        telemetry.execution = state.clone();
+                        telemetry.execution_error = error.clone();
+                        if let Some(request) = telemetry.requests.last_mut() {
+                            match state.as_str() {
+                                "busy" => request.state = "running".into(),
+                                "idle"
+                                    if matches!(
+                                        request.state.as_str(),
+                                        "running" | "submitted"
+                                    ) =>
+                                {
+                                    request.state = "completed".into();
+                                    request.completed_at = Some(at.clone());
+                                }
+                                "error" => {
+                                    request.state = "failed".into();
+                                    request.completed_at = Some(at.clone());
+                                    request.error = error.clone();
+                                }
+                                _ => {}
                             }
-                            "error" => {
-                                request.state = "failed".into();
-                                request.completed_at = Some(at.clone());
-                                request.error = error.clone();
-                            }
-                            _ => {}
+                            request.last_activity_at = Some(at.clone());
                         }
-                        request.last_activity_at = Some(at.clone());
+                        telemetry.last_activity_at = Some(at.clone());
                     }
-                    telemetry.last_activity_at = Some(at.clone());
                 }
                 TelemetryFact::Operation { value, active } => {
                     if *active {
@@ -3032,41 +3121,44 @@ async fn reconcile_lifecycle_messages(
         return Ok(());
     };
     let info = message_value.get("info").unwrap_or(message_value);
-    let mut telemetry = record.telemetry;
-    if let Some(request) = telemetry
-        .requests
-        .iter_mut()
-        .find(|request| request.id == user_message_id.0)
-    {
-        if let Some(error) = assistant.error.clone() {
-            request.state = "failed".into();
-            request.error = Some(error.clone());
-            telemetry.execution = "error".into();
-            telemetry.execution_error = Some(error);
-        } else if assistant.completed {
-            request.state = "completed".into();
-        } else {
-            request.state = "running".into();
+    let completed_at =
+        timestamp_from_value(info.get("time").and_then(|time| time.get("completed")));
+    let operation = assistant_operation(message_value);
+    let last_activity = assistant_last_activity(message_value);
+    let correlated_assistant = assistant.clone();
+    update_telemetry(state, anvil_session_id, |telemetry| {
+        if let Some(request) = telemetry
+            .requests
+            .iter_mut()
+            .find(|request| request.id == user_message_id.0)
+        {
+            if let Some(error) = correlated_assistant.error.clone() {
+                request.state = "failed".into();
+                request.error = Some(error.clone());
+                telemetry.execution = "error".into();
+                telemetry.execution_error = Some(error);
+            } else if correlated_assistant.completed {
+                request.state = "completed".into();
+            } else {
+                request.state = "running".into();
+            }
+            request.completed_at = completed_at;
+            request.current_operation = operation.clone();
+            request.last_activity_at = last_activity
+                .clone()
+                .or_else(|| request.last_activity_at.clone());
+            if let Some(operation) = request.current_operation.clone() {
+                telemetry.current_operation = Some(OperationTelemetry {
+                    kind: "tool".into(),
+                    name: operation,
+                    started_at: request.last_activity_at.clone(),
+                    ended_at: None,
+                });
+            }
+            telemetry.last_activity_at = request.last_activity_at.clone();
         }
-        request.completed_at =
-            timestamp_from_value(info.get("time").and_then(|time| time.get("completed")));
-        request.current_operation = assistant_operation(message_value);
-        request.last_activity_at =
-            assistant_last_activity(message_value).or_else(|| request.last_activity_at.clone());
-        if let Some(operation) = request.current_operation.clone() {
-            telemetry.current_operation = Some(OperationTelemetry {
-                kind: "tool".into(),
-                name: operation,
-                started_at: request.last_activity_at.clone(),
-                ended_at: None,
-            });
-        }
-        telemetry.last_activity_at = request.last_activity_at.clone();
-    }
-    state
-        .kube
-        .set_telemetry(anvil_session_id, &telemetry)
-        .await?;
+    })
+    .await?;
     apply_lifecycle_observation(
         state,
         anvil_session_id,
@@ -3111,9 +3203,7 @@ async fn reconcile_lifecycle_from_opencode(
         })
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let execution = if selected.is_null() {
-        "unknown"
-    } else if error.is_some() {
+    let execution = if error.is_some() {
         "error"
     } else if busy {
         "busy"
@@ -3149,12 +3239,12 @@ async fn reconcile_lifecycle_from_opencode(
 }
 
 async fn set_observer_health(state: &AppState, id: &str, health: &str) {
-    if let Ok(record) = state.kube.get(id).await {
-        let mut telemetry = record.telemetry;
-        telemetry.observer = health.into();
+    let health = health.to_owned();
+    let _ = update_telemetry(state, id, |telemetry| {
+        telemetry.observer = health;
         telemetry.observer_changed_at = Some(chrono_like_now());
-        let _ = state.kube.set_telemetry(id, &telemetry).await;
-    }
+    })
+    .await;
 }
 
 async fn lifecycle_watch_loop(
@@ -3366,7 +3456,6 @@ async fn status(
 ) -> Result<Json<Value>, ServiceError> {
     let x = reconcile_binding(&s, &id).await?;
     let record = s.kube.get(&id).await?;
-    let mut telemetry = record.telemetry.clone();
     if !binding_is_usable(&x) {
         return Ok(Json(json!({
             "environment_state": x.environment_state,
@@ -3379,7 +3468,7 @@ async fn status(
             "current_run": x.current_run,
             "last_run": x.last_run,
             "last_activity_at": x.work_state_changed_at,
-            "telemetry": telemetry,
+            "telemetry": record.telemetry,
             "session_binding_state": x.session_binding_state,
             "session_binding_continuity": x.session_binding_continuity,
             "session_binding_error": x.session_binding_error,
@@ -3400,19 +3489,38 @@ async fn status(
     // Execution state is authoritative in session/status. Do not replay the
     // transcript on a current-state read: the lifecycle observer reconciles
     // messages when it needs run identity, while this endpoint stays bounded.
-    let selected = v
-        .get(
-            &x.opencode_session_id
-                .clone()
-                .ok_or(ServiceError::NotFound)?,
-        )
-        .cloned()
-        .unwrap_or(Value::Null);
-    let execution_state = if record.telemetry.execution == "error" {
-        "failed"
-    } else {
-        execution_state(&v, Some(&opencode_session_id))
-    };
+    let execution_state = execution_state(&v, Some(&opencode_session_id));
+    let selected = v.get(&opencode_session_id).cloned().unwrap_or(Value::Null);
+    let error = selected
+        .get("error")
+        .and_then(|value| {
+            value
+                .get("data")
+                .and_then(|data| data.get("message"))
+                .or_else(|| value.get("message"))
+        })
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    apply_lifecycle_observation(
+        &s,
+        &id,
+        &opencode_session_id,
+        LifecycleObservation::Telemetry(NormalizedTelemetryEvent {
+            schema_version: 1,
+            fact: TelemetryFact::Execution {
+                state: match execution_state {
+                    "running" => "busy",
+                    "idle" => "idle",
+                    "failed" => "error",
+                    _ => "unknown",
+                }
+                .into(),
+                error: error.clone(),
+            },
+        }),
+    )
+    .await?;
+    let mut telemetry = s.kube.get(&id).await?.telemetry;
     telemetry.execution = match execution_state {
         "running" => "busy",
         "idle" => "idle",
@@ -3420,6 +3528,10 @@ async fn status(
         _ => "unknown",
     }
     .into();
+    telemetry.execution_error = error;
+    if telemetry.execution == "idle" {
+        telemetry.current_operation = None;
+    }
     Ok(Json(json!({
         "environment_state": x.environment_state,
         "environment_error": x.environment_error,
@@ -4575,7 +4687,7 @@ mod tests {
     }
 
     async fn fixture_status() -> Json<Value> {
-        Json(json!({"ses_demo":{"type":"idle"}}))
+        Json(json!({}))
     }
 
     async fn fixture_session_messages(
@@ -4595,7 +4707,7 @@ mod tests {
     }
 
     async fn fixture_events() -> Response {
-        let body = "data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_demo\"}}\n\ndata: {\"type\":\"session.error\",\"properties\":{\"sessionID\":\"other-session\",\"error\":{\"message\":\"wrong session\"}}}\n\n";
+        let body = "data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_demo\"}}\n\ndata: {\"type\":\"session.error\",\"properties\":{\"sessionID\":\"other-session\",\"error\":{\"message\":\"wrong session\"}}}\n\ndata: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"sessionID\":\"other-session\",\"messageID\":\"m\",\"type\":\"tool\",\"tool\":\"bash\",\"state\":{\"status\":\"pending\"}}}}\n\n";
         (
             [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
             body,
@@ -5161,21 +5273,41 @@ mod tests {
                 );
             }
         }
-        let tool = json!({"type":"message.part.updated","properties":{"sessionID":"ses_demo","part":{"type":"tool","tool":"bash","state":{"status":"running","time":{"start":1700000000000_i64}}}}});
-        let (_, observation) = lifecycle_event(&tool).unwrap();
+        let tool = json!({"type":"message.part.updated","properties":{"part":{"sessionID":"ses_demo","messageID":"msg-1","type":"tool","tool":"bash","state":{"status":"pending","time":{}}}}});
+        let (tool_session, observation) = lifecycle_event(&tool).unwrap();
+        assert_eq!(tool_session, "ses_demo");
         assert!(
-            matches!(observation, LifecycleObservation::Telemetry(NormalizedTelemetryEvent { schema_version: 1, fact: TelemetryFact::Operation { value: OperationTelemetry { kind, name, started_at: Some(started), .. }, active: true }}) if kind == "tool" && name == "bash" && started == "2023-11-14T22:13:20+00:00")
+            matches!(observation, LifecycleObservation::Telemetry(NormalizedTelemetryEvent { schema_version: 1, fact: TelemetryFact::Operation { value: OperationTelemetry { kind, name, started_at: None, .. }, active: true }}) if kind == "tool" && name == "bash")
         );
-        for event_type in ["todo.updated", "question.asked", "permission.asked"] {
-            let value = json!({"type":event_type,"properties":{"sessionID":"ses_demo","todos":[{"content":"agent plan"}],"questions":[]}});
-            assert!(matches!(
-                lifecycle_event(&value).unwrap().1,
-                LifecycleObservation::Telemetry(NormalizedTelemetryEvent {
-                    schema_version: 1,
-                    fact: TelemetryFact::Todo(_) | TelemetryFact::Wait(_)
-                })
-            ));
-        }
+        let wrong_session_tool = json!({"type":"message.part.updated","properties":{"part":{"sessionID":"other-session","messageID":"msg-1","type":"tool","tool":"bash","state":{"status":"running"}}}});
+        assert_eq!(
+            lifecycle_event(&wrong_session_tool).unwrap().0,
+            "other-session"
+        );
+        let todo_update = json!({"type":"todo.updated","properties":{"sessionID":"ses_demo","todos":[{"content":"agent plan"}]}});
+        assert!(matches!(
+            lifecycle_event(&todo_update).unwrap().1,
+            LifecycleObservation::Telemetry(NormalizedTelemetryEvent {
+                schema_version: 1,
+                fact: TelemetryFact::Todo(_)
+            })
+        ));
+        let permission_updated = json!({"type":"permission.updated","properties":{"id":"per-1","sessionID":"ses_demo","title":"Run command","time":{"created":1700000000000_i64}}});
+        assert!(
+            matches!(lifecycle_event(&permission_updated).unwrap(), (session, LifecycleObservation::Telemetry(NormalizedTelemetryEvent { fact: TelemetryFact::Wait(ref wait), .. })) if session == "ses_demo" && wait["kind"] == "permission" && wait["id"] == "per-1" && wait["state"] == "updated")
+        );
+        let permission_replied = json!({"type":"permission.replied","properties":{"sessionID":"ses_demo","permissionID":"per-1","response":"once"}});
+        assert!(
+            matches!(lifecycle_event(&permission_replied).unwrap(), (_, LifecycleObservation::Telemetry(NormalizedTelemetryEvent { fact: TelemetryFact::Wait(ref wait), .. })) if wait["id"] == "per-1" && wait["state"] == "replied")
+        );
+        assert!(lifecycle_event(
+            &json!({"type":"question.asked","properties":{"sessionID":"ses_demo"}})
+        )
+        .is_none());
+        assert!(lifecycle_event(
+            &json!({"type":"permission.asked","properties":{"sessionID":"ses_demo"}})
+        )
+        .is_none());
         let message_update = json!({
             "type":"message.updated",
             "properties":{
@@ -5218,7 +5350,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            begin_run(&state, "demo-12345678").await,
+            begin_run(&state, "demo-12345678", None).await,
             Err(ServiceError::Conflict(_))
         ));
         let messages = json!([
@@ -5369,6 +5501,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authoritative_absent_status_clears_stale_error_to_idle() {
+        let mock = MockServer::start();
+        mock.mock(|when, then| {
+            when.method(GET).path("/session/ses_demo");
+            then.status(200).json_body(json!({"id":"ses_demo"}));
+        });
+        mock.mock(|when, then| {
+            when.method(GET).path("/session/status");
+            then.status(200).json_body(json!({}));
+        });
+        let mut session = activity_session();
+        session.service = "127.0.0.1".into();
+        session.opencode_port = mock.port();
+        let record = Arc::new(Mutex::new(active_work_record(session)));
+        {
+            let mut record = record.lock().unwrap();
+            record.telemetry.execution = "error".into();
+            record.telemetry.execution_error = Some("stale failure".into());
+        }
+        let mut test_config = config("http://profile.test".into());
+        test_config.opencode_port = mock.port();
+        let app = router(AppState::new(
+            test_config,
+            LifecycleSandbox {
+                record: record.clone(),
+            },
+        ));
+        let response = app
+            .oneshot(
+                Request::get("/v1/sessions/demo-12345678/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_response(response).await;
+        assert_eq!(body["execution_state"], "idle");
+        assert_eq!(body["telemetry"]["execution"], "idle");
+        assert!(body["telemetry"]["execution_error"].is_null());
+        let record = record.lock().unwrap();
+        assert_eq!(record.telemetry.execution, "idle");
+        assert_eq!(record.telemetry.execution_error, None);
+    }
+
+    #[tokio::test]
     async fn sse_reconnect_message_reconciliation_repairs_a_missed_completion() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let app = Router::new()
@@ -5432,8 +5610,7 @@ mod tests {
         });
         opencode.mock(|when, then| {
             when.method(GET).path("/session/status");
-            then.status(200)
-                .json_body(json!({"ses_demo":{"type":"idle"}}));
+            then.status(200).json_body(json!({}));
         });
         let transcript = opencode.mock(|when, then| {
             when.method(GET).path("/session/ses_demo/message");
@@ -5454,7 +5631,7 @@ mod tests {
                     "anvil.example/opencode-session-id": "ses_demo",
                     "anvil.example/binding-state": "available",
                     "anvil.example/binding-continuity": "exact",
-                    "anvil.example/telemetry-v1": "{\"schema_version\":1,\"execution\":\"idle\",\"observer\":\"connected\",\"requests\":[{\"id\":\"req-1\",\"number\":1,\"origin\":\"OpenCode\",\"prompt\":\"materialized prompt\",\"state\":\"completed\",\"started_at\":\"2026-01-01T10:00:00Z\"}],\"todos\":[],\"waits\":[]}"
+                    "anvil.example/telemetry-v1": "{\"schema_version\":1,\"execution\":\"error\",\"execution_error\":\"stale failure\",\"observer\":\"connected\",\"requests\":[{\"id\":\"req-1\",\"number\":1,\"origin\":\"OpenCode\",\"prompt\":\"materialized prompt\",\"state\":\"completed\",\"started_at\":\"2026-01-01T10:00:00Z\"}],\"todos\":[],\"waits\":[]}"
                 }
             },
             "status": {"phase": "Ready", "serviceFQDN": "127.0.0.1"}
@@ -5476,6 +5653,8 @@ mod tests {
         let body = json_response(response).await;
         assert_eq!(body["session"]["project"], "demo");
         assert_eq!(body["execution_state"], "idle");
+        assert_eq!(body["telemetry"]["execution"], "idle");
+        assert!(body["telemetry"]["execution_error"].is_null());
         assert_eq!(body["environment_state"], "ready");
         assert_eq!(
             body["attach_command"],

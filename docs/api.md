@@ -53,6 +53,10 @@ OpenCode errors map to execution `failed`, while observer transport degradation
 is reported separately in telemetry. Suspended and completed remain explicit
 Anvil administrative states.
 
+OpenCode v1.18.30 `session/status` lists only non-idle sessions, so an absent
+entry for the exact bound session is authoritative `idle`. Successful live
+status reads supersede persisted telemetry and clear stale execution errors.
+
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/v1/sessions/{id}/complete` | Controller acceptance into `completed` |
