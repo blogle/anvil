@@ -67,6 +67,7 @@ export ANVIL_PREVIEW_DOMAIN=localhost ANVIL_ANNOTATION_PREFIX=anvil.local
 export ANVIL_PROFILE_OPENCODE_URL=http://127.0.0.1:4097 ANVIL_CREDENTIAL_URL=http://127.0.0.1:8080
 export ANVIL_SESSION_SIGNING_SECRET=anvil-local-development-only-signing-secret
 export ANVIL_HISTORY_PATH="$tmp/history.jsonl"
+unset ANVIL_STORE_PATH
 "$root/target/debug/anvild" >"$tmp/anvild.log" 2>&1 & api_pid=$!
 
 poll() {
@@ -115,6 +116,7 @@ worker_health() {
 poll http://127.0.0.1:4098/healthz
 poll http://127.0.0.1:4097/global/health
 poll http://127.0.0.1:8080/readyz
+[[ -f "$tmp/controller.sqlite3" ]] || { printf 'controller store was not created beside history\n' >&2; exit 1; }
 
 git -C "$fixture" init -b main >/dev/null
 git -C "$fixture" config user.name Fixture
