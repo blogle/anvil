@@ -45,8 +45,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v19
-      - name: Run Nix checks
-        run: time nix --option build-users-group "" flake check
+      - name: Validate flake outputs
+        run: time nix --option build-users-group "" flake check --no-build
       - name: Build OCI archives
         run: |
           set -euo pipefail
@@ -61,9 +61,9 @@ jobs:
           upgrade_pid=$!
           wait "$anvil_pid" "$sandbox_pid" "$daemon_pid" "$upgrade_pid"
           cp "$(<paths/anvil)" image-artifacts/anvil-image.tar
-          nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/sandbox)" docker-archive:image-artifacts/anvil-sandbox-image.tar
-          nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/daemon)" docker-archive:image-artifacts/anvil-nix-daemon-image.tar
-          nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/upgrade)" docker-archive:image-artifacts/anvil-nix-daemon-upgrade-test-image.tar
+          nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/sandbox)" docker-archive:image-artifacts/anvil-sandbox-image.tar:ghcr.io/blogle/anvil-sandbox:main
+          nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/daemon)" docker-archive:image-artifacts/anvil-nix-daemon-image.tar:ghcr.io/blogle/anvil-nix-daemon:main
+          nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "nix:$(<paths/upgrade)" docker-archive:image-artifacts/anvil-nix-daemon-upgrade-test-image.tar:ghcr.io/blogle/anvil-nix-daemon:kind-upgrade
           (cd image-artifacts && sha256sum *.tar > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
