@@ -42,6 +42,7 @@
         packages.anvilctl = rust.releaseBinaries.anvilCtl;
         packages.anvil-image = images.anvilImage;
         packages.anvil-image-ci = images.anvilImageCi;
+        packages.anvil-ci-release-cargo-artifacts = rust.ciReleaseCargoArtifacts;
         packages.anvil-sandbox-image = sandbox.sandboxImage;
         packages.anvil-nix-daemon-image = sandbox.daemonImage;
         packages.anvil-nix-daemon-upgrade-test-image = sandbox.daemonUpgradeImage;

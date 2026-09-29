@@ -49,7 +49,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/anvil-image-cache
-          key: ${{ runner.os }}-anvil-image-ci-${{ hashFiles('flake.lock', 'Cargo.lock') }}-${{ hashFiles('Cargo.toml', 'crates/**', 'web/**', 'nix/rust.nix', 'nix/images.nix') }}
+          key: ${{ runner.os }}-anvil-image-ci-${{ hashFiles('flake.lock', 'Cargo.lock') }}-${{ hashFiles('flake.nix', 'Cargo.toml', 'crates/**', 'web/**', 'nix/rust.nix', 'nix/images.nix') }}
           restore-keys: |
             ${{ runner.os }}-anvil-image-ci-${{ hashFiles('flake.lock', 'Cargo.lock') }}-
       - name: Validate flake outputs
@@ -129,7 +129,8 @@ jobs:
               printf "%s %s\n" "$image" "$actual"
             done
           ' | tee image-report.txt
-          nix --option build-users-group "" path-info --recursive .#anvil-image-ci > "$cache_dir/paths.new"
+          nix --option build-users-group "" path-info --recursive \
+            .#anvil-image-ci .#anvil-ci-release-cargo-artifacts > "$cache_dir/paths.new"
           nix --option build-users-group "" copy --to "file://$cache_dir" $(<"$cache_dir/paths.new")
           mv "$cache_dir/paths.new" "$cache_dir/paths"
           (cd image-artifacts && sha256sum *.tar > SHA256SUMS)
