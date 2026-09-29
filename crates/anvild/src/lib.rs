@@ -2,6 +2,7 @@
 
 mod github;
 mod local;
+pub mod store;
 pub use local::LocalSandboxApi;
 
 use anvil_core::{
@@ -94,6 +95,7 @@ pub struct Config {
     pub session_capability_ttl: Duration,
     pub github_api_url: String,
     pub history_path: PathBuf,
+    pub store_path: PathBuf,
 }
 impl Config {
     pub fn from_env() -> Result<Self, ServiceError> {
@@ -205,6 +207,7 @@ impl Config {
             ),
             github_api_url: get("ANVIL_GITHUB_API_URL", "https://api.github.com"),
             history_path: PathBuf::from(get("ANVIL_HISTORY_PATH", "/var/lib/anvil/history.jsonl")),
+            store_path: PathBuf::from(get("ANVIL_STORE_PATH", "/var/lib/anvil/controller.sqlite3")),
         })
     }
 }
@@ -1455,6 +1458,7 @@ pub struct AppState {
     pub config: Config,
     pub kube: Arc<dyn SandboxApi>,
     history: HistoryStore,
+    pub store: store::ControllerStore,
     profile: ProfileClient,
     pending_logins: Arc<Mutex<HashMap<String, PendingLogin>>>,
     binding_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
@@ -1468,6 +1472,8 @@ type LifecycleWatchers = Arc<Mutex<HashMap<String, (uuid::Uuid, watch::Sender<bo
 
 impl AppState {
     pub fn new<K: SandboxApi>(config: Config, kube: K) -> Self {
+        let store = store::ControllerStore::open(&config.store_path)
+            .expect("controller store must initialize successfully");
         let profile = ProfileClient::new(&config.profile_opencode_url)
             .expect("ANVIL_PROFILE_OPENCODE_URL must be a valid URL");
         let capability_signer = config.session_signing_secret.as_deref().and_then(|secret| {
@@ -1491,6 +1497,7 @@ impl AppState {
         };
         Self {
             history: HistoryStore::new(config.history_path.clone()),
+            store,
             config,
             kube: Arc::new(kube),
             profile,
@@ -4392,6 +4399,7 @@ mod tests {
             session_capability_ttl: Duration::from_secs(86400),
             github_api_url: "https://api.github.com".into(),
             history_path: PathBuf::from("/tmp/anvil-history.jsonl"),
+            store_path: PathBuf::from(format!("/tmp/anvil-test-{}.sqlite3", uuid::Uuid::new_v4())),
         }
     }
 

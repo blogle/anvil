@@ -729,6 +729,8 @@ mod tests {
             session_capability_ttl: Duration::from_secs(60),
             github_api_url: "https://api.github.com".into(),
             history_path: std::env::temp_dir().join("anvil-local-test-history.jsonl"),
+            store_path: std::env::temp_dir()
+                .join(format!("anvil-local-test-{}.sqlite3", uuid::Uuid::new_v4())),
         }
     }
 
