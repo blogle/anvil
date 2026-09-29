@@ -135,7 +135,7 @@ if [ "$ui_only" = 1 ]; then
 fi
 
 scenario_start=$SECONDS
-created="$(create_session fixture 'ANVIL-E2E:edit-file ANVIL-E2E:wait-for-release inspect the fixture and change target.txt from before to after.')"
+created="$(create_session fixture 'ANVIL-E2E:durable-context=amber-731 ANVIL-E2E:edit-file ANVIL-E2E:wait-for-release inspect the fixture and change target.txt from before to after.')"
 jq -e '.id | strings' <<<"$created" >/dev/null
 id="$(jq -r .id <<<"$created")"
 runtime_dir="$runtime/$id"
@@ -193,10 +193,10 @@ jq -e --argjson before "$before_transcript" 'length >= ($before | length)' <<<"$
 jq -e '.. | strings | select(contains("ANVIL-E2E:edit-file"))' <<<"$after_transcript" >/dev/null
 test "$(<"$workspace/target.txt")" = after
 test "$(git -C "$workspace" status --porcelain)" = " M target.txt"
-curl -fsS -H 'content-type: application/json' -d '{"prompt":"ANVIL-E2E:followup after a destructive restart, use the existing conversation context."}' \
+curl -fsS -H 'content-type: application/json' -d '{"prompt":"ANVIL-E2E:restart-one-followup use the durable context from the first turn."}' \
   "http://127.0.0.1:8080/v1/sessions/$id/messages" >/dev/null
 wait_for_state "$id" ready_for_review
-curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages" | jq -e '.. | strings | select(contains("Confirmed: this is the same OpenCode conversation."))' >/dev/null
+curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages" | jq -e '.. | strings | select(contains("Confirmed restart one: prior conversation context is present."))' >/dev/null
 
 # A second full OpenCode process recreation proves that reconciliation is
 # reading its native session store repeatedly, rather than relying on a warm
@@ -215,10 +215,10 @@ second_transcript="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages")
 jq -e --argjson before "$before_transcript" 'length >= ($before | length)' <<<"$second_transcript" >/dev/null
 test "$(<"$workspace/target.txt")" = after
 test "$(git -C "$workspace" status --porcelain)" = " M target.txt"
-curl -fsS -H 'content-type: application/json' -d '{"prompt":"ANVIL-E2E:followup after the second destructive restart, continue our existing conversation."}' \
+curl -fsS -H 'content-type: application/json' -d '{"prompt":"ANVIL-E2E:restart-two-followup continue using the first-turn context."}' \
   "http://127.0.0.1:8080/v1/sessions/$id/messages" >/dev/null
 wait_for_state "$id" ready_for_review
-curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages" | jq -e '.. | strings | select(contains("Confirmed: this is the same OpenCode conversation."))' >/dev/null
+curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages" | jq -e '.. | strings | select(contains("Confirmed restart two: prior conversation context is present."))' >/dev/null
 printf 'suspend/resume workspace, OpenCode binding, watcher reconciliation: %ds\n' "$((SECONDS - scenario_start))"
 
 scenario_start=$SECONDS
