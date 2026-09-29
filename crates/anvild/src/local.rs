@@ -2,7 +2,7 @@ use super::{
     BindingStateRecord, Config, CreateRequest, SandboxApi, SandboxRecord, ServiceError,
     WorkStateRecord,
 };
-use anvil_core::{branch_name, Session, SessionId};
+use anvil_core::{branch_name, Session, SessionId, SessionTelemetry};
 use async_trait::async_trait;
 use std::{
     collections::HashMap, net::TcpListener, os::unix::fs::PermissionsExt, path::PathBuf,
@@ -510,6 +510,7 @@ impl SandboxApi for LocalSandboxApi {
                 },
                 operating_mode: "Running".into(),
                 created_at: chrono::Utc::now().to_rfc3339(),
+                telemetry: SessionTelemetry::default(),
             };
             let mut state = LocalState {
                 record: state,
@@ -635,6 +636,13 @@ impl SandboxApi for LocalSandboxApi {
         state.record.session.session_binding_error = value.error.clone();
         state.record.session.previous_opencode_session_id = value.previous_session_id.clone();
         state.record.session.session_binding_recovery_event = value.recovery_event.clone();
+        persist(&state.directory, &state.record).await
+    }
+
+    async fn set_telemetry(&self, id: &str, value: &SessionTelemetry) -> Result<(), ServiceError> {
+        let mut sessions = self.sessions.lock().await;
+        let state = sessions.get_mut(id).ok_or(ServiceError::NotFound)?;
+        state.record.telemetry = value.clone();
         persist(&state.directory, &state.record).await
     }
 
