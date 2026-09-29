@@ -56,17 +56,37 @@ poll() {
 kind create cluster --name "$cluster" --kubeconfig "$kubeconfig" --wait 120s
 created=1
 
-# The CI profile has the same runtime filesystem/configuration as the
-# production image; the independent image job owns production-profile builds.
-anvil_image="$(nix build --no-link --print-out-paths .#anvil-image-ci)"
-sandbox_image="$(nix build --no-link --print-out-paths .#anvil-sandbox-image)"
-daemon_image="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-image)"
-upgrade_image="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-image)"
-upgrade_canary="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-canary)"
-skopeo --tmpdir "$tmp" --insecure-policy copy "docker-archive:$anvil_image" docker-daemon:ghcr.io/blogle/anvil:kind-e2e >/dev/null
-skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$sandbox_image" docker-daemon:ghcr.io/blogle/anvil-sandbox:kind-e2e >/dev/null
-skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$daemon_image" docker-daemon:ghcr.io/blogle/anvil-nix-daemon:kind-e2e >/dev/null
-skopeo --tmpdir "$tmp" --insecure-policy copy "nix:$upgrade_image" docker-daemon:ghcr.io/blogle/anvil-nix-daemon:kind-upgrade >/dev/null
+# PR CI supplies archives produced by the image producer job. The fallback
+# keeps this acceptance script runnable locally and preserves its old contract.
+artifact_dir="${ANVIL_KIND_ARTIFACT_DIR:-}"
+if [ -n "$artifact_dir" ]; then
+  anvil_image="$artifact_dir/anvil-image.tar"
+  sandbox_image="$artifact_dir/anvil-sandbox-image.tar"
+  daemon_image="$artifact_dir/anvil-nix-daemon-image.tar"
+  upgrade_image="$artifact_dir/anvil-nix-daemon-upgrade-test-image.tar"
+  upgrade_canary="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-canary)"
+  (cd "$artifact_dir" && sha256sum -c SHA256SUMS)
+  anvil_source="docker-archive:$anvil_image"
+  sandbox_source="docker-archive:$sandbox_image"
+  daemon_source="docker-archive:$daemon_image"
+  upgrade_source="docker-archive:$upgrade_image"
+else
+  # The CI profile has the same runtime filesystem/configuration as the
+  # production image; the image producer owns production-profile builds.
+  anvil_image="$(nix build --no-link --print-out-paths .#anvil-image-ci)"
+  sandbox_image="$(nix build --no-link --print-out-paths .#anvil-sandbox-image)"
+  daemon_image="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-image)"
+  upgrade_image="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-image)"
+  upgrade_canary="$(nix build --no-link --print-out-paths .#anvil-nix-daemon-upgrade-test-canary)"
+  anvil_source="docker-archive:$anvil_image"
+  sandbox_source="nix:$sandbox_image"
+  daemon_source="nix:$daemon_image"
+  upgrade_source="nix:$upgrade_image"
+fi
+skopeo --tmpdir "$tmp" --insecure-policy copy "$anvil_source" docker-daemon:ghcr.io/blogle/anvil:kind-e2e >/dev/null
+skopeo --tmpdir "$tmp" --insecure-policy copy "$sandbox_source" docker-daemon:ghcr.io/blogle/anvil-sandbox:kind-e2e >/dev/null
+skopeo --tmpdir "$tmp" --insecure-policy copy "$daemon_source" docker-daemon:ghcr.io/blogle/anvil-nix-daemon:kind-e2e >/dev/null
+skopeo --tmpdir "$tmp" --insecure-policy copy "$upgrade_source" docker-daemon:ghcr.io/blogle/anvil-nix-daemon:kind-upgrade >/dev/null
 kind load docker-image ghcr.io/blogle/anvil:kind-e2e ghcr.io/blogle/anvil-sandbox:kind-e2e ghcr.io/blogle/anvil-nix-daemon:kind-e2e ghcr.io/blogle/anvil-nix-daemon:kind-upgrade --name "$cluster"
 
 kubectl --kubeconfig "$kubeconfig" cluster-info
