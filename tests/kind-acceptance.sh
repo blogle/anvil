@@ -407,7 +407,10 @@ api_c_name="anvil-$api_c_id"
 api_c_pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$api_c_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
 test -n "$api_c_pod"
 agent_exec "$api_c_pod" /bin/bash -c 'nix store info >/dev/null && nix path-info "$1" >/dev/null && nix path-info "$2" >/dev/null' -- "$shared_path" "$upgrade_canary"
-agent_exec "$api_b_pod" /bin/bash -lc 'cd /home/anvil/workspace/anvil && nix develop --command just check'
+# The outer CI lane runs the full Rust checks. Here, prove the existing sandbox
+# can enter the repo dev shell and use its toolchain/workspace metadata after the
+# daemon upgrade without compiling the workspace into this sandbox's local target.
+agent_exec "$api_b_pod" /bin/bash -lc 'cd /home/anvil/workspace/anvil && nix develop --command bash -lc "rustc --version >/dev/null && cargo metadata --no-deps --format-version 1 >/dev/null"'
 
 ANVIL_KUBECONFIG="$kubeconfig" \
 ANVIL_SANDBOX_POD="$pod_name" \
