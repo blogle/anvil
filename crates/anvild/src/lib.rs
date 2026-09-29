@@ -2939,10 +2939,9 @@ async fn status(
         .as_deref()
         .ok_or(ServiceError::NotFound)?
         .to_owned();
-    if let Ok(messages) = op.session_messages(&opencode_session_id).await {
-        reconcile_lifecycle_messages(&s, &id, &opencode_session_id, &messages).await?;
-    }
-    let x = s.kube.get(&id).await?.session;
+    // Execution state is authoritative in session/status. Do not replay the
+    // transcript on a current-state read: the lifecycle observer reconciles
+    // messages when it needs run identity, while this endpoint stays bounded.
     let selected = v
         .get(
             &x.opencode_session_id
@@ -2951,13 +2950,7 @@ async fn status(
         )
         .cloned()
         .unwrap_or(Value::Null);
-    let execution_state = if status_is_busy(&v, &opencode_session_id) {
-        "running"
-    } else if x.work_state == WorkState::Failed.as_str() {
-        "failed"
-    } else {
-        "idle"
-    };
+    let execution_state = execution_state(&v, Some(&opencode_session_id));
     Ok(Json(json!({
         "environment_state": x.environment_state,
         "environment_error": x.environment_error,
