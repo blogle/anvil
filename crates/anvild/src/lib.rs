@@ -5851,9 +5851,12 @@ mod tests {
             "status": {"phase": "Ready"}
         }))
         .unwrap();
-        let sandbox = ActivitySandbox { object };
         let mut test_config = config(server.base_url());
         test_config.session_signing_secret = Some("x".repeat(32));
+        let sandbox = ActivitySandbox {
+            object,
+            config: test_config.clone(),
+        };
         let signer =
             github::CapabilitySigner::new("x".repeat(32), Duration::from_secs(60)).unwrap();
         let valid_token = signer
