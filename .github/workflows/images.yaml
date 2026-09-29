@@ -129,10 +129,12 @@ jobs:
               printf "%s %s\n" "$image" "$actual"
             done
           ' | tee image-report.txt
+          cache_export_start=$SECONDS
           nix --option build-users-group "" path-info --recursive \
             .#anvil-image-ci .#anvil-ci-release-cargo-artifacts > "$cache_dir/paths.new"
           nix --option build-users-group "" copy --no-check-sigs --to "file://$cache_dir" $(<"$cache_dir/paths.new")
           mv "$cache_dir/paths.new" "$cache_dir/paths"
+          printf 'anvil-cache-export-seconds=%s\n' "$((SECONDS - cache_export_start))" | tee -a image-build-timings.txt
           (cd image-artifacts && sha256sum *.tar > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
