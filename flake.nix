@@ -61,5 +61,15 @@
             export ANVIL_SHARED_NIX_SMOKE=1
           '';
         };
+        # Kind owns Kubernetes/image/runtime fidelity, not Cargo validation.
+        # Do not enter rust.devShell here: its hook seeds the full dependency
+        # artifact set before the acceptance script can start.
+        devShells.kind-ci = pkgs.mkShell {
+          packages = [
+            pkgs.bash pkgs.curl pkgs.gitMinimal pkgs.jq pkgs.just pkgs.kind
+            pkgs.kubectl pkgs.kustomize pkgs.nix pkgs.util-linux
+            nix2container.packages.${system}.skopeo-nix2container
+          ];
+        };
       });
 }
