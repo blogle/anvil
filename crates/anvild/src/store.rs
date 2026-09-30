@@ -146,6 +146,47 @@ impl ControllerStore {
         }))
     }
 
+    /// Atomically bind an idempotency key to a batch and persist its batch/task resources.
+    pub fn accept_batch(
+        &self,
+        key: &str,
+        scope: &str,
+        request: &Value,
+        batch_id: &str,
+        batch: &Value,
+        tasks: &[(String, Value)],
+    ) -> Result<Acceptance, StoreError> {
+        let canonical = canonical_json(request);
+        let hash = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut connection = self.connection.lock().expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = tx.query_row(
+            "SELECT operation_kind, scope, request_hash, canonicalization_version, result_reference, result_json, state, created_at, updated_at FROM idempotency_records WHERE idempotency_key=?1",
+            [key],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?)),
+        ).optional()?;
+        if let Some((kind, stored_scope, stored_hash, version, reference, json, state, created_at, updated_at)) = existing {
+            if version != CANONICALIZATION_VERSION { return Err(StoreError::UnsupportedCanonicalization(version)); }
+            if kind != "submit_batch" || stored_scope != scope || stored_hash != hash { return Err(StoreError::Conflict); }
+            let result = serde_json::from_str(&json)?;
+            tx.commit()?;
+            return Ok(Acceptance::Replayed(AcceptedResult { idempotency_key: key.into(), operation_kind: kind, scope: stored_scope, result_reference: reference, result, state: parse_state(&state)?, created_at, updated_at }));
+        }
+        tx.execute("INSERT INTO orchestration_resources (resource_type, resource_id, batch_id, task_id, attempt_id, payload_json, created_at, updated_at) VALUES ('batch',?1,?1,NULL,NULL,?2,?3,?3)", params![batch_id, serde_json::to_string(batch)?, now])?;
+        for (task_id, task) in tasks {
+            tx.execute("INSERT INTO orchestration_resources (resource_type, resource_id, batch_id, task_id, attempt_id, payload_json, created_at, updated_at) VALUES ('task',?1,?2,?1,NULL,?3,?4,?4)", params![task_id, batch_id, serde_json::to_string(task)?, now])?;
+        }
+        tx.execute("INSERT INTO idempotency_records (idempotency_key, operation_kind, scope, request_hash, canonicalization_version, result_reference, result_json, state, created_at, updated_at) VALUES (?1,'submit_batch',?2,?3,?4,?5,?6,'accepted',?7,?7)", params![key, scope, hash, CANONICALIZATION_VERSION, batch_id, serde_json::to_string(batch)?, now])?;
+        tx.commit()?;
+        Ok(Acceptance::Created(AcceptedResult { idempotency_key: key.into(), operation_kind: "submit_batch".into(), scope: scope.into(), result_reference: batch_id.into(), result: batch.clone(), state: IdempotencyState::Accepted, created_at: now.clone(), updated_at: now }))
+    }
+
+    pub fn get_resource(&self, resource_type: &str, id: &str) -> Result<Option<Value>, StoreError> {
+        let connection = self.connection.lock().expect("controller store lock poisoned");
+        connection.query_row("SELECT payload_json FROM orchestration_resources WHERE resource_type=?1 AND resource_id=?2", params![resource_type, id], |row| row.get::<_, String>(0)).optional()?.map(|value| serde_json::from_str(&value).map_err(StoreError::from)).transpose()
+    }
+
     pub fn get(&self, key: &str) -> Result<Option<AcceptedResult>, StoreError> {
         let connection = self
             .connection
