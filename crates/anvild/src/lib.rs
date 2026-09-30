@@ -6,7 +6,7 @@ pub mod store;
 pub use local::LocalSandboxApi;
 
 use anvil_core::{
-    branch_name, preview_hostname, GitRef, LifecycleEvent, LoginFlow, OpenCodeMessageId,
+    branch_name, preview_hostname, ActivityEvent, GitRef, LifecycleEvent, LoginFlow, OpenCodeMessageId,
     OperationTelemetry, Port, Project, Prompt, ProviderAuthMethod, ProviderListResponse,
     ProviderStatus, ProviderSummary, Repository, Run, RunId, RunState, Session, SessionActivity,
     SessionId, SessionRequest, SessionTelemetry,
@@ -3903,11 +3903,19 @@ async fn activity(
     } else {
         "recovering".into()
     };
+    let raw_messages = if binding_is_usable(&session) {
+        OpenCode::new(service_url(&session, &s.config), s.config.request_timeout)
+            .session_messages(session.opencode_session_id.as_deref().unwrap_or_default())
+            .await
+            .unwrap_or(Value::Array(Vec::new()))
+    } else {
+        Value::Array(Vec::new())
+    };
     let mut messages = build_activity(
         &session,
         &session.environment_state,
         operating_mode,
-        Value::Array(Vec::new()),
+        raw_messages,
         status,
         &s.config,
     );
@@ -5439,6 +5447,7 @@ fn build_activity(
         .is_some_and(|id| status_is_busy(&status, id));
     let mut requests = Vec::with_capacity(user_messages.len());
     let mut lifecycle = Vec::new();
+    let mut events = Vec::new();
 
     if let Some(at) = session.created_at.clone() {
         lifecycle.push(LifecycleEvent {
@@ -5535,6 +5544,47 @@ fn build_activity(
         requests.push(request);
     }
 
+    for message in &messages {
+        let info = message.get("info").unwrap_or(message);
+        if info.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let message_id = info.get("id").and_then(Value::as_str).unwrap_or("assistant");
+        let created = timestamp_from_value(info.get("time").and_then(|time| time.get("created")))
+            .unwrap_or_else(|| session.created_at.clone().unwrap_or_default());
+        if let Some(parts) = message.get("parts").and_then(Value::as_array) {
+            for (part_index, part) in parts.iter().enumerate() {
+                let part_type = part.get("type").and_then(Value::as_str).unwrap_or_default();
+                let part_id = part.get("id").and_then(Value::as_str).unwrap_or("");
+                let state = part.get("state");
+                let (kind, title, status, detail, at) = if part_type == "tool" {
+                    let tool = part.get("tool").and_then(Value::as_str).unwrap_or("Tool");
+                    let status = state.and_then(|value| value.get("status")).and_then(Value::as_str).unwrap_or("pending");
+                    let title = state.and_then(|value| value.get("title")).and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| format!("{tool} tool"));
+                    let detail = state.and_then(|value| value.get("output")).and_then(Value::as_str).map(|value| value.chars().take(500).collect::<String>())
+                        .or_else(|| part.get("input").map(|value| value.to_string().chars().take(300).collect()));
+                    let at = state.and_then(|value| value.get("time")).and_then(|time| time.get("start").or_else(|| time.get("end"))).and_then(|value| timestamp_from_value(Some(value))).unwrap_or_else(|| created.clone());
+                    ("tool", title, Some(status.to_owned()), detail, at)
+                } else if part_type == "text" {
+                    let text = part.get("text").and_then(Value::as_str).unwrap_or_default().trim();
+                    if text.is_empty() { continue; }
+                    ("message", "Agent message".to_owned(), None, Some(text.chars().take(1000).collect()), created.clone())
+                } else {
+                    continue;
+                };
+                events.push(ActivityEvent {
+                    id: format!("{message_id}:{part_id}:{part_index}"), at, kind: kind.into(), title,
+                    detail, status,
+                });
+            }
+        }
+        if let Some(error) = assistant_error(message) {
+            events.push(ActivityEvent { id: format!("{message_id}:error"), at: created, kind: "error".into(), title: "Agent error".into(), detail: Some(error.chars().take(1000).collect()), status: Some("failed".into()) });
+        }
+    }
+    events.sort_by(|left, right| left.at.cmp(&right.at).then_with(|| left.id.cmp(&right.id)));
+    if events.len() > 500 { events.drain(..events.len() - 500); }
+
     let current = busy
         .then(|| requests.last().filter(|request| request.state == "running"))
         .flatten();
@@ -5569,6 +5619,7 @@ fn build_activity(
         last_activity_at,
         requests,
         lifecycle,
+        events,
         preview_url: None,
         opencode_url,
         attach_command: format!("anvilctl sessions attach {}", session.id),
@@ -6109,7 +6160,7 @@ impl OpenCode {
             .await
     }
     async fn session_messages(&self, id: &str) -> Result<Value, ServiceError> {
-        self.request(&format!("session/{id}/message"), reqwest::Method::GET, None)
+        self.request(&format!("session/{id}/message?limit=100"), reqwest::Method::GET, None)
             .await
     }
     async fn event_stream(&self) -> Result<reqwest::Response, ServiceError> {
@@ -9048,6 +9099,31 @@ mod tests {
         assert_eq!(activity.requests.len(), 2);
         assert_eq!(activity.requests[0].prompt, "first prompt");
         assert_eq!(activity.requests[1].prompt, "second prompt");
+    }
+
+    #[test]
+    fn activity_projects_stable_user_visible_tool_and_text_parts_only() {
+        let session: Session = serde_json::from_value(json!({
+            "id":"demo-12345678", "sandbox":"anvil-demo-12345678", "service":"anvil-demo-12345678",
+            "namespace":"anvil", "opencode_port":4096, "phase":"Ready", "project":"demo",
+            "repository":"https://github.com/example/demo.git", "ref":"main", "work_branch":"anvil/demo-12345678",
+            "model":"openai/gpt-5.6-luna", "environment_state":"ready", "work_state":"in_progress",
+            "opencode_session_id":"ses-test"
+        })).unwrap();
+        let response = build_activity(&session, "Ready", None, json!([{
+            "info":{"id":"msg-1","role":"assistant","time":{"created":1780000000000}},
+            "parts":[
+                {"id":"part-tool","type":"tool","tool":"bash","state":{"status":"completed","title":"Ran tests","output":"ok","time":{"start":1780000001000}}},
+                {"id":"part-text","type":"text","text":"Tests passed"},
+                {"id":"part-reasoning","type":"reasoning","text":"private"}
+            ]
+        }]), json!({}), &config("http://profile.test".into()));
+        assert_eq!(response.events.len(), 2);
+        assert_eq!(response.events[0].id, "msg-1:part-tool:0");
+        assert_eq!(response.events[0].kind, "tool");
+        assert_eq!(response.events[0].status.as_deref(), Some("completed"));
+        assert_eq!(response.events[1].kind, "message");
+        assert!(!response.events.iter().any(|event| event.detail.as_deref() == Some("private")));
     }
 
     #[tokio::test]

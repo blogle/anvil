@@ -366,6 +366,8 @@ pub struct SessionActivity {
     pub last_activity_at: Option<String>,
     pub requests: Vec<SessionRequest>,
     pub lifecycle: Vec<LifecycleEvent>,
+    #[serde(default)]
+    pub events: Vec<ActivityEvent>,
     pub preview_url: Option<String>,
     pub opencode_url: Option<String>,
     pub attach_command: String,
@@ -382,6 +384,19 @@ pub struct SessionActivity {
     pub session_binding_checked_at: Option<String>,
     pub previous_opencode_session_id: Option<String>,
     pub session_binding_recovery_event: Option<String>,
+}
+
+/// Bounded, user-visible projection of an OpenCode conversation event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityEvent {
+    pub id: String,
+    pub at: String,
+    pub kind: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 /// Anvil-owned, versioned projection of OpenCode execution telemetry.
