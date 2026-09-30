@@ -1694,6 +1694,17 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
         .route("/v1/sessions", post(create).get(enumerate))
+        .route("/v1/batches", post(submit_batch))
+        .route("/v1/batches/:id", get(get_batch))
+        .route("/v1/tasks/:id", get(get_task))
+        .route(
+            "/v1/tasks/:id/attempts",
+            get(list_attempts).post(create_attempt),
+        )
+        .route(
+            "/v1/attempts/:id",
+            get(get_attempt).post(bind_attempt_session),
+        )
         .route("/v1/sessions/:id", get(session).delete(remove))
         .route("/v1/sessions/:id/messages", post(prompt).get(messages))
         .route("/v1/sessions/:id/complete", post(complete))
@@ -1721,6 +1732,391 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/opencode/config", get(opencode_config))
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct BatchSubmission {
+    project: String,
+    repository: String,
+    #[serde(rename = "ref")]
+    revision: String,
+    #[serde(default)]
+    concurrency: usize,
+    #[serde(default)]
+    allow_competing_tasks: bool,
+    #[serde(default)]
+    policies: Value,
+    #[serde(default)]
+    tasks: Vec<BatchTaskSubmission>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct BatchTaskSubmission {
+    task_id: String,
+    prompt: String,
+    #[serde(default)]
+    dependencies: Vec<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    policy: Value,
+    #[serde(default)]
+    pr_policy: Value,
+    #[serde(default)]
+    evidence_contract: Value,
+}
+
+async fn submit_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<BatchSubmission>,
+) -> Result<(StatusCode, Json<Value>), ServiceError> {
+    let project =
+        Project::new(&request.project).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    if request.tasks.is_empty() || request.concurrency == 0 {
+        return Err(ServiceError::Invalid(
+            "tasks and positive concurrency are required".into(),
+        ));
+    }
+    Repository::new(&request.repository)
+        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    GitRef::new(&request.revision).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let mut seen = std::collections::HashSet::new();
+    for task in &request.tasks {
+        if task.task_id.trim().is_empty() || !seen.insert(task.task_id.clone()) {
+            return Err(ServiceError::Invalid(format!(
+                "duplicate or empty task_id: {}",
+                task.task_id
+            )));
+        }
+        Prompt::new(&task.prompt).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        if task.dependencies.iter().any(|dependency| {
+            !request
+                .tasks
+                .iter()
+                .any(|candidate| &candidate.task_id == dependency)
+        }) {
+            return Err(ServiceError::Invalid(format!(
+                "task {} has an unknown dependency",
+                task.task_id
+            )));
+        }
+    }
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ServiceError::Invalid("Idempotency-Key header is required".into()))?;
+    let semantic_request =
+        serde_json::to_value(&request).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let store = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?;
+    if let Some(replayed) = store
+        .replay_batch(key, &project.name, &semantic_request)
+        .map_err(|error| match error {
+            store::StoreError::Conflict => ServiceError::Conflict(
+                "idempotency key was already used for a different batch plan".into(),
+            ),
+            other => ServiceError::Store(other.to_string()),
+        })?
+    {
+        return Ok((StatusCode::OK, Json(replayed.result)));
+    }
+    let resolved_base = resolve_batch_base(&state, &request.repository, &request.revision).await?;
+    let batch_id = uuid::Uuid::new_v4().to_string();
+    // Client task names are batch-local aliases. Durable Task IDs are globally unique,
+    // which prevents two independent batches that both call work "build" from colliding.
+    let task_ids: std::collections::HashMap<_, _> = request
+        .tasks
+        .iter()
+        .map(|task| (task.task_id.clone(), uuid::Uuid::new_v4().to_string()))
+        .collect();
+    let accepted_ids: Vec<_> = request
+        .tasks
+        .iter()
+        .map(|task| task_ids[&task.task_id].clone())
+        .collect();
+    let accepted_tasks: Vec<_> = request
+        .tasks
+        .iter()
+        .map(|task| {
+            let id = &task_ids[&task.task_id];
+            let dependencies: Vec<_> = task
+                .dependencies
+                .iter()
+                .map(|dependency| task_ids[dependency].clone())
+                .collect();
+            (
+                id.clone(),
+                json!({"task_id":id,"requested_task_id":task.task_id,"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"base_id":resolved_base,"base_commit":resolved_base,"prompt":task.prompt,"dependencies":dependencies,"owner":task.owner,"policy":task.policy,"pr_policy":task.pr_policy,"evidence_contract":task.evidence_contract,"batch_policies":request.policies,"state":"queued"}),
+            )
+        })
+        .collect();
+    let batch = json!({"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"resolved_base_id":resolved_base,"base_commit":resolved_base,"default_policies":request.policies,"accepted_task_ids":accepted_ids,"requested_task_ids":request.tasks.iter().map(|task| task.task_id.clone()).collect::<Vec<_>>(),"rejected_task_ids":[],"preflight_results":[],"queued_count":request.tasks.len(),"runnable_count":request.tasks.iter().filter(|task|task.dependencies.is_empty()).count(),"requested_concurrency":request.concurrency,"duplicate_suppression":[]});
+    let acceptance = store
+        .accept_batch(store::BatchAcceptance {
+            key,
+            scope: &project.name,
+            request: &semantic_request,
+            batch_id: &batch_id,
+            batch: &batch,
+            tasks: &accepted_tasks,
+            allow_competing: request.allow_competing_tasks,
+        })
+        .map_err(|error| match error {
+            store::StoreError::Conflict => ServiceError::Conflict(
+                "idempotency key was already used for a different batch plan".into(),
+            ),
+            other => ServiceError::Store(other.to_string()),
+        })?;
+    let status = if matches!(&acceptance, store::Acceptance::Created(_)) {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    let (store::Acceptance::Created(result) | store::Acceptance::Replayed(result)) = acceptance;
+    Ok((status, Json(result.result)))
+}
+
+async fn resolve_batch_base(
+    state: &AppState,
+    repository: &str,
+    revision: &str,
+) -> Result<String, ServiceError> {
+    let token = match &state.github {
+        Some(broker) => Some(
+            broker
+                .credential(repository, github::GithubCredentialPurpose::GhRead)
+                .await?
+                .token,
+        ),
+        None => None,
+    };
+    resolve_batch_base_at(
+        &state.config.github_api_url,
+        repository,
+        revision,
+        token.as_deref(),
+    )
+    .await
+}
+
+async fn resolve_batch_base_at(
+    api_url: &str,
+    repository: &str,
+    revision: &str,
+    token: Option<&str>,
+) -> Result<String, ServiceError> {
+    let repo = reqwest::Url::parse(repository)
+        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    if repo.host_str() != Some("github.com") {
+        return resolve_git_remote_base(repository, revision).await;
+    }
+    let path = repo.path().trim_matches('/').trim_end_matches(".git");
+    let mut endpoint = reqwest::Url::parse(api_url)
+        .map_err(|error| ServiceError::Invalid(format!("invalid GitHub API URL: {error}")))?;
+    endpoint
+        .path_segments_mut()
+        .map_err(|_| ServiceError::Invalid("GitHub API URL cannot be a base URL".into()))?
+        .pop_if_empty()
+        .push("repos")
+        .extend(path.split('/'))
+        .push("commits")
+        .push(revision);
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(endpoint)
+        .header(reqwest::header::USER_AGENT, "anvil-controller");
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| ServiceError::OpenCode(format!("base resolution failed: {error}")))?;
+    if !response.status().is_success() {
+        return Err(ServiceError::Invalid(format!(
+            "repository revision could not be resolved: {}",
+            response.status()
+        )));
+    }
+    let value: Value = response.json().await.map_err(|error| {
+        ServiceError::Invalid(format!("invalid base resolution response: {error}"))
+    })?;
+    let commit = value
+        .get("sha")
+        .and_then(Value::as_str)
+        .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| {
+            ServiceError::Invalid("repository did not return a full commit SHA".into())
+        })?;
+    Ok(commit.to_ascii_lowercase())
+}
+
+async fn resolve_git_remote_base(repository: &str, revision: &str) -> Result<String, ServiceError> {
+    let output = tokio::process::Command::new("git")
+        .args(["ls-remote", repository])
+        .output()
+        .await
+        .map_err(|error| {
+            ServiceError::OpenCode(format!("repository base lookup failed: {error}"))
+        })?;
+    if !output.status.success() {
+        return Err(ServiceError::Invalid(format!(
+            "repository revision could not be resolved: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let refs: Vec<_> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(sha, reference)| (sha.to_owned(), reference.to_owned()))
+        .collect();
+    let full_sha =
+        |value: &str| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if full_sha(revision) {
+        if let Some((sha, _)) = refs
+            .iter()
+            .find(|(sha, _)| sha.eq_ignore_ascii_case(revision))
+        {
+            return Ok(sha.to_ascii_lowercase());
+        }
+        return Err(ServiceError::Invalid(
+            "repository did not advertise the requested commit SHA".into(),
+        ));
+    }
+    let mut candidates = Vec::new();
+    if let Some(name) = revision.strip_prefix("refs/heads/") {
+        candidates.push(format!("refs/heads/{name}"));
+    } else if let Some(name) = revision.strip_prefix("refs/tags/") {
+        candidates.push(format!("refs/tags/{name}^{{}}"));
+        candidates.push(format!("refs/tags/{name}"));
+    } else {
+        candidates.push(format!("refs/heads/{revision}"));
+        candidates.push(format!("refs/tags/{revision}^{{}}"));
+        candidates.push(format!("refs/tags/{revision}"));
+    }
+    for candidate in candidates {
+        if let Some((sha, _)) = refs
+            .iter()
+            .find(|(_, reference)| reference.as_str() == candidate)
+        {
+            if full_sha(sha) {
+                return Ok(sha.to_ascii_lowercase());
+            }
+        }
+    }
+    Err(ServiceError::Invalid(
+        "repository revision could not be resolved to an immutable commit".into(),
+    ))
+}
+
+async fn get_batch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ServiceError> {
+    state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .get_resource("batch", &id)
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+        .map(Json)
+        .ok_or(ServiceError::NotFound)
+}
+
+async fn get_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ServiceError> {
+    state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .get_resource("task", &id)
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+        .map(Json)
+        .ok_or(ServiceError::NotFound)
+}
+
+async fn list_attempts(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ServiceError> {
+    let attempts = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .attempts_for_task(&id)
+        .map_err(|error| ServiceError::Store(error.to_string()))?;
+    Ok(Json(json!({"task_id":id,"attempts":attempts})))
+}
+
+async fn create_attempt(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<Value>), ServiceError> {
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ServiceError::Invalid("Idempotency-Key header is required for attempt creation".into())
+        })?;
+    let attempt_id = uuid::Uuid::new_v4().to_string();
+    let acceptance = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .create_attempt(&id, &attempt_id, key)
+        .map_err(|error| match error {
+            store::StoreError::NotFound => ServiceError::NotFound,
+            store::StoreError::Conflict => ServiceError::Conflict(
+                "attempt idempotency key is bound to a different task".into(),
+            ),
+            other => ServiceError::Store(other.to_string()),
+        })?;
+    let status = if acceptance.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(acceptance.attempt)))
+}
+
+#[derive(Deserialize)]
+struct AttemptSessionBinding {
+    session_id: String,
+}
+
+async fn bind_attempt_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(binding): Json<AttemptSessionBinding>,
+) -> Result<Json<Value>, ServiceError> {
+    if binding.session_id.trim().is_empty() {
+        return Err(ServiceError::Invalid("session_id must not be empty".into()));
+    }
+    state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .bind_attempt_session(&id, &binding.session_id)
+        .map(Json)
+        .map_err(|error| match error {
+            store::StoreError::NotFound => ServiceError::NotFound,
+            other => ServiceError::Store(other.to_string()),
+        })
+}
+
+async fn get_attempt(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ServiceError> {
+    state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .get_resource("attempt", &id)
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+        .map(Json)
+        .ok_or(ServiceError::NotFound)
 }
 async fn health() -> Json<Value> {
     Json(json!({"status":"ok"}))
@@ -4731,6 +5127,308 @@ mod tests {
     use httpmock::{Method::GET, MockServer};
     use std::collections::BTreeMap;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn batch_base_resolution_freezes_branch_tag_and_full_sha() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(GET);
+            then.status(200)
+                .json_body(json!({"sha":"0123456789abcdef0123456789abcdef01234567"}));
+        });
+        for revision in ["main", "v1.2.3", "0123456789abcdef0123456789abcdef01234567"] {
+            let resolved = resolve_batch_base_at(
+                &server.base_url(),
+                "https://github.com/example/project.git",
+                revision,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(resolved, "0123456789abcdef0123456789abcdef01234567");
+            if revision.len() == 40 {
+                assert_eq!(resolved, revision);
+            } else {
+                assert_ne!(resolved, revision);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn git_remote_base_resolution_freezes_branch_tag_and_full_sha() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let remote = temp.path().join("remote.git");
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        std::fs::create_dir_all(&work).unwrap();
+        run(&["init", "-b", "main", work.to_str().unwrap()]);
+        run(&[
+            "-C",
+            work.to_str().unwrap(),
+            "config",
+            "user.name",
+            "Anvil Test",
+        ]);
+        run(&[
+            "-C",
+            work.to_str().unwrap(),
+            "config",
+            "user.email",
+            "anvil@example.test",
+        ]);
+        std::fs::write(work.join("README.md"), "base\n").unwrap();
+        run(&["-C", work.to_str().unwrap(), "add", "README.md"]);
+        run(&["-C", work.to_str().unwrap(), "commit", "-m", "base"]);
+        run(&[
+            "-C",
+            work.to_str().unwrap(),
+            "tag",
+            "-a",
+            "v1.0",
+            "-m",
+            "release",
+        ]);
+        run(&[
+            "clone",
+            "--bare",
+            work.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ]);
+        let commit =
+            String::from_utf8(run(&["-C", work.to_str().unwrap(), "rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim()
+                .to_owned();
+        for revision in ["main", "v1.0", commit.as_str()] {
+            assert_eq!(
+                resolve_git_remote_base(remote.to_str().unwrap(), revision)
+                    .await
+                    .unwrap(),
+                commit
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_rest_accepts_replays_queries_attempts_and_rejects_conflicts() {
+        let upstream = MockServer::start_async().await;
+        let resolution = upstream.mock(|when, then| {
+            when.method(GET);
+            then.status(200)
+                .json_body(json!({"sha":"0123456789abcdef0123456789abcdef01234567"}));
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.github_api_url = upstream.base_url();
+        config.store_path = directory.path().join("controller.sqlite3");
+        let app = router(AppState::new(config, FakeSandbox));
+        let plan = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":2,"tasks":[{"task_id":"build","prompt":"compile it","dependencies":[],"policy":{}}]});
+        let submit = |plan: Value, key: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/batches")
+                .header("idempotency-key", key)
+                .header("content-type", "application/json")
+                .body(Body::from(plan.to_string()))
+                .unwrap()
+        };
+        let first = app
+            .clone()
+            .oneshot(submit(plan.clone(), "stable-key"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(first.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first_body["requested_revision"], "main");
+        assert_eq!(
+            first_body["resolved_base_id"],
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        let independent = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":1,"tasks":[{"task_id":"build","prompt":"different logical work"}]});
+        let independent_response = app
+            .clone()
+            .oneshot(submit(independent, "independent-key"))
+            .await
+            .unwrap();
+        let independent_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(independent_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(
+            first_body["accepted_task_ids"][0].as_str().unwrap(),
+            independent_body["accepted_task_ids"][0].as_str().unwrap()
+        );
+        resolution.delete_async().await;
+        upstream.mock(|when, then| {
+            when.method(GET);
+            then.status(503);
+        });
+        let replay = app
+            .clone()
+            .oneshot(submit(plan.clone(), "stable-key"))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(replay.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first_body, replay_body);
+        let conflict_plan = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":2,"tasks":[{"task_id":"build","prompt":"different work","dependencies":[],"policy":{}}]});
+        let conflict = app
+            .clone()
+            .oneshot(submit(conflict_plan, "stable-key"))
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let batch_id = first_body["batch_id"].as_str().unwrap();
+        let task_id = first_body["accepted_task_ids"][0].as_str().unwrap();
+        for (path, expected) in [
+            (format!("/v1/batches/{batch_id}"), first_body.clone()),
+            (format!("/v1/tasks/{task_id}"), json!({"task_id":task_id})),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            if expected.get("batch_id").is_some() {
+                assert_eq!(body, expected);
+            } else {
+                assert_eq!(body["task_id"], task_id);
+            }
+        }
+        for ordinal in 1..=2 {
+            let key = format!("attempt-key-{ordinal}");
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/tasks/{task_id}/attempts"))
+                        .header("idempotency-key", &key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let body: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["ordinal"], ordinal);
+            if ordinal == 1 {
+                let retry = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(format!("/v1/tasks/{task_id}/attempts"))
+                            .header("idempotency-key", &key)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(retry.status(), StatusCode::OK);
+                let replay: Value = serde_json::from_slice(
+                    &axum::body::to_bytes(retry.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(replay["attempt_id"], body["attempt_id"]);
+                assert_eq!(replay["ordinal"], 1);
+            }
+        }
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/tasks/{task_id}/attempts"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let attempts: Value = serde_json::from_slice(
+            &axum::body::to_bytes(listed.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(attempts["attempts"].as_array().unwrap().len(), 2);
+        let attempt_id = attempts["attempts"][0]["attempt_id"].as_str().unwrap();
+        let get_attempt = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/attempts/{attempt_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_attempt.status(), StatusCode::OK);
+        let bind_session = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/attempts/{attempt_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"session_id":"session-runtime-id"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bound: Value = serde_json::from_slice(
+            &axum::body::to_bytes(bind_session.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(bound["attempt_id"], attempt_id);
+        assert_eq!(bound["session_id"], "session-runtime-id");
+        let duplicate = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":2,"tasks":[{"task_id":"x","prompt":"a"},{"task_id":"x","prompt":"b"}]});
+        let rejected = app
+            .oneshot(submit(duplicate, "duplicate-key"))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    }
 
     struct FakeSandbox;
 
