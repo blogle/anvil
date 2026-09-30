@@ -22,6 +22,9 @@ public router. It verifies:
   is shared by all 100 accepted Tasks;
 - controller acceptance exposes queued/runnable counts and each retrieved Task
   has controller-owned `queued` state;
+- the compact batch acceptance response does not inline prompts, messages,
+  transcripts, logs, or diffs; detail is followed by stable Batch/Task/Attempt
+  IDs through their actual GET routes;
 - stable Batch, Task, and Attempt IDs can be followed through the existing GET
   routes; attempt creation is idempotent and currently reports `queued`;
 - Batch, Task, and Attempt records plus the submission binding survive opening a
