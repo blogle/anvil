@@ -3737,6 +3737,7 @@ async fn session(
 
 async fn activity(
     Path(id): Path<String>,
+    Query(query): Query<ActivityQuery>,
     State(s): State<AppState>,
 ) -> Result<Json<SessionActivity>, ServiceError> {
     let object = s.kube.get(&id).await?;
@@ -3749,7 +3750,7 @@ async fn activity(
         Value::Null
     };
     let has_authoritative_session_status = binding_is_usable(&session) && status.is_object();
-    let raw_messages = if binding_is_usable(&session) {
+    let raw_messages = if query.include_events && binding_is_usable(&session) {
         OpenCode::new(service_url(&session, &s.config), s.config.request_timeout)
             .session_messages(session.opencode_session_id.as_deref().unwrap_or_default())
             .await
@@ -3851,6 +3852,12 @@ async fn changed_since(
     Ok(Json(
         json!({"schema_version":1,"reset_required":false,"cursor":cursor,"snapshot":snapshot}),
     ))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ActivityQuery {
+    #[serde(default)]
+    include_events: bool,
 }
 async fn suspend(
     Path(id): Path<String>,
@@ -9030,6 +9037,14 @@ mod tests {
         assert_eq!(response.events[0].status.as_deref(), Some("completed"));
         assert_eq!(response.events[1].kind, "message");
         assert!(!response.events.iter().any(|event| event.detail.as_deref() == Some("private")));
+    }
+
+    #[test]
+    fn activity_query_defaults_to_lightweight_state_and_can_request_events() {
+        assert!(!ActivityQuery::default().include_events);
+        assert!(serde_json::from_value::<ActivityQuery>(json!({ "include_events": true }))
+            .unwrap()
+            .include_events);
     }
 
     #[tokio::test]
