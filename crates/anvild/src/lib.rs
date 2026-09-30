@@ -5231,6 +5231,22 @@ mod tests {
             first_body["resolved_base_id"],
             "0123456789abcdef0123456789abcdef01234567"
         );
+        let independent = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":1,"tasks":[{"task_id":"build","prompt":"different logical work"}]});
+        let independent_response = app
+            .clone()
+            .oneshot(submit(independent, "independent-key"))
+            .await
+            .unwrap();
+        let independent_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(independent_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(
+            first_body["accepted_task_ids"][0].as_str().unwrap(),
+            independent_body["accepted_task_ids"][0].as_str().unwrap()
+        );
         resolution.delete_async().await;
         upstream.mock(|when, then| {
             when.method(GET);
@@ -5377,27 +5393,6 @@ mod tests {
         .unwrap();
         assert_eq!(bound["attempt_id"], attempt_id);
         assert_eq!(bound["session_id"], "session-runtime-id");
-        upstream.mock(|when, then| {
-            when.method(GET);
-            then.status(200)
-                .json_body(json!({"sha":"0123456789abcdef0123456789abcdef01234567"}));
-        });
-        let independent = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":1,"tasks":[{"task_id":"build","prompt":"different logical work"}]});
-        let independent_response = app
-            .clone()
-            .oneshot(submit(independent, "independent-key"))
-            .await
-            .unwrap();
-        let independent_body: Value = serde_json::from_slice(
-            &axum::body::to_bytes(independent_response.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_ne!(
-            task_id,
-            independent_body["accepted_task_ids"][0].as_str().unwrap()
-        );
         let duplicate = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":2,"tasks":[{"task_id":"x","prompt":"a"},{"task_id":"x","prompt":"b"}]});
         let rejected = app
             .oneshot(submit(duplicate, "duplicate-key"))
