@@ -1287,9 +1287,11 @@ impl SandboxApi for KubeSandboxApi {
             json!({"name":"XDG_RUNTIME_DIR","value":"/home/anvil/.local/state/runtime"}),
             json!({"name":"DISPLAY","value":":99"}),
         ];
-        env.extend(git_committer_environment(&self.config).into_iter().map(
-            |(name, value)| json!({"name":name,"value":value}),
-        ));
+        env.extend(
+            git_committer_environment(&self.config)
+                .into_iter()
+                .map(|(name, value)| json!({"name":name,"value":value})),
+        );
         env.extend(
             sandbox_env
                 .iter()
@@ -5121,9 +5123,7 @@ mod tests {
         assert!(!configured
             .git_committer_email
             .contains("@users.noreply.github.com"));
-        assert!(!DEFAULT_GIT_COMMITTER_EMAIL.contains(
-            "@users.noreply.github.com"
-        ));
+        assert!(!DEFAULT_GIT_COMMITTER_EMAIL.contains("@users.noreply.github.com"));
         assert!(!DEFAULT_GIT_COMMITTER_EMAIL.contains("thejeffer.net"));
         assert_eq!(DEFAULT_GIT_COMMITTER_NAME, "Anvil");
         let defaults = config("http://profile".into());
