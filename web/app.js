@@ -1,4 +1,5 @@
 import { applyServerRefresh, detailRenderSignature, formatElapsedValue, operatorState, parseRoute, patchSessionRows, reconcileSessionRows, sessionRowMarkup, sessionUiState, updateSessionRowElapsed } from "./ui-state.js"
+import { renderFilesResult } from "./files-view.js"
 
 const app = document.querySelector("#app")
 const state = {
@@ -11,6 +12,7 @@ const state = {
   loading: true,
   refreshInFlight: false,
   refreshGeneration: 0,
+  fileDiffs: new Map(),
 }
 
 function routeFor(sessionId) {
@@ -206,6 +208,10 @@ function updateDetail() {
   const session = activity?.session || state.sessions.find((item) => item.id === state.selected)
   const signature = JSON.stringify(detailRenderSignature({ selected: state.selected, activity, session }))
   if (detail.dataset.detailSignature === signature) {
+    if (session) {
+      const filesPanel = detail.querySelector("#files-panel")
+      if (filesPanel) filesPanel.innerHTML = renderFiles(session)
+    }
     updateDetailTab()
     return
   }
@@ -226,8 +232,8 @@ function renderDetail(activity, session) {
      <div class="detail-header"><div><div class="eyebrow">Session overview</div><h2>${escapeHtml(titleFor(session))}</h2><div class="detail-subtitle"><span>${escapeHtml(session.project)}</span><span>·</span><code>${escapeHtml(session.work_branch)}</code></div><div class="detail-status state-${escapeHtml(status)}"><span class="status-dot"></span><strong>${stateLabel(status)}</strong><span>${activity?.work_state_changed_at ? `· <span data-live-state-elapsed="${escapeHtml(activity.work_state_changed_at)}">${formatStateElapsed(activity)}</span>` : ""}</span></div></div></div>
      ${activity?.work_state_summary ? `<div class="work-summary"><div class="eyebrow">Work summary</div>${escapeHtml(activity.work_state_summary)}</div>` : ""}
      ${renderActions(activity, session, attachCommand)}
-     <div class="tabs" role="tablist" aria-label="Session detail"><button id="logs-tab" class="tab" data-tab="logs" data-focus-key="tab-logs" role="tab" aria-controls="logs-panel">Logs</button><button id="runtime-tab" class="tab" data-tab="runtime" data-focus-key="tab-runtime" role="tab" aria-controls="runtime-panel">Runtime</button></div>
-     <div id="logs-panel" role="tabpanel" tabindex="0" aria-labelledby="logs-tab">${renderLogs(activity)}</div><div id="runtime-panel" role="tabpanel" tabindex="0" aria-labelledby="runtime-tab">${renderRuntime(activity, session)}</div>
+      <div class="tabs" role="tablist" aria-label="Session detail"><button id="logs-tab" class="tab" data-tab="logs" data-focus-key="tab-logs" role="tab" aria-controls="logs-panel">Logs</button><button id="files-tab" class="tab" data-tab="files" data-focus-key="tab-files" role="tab" aria-controls="files-panel">Files</button><button id="runtime-tab" class="tab" data-tab="runtime" data-focus-key="tab-runtime" role="tab" aria-controls="runtime-panel">Runtime</button></div>
+      <div id="logs-panel" role="tabpanel" tabindex="0" aria-labelledby="logs-tab">${renderLogs(activity)}</div><div id="files-panel" role="tabpanel" tabindex="0" aria-labelledby="files-tab">${renderFiles(session)}</div><div id="runtime-panel" role="tabpanel" tabindex="0" aria-labelledby="runtime-tab">${renderRuntime(activity, session)}</div>
   </div>`
 }
 
@@ -243,7 +249,7 @@ function updateDetailTab() {
   const detail = document.querySelector("#detail")
   const ui = selectedUi()
   if (!detail || !ui) return
-  const active = ui.tab === "runtime" ? "runtime" : "logs"
+  const active = ["runtime", "files"].includes(ui.tab) ? ui.tab : "logs"
   for (const tab of detail.querySelectorAll("[role=tab]")) {
     const selected = tab.dataset.tab === active
     tab.classList.toggle("active", selected)
@@ -252,6 +258,11 @@ function updateDetailTab() {
   }
   detail.querySelector("#logs-panel")?.toggleAttribute("hidden", active !== "logs")
   detail.querySelector("#runtime-panel")?.toggleAttribute("hidden", active !== "runtime")
+  detail.querySelector("#files-panel")?.toggleAttribute("hidden", active !== "files")
+}
+
+function renderFiles(session) {
+  return renderFilesResult(state.fileDiffs.get(session.id))
 }
 
 function relativeTime(value) {
@@ -305,6 +316,14 @@ async function handleClick(event) {
     if (ui) {
       ui.tab = tab.dataset.tab
       updateDetailTab()
+      if (ui.tab === "files" && !state.fileDiffs.has(state.selected)) {
+        const id = state.selected
+        state.fileDiffs.set(id, { status: "loading" })
+        updateDetail()
+        api(`/v1/sessions/${encodeURIComponent(id)}/diff`).then((result) => state.fileDiffs.set(id, result)).catch((error) => state.fileDiffs.set(id, { status: "unavailable", message: error.message })).finally(() => {
+          if (state.selected === id) updateDetail()
+        })
+      }
     }
     return
   }

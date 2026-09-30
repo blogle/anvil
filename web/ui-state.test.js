@@ -1,6 +1,8 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { applyServerRefresh, detailRenderSignature, formatElapsedValue, operatorState, parseRoute, reconcileSessionRows, sessionUiState } from "./ui-state.js"
+import { readFile } from "node:fs/promises"
+import { renderFilesResult } from "./files-view.js"
 
 test("poll payload preserves local interaction state and selected session", () => {
   const activities = new Map([["demo-12345678", {
@@ -113,4 +115,23 @@ test("detail interaction state is scoped to each session", () => {
   assert.deepEqual(second.expandedPrompts, new Set())
   assert.equal(second.tab, "logs")
   assert.equal(second.focusKey, null)
+})
+
+test("Files tab renderer covers empty, unavailable, statuses, binary and large files safely", async () => {
+  const app = await readFile(new URL("./app.js", import.meta.url), "utf8")
+  assert.match(app, /id="files-tab"/)
+  assert.match(renderFilesResult({ status: "loading" }), /Loading file changes/)
+  assert.match(renderFilesResult({ status: "unavailable", message: "No recorded worker base" }), /Files unavailable[\s\S]*No recorded worker base/)
+  assert.match(renderFilesResult({ status: "ready", diff: { base_revision: "abc", files: [] } }), /No file changes/)
+  const html = renderFilesResult({ status: "ready", diff: { files: [
+    { path: "added<.txt", status: "added", additions: 1, deletions: 0, diff: "+<script>" },
+    { path: "renamed.txt", old_path: "old.txt", status: "renamed", additions: 0, deletions: 0, diff: "rename" },
+    { path: "image.png", status: "modified", binary: true },
+    { path: "huge.txt", status: "modified", too_large: true },
+  ] } })
+  assert.match(html, /added&lt;\.txt/)
+  assert.match(html, /&lt;script&gt;/)
+  assert.match(html, /old\.txt → renamed\.txt/)
+  assert.match(html, /Binary file/)
+  assert.match(html, /Diff too large/)
 })
