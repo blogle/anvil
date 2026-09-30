@@ -67,33 +67,30 @@ pub struct DigestTask {
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr: Option<u64>,
-    pub detail: String,
-    pub review: String,
-    pub messages: String,
-    pub logs: String,
-    pub diff: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
-/// Minimal seam for the batch service; deliberately excludes prompts and artifacts.
+/// Minimal service projection input; deliberately excludes prompts and artifacts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchTaskFact {
     pub id: String,
     pub state: String,
-    pub changed_at: u64,
     pub op: Option<String>,
     pub attempt: Option<String>,
     pub reason: Option<String>,
     pub branch: Option<String>,
     pub pr: Option<u64>,
+    pub duration_ms: Option<u64>,
 }
 
-/// Build full or changed-since compact projection. Cursor is the durable stream offset;
-/// filter_attention keeps failed/retrying/review tasks without changing cursor semantics.
+/// Project service-selected task facts. For a delta, the service must select changed
+/// tasks using its durable opaque cursor and pass its next cursor through unchanged.
+/// This function intentionally does not implement cursor/change-stream semantics.
 pub fn batch_digest(
     batch: &str,
     cursor: &str,
     tasks: &[BatchTaskFact],
-    since: Option<u64>,
     filter_attention: bool,
 ) -> BatchDigest {
     let mut counts = BatchCounts {
@@ -112,11 +109,10 @@ pub fn batch_digest(
     let rows = tasks
         .iter()
         .filter(|t| {
-            since.is_none_or(|offset| t.changed_at > offset)
-                && (!filter_attention
-                    || t.reason.is_some()
-                    || t.attempt.is_some()
-                    || matches!(t.state.as_str(), "failed" | "review" | "ready_for_review"))
+            !filter_attention
+                || t.reason.is_some()
+                || t.attempt.is_some()
+                || matches!(t.state.as_str(), "failed" | "review" | "ready_for_review")
         })
         .map(|t| DigestTask {
             id: t.id.clone(),
@@ -126,11 +122,7 @@ pub fn batch_digest(
             reason: t.reason.clone(),
             branch: t.branch.clone(),
             pr: t.pr,
-            detail: format!("tasks/{}/detail", t.id),
-            review: format!("tasks/{}/review", t.id),
-            messages: format!("tasks/{}/messages", t.id),
-            logs: format!("tasks/{}/logs", t.id),
-            diff: format!("tasks/{}/diff", t.id),
+            duration_ms: t.duration_ms,
         })
         .collect();
     BatchDigest {
@@ -140,6 +132,33 @@ pub fn batch_digest(
         counts,
         tasks: rows,
     }
+}
+
+/// Human-readable projection for CLI/UI consumers; agent/MCP serialization stays compact.
+pub fn render_batch_digest_human(digest: &BatchDigest) -> String {
+    let mut output = format!(
+        "Batch {} — {} tasks ({} active, {} review, {} failed, {} done)\n",
+        digest.batch,
+        digest.counts.total,
+        digest.counts.active,
+        digest.counts.review,
+        digest.counts.failed,
+        digest.counts.done
+    );
+    for task in &digest.tasks {
+        output.push_str(&format!("- {}: {}", task.id, task.state.replace('_', " ")));
+        if let Some(operation) = &task.op {
+            output.push_str(&format!(" · {operation}"));
+        }
+        if let Some(duration) = task.duration_ms {
+            output.push_str(&format!(" · {}s", duration / 1000));
+        }
+        if let Some(reason) = &task.reason {
+            output.push_str(&format!(" · {reason}"));
+        }
+        output.push('\n');
+    }
+    output
 }
 
 impl WorkState {
@@ -746,32 +765,34 @@ mod tests {
                     "active"
                 }
                 .into(),
-                changed_at: i as u64,
                 op: (i % 10 != 0 && i % 25 != 0).then(|| "edit".into()),
                 attempt: (i % 25 == 0).then(|| "2/3".into()),
                 reason: (i % 25 == 0).then(|| "worker_error".into()),
                 branch: (i % 10 == 0).then(|| format!("anvil/task-{i:03}")),
                 pr: None,
+                duration_ms: Some(i as u64 * 1000),
             })
             .collect()
     }
 
     #[test]
     fn batch_digest_size_regressions_and_delta_semantics() {
-        let one = batch_digest("batch-x", "c100", &fixture(1), None, false);
-        let twenty = batch_digest("batch-x", "c100", &fixture(20), None, false);
-        let fifty = batch_digest("batch-x", "c100", &fixture(50), None, false);
+        let one = batch_digest("batch-x", "cursor:opaque:100", &fixture(1), false);
+        let twenty = batch_digest("batch-x", "cursor:opaque:100", &fixture(20), false);
+        let fifty = batch_digest("batch-x", "cursor:opaque:100", &fixture(50), false);
         let hundred_tasks = fixture(100);
-        let hundred = batch_digest("batch-x", "c100", &hundred_tasks, None, false);
+        let hundred = batch_digest("batch-x", "cursor:opaque:100", &hundred_tasks, false);
         let sizes = [one, twenty, fifty, hundred].map(|d| serde_json::to_vec(&d).unwrap().len());
         // Budgets allow natural IDs/state fields but reject verbose or null-heavy expansion.
         assert!(sizes[0] < 700, "1 task: {} bytes", sizes[0]);
         assert!(sizes[1] < 5_000, "20 tasks: {} bytes", sizes[1]);
         assert!(sizes[2] < 11_000, "50 tasks: {} bytes", sizes[2]);
         assert!(sizes[3] < 22_000, "100 tasks: {} bytes", sizes[3]);
-        let no_change = batch_digest("batch-x", "c101", &hundred_tasks, Some(99), false);
+        // The durable change stream selects rows. The projection only serializes those rows
+        // and carries its opaque next cursor; it does not emulate cursor ordering locally.
+        let no_change = batch_digest("batch-x", "cursor:opaque:101", &[], false);
         assert!(no_change.tasks.is_empty());
-        let two_change = batch_digest("batch-x", "c101", &hundred_tasks, Some(97), false);
+        let two_change = batch_digest("batch-x", "cursor:opaque:101", &hundred_tasks[98..], false);
         assert_eq!(
             two_change
                 .tasks
@@ -780,10 +801,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["task-098", "task-099"]
         );
-        let attention = batch_digest("batch-x", "c100", &hundred_tasks, None, true);
-        assert!(attention.tasks.iter().all(|t| t.reason.is_some() || t.state == "review"));
+        let attention = batch_digest("batch-x", "cursor:opaque:100", &hundred_tasks, true);
+        assert!(attention
+            .tasks
+            .iter()
+            .all(|t| t.reason.is_some() || t.state == "review"));
         assert!(!serde_json::to_string(&hundred).unwrap().contains("prompt"));
-        assert!(!serde_json::to_string(&hundred).unwrap().contains("transcript"));
+        assert!(!serde_json::to_string(&hundred)
+            .unwrap()
+            .contains("transcript"));
+        let human = render_batch_digest_human(&hundred);
+        assert!(human.contains("Batch batch-x"));
+        assert!(human.contains("1s"));
     }
 
     // ── Project ──────────────────────────────────────────────────────
