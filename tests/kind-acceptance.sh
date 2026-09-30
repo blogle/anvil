@@ -53,6 +53,26 @@ poll() {
   done
 }
 
+wait_for_sandbox_pod() {
+  local name="$1"
+  local pod_name=""
+  local deadline
+
+  kubectl --kubeconfig "$kubeconfig" -n "$namespace" wait --for=condition=Ready "sandbox/$name" --timeout=120s
+  deadline=$((SECONDS + 120))
+  while (( SECONDS < deadline )); do
+    pod_name="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$name" -o json 2>/dev/null | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
+    if [ -n "$pod_name" ]; then
+      printf '%s\n' "$pod_name"
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  printf 'timed out after 120s waiting for a pod in endpoints for sandbox/%s\n' "$name" >&2
+  return 1
+}
+
 kind create cluster --name "$cluster" --kubeconfig "$kubeconfig" --wait 120s
 created=1
 
@@ -289,20 +309,13 @@ jq -n \
   }' >"$tmp/kind-sandbox.json"
 kubectl --kubeconfig "$kubeconfig" apply -f "$tmp/kind-sandbox.json"
 sandbox_name=anvil-fixture-12345678
-kubectl --kubeconfig "$kubeconfig" -n "$namespace" wait --for=condition=Ready "sandbox/$sandbox_name" --timeout=120s
+pod_name="$(wait_for_sandbox_pod "$sandbox_name")"
 sandbox_pvc="workspace-$sandbox_name"
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" wait --for=jsonpath='{.status.phase}'=Bound "pvc/$sandbox_pvc" --timeout=120s
 service_fqdn="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get sandbox "$sandbox_name" -o json | jq -r '.status.serviceFQDN // empty')"
 test -n "$service_fqdn"
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" get service "$sandbox_name" -o json | jq -e '.spec.ports[] | select(.port == 4096)' >/dev/null
 
-deadline=$((SECONDS + 120))
-while (( SECONDS < deadline )); do
-  pod_name="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$sandbox_name" -o json 2>/dev/null | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
-  [ -n "$pod_name" ] && break
-  sleep 0.2
-done
-test -n "$pod_name"
 mount_output="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- mount)"
 [[ "$mount_output" == *"/home/anvil"* ]]
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- curl -fsS "http://$service_fqdn:4096/global/health" >/dev/null
@@ -329,9 +342,8 @@ for name in "$api_a_name" "$api_b_name"; do
     ([$pod.containers[] | select(.name == "sandbox") | .volumeMounts[] | select(.name == "shared-nix")] | length == 2 and
       all(.[]; .readOnly == true and ((.mountPath == "/nix/store" and .subPath == "store") or (.mountPath == "/nix/var/nix/daemon-socket" and .subPath == "var/nix/daemon-socket"))))' >/dev/null
 done
-api_a_pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$api_a_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
-api_b_pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$api_b_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
-test -n "$api_a_pod" && test -n "$api_b_pod"
+api_a_pod="$(wait_for_sandbox_pod "$api_a_name")"
+api_b_pod="$(wait_for_sandbox_pod "$api_b_name")"
 agent_exec() {
   local pod="$1"
   shift
@@ -397,13 +409,7 @@ session_after_resume="$(curl -fsS http://127.0.0.1:18080/v1/sessions/fixture-123
 test "$(jq -r .opencode_session_id <<<"$session_after_resume")" = "$opencode_session"
 status="$(curl -fsS http://127.0.0.1:18080/v1/sessions/fixture-12345678/status)"
 jq -e '.environment_state == "ready" and .execution_state == "idle" and .work_state == "ready_for_review" and .current_run == null' <<<"$status" >/dev/null
-deadline=$((SECONDS + 120))
-while (( SECONDS < deadline )); do
-  pod_name="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$sandbox_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
-  [ -n "$pod_name" ] && break
-  sleep 0.2
-done
-test -n "$pod_name"
+pod_name="$(wait_for_sandbox_pod "$sandbox_name")"
 
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout restart deployment/anvil-nix-daemon
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-nix-daemon --timeout=300s
@@ -425,8 +431,7 @@ agent_exec "$api_b_pod" /bin/bash -c 'test "$(cat "$1")" = kind-shared && nix pa
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c 'test -L "/nix/var/nix/gcroots/anvil-baseline/${1##*/}" && test -f /nix/var/nix/.anvil-bootstrap-complete && test ! -e /nix/var/nix/.anvil-baseline-pending && test ! -e "/nix/.anvil-import/${1##*/}"' -- "$upgrade_canary"
 api_c_id="$(create_anvil_session)"
 api_c_name="anvil-$api_c_id"
-api_c_pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$api_c_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
-test -n "$api_c_pod"
+api_c_pod="$(wait_for_sandbox_pod "$api_c_name")"
 agent_exec "$api_c_pod" /bin/bash -c 'nix store info >/dev/null && nix path-info "$1" >/dev/null && nix path-info "$2" >/dev/null' -- "$shared_path" "$upgrade_canary"
 # Rust checks are owned by the parallel local-first lane. Keep this narrowly
 # scoped smoke because it proves the sandbox can enter a Nix shell through the

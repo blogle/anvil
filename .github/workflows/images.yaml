@@ -150,6 +150,37 @@ jobs:
             image-build-timings.txt
           if-no-files-found: error
 
+  kind-plan:
+    name: Plan Kind lane
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      lane: ${{ steps.plan.outputs.lane }}
+      requires-kind: ${{ steps.plan.outputs.requires-kind }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: plan
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          lane=$((PR_NUMBER % 2))
+          requires_kind=false
+          while IFS= read -r path; do
+            case "$path" in
+              web/*|package.json|package-lock.json) ;;
+              *) requires_kind=true; break ;;
+            esac
+          done < <(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          {
+            printf 'lane=%s\n' "$lane"
+            printf 'requires-kind=%s\n' "$requires_kind"
+          } >> "$GITHUB_OUTPUT"
+
   pr-build:
     name: Build and inspect PR images
     if: github.event_name == 'pull_request'
@@ -176,8 +207,12 @@ jobs:
 
   kind-fidelity:
     name: Isolated Agent Sandbox Kubernetes lane
-    if: github.event_name == 'pull_request'
-    needs: pr-artifacts
+    if: github.event_name == 'pull_request' && needs.kind-plan.outputs.requires-kind == 'true'
+    needs: [pr-artifacts, kind-plan]
+    concurrency:
+      group: anvil-kind-fidelity-${{ needs.kind-plan.outputs.lane }}
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
