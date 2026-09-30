@@ -41,6 +41,7 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
+trap 'status=$?; trap - ERR; printf "kind acceptance failed at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2; exit "$status"' ERR
 
 poll() {
   local url="$1" deadline=$((SECONDS + 120))
