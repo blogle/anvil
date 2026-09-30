@@ -5556,9 +5556,15 @@ fn build_activity(
         if info.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
-        let message_id = info.get("id").and_then(Value::as_str).unwrap_or("assistant");
+        let message_id = info
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("assistant");
         let created = timestamp_from_value(info.get("time").and_then(|time| time.get("created")))
             .unwrap_or_else(|| session.created_at.clone().unwrap_or_default());
+        let visible_at =
+            timestamp_from_value(info.get("time").and_then(|time| time.get("completed")))
+                .unwrap_or_else(|| created.clone());
         if let Some(parts) = message.get("parts").and_then(Value::as_array) {
             for (part_index, part) in parts.iter().enumerate() {
                 let part_type = part.get("type").and_then(Value::as_str).unwrap_or_default();
@@ -5566,31 +5572,73 @@ fn build_activity(
                 let state = part.get("state");
                 let (kind, title, status, detail, at) = if part_type == "tool" {
                     let tool = part.get("tool").and_then(Value::as_str).unwrap_or("Tool");
-                    let status = state.and_then(|value| value.get("status")).and_then(Value::as_str).unwrap_or("pending");
-                    let title = state.and_then(|value| value.get("title")).and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| format!("{tool} tool"));
-                    let detail = state.and_then(|value| value.get("output")).and_then(Value::as_str).map(|value| value.chars().take(500).collect::<String>())
-                        .or_else(|| part.get("input").map(|value| value.to_string().chars().take(300).collect()));
-                    let at = state.and_then(|value| value.get("time")).and_then(|time| time.get("start").or_else(|| time.get("end"))).and_then(|value| timestamp_from_value(Some(value))).unwrap_or_else(|| created.clone());
+                    let status = state
+                        .and_then(|value| value.get("status"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("pending");
+                    let title = state
+                        .and_then(|value| value.get("title"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("{tool} tool"));
+                    let detail = state
+                        .and_then(|value| value.get("output"))
+                        .and_then(Value::as_str)
+                        .map(|value| value.chars().take(500).collect::<String>())
+                        .or_else(|| {
+                            part.get("input")
+                                .map(|value| value.to_string().chars().take(300).collect())
+                        });
+                    let at = state
+                        .and_then(|value| value.get("time"))
+                        .and_then(|time| time.get("start").or_else(|| time.get("end")))
+                        .and_then(|value| timestamp_from_value(Some(value)))
+                        .unwrap_or_else(|| created.clone());
                     ("tool", title, Some(status.to_owned()), detail, at)
                 } else if part_type == "text" {
-                    let text = part.get("text").and_then(Value::as_str).unwrap_or_default().trim();
-                    if text.is_empty() { continue; }
-                    ("message", "Agent message".to_owned(), None, Some(text.chars().take(1000).collect()), created.clone())
+                    let text = part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    (
+                        "message",
+                        "Agent message".to_owned(),
+                        None,
+                        Some(text.chars().take(1000).collect()),
+                        visible_at.clone(),
+                    )
                 } else {
                     continue;
                 };
                 events.push(ActivityEvent {
-                    id: format!("{message_id}:{part_id}:{part_index}"), at, kind: kind.into(), title,
-                    detail, status,
+                    id: format!("{message_id}:{part_id}:{part_index}"),
+                    at,
+                    kind: kind.into(),
+                    title,
+                    detail,
+                    status,
                 });
             }
         }
         if let Some(error) = assistant_error(message) {
-            events.push(ActivityEvent { id: format!("{message_id}:error"), at: created, kind: "error".into(), title: "Agent error".into(), detail: Some(error.chars().take(1000).collect()), status: Some("failed".into()) });
+            events.push(ActivityEvent {
+                id: format!("{message_id}:error"),
+                at: created,
+                kind: "error".into(),
+                title: "Agent error".into(),
+                detail: Some(error.chars().take(1000).collect()),
+                status: Some("failed".into()),
+            });
         }
     }
     events.sort_by(|left, right| left.at.cmp(&right.at).then_with(|| left.id.cmp(&right.id)));
-    if events.len() > 500 { events.drain(..events.len() - 500); }
+    if events.len() > 500 {
+        events.drain(..events.len() - 500);
+    }
 
     let current = busy
         .then(|| requests.last().filter(|request| request.state == "running"))
@@ -6167,8 +6215,12 @@ impl OpenCode {
             .await
     }
     async fn session_messages(&self, id: &str) -> Result<Value, ServiceError> {
-        self.request(&format!("session/{id}/message?limit=100"), reqwest::Method::GET, None)
-            .await
+        self.request(
+            &format!("session/{id}/message?limit=100"),
+            reqwest::Method::GET,
+            None,
+        )
+        .await
     }
     async fn event_stream(&self) -> Result<reqwest::Response, ServiceError> {
         let url = self
@@ -9117,28 +9169,40 @@ mod tests {
             "model":"openai/gpt-5.6-luna", "environment_state":"ready", "work_state":"in_progress",
             "opencode_session_id":"ses-test"
         })).unwrap();
-        let response = build_activity(&session, "Ready", None, json!([{
-            "info":{"id":"msg-1","role":"assistant","time":{"created":1780000000000}},
-            "parts":[
-                {"id":"part-tool","type":"tool","tool":"bash","state":{"status":"completed","title":"Ran tests","output":"ok","time":{"start":1780000001000}}},
-                {"id":"part-text","type":"text","text":"Tests passed"},
-                {"id":"part-reasoning","type":"reasoning","text":"private"}
-            ]
-        }]), json!({}), &config("http://profile.test".into()));
+        let response = build_activity(
+            &session,
+            "Ready",
+            None,
+            json!([{
+                "info":{"id":"msg-1","role":"assistant","time":{"created":1780000000000i64,"completed":1780000002000i64}},
+                "parts":[
+                    {"id":"part-tool","type":"tool","tool":"bash","state":{"status":"completed","title":"Ran tests","output":"ok","time":{"start":1780000001000i64}}},
+                    {"id":"part-text","type":"text","text":"Tests passed"},
+                    {"id":"part-reasoning","type":"reasoning","text":"private"}
+                ]
+            }]),
+            json!({}),
+            &config("http://profile.test".into()),
+        );
         assert_eq!(response.events.len(), 2);
         assert_eq!(response.events[0].id, "msg-1:part-tool:0");
         assert_eq!(response.events[0].kind, "tool");
         assert_eq!(response.events[0].status.as_deref(), Some("completed"));
         assert_eq!(response.events[1].kind, "message");
-        assert!(!response.events.iter().any(|event| event.detail.as_deref() == Some("private")));
+        assert!(!response
+            .events
+            .iter()
+            .any(|event| event.detail.as_deref() == Some("private")));
     }
 
     #[test]
     fn activity_query_defaults_to_lightweight_state_and_can_request_events() {
         assert!(!ActivityQuery::default().include_events);
-        assert!(serde_json::from_value::<ActivityQuery>(json!({ "include_events": true }))
-            .unwrap()
-            .include_events);
+        assert!(
+            serde_json::from_value::<ActivityQuery>(json!({ "include_events": true }))
+                .unwrap()
+                .include_events
+        );
     }
 
     #[tokio::test]
