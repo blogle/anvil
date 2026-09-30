@@ -1872,9 +1872,7 @@ async fn resolve_batch_base_at(
     let repo = reqwest::Url::parse(repository)
         .map_err(|error| ServiceError::Invalid(error.to_string()))?;
     if repo.host_str() != Some("github.com") {
-        return Err(ServiceError::Invalid(
-            "immutable base resolution is not supported for this repository host".into(),
-        ));
+        return resolve_git_remote_base(repository, revision).await;
     }
     let path = repo.path().trim_matches('/').trim_end_matches(".git");
     let mut endpoint = reqwest::Url::parse(api_url)
@@ -1915,6 +1913,64 @@ async fn resolve_batch_base_at(
             ServiceError::Invalid("repository did not return a full commit SHA".into())
         })?;
     Ok(commit.to_ascii_lowercase())
+}
+
+async fn resolve_git_remote_base(repository: &str, revision: &str) -> Result<String, ServiceError> {
+    let output = tokio::process::Command::new("git")
+        .args(["ls-remote", repository])
+        .output()
+        .await
+        .map_err(|error| {
+            ServiceError::OpenCode(format!("repository base lookup failed: {error}"))
+        })?;
+    if !output.status.success() {
+        return Err(ServiceError::Invalid(format!(
+            "repository revision could not be resolved: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let refs: Vec<_> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(sha, reference)| (sha.to_owned(), reference.to_owned()))
+        .collect();
+    let full_sha =
+        |value: &str| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if full_sha(revision) {
+        if let Some((sha, _)) = refs
+            .iter()
+            .find(|(sha, _)| sha.eq_ignore_ascii_case(revision))
+        {
+            return Ok(sha.to_ascii_lowercase());
+        }
+        return Err(ServiceError::Invalid(
+            "repository did not advertise the requested commit SHA".into(),
+        ));
+    }
+    let mut candidates = Vec::new();
+    if let Some(name) = revision.strip_prefix("refs/heads/") {
+        candidates.push(format!("refs/heads/{name}"));
+    } else if let Some(name) = revision.strip_prefix("refs/tags/") {
+        candidates.push(format!("refs/tags/{name}^{{}}"));
+        candidates.push(format!("refs/tags/{name}"));
+    } else {
+        candidates.push(format!("refs/heads/{revision}"));
+        candidates.push(format!("refs/tags/{revision}^{{}}"));
+        candidates.push(format!("refs/tags/{revision}"));
+    }
+    for candidate in candidates {
+        if let Some((sha, _)) = refs
+            .iter()
+            .find(|(_, reference)| reference.as_str() == candidate)
+        {
+            if full_sha(sha) {
+                return Ok(sha.to_ascii_lowercase());
+            }
+        }
+    }
+    Err(ServiceError::Invalid(
+        "repository revision could not be resolved to an immutable commit".into(),
+    ))
 }
 
 async fn get_batch(
@@ -5066,6 +5122,72 @@ mod tests {
             } else {
                 assert_ne!(resolved, revision);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn git_remote_base_resolution_freezes_branch_tag_and_full_sha() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let remote = temp.path().join("remote.git");
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        std::fs::create_dir_all(&work).unwrap();
+        run(&["init", "-b", "main", work.to_str().unwrap()]);
+        run(&[
+            "-C",
+            work.to_str().unwrap(),
+            "config",
+            "user.name",
+            "Anvil Test",
+        ]);
+        run(&[
+            "-C",
+            work.to_str().unwrap(),
+            "config",
+            "user.email",
+            "anvil@example.test",
+        ]);
+        std::fs::write(work.join("README.md"), "base\n").unwrap();
+        run(&["-C", work.to_str().unwrap(), "add", "README.md"]);
+        run(&["-C", work.to_str().unwrap(), "commit", "-m", "base"]);
+        run(&[
+            "-C",
+            work.to_str().unwrap(),
+            "tag",
+            "-a",
+            "v1.0",
+            "-m",
+            "release",
+        ]);
+        run(&[
+            "clone",
+            "--bare",
+            work.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ]);
+        let commit =
+            String::from_utf8(run(&["-C", work.to_str().unwrap(), "rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim()
+                .to_owned();
+        for revision in ["main", "v1.0", commit.as_str()] {
+            assert_eq!(
+                resolve_git_remote_base(remote.to_str().unwrap(), revision)
+                    .await
+                    .unwrap(),
+                commit
+            );
         }
     }
 
