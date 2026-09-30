@@ -48,6 +48,25 @@ struct Preview {
     session_id: String,
     port: u16,
 }
+#[derive(Debug, Deserialize, JsonSchema)]
+struct BatchTask {
+    task_id: String,
+    prompt: String,
+    #[serde(default)]
+    dependencies: Vec<String>,
+    owner: Option<String>,
+    policy: Option<Value>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+struct BatchSubmission {
+    project: String,
+    repository: String,
+    #[serde(rename = "ref")]
+    reference: String,
+    concurrency: usize,
+    tasks: Vec<BatchTask>,
+    idempotency_key: String,
+}
 
 #[derive(Clone)]
 struct AnvilMcp {
@@ -184,6 +203,16 @@ impl AnvilMcp {
         Ok(Json(
             json!({"accepted":true,"session_id":session.get("id").and_then(Value::as_str),"session":session}),
         ))
+    }
+    #[rmcp::tool(description = "Atomically accept a durable batch plan and its logical tasks. Task execution is queued for later provisioning.")]
+    async fn anvil_submit_batch(&self, Parameters(p): Parameters<BatchSubmission>) -> Result<Json<Value>, ErrorData> {
+        let tasks: Vec<_> = p.tasks.into_iter().map(|task| json!({"task_id":task.task_id,"prompt":task.prompt,"dependencies":task.dependencies,"owner":task.owner,"policy":task.policy.unwrap_or(Value::Null)})).collect();
+        let url = self.base.join("v1/batches").map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        let response = self.client.post(url).header("idempotency-key", p.idempotency_key).json(&json!({"project":p.project,"repository":p.repository,"ref":p.reference,"concurrency":p.concurrency,"tasks":tasks})).send().await.map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        let status = response.status();
+        let body = response.json::<Value>().await.map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        if !status.is_success() { return Err(ErrorData::internal_error(format!("Anvil API returned {status}"), Some(json!({"http_status":status.as_u16(),"error":body})))); }
+        Ok(Json(body))
     }
     #[rmcp::tool(description = "List available Anvil development sessions.")]
     async fn anvil_list_sessions(&self) -> Result<Json<Value>, ErrorData> {

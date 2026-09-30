@@ -1655,6 +1655,9 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
         .route("/v1/sessions", post(create).get(enumerate))
+        .route("/v1/batches", post(submit_batch))
+        .route("/v1/batches/:id", get(get_batch))
+        .route("/v1/tasks/:id", get(get_task))
         .route("/v1/sessions/:id", get(session).delete(remove))
         .route("/v1/sessions/:id/messages", post(prompt).get(messages))
         .route("/v1/sessions/:id/complete", post(complete))
@@ -1682,6 +1685,71 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/opencode/config", get(opencode_config))
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchSubmission {
+    project: String,
+    repository: String,
+    #[serde(rename = "ref")]
+    revision: String,
+    #[serde(default)]
+    concurrency: usize,
+    #[serde(default)]
+    tasks: Vec<BatchTaskSubmission>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct BatchTaskSubmission {
+    task_id: String,
+    prompt: String,
+    #[serde(default)]
+    dependencies: Vec<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    policy: Value,
+}
+
+async fn submit_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<BatchSubmission>,
+) -> Result<(StatusCode, Json<Value>), ServiceError> {
+    let project = Project::new(&request.project).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    if request.tasks.is_empty() || request.concurrency == 0 {
+        return Err(ServiceError::Invalid("tasks and positive concurrency are required".into()));
+    }
+    Repository::new(&request.repository).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    GitRef::new(&request.revision).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let mut seen = std::collections::HashSet::new();
+    for task in &request.tasks {
+        if task.task_id.trim().is_empty() || !seen.insert(task.task_id.clone()) {
+            return Err(ServiceError::Invalid(format!("duplicate or empty task_id: {}", task.task_id)));
+        }
+        Prompt::new(&task.prompt).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        if task.dependencies.iter().any(|dependency| !request.tasks.iter().any(|candidate| &candidate.task_id == dependency)) {
+            return Err(ServiceError::Invalid(format!("task {} has an unknown dependency", task.task_id)));
+        }
+    }
+    let key = headers.get("idempotency-key").and_then(|value| value.to_str().ok()).filter(|value| !value.trim().is_empty()).ok_or_else(|| ServiceError::Invalid("Idempotency-Key header is required".into()))?;
+    let batch_id = uuid::Uuid::new_v4().to_string();
+    let task_ids: Vec<_> = request.tasks.iter().map(|task| task.task_id.clone()).collect();
+    let accepted_tasks: Vec<_> = request.tasks.iter().map(|task| (task.task_id.clone(), json!({"task_id":task.task_id,"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"base_id":request.revision,"prompt":task.prompt,"dependencies":task.dependencies,"owner":task.owner,"policy":task.policy,"state":"queued"}))).collect();
+    let batch = json!({"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"resolved_base_id":request.revision,"accepted_task_ids":task_ids,"rejected_task_ids":[],"preflight_results":[],"queued_count":request.tasks.len(),"runnable_count":request.tasks.iter().filter(|task|task.dependencies.is_empty()).count(),"requested_concurrency":request.concurrency,"duplicate_suppression":[]});
+    let semantic_request = serde_json::to_value(&request).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let acceptance = state.store().map_err(|error| ServiceError::Store(error.into()))?.accept_batch(key, &project.name, &semantic_request, &batch_id, &batch, &accepted_tasks).map_err(|error| match error { store::StoreError::Conflict => ServiceError::Conflict("idempotency key was already used for a different batch plan".into()), other => ServiceError::Store(other.to_string()) })?;
+    let status = if matches!(acceptance, store::Acceptance::Created(_)) { StatusCode::CREATED } else { StatusCode::OK };
+    let store::Acceptance::Created(result) | store::Acceptance::Replayed(result) = acceptance;
+    Ok((status, Json(result.result)))
+}
+
+async fn get_batch(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ServiceError> {
+    state.store().map_err(|error| ServiceError::Store(error.into()))?.get_resource("batch", &id).map_err(|error| ServiceError::Store(error.to_string()))?.map(Json).ok_or(ServiceError::NotFound)
+}
+
+async fn get_task(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ServiceError> {
+    state.store().map_err(|error| ServiceError::Store(error.into()))?.get_resource("task", &id).map_err(|error| ServiceError::Store(error.to_string()))?.map(Json).ok_or(ServiceError::NotFound)
 }
 async fn health() -> Json<Value> {
     Json(json!({"status":"ok"}))
