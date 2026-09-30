@@ -1810,7 +1810,7 @@ async fn submit_batch(
                 .collect();
             (
                 id.clone(),
-                json!({"task_id":id,"requested_task_id":task.task_id,"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"base_id":resolved_base,"base_commit":resolved_base,"prompt":task.prompt,"dependencies":dependencies,"owner":task.owner,"policy":task.policy,"pr_policy":task.pr_policy,"evidence_contract":task.evidence_contract,"state":"queued"}),
+                json!({"task_id":id,"requested_task_id":task.task_id,"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"base_id":resolved_base,"base_commit":resolved_base,"prompt":task.prompt,"dependencies":dependencies,"owner":task.owner,"policy":task.policy,"pr_policy":task.pr_policy,"evidence_contract":task.evidence_contract,"batch_policies":request.policies,"state":"queued"}),
             )
         })
         .collect();
