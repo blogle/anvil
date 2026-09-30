@@ -329,9 +329,21 @@ for name in "$api_a_name" "$api_b_name"; do
     ([$pod.containers[] | select(.name == "sandbox") | .volumeMounts[] | select(.name == "shared-nix")] | length == 2 and
       all(.[]; .readOnly == true and ((.mountPath == "/nix/store" and .subPath == "store") or (.mountPath == "/nix/var/nix/daemon-socket" and .subPath == "var/nix/daemon-socket"))))' >/dev/null
 done
-api_a_pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$api_a_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
-api_b_pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$api_b_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
-test -n "$api_a_pod" && test -n "$api_b_pod"
+sandbox_endpoint_pod() {
+  local name="$1" pod="" deadline=$((SECONDS + 120))
+  while (( SECONDS < deadline )); do
+    pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$name" -o json 2>/dev/null | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
+    if [ -n "$pod" ]; then
+      printf '%s\n' "$pod"
+      return 0
+    fi
+    sleep 0.2
+  done
+  printf 'timed out waiting for sandbox endpoint %s\n' "$name" >&2
+  return 1
+}
+api_a_pod="$(sandbox_endpoint_pod "$api_a_name")"
+api_b_pod="$(sandbox_endpoint_pod "$api_b_name")"
 agent_exec() {
   local pod="$1"
   shift
