@@ -153,7 +153,9 @@ function updateSidebar() {
         elapsed.textContent = formatStateElapsed(sessionActivity(session.id))
       }
     })
-    list.replaceChildren(...rows)
+    if (rows.length !== list.children.length || rows.some((row, index) => row !== list.children[index])) {
+      list.replaceChildren(...rows)
+    }
   }
   if (focused) sidebar.querySelector(`[data-focus-key="${CSS.escape(focused)}"]`)?.focus({ preventScroll: true })
 }
