@@ -6735,7 +6735,10 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-            assert_eq!(task_after_restart["base_commit"], first_body["resolved_base_id"]);
+            assert_eq!(
+                task_after_restart["base_commit"],
+                first_body["resolved_base_id"]
+            );
         }
         let persisted_task_id = first_body["accepted_task_ids"][0].as_str().unwrap();
         let attempts_after_restart = reopened
