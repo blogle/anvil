@@ -1504,4 +1504,43 @@ mod tests {
         }
         assert_eq!(observed, (1..=7).collect::<Vec<_>>());
     }
+
+    #[test]
+    fn concurrent_materializations_have_one_total_order_and_matching_final_snapshot() {
+        let (dir, store) = store();
+        let mut writers = Vec::new();
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        for transition in 1..=8 {
+            let writer = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
+            let barrier = barrier.clone();
+            writers.push(std::thread::spawn(move || {
+                barrier.wait();
+                writer
+                    .materialize(
+                        "session",
+                        "shared",
+                        Some(&serde_json::json!({"transition":transition})),
+                    )
+                    .unwrap();
+            }));
+        }
+        barrier.wait();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let page = store.changes_after("anv1.0", 100).unwrap();
+        assert_eq!(page.changes.len(), 8);
+        let transitions = page
+            .changes
+            .iter()
+            .map(|change| change["change"]["record"]["transition"].as_i64().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(transitions, (1..=8).collect());
+        let (snapshot_cursor, snapshot) = store.materialized_snapshot().unwrap();
+        assert_eq!(snapshot_cursor, page.cursor);
+        assert_eq!(
+            snapshot[0]["record"]["transition"],
+            page.changes.last().unwrap()["change"]["record"]["transition"]
+        );
+    }
 }
