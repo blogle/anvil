@@ -6133,7 +6133,10 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-            assert_eq!(task_after_restart["base_commit"], first_body["resolved_base_id"]);
+            assert_eq!(
+                task_after_restart["base_commit"],
+                first_body["resolved_base_id"]
+            );
         }
         let persisted_task_id = first_body["accepted_task_ids"][0].as_str().unwrap();
         let attempts_after_restart = reopened
@@ -6152,8 +6155,14 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(attempts_after_restart["attempts"].as_array().unwrap().len(), 2);
-        assert_eq!(attempts_after_restart["attempts"][0]["attempt_id"], attempt_id);
+        assert_eq!(
+            attempts_after_restart["attempts"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            attempts_after_restart["attempts"][0]["attempt_id"],
+            attempt_id
+        );
         let retry_after_restart = reopened
             .clone()
             .oneshot(submit(plan, "stable-key"))
