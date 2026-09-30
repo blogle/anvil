@@ -350,7 +350,7 @@ agent_exec() {
   kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod" -c sandbox -- \
     setpriv --reuid=1000 --regid=1000 --init-groups -- env HOME=/home/anvil "$@"
 }
-agent_exec "$api_a_pod" /bin/bash -c '
+agent_exec "$api_a_pod" /bin/bash -xc '
   test "$(id -u):$(id -g)" = 1000:1000
   ! touch /nix/store/anvil-must-not-write
   ! pgrep -x nix-daemon
