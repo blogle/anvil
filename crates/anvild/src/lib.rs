@@ -1736,7 +1736,6 @@ async fn submit_batch(
     Repository::new(&request.repository)
         .map_err(|error| ServiceError::Invalid(error.to_string()))?;
     GitRef::new(&request.revision).map_err(|error| ServiceError::Invalid(error.to_string()))?;
-    let resolved_base = resolve_batch_base(&state, &request.repository, &request.revision).await?;
     let mut seen = std::collections::HashSet::new();
     for task in &request.tasks {
         if task.task_id.trim().is_empty() || !seen.insert(task.task_id.clone()) {
@@ -1763,6 +1762,23 @@ async fn submit_batch(
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| ServiceError::Invalid("Idempotency-Key header is required".into()))?;
+    let semantic_request =
+        serde_json::to_value(&request).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let store = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?;
+    if let Some(replayed) = store
+        .replay_batch(key, &project.name, &semantic_request)
+        .map_err(|error| match error {
+            store::StoreError::Conflict => ServiceError::Conflict(
+                "idempotency key was already used for a different batch plan".into(),
+            ),
+            other => ServiceError::Store(other.to_string()),
+        })?
+    {
+        return Ok((StatusCode::OK, Json(replayed.result)));
+    }
+    let resolved_base = resolve_batch_base(&state, &request.repository, &request.revision).await?;
     let batch_id = uuid::Uuid::new_v4().to_string();
     // Client task names are batch-local aliases. Durable Task IDs are globally unique,
     // which prevents two independent batches that both call work "build" from colliding.
@@ -1793,11 +1809,7 @@ async fn submit_batch(
         })
         .collect();
     let batch = json!({"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"resolved_base_id":resolved_base,"base_commit":resolved_base,"accepted_task_ids":accepted_ids,"requested_task_ids":request.tasks.iter().map(|task| task.task_id.clone()).collect::<Vec<_>>(),"rejected_task_ids":[],"preflight_results":[],"queued_count":request.tasks.len(),"runnable_count":request.tasks.iter().filter(|task|task.dependencies.is_empty()).count(),"requested_concurrency":request.concurrency,"duplicate_suppression":[]});
-    let semantic_request =
-        serde_json::to_value(&request).map_err(|error| ServiceError::Invalid(error.to_string()))?;
-    let acceptance = state
-        .store()
-        .map_err(|error| ServiceError::Store(error.into()))?
+    let acceptance = store
         .accept_batch(store::BatchAcceptance {
             key,
             scope: &project.name,
@@ -1940,17 +1952,21 @@ async fn list_attempts(
 async fn create_attempt(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<(StatusCode, Json<Value>), ServiceError> {
+    let key = headers.get("idempotency-key").and_then(|value| value.to_str().ok()).filter(|value| !value.trim().is_empty()).ok_or_else(|| ServiceError::Invalid("Idempotency-Key header is required for attempt creation".into()))?;
     let attempt_id = uuid::Uuid::new_v4().to_string();
-    let attempt = state
+    let acceptance = state
         .store()
         .map_err(|error| ServiceError::Store(error.into()))?
-        .create_attempt(&id, &attempt_id)
+        .create_attempt(&id, &attempt_id, key)
         .map_err(|error| match error {
             store::StoreError::NotFound => ServiceError::NotFound,
+            store::StoreError::Conflict => ServiceError::Conflict("attempt idempotency key is bound to a different task".into()),
             other => ServiceError::Store(other.to_string()),
         })?;
-    Ok((StatusCode::CREATED, Json(attempt)))
+    let status = if acceptance.created { StatusCode::CREATED } else { StatusCode::OK };
+    Ok((status, Json(acceptance.attempt)))
 }
 
 #[derive(Deserialize)]
@@ -5034,7 +5050,7 @@ mod tests {
     #[tokio::test]
     async fn batch_rest_accepts_replays_queries_attempts_and_rejects_conflicts() {
         let upstream = MockServer::start_async().await;
-        upstream.mock(|when, then| {
+        let resolution = upstream.mock(|when, then| {
             when.method(GET);
             then.status(200)
                 .json_body(json!({"sha":"0123456789abcdef0123456789abcdef01234567"}));
@@ -5053,6 +5069,11 @@ mod tests {
         let first_body: Value = serde_json::from_slice(&axum::body::to_bytes(first.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(first_body["requested_revision"], "main");
         assert_eq!(first_body["resolved_base_id"], "0123456789abcdef0123456789abcdef01234567");
+        resolution.delete_async().await;
+        upstream.mock(|when, then| {
+            when.method(GET);
+            then.status(503);
+        });
         let replay = app.clone().oneshot(submit(plan.clone(), "stable-key")).await.unwrap();
         assert_eq!(replay.status(), StatusCode::OK);
         let replay_body: Value = serde_json::from_slice(&axum::body::to_bytes(replay.into_body(), usize::MAX).await.unwrap()).unwrap();
@@ -5069,10 +5090,18 @@ mod tests {
             if expected.get("batch_id").is_some() { assert_eq!(body, expected); } else { assert_eq!(body["task_id"], task_id); }
         }
         for ordinal in 1..=2 {
-            let response = app.clone().oneshot(Request::builder().method("POST").uri(format!("/v1/tasks/{task_id}/attempts")).body(Body::empty()).unwrap()).await.unwrap();
+            let key = format!("attempt-key-{ordinal}");
+            let response = app.clone().oneshot(Request::builder().method("POST").uri(format!("/v1/tasks/{task_id}/attempts")).header("idempotency-key", &key).body(Body::empty()).unwrap()).await.unwrap();
             assert_eq!(response.status(), StatusCode::CREATED);
             let body: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
             assert_eq!(body["ordinal"], ordinal);
+            if ordinal == 1 {
+                let retry = app.clone().oneshot(Request::builder().method("POST").uri(format!("/v1/tasks/{task_id}/attempts")).header("idempotency-key", &key).body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(retry.status(), StatusCode::OK);
+                let replay: Value = serde_json::from_slice(&axum::body::to_bytes(retry.into_body(), usize::MAX).await.unwrap()).unwrap();
+                assert_eq!(replay["attempt_id"], body["attempt_id"]);
+                assert_eq!(replay["ordinal"], 1);
+            }
         }
         let listed = app.clone().oneshot(Request::builder().uri(format!("/v1/tasks/{task_id}/attempts")).body(Body::empty()).unwrap()).await.unwrap();
         let attempts: Value = serde_json::from_slice(&axum::body::to_bytes(listed.into_body(), usize::MAX).await.unwrap()).unwrap();
