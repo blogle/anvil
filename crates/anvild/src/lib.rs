@@ -1658,6 +1658,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/batches", post(submit_batch))
         .route("/v1/batches/:id", get(get_batch))
         .route("/v1/tasks/:id", get(get_task))
+        .route(
+            "/v1/tasks/:id/attempts",
+            get(list_attempts).post(create_attempt),
+        )
+        .route("/v1/attempts/:id/session", post(bind_attempt_session))
         .route("/v1/sessions/:id", get(session).delete(remove))
         .route("/v1/sessions/:id/messages", post(prompt).get(messages))
         .route("/v1/sessions/:id/complete", post(complete))
@@ -1687,7 +1692,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct BatchSubmission {
     project: String,
     repository: String,
@@ -1695,6 +1700,8 @@ struct BatchSubmission {
     revision: String,
     #[serde(default)]
     concurrency: usize,
+    #[serde(default)]
+    allow_competing_tasks: bool,
     #[serde(default)]
     tasks: Vec<BatchTaskSubmission>,
 }
@@ -1716,40 +1723,207 @@ async fn submit_batch(
     headers: HeaderMap,
     Json(request): Json<BatchSubmission>,
 ) -> Result<(StatusCode, Json<Value>), ServiceError> {
-    let project = Project::new(&request.project).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let project =
+        Project::new(&request.project).map_err(|error| ServiceError::Invalid(error.to_string()))?;
     if request.tasks.is_empty() || request.concurrency == 0 {
-        return Err(ServiceError::Invalid("tasks and positive concurrency are required".into()));
+        return Err(ServiceError::Invalid(
+            "tasks and positive concurrency are required".into(),
+        ));
     }
-    Repository::new(&request.repository).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    Repository::new(&request.repository)
+        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
     GitRef::new(&request.revision).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let resolved_base = resolve_batch_base(&state, &request.repository, &request.revision).await?;
     let mut seen = std::collections::HashSet::new();
     for task in &request.tasks {
         if task.task_id.trim().is_empty() || !seen.insert(task.task_id.clone()) {
-            return Err(ServiceError::Invalid(format!("duplicate or empty task_id: {}", task.task_id)));
+            return Err(ServiceError::Invalid(format!(
+                "duplicate or empty task_id: {}",
+                task.task_id
+            )));
         }
         Prompt::new(&task.prompt).map_err(|error| ServiceError::Invalid(error.to_string()))?;
-        if task.dependencies.iter().any(|dependency| !request.tasks.iter().any(|candidate| &candidate.task_id == dependency)) {
-            return Err(ServiceError::Invalid(format!("task {} has an unknown dependency", task.task_id)));
+        if task.dependencies.iter().any(|dependency| {
+            !request
+                .tasks
+                .iter()
+                .any(|candidate| &candidate.task_id == dependency)
+        }) {
+            return Err(ServiceError::Invalid(format!(
+                "task {} has an unknown dependency",
+                task.task_id
+            )));
         }
     }
-    let key = headers.get("idempotency-key").and_then(|value| value.to_str().ok()).filter(|value| !value.trim().is_empty()).ok_or_else(|| ServiceError::Invalid("Idempotency-Key header is required".into()))?;
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ServiceError::Invalid("Idempotency-Key header is required".into()))?;
     let batch_id = uuid::Uuid::new_v4().to_string();
-    let task_ids: Vec<_> = request.tasks.iter().map(|task| task.task_id.clone()).collect();
-    let accepted_tasks: Vec<_> = request.tasks.iter().map(|task| (task.task_id.clone(), json!({"task_id":task.task_id,"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"base_id":request.revision,"prompt":task.prompt,"dependencies":task.dependencies,"owner":task.owner,"policy":task.policy,"state":"queued"}))).collect();
-    let batch = json!({"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"resolved_base_id":request.revision,"accepted_task_ids":task_ids,"rejected_task_ids":[],"preflight_results":[],"queued_count":request.tasks.len(),"runnable_count":request.tasks.iter().filter(|task|task.dependencies.is_empty()).count(),"requested_concurrency":request.concurrency,"duplicate_suppression":[]});
-    let semantic_request = serde_json::to_value(&request).map_err(|error| ServiceError::Invalid(error.to_string()))?;
-    let acceptance = state.store().map_err(|error| ServiceError::Store(error.into()))?.accept_batch(key, &project.name, &semantic_request, &batch_id, &batch, &accepted_tasks).map_err(|error| match error { store::StoreError::Conflict => ServiceError::Conflict("idempotency key was already used for a different batch plan".into()), other => ServiceError::Store(other.to_string()) })?;
-    let status = if matches!(acceptance, store::Acceptance::Created(_)) { StatusCode::CREATED } else { StatusCode::OK };
-    let store::Acceptance::Created(result) | store::Acceptance::Replayed(result) = acceptance;
+    let task_ids: Vec<_> = request
+        .tasks
+        .iter()
+        .map(|task| task.task_id.clone())
+        .collect();
+    let accepted_tasks: Vec<_> = request.tasks.iter().map(|task| (task.task_id.clone(), json!({"task_id":task.task_id,"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"base_commit":resolved_base,"prompt":task.prompt,"dependencies":task.dependencies,"owner":task.owner,"policy":task.policy,"state":"queued"}))).collect();
+    let batch = json!({"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"base_commit":resolved_base,"accepted_task_ids":task_ids,"rejected_task_ids":[],"preflight_results":[],"queued_count":request.tasks.len(),"runnable_count":request.tasks.iter().filter(|task|task.dependencies.is_empty()).count(),"requested_concurrency":request.concurrency,"duplicate_suppression":[]});
+    let semantic_request =
+        serde_json::to_value(&request).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let acceptance = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .accept_batch(
+            key,
+            &project.name,
+            &semantic_request,
+            &batch_id,
+            &batch,
+            &accepted_tasks,
+            request.allow_competing_tasks,
+        )
+        .map_err(|error| match error {
+            store::StoreError::Conflict => ServiceError::Conflict(
+                "idempotency key was already used for a different batch plan".into(),
+            ),
+            other => ServiceError::Store(other.to_string()),
+        })?;
+    let status = if matches!(&acceptance, store::Acceptance::Created(_)) {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    let (store::Acceptance::Created(result) | store::Acceptance::Replayed(result)) = acceptance;
     Ok((status, Json(result.result)))
 }
 
-async fn get_batch(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ServiceError> {
-    state.store().map_err(|error| ServiceError::Store(error.into()))?.get_resource("batch", &id).map_err(|error| ServiceError::Store(error.to_string()))?.map(Json).ok_or(ServiceError::NotFound)
+async fn resolve_batch_base(
+    state: &AppState,
+    repository: &str,
+    revision: &str,
+) -> Result<String, ServiceError> {
+    resolve_batch_base_at(&state.config.github_api_url, repository, revision).await
 }
 
-async fn get_task(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ServiceError> {
-    state.store().map_err(|error| ServiceError::Store(error.into()))?.get_resource("task", &id).map_err(|error| ServiceError::Store(error.to_string()))?.map(Json).ok_or(ServiceError::NotFound)
+async fn resolve_batch_base_at(
+    api_url: &str,
+    repository: &str,
+    revision: &str,
+) -> Result<String, ServiceError> {
+    let repo = reqwest::Url::parse(repository)
+        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    if repo.host_str() != Some("github.com") {
+        return Err(ServiceError::Invalid(
+            "immutable base resolution is not supported for this repository host".into(),
+        ));
+    }
+    let path = repo.path().trim_matches('/').trim_end_matches(".git");
+    let endpoint = format!(
+        "{}/repos/{path}/commits/{}",
+        api_url.trim_end_matches('/'),
+        revision
+    );
+    let response = reqwest::Client::new()
+        .get(endpoint)
+        .header(reqwest::header::USER_AGENT, "anvil-controller")
+        .send()
+        .await
+        .map_err(|error| ServiceError::OpenCode(format!("base resolution failed: {error}")))?;
+    if !response.status().is_success() {
+        return Err(ServiceError::Invalid(format!(
+            "repository revision could not be resolved: {}",
+            response.status()
+        )));
+    }
+    let value: Value = response.json().await.map_err(|error| {
+        ServiceError::Invalid(format!("invalid base resolution response: {error}"))
+    })?;
+    let commit = value
+        .get("sha")
+        .and_then(Value::as_str)
+        .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| {
+            ServiceError::Invalid("repository did not return a full commit SHA".into())
+        })?;
+    Ok(commit.to_ascii_lowercase())
+}
+
+async fn get_batch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ServiceError> {
+    state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .get_resource("batch", &id)
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+        .map(Json)
+        .ok_or(ServiceError::NotFound)
+}
+
+async fn get_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ServiceError> {
+    state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .get_resource("task", &id)
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+        .map(Json)
+        .ok_or(ServiceError::NotFound)
+}
+
+async fn list_attempts(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ServiceError> {
+    let attempts = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .attempts_for_task(&id)
+        .map_err(|error| ServiceError::Store(error.to_string()))?;
+    Ok(Json(json!({"task_id":id,"attempts":attempts})))
+}
+
+async fn create_attempt(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<Value>), ServiceError> {
+    let attempt_id = uuid::Uuid::new_v4().to_string();
+    let attempt = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .create_attempt(&id, &attempt_id)
+        .map_err(|error| match error {
+            store::StoreError::NotFound => ServiceError::NotFound,
+            other => ServiceError::Store(other.to_string()),
+        })?;
+    Ok((StatusCode::CREATED, Json(attempt)))
+}
+
+#[derive(Deserialize)]
+struct AttemptSessionBinding {
+    session_id: String,
+}
+
+async fn bind_attempt_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(binding): Json<AttemptSessionBinding>,
+) -> Result<Json<Value>, ServiceError> {
+    if binding.session_id.trim().is_empty() {
+        return Err(ServiceError::Invalid("session_id must not be empty".into()));
+    }
+    state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .bind_attempt_session(&id, &binding.session_id)
+        .map(Json)
+        .map_err(|error| match error {
+            store::StoreError::NotFound => ServiceError::NotFound,
+            other => ServiceError::Store(other.to_string()),
+        })
 }
 async fn health() -> Json<Value> {
     Json(json!({"status":"ok"}))
@@ -4770,6 +4944,27 @@ mod tests {
     use httpmock::{Method::GET, MockServer};
     use std::collections::BTreeMap;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn batch_base_resolution_freezes_branch_tag_and_full_sha() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(GET);
+            then.status(200)
+                .json_body(json!({"sha":"0123456789abcdef0123456789abcdef01234567"}));
+        });
+        for revision in ["main", "v1.2.3", "0123456789abcdef0123456789abcdef01234567"] {
+            let resolved = resolve_batch_base_at(
+                &server.base_url(),
+                "https://github.com/example/project.git",
+                revision,
+            )
+            .await
+            .unwrap();
+            assert_eq!(resolved, "0123456789abcdef0123456789abcdef01234567");
+            assert_ne!(resolved, revision);
+        }
+    }
 
     struct FakeSandbox;
 
