@@ -235,9 +235,10 @@ impl LocalSandboxApi {
             .env("OPENCODE_CONFIG_DIR", profile.join("config"))
             .env("OPENCODE_DISABLE_CHANNEL_DB", "1")
             .env("DISPLAY", ":99")
-            .env("ANVIL_GIT_COMMITTER_NAME", &self.config.git_committer_name)
-            .env("ANVIL_GIT_COMMITTER_EMAIL", &self.config.git_committer_email)
             .stdin(Stdio::null());
+        for (key, value) in super::git_committer_environment(&self.config) {
+            command.env(key, value);
+        }
         let worker_log =
             std::fs::File::create(state.directory.join("worker.log")).map_err(local_error)?;
         command
@@ -782,6 +783,8 @@ mod tests {
             github_app_id: None,
             github_installation_id: None,
             github_private_key: None,
+            git_committer_name: crate::DEFAULT_GIT_COMMITTER_NAME.into(),
+            git_committer_email: crate::DEFAULT_GIT_COMMITTER_EMAIL.into(),
             session_signing_secret: None,
             session_capability_ttl: Duration::from_secs(60),
             github_api_url: "https://api.github.com".into(),
@@ -848,7 +851,8 @@ mod tests {
             std::fs::write(
                 &fake_opencode,
                 format!(
-                    "#!/bin/sh\nexport ANVIL_TEST_FAKE_OPENCODE_PORT=\"$5\"\nexec '{test_binary}' --exact local::tests::fake_opencode_worker_process --nocapture\n"
+                    "#!/bin/sh\nprintf '%s\\n%s\\n' \"$ANVIL_GIT_COMMITTER_NAME\" \"$ANVIL_GIT_COMMITTER_EMAIL\" > '{}/worker-identity'\nexport ANVIL_TEST_FAKE_OPENCODE_PORT=\"$5\"\nexec '{test_binary}' --exact local::tests::fake_opencode_worker_process --nocapture\n",
+                    root.display()
                 ),
             )
             .unwrap();
@@ -866,8 +870,12 @@ mod tests {
         }
 
         fn api(&self) -> LocalSandboxApi {
+            self.api_with_config(test_config())
+        }
+
+        fn api_with_config(&self, config: Config) -> LocalSandboxApi {
             LocalSandboxApi::with_paths(
-                test_config(),
+                config,
                 self.runtime.clone(),
                 self.fake_opencode.clone(),
                 self.profile.clone(),
@@ -931,7 +939,10 @@ mod tests {
     async fn local_backend_preserves_workspace_and_conversation_across_suspend_resume_and_restart()
     {
         let fixture = Fixture::new();
-        let api = fixture.api();
+        let mut configured = test_config();
+        configured.git_committer_name = "Anvil".into();
+        configured.git_committer_email = "anvil@noreply.thejeffer.net".into();
+        let api = fixture.api_with_config(configured);
         let initial_work_state = initial_work_state();
         let session = api
             .create(
@@ -946,6 +957,10 @@ mod tests {
             .await
             .unwrap();
         let directory = fixture.runtime.join(&session.id);
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("worker-identity")).unwrap(),
+            "Anvil\nanvil@noreply.thejeffer.net\n"
+        );
         let workspace = directory.join("home/workspace/demo/target.txt");
         assert_eq!(
             std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
