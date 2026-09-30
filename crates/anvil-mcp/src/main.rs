@@ -76,6 +76,7 @@ struct ResourceId {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TaskResourceId {
     task_id: String,
+    idempotency_key: String,
 }
 
 #[derive(Clone)]
@@ -259,7 +260,12 @@ impl AnvilMcp {
     }
     #[rmcp::tool(description = "Create a replacement execution attempt for an existing logical task.")]
     async fn anvil_create_attempt(&self, Parameters(p): Parameters<TaskResourceId>) -> Result<Json<Value>, ErrorData> {
-        Ok(Json(self.call(Method::POST, &format!("v1/tasks/{}/attempts", p.task_id), Some(json!({}))).await?))
+        let url = self.base.join(&format!("v1/tasks/{}/attempts", p.task_id)).map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        let response = self.client.post(url).header("idempotency-key", p.idempotency_key).json(&json!({})).send().await.map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        let status = response.status();
+        let body = response.json::<Value>().await.map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        if !status.is_success() { return Err(ErrorData::internal_error(format!("Anvil API returned {status}"), Some(json!({"http_status":status.as_u16(),"error":body})))); }
+        Ok(Json(body))
     }
     #[rmcp::tool(description = "List available Anvil development sessions.")]
     async fn anvil_list_sessions(&self) -> Result<Json<Value>, ErrorData> {
@@ -585,14 +591,15 @@ mod tests {
         }
         server.mock(|when, then| {
             when.method(httpmock::Method::POST)
-                .path("/v1/tasks/task-1/attempts");
+                .path("/v1/tasks/task-1/attempts")
+                .header("idempotency-key", "attempt-key");
             then.status(201).json_body(json!({"attempt_id":"attempt-2","ordinal":2}));
         });
         let mcp = AnvilMcp::new(reqwest::Url::parse(&format!("{}/", server.base_url())).unwrap()).unwrap();
         assert_eq!(mcp.anvil_get_batch(Parameters(ResourceId { id: "batch-1".into() })).await.unwrap().0["batch_id"], "batch-1");
         assert_eq!(mcp.anvil_get_task(Parameters(ResourceId { id: "task-1".into() })).await.unwrap().0["task_id"], "task-1");
         assert_eq!(mcp.anvil_get_attempt(Parameters(ResourceId { id: "attempt-1".into() })).await.unwrap().0["attempt_id"], "attempt-1");
-        assert_eq!(mcp.anvil_create_attempt(Parameters(TaskResourceId { task_id: "task-1".into() })).await.unwrap().0["ordinal"], 2);
+        assert_eq!(mcp.anvil_create_attempt(Parameters(TaskResourceId { task_id: "task-1".into(), idempotency_key: "attempt-key".into() })).await.unwrap().0["ordinal"], 2);
     }
 
     #[test]
