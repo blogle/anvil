@@ -982,9 +982,11 @@ mod tests {
             std::fs::read_to_string(fixture.root.join("worker-identity")).unwrap(),
             "Invoking Developer <developer@example.test>\nAnvil <anvil@noreply.thejeffer.net>\n"
         );
-        assert!(!std::fs::read_to_string(fixture.root.join("worker-identity"))
-            .unwrap()
-            .contains("@users.noreply.github.com"));
+        assert!(
+            !std::fs::read_to_string(fixture.root.join("worker-identity"))
+                .unwrap()
+                .contains("@users.noreply.github.com")
+        );
         let workspace = directory.join("home/workspace/demo/target.txt");
         assert_eq!(
             std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
