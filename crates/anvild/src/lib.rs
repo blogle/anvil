@@ -1798,15 +1798,15 @@ async fn submit_batch(
     let acceptance = state
         .store()
         .map_err(|error| ServiceError::Store(error.into()))?
-        .accept_batch(
+        .accept_batch(store::BatchAcceptance {
             key,
-            &project.name,
-            &semantic_request,
-            &batch_id,
-            &batch,
-            &accepted_tasks,
-            request.allow_competing_tasks,
-        )
+            scope: &project.name,
+            request: &semantic_request,
+            batch_id: &batch_id,
+            batch: &batch,
+            tasks: &accepted_tasks,
+            allow_competing: request.allow_competing_tasks,
+        })
         .map_err(|error| match error {
             store::StoreError::Conflict => ServiceError::Conflict(
                 "idempotency key was already used for a different batch plan".into(),
