@@ -2878,8 +2878,9 @@ struct ChangesQuery {
     after: Option<String>,
 }
 
-/// Durable cursor stream of Anvil-normalized session telemetry. Cursors are exclusive;
-/// invalid or expired cursors explicitly request a fresh authoritative snapshot.
+/// Durable cursor stream of Anvil-normalized session state. Cursors are opaque and exclusive;
+/// invalid, expired, or unserviceable cursors explicitly request a fresh snapshot. The log
+/// currently has unbounded retention, so normal operation does not expire a cursor.
 async fn changed_since(
     State(s): State<AppState>,
     Query(query): Query<ChangesQuery>,
@@ -6053,6 +6054,19 @@ mod tests {
             created_at: "2026-01-01T10:00:00Z".into(),
             telemetry: SessionTelemetry::default(),
         }
+    }
+
+    #[test]
+    fn stream_materialization_contains_normalized_axes_without_upstream_events() {
+        let value = normalized_sandbox_value(&active_work_record(activity_session()));
+        assert_eq!(value["session"]["environment_state"], "ready");
+        assert_eq!(value["work_state"]["state"]["state"], "active");
+        assert_eq!(value["binding_state"]["state"], "available");
+        assert!(value.get("telemetry").is_some());
+        assert!(value.get("event").is_none());
+        let public = serde_json::to_string(&value).unwrap();
+        assert!(!public.contains("message.part.updated"));
+        assert!(!public.contains("tool_call"));
     }
 
     fn assistant_observation(

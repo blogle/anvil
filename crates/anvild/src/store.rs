@@ -137,6 +137,8 @@ impl ControllerStore {
     }
 
     /// Read a full materialized snapshot and its boundary from a single SQLite read transaction.
+    /// The change log is intentionally unbounded in this version; pruning must advance an
+    /// explicit retention floor before old cursors can be considered expired.
     pub fn materialized_snapshot(&self) -> Result<(String, Vec<Value>), StoreError> {
         self.materialized_snapshot_with(|| {})
     }
@@ -174,8 +176,9 @@ impl ControllerStore {
         Ok((encode_cursor(cursor), snapshot))
     }
 
-    /// Read strictly after the supplied cursor. Reusing a cursor is deterministic and
-    /// exclusive; cursors beyond the stream or malformed cursors require a full reset.
+    /// Read strictly after an opaque cursor. Reusing it is deterministic and exclusive;
+    /// cursors beyond the stream or crossing a retained-history gap require a full reset.
+    /// History is currently unbounded, so the gap path protects against manual/partial loss.
     pub fn changes_after(&self, cursor: &str, limit: usize) -> Result<ChangePage, StoreError> {
         let Some(after) = decode_cursor(cursor) else {
             return Ok(ChangePage {
@@ -1470,5 +1473,35 @@ mod tests {
             .execute("DELETE FROM orchestration_changes WHERE sequence=1", [])
             .unwrap();
         assert!(store.changes_after("anv1.0", 100).unwrap().reset_required);
+    }
+
+    #[test]
+    fn limited_pages_continue_without_losing_or_duplicating_transitions() {
+        let (_dir, store) = store();
+        for transition in 1..=7 {
+            store
+                .materialize(
+                    "task",
+                    "task-1",
+                    Some(&serde_json::json!({"transition":transition})),
+                )
+                .unwrap();
+        }
+        let mut cursor = "anv1.0".to_owned();
+        let mut observed = Vec::new();
+        loop {
+            let page = store.changes_after(&cursor, 3).unwrap();
+            assert!(!page.reset_required);
+            observed.extend(
+                page.changes
+                    .iter()
+                    .map(|change| change["change"]["record"]["transition"].as_i64().unwrap()),
+            );
+            if page.changes.is_empty() {
+                break;
+            }
+            cursor = page.cursor;
+        }
+        assert_eq!(observed, (1..=7).collect::<Vec<_>>());
     }
 }
