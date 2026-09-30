@@ -14,3 +14,10 @@ queue_rules:
     merge_conditions:
       - check-success = Integration E2E
       - check-success = Batch image and Kind
+
+pull_request_rules:
+  - name: Keep pull requests up to date with main
+    conditions:
+      - base = main
+    actions:
+      update:
