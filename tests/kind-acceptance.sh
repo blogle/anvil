@@ -326,7 +326,7 @@ api_b_name="anvil-$api_b_id"
 for name in "$api_a_name" "$api_b_name"; do
   kubectl --kubeconfig "$kubeconfig" -n "$namespace" get sandbox "$name" -o json | jq -e '
     .spec.podTemplate.spec as $pod |
-    any($pod.volumes[]; .name == "shared-nix" and .persistentVolumeClaim.claimName == "anvil-nix" and .persistentVolumeClaim.readOnly == true) and
+    any($pod.volumes[]; .name == "shared-nix" and .persistentVolumeClaim.claimName == "anvil-nix" and (.persistentVolumeClaim | has("readOnly") | not)) and
     ([$pod.containers[] | select(.name == "sandbox") | .volumeMounts[] | select(.name == "shared-nix")] | length == 2 and
       all(.[]; .readOnly == true and ((.mountPath == "/nix/store" and .subPath == "store") or (.mountPath == "/nix/var/nix/daemon-socket" and .subPath == "var/nix/daemon-socket"))))' >/dev/null
 done
