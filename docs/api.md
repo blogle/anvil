@@ -31,7 +31,14 @@ Session controller routes are:
 | `GET` | `/v1/sessions/{id}/messages` | Read OpenCode messages |
 | `GET` | `/v1/sessions/{id}/status` | Read environment, execution, run, and binding state |
 | `GET` | `/v1/sessions/{id}/activity` | Read the normalized dashboard/activity model |
-| `GET` | `/v1/sessions/{id}/diff` | Read the repository diff |
+| `GET` | `/v1/sessions/{id}/diff` | Read worker changes against its recorded base revision |
+
+The diff response is `{ "status": "ready", "diff": { "base_revision": "<sha>",
+"files": [...], "truncated": false } }`. Files include `path`, optional
+`old_path`, status, line counts, and either textual patch data or an explicit
+`binary`/`too_large` marker. Legacy sessions whose checkout SHA was not recorded
+return `{ "status": "unavailable", "message": "..." }`; the controller never
+substitutes the current default branch.
 | `GET` | `/v1/sessions/{id}/previews/{port}` | Resolve a preview URL |
 | `POST` | `/v1/sessions/{id}/abort` | Abort the current OpenCode turn |
 | `POST` | `/v1/sessions/{id}/suspend` | Suspend the Sandbox |
