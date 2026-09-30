@@ -60,6 +60,20 @@ pub(crate) fn git_committer_environment(config: &Config) -> [(String, String); 2
     ]
 }
 
+pub(crate) fn git_author_environment(
+    author_name: Option<&str>,
+    author_email: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut environment = Vec::new();
+    if let Some(name) = author_name.filter(|value| !value.trim().is_empty()) {
+        environment.push(("ANVIL_GIT_AUTHOR_NAME".into(), name.to_owned()));
+    }
+    if let Some(email) = author_email.filter(|value| !value.trim().is_empty()) {
+        environment.push(("ANVIL_GIT_AUTHOR_EMAIL".into(), email.to_owned()));
+    }
+    environment
+}
+
 const MANAGED: &str = "app.kubernetes.io/managed-by";
 const APP: &str = "app.kubernetes.io/name";
 const LOGIN_TTL: Duration = Duration::from_secs(10 * 60);
@@ -1798,20 +1812,10 @@ async fn create(
                 .map_err(ServiceError::Config)?,
         ));
     }
-    if let Some(name) = r
-        .author_name
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        sandbox_env.push(("ANVIL_GIT_AUTHOR_NAME".into(), name.to_owned()));
-    }
-    if let Some(email) = r
-        .author_email
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        sandbox_env.push(("ANVIL_GIT_AUTHOR_EMAIL".into(), email.to_owned()));
-    }
+    sandbox_env.extend(git_author_environment(
+        r.author_name.as_deref(),
+        r.author_email.as_deref(),
+    ));
     let started_at = chrono_like_now();
     let initial_submission = RunSubmission {
         run_id: RunId(new_run_id()),

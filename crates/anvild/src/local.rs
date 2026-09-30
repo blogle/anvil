@@ -965,11 +965,17 @@ mod tests {
         let mut request = fixture.request("demo");
         request.author_name = Some("Invoking Developer".into());
         request.author_email = Some("developer@example.test".into());
+        let author_environment = crate::git_author_environment(
+            request.author_name.as_deref(),
+            request.author_email.as_deref(),
+        );
+        let mut sandbox_environment = vec![("ANVIL_TEST_ENV".into(), "retained".into())];
+        sandbox_environment.extend(author_environment);
         let session = api
             .create(
                 "demo-12345678",
                 &request,
-                &[("ANVIL_TEST_ENV".into(), "retained".into())],
+                &sandbox_environment,
                 &initial_work_state,
             )
             .await
