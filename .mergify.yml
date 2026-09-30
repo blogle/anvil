@@ -16,8 +16,10 @@ queue_rules:
       - check-success = Batch image and Kind
 
 pull_request_rules:
-  - name: Keep pull requests up to date with main
+  - name: Keep pull requests rebased on main
     conditions:
       - base = main
+      - -draft
     actions:
-      update:
+      rebase:
+        bot_account: blogle
