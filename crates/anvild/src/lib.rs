@@ -5383,6 +5383,82 @@ fn safe_activity_text(value: &Value, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
+fn summarize_tool_input(tool: &str, input: &Value) -> Option<String> {
+    let input = redact_activity_value(input);
+    let object = input.as_object()?;
+    let tool = tool.to_ascii_lowercase();
+    let value = if matches!(tool.as_str(), "bash" | "shell") {
+        object
+            .get("command")
+            .or_else(|| object.get("cmd"))
+            .or_else(|| object.get("script"))
+    } else if matches!(tool.as_str(), "grep" | "glob" | "search") {
+        object
+            .get("pattern")
+            .or_else(|| object.get("query"))
+            .or_else(|| object.get("include"))
+    } else {
+        None
+    }?;
+    let value = value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string());
+    Some(value.chars().take(180).collect())
+}
+
+fn summarize_tool_output(tool: &str, output: &Value) -> Option<String> {
+    let output = redact_activity_value(output);
+    let object = output.as_object();
+    let summary = object.and_then(|object| {
+        ["summary", "message", "result"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(Value::as_str))
+    });
+    let text = summary
+        .map(str::to_owned)
+        .or_else(|| output.as_str().map(str::to_owned))
+        .unwrap_or_else(|| output.to_string());
+    let tool = tool.to_ascii_lowercase();
+    if tool == "read" {
+        let content = text
+            .split_once("<content>")
+            .map(|(_, content)| content.split("</content>").next().unwrap_or(content));
+        let lines = content
+            .unwrap_or(&text)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        return Some(format!(
+            "{lines} {} read",
+            if lines == 1 { "line" } else { "lines" }
+        ));
+    }
+    if matches!(tool.as_str(), "edit" | "write" | "apply_patch")
+        && text.to_ascii_lowercase().contains("success")
+    {
+        return Some("Change applied successfully".into());
+    }
+    if matches!(tool.as_str(), "grep" | "glob" | "search") {
+        if let Some(line) = text
+            .lines()
+            .find(|line| line.to_ascii_lowercase().contains("match"))
+        {
+            return Some(line.trim().chars().take(180).collect());
+        }
+    }
+    let useful = if matches!(tool.as_str(), "bash" | "shell") {
+        text.lines().rev().find(|line| {
+            let line = line.to_ascii_lowercase();
+            line.contains("passed") || line.contains("failed") || line.starts_with("ok ")
+        })
+    } else {
+        None
+    }
+    .or_else(|| text.lines().rev().find(|line| !line.trim().is_empty()))?;
+    Some(useful.trim().chars().take(180).collect())
+}
+
 fn text_parts(message: &Value) -> String {
     message
         .get("parts")
@@ -5616,7 +5692,8 @@ fn build_activity(
 
     for message in &messages {
         let info = message.get("info").unwrap_or(message);
-        if info.get("role").and_then(Value::as_str) != Some("assistant") {
+        let role = info.get("role").and_then(Value::as_str).unwrap_or_default();
+        if !matches!(role, "user" | "assistant") {
             continue;
         }
         let created = timestamp_from_value(info.get("time").and_then(|time| time.get("created")))
@@ -5641,6 +5718,21 @@ fn build_activity(
                     created
                 )
             });
+        if role == "user" {
+            let prompt = text_parts(message);
+            if !prompt.trim().is_empty() {
+                events.push(ActivityEvent {
+                    id: format!("{message_id}:prompt"),
+                    at: created,
+                    kind: "prompt".into(),
+                    title: "You".into(),
+                    tool: None,
+                    detail: Some(safe_activity_text(&Value::String(prompt), 1000)),
+                    status: None,
+                });
+            }
+            continue;
+        }
         if let Some(parts) = message.get("parts").and_then(Value::as_array) {
             for (part_index, part) in parts.iter().enumerate() {
                 let part_type = part.get("type").and_then(Value::as_str).unwrap_or_default();
@@ -5650,7 +5742,7 @@ fn build_activity(
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("part-index-{part_index}"));
                 let state = part.get("state");
-                let (kind, title, status, detail, at) = if part_type == "tool" {
+                let (kind, tool_name, title, status, detail, at) = if part_type == "tool" {
                     let tool = part.get("tool").and_then(Value::as_str).unwrap_or("Tool");
                     let status = state
                         .and_then(|value| value.get("status"))
@@ -5667,16 +5759,14 @@ fn build_activity(
                     let input = state
                         .and_then(|value| value.get("input"))
                         .or_else(|| part.get("input"))
-                        .map(|value| safe_activity_text(value, 250));
+                        .and_then(|value| summarize_tool_input(tool, value));
                     let output = state
                         .and_then(|value| value.get("output"))
-                        .map(|value| safe_activity_text(value, 450));
+                        .and_then(|value| summarize_tool_output(tool, value));
                     let detail = match (input, output) {
-                        (Some(input), Some(output)) => {
-                            Some(format!("Input: {input}\nOutput: {output}"))
-                        }
-                        (Some(input), None) => Some(format!("Input: {input}")),
-                        (None, Some(output)) => Some(format!("Output: {output}")),
+                        (Some(input), Some(output)) => Some(format!("{input} · {output}")),
+                        (Some(input), None) => Some(input),
+                        (None, Some(output)) => Some(output),
                         (None, None) => None,
                     }
                     .map(|value| value.chars().take(750).collect::<String>());
@@ -5701,7 +5791,14 @@ fn build_activity(
                         })
                         .and_then(|value| timestamp_from_value(Some(value)))
                         .unwrap_or_else(|| created.clone());
-                    ("tool", title, Some(status.to_owned()), detail, at)
+                    (
+                        "tool",
+                        Some(redact_activity_text(tool)),
+                        title,
+                        Some(status.to_owned()),
+                        detail,
+                        at,
+                    )
                 } else if part_type == "text" {
                     let text = part
                         .get("text")
@@ -5713,7 +5810,8 @@ fn build_activity(
                     }
                     (
                         "message",
-                        "Agent message".to_owned(),
+                        None,
+                        "Agent".to_owned(),
                         None,
                         Some(safe_activity_text(&Value::String(text.to_owned()), 1000)),
                         part.get("time")
@@ -5729,6 +5827,7 @@ fn build_activity(
                     at,
                     kind: kind.into(),
                     title,
+                    tool: tool_name,
                     detail,
                     status,
                 });
@@ -5740,6 +5839,7 @@ fn build_activity(
                 at: visible_at,
                 kind: "error".into(),
                 title: "Agent error".into(),
+                tool: None,
                 detail: Some(redact_activity_text(&error).chars().take(1000).collect()),
                 status: Some("failed".into()),
             });
@@ -9365,35 +9465,56 @@ mod tests {
             "namespace":"anvil", "opencode_port":4096, "phase":"Ready", "project":"demo",
             "repository":"https://github.com/example/demo.git", "ref":"main", "work_branch":"anvil/demo-12345678",
             "model":"openai/gpt-5.6-luna", "environment_state":"ready", "work_state":"in_progress",
-            "opencode_session_id":"ses-test"
+            "opencode_session_id":"ses-test", "created_at":"2026-05-28T20:26:00Z",
+            "ready_at":"2026-05-28T20:26:01Z"
         })).unwrap();
+        let transcript = json!([
+            {
+                "info":{"id":"user-1","role":"user","time":{"created":1779999999000i64}},
+                "parts":[{"id":"prompt-text","type":"text","text":"Inspect the retry path.","time":{"start":1779999999000i64,"end":1779999999100i64}}]
+            },
+            {
+                "info":{"id":"msg-1","parentID":"user-1","role":"assistant","time":{"created":1780000000000i64,"completed":1780000002000i64}},
+                "parts":[
+                    {"id":"part-tool","type":"tool","tool":"bash","state":{"status":"completed","title":"Ran tests","input":{"command":"curl -H 'Authorization: Bearer input-auth-secret'","api_key":"input-api-secret"},"output":{"message":"ok","access_token":"output-token-secret"},"time":{"start":1780000001000i64,"end":1780000001500i64}}},
+                    {"id":"part-text","type":"text","text":"The retry path behaves as expected.","time":{"start":1780000001600i64,"end":1780000001700i64}},
+                    {"id":"part-reasoning","type":"reasoning","text":"private"}
+                ]
+            }
+        ]);
         let response = build_activity(
             &session,
             "Ready",
             None,
-            json!([{
-                "info":{"id":"msg-1","role":"assistant","time":{"created":1780000000000i64,"completed":1780000002000i64}},
-                "parts":[
-                    {"id":"part-tool","type":"tool","tool":"bash","state":{"status":"completed","title":"Ran tests","input":{"command":"curl -H 'Authorization: Bearer input-auth-secret'","api_key":"input-api-secret"},"output":{"message":"ok","access_token":"output-token-secret"},"time":{"start":1780000001000i64,"end":1780000001500i64}}},
-                    {"id":"part-text","type":"text","text":"Tests passed","time":{"start":1780000001600i64,"end":1780000001700i64}},
-                    {"id":"part-reasoning","type":"reasoning","text":"private"}
-                ]
-            }]),
+            transcript.clone(),
             json!({}),
             &config("http://profile.test".into()),
         );
-        assert_eq!(response.events.len(), 2);
-        assert_eq!(response.events[0].id, "msg-1:part-tool");
-        assert_eq!(response.events[0].kind, "tool");
-        assert_eq!(response.events[0].status.as_deref(), Some("completed"));
+        assert_eq!(response.events.len(), 3);
+        assert_eq!(response.events[0].id, "user-1:prompt");
+        assert_eq!(response.events[0].kind, "prompt");
+        assert_eq!(response.events[0].title, "You");
+        assert_eq!(response.events[1].id, "msg-1:part-tool");
+        assert_eq!(response.events[1].kind, "tool");
+        assert_eq!(response.events[1].tool.as_deref(), Some("bash"));
+        assert_eq!(response.events[1].status.as_deref(), Some("completed"));
         assert_eq!(
-            DateTime::parse_from_rfc3339(&response.events[0].at)
+            DateTime::parse_from_rfc3339(&response.events[1].at)
                 .unwrap()
                 .timestamp_millis(),
             1_780_000_001_500
         );
-        assert_eq!(response.events[1].kind, "message");
+        assert_eq!(response.events[2].kind, "message");
         assert!(response.events[0].at < response.events[1].at);
+        assert!(response.events[1].at < response.events[2].at);
+        assert!(response
+            .lifecycle
+            .iter()
+            .any(|event| event.kind == "created"));
+        assert!(response.events.iter().all(|event| !matches!(
+            event.kind.as_str(),
+            "created" | "ready" | "request_started" | "request_completed"
+        )));
         assert!(!response
             .events
             .iter()
@@ -9402,14 +9523,7 @@ mod tests {
             &session,
             "Ready",
             None,
-            json!([{
-                "info":{"id":"msg-1","role":"assistant","time":{"created":1780000000000i64,"completed":1780000002000i64}},
-                "parts":[
-                    {"id":"part-tool","type":"tool","tool":"bash","state":{"status":"completed","title":"Ran tests","input":{"command":"curl -H 'Authorization: Bearer input-auth-secret'","api_key":"input-api-secret"},"output":{"message":"ok","access_token":"output-token-secret"},"time":{"start":1780000001000i64,"end":1780000001500i64}}},
-                    {"id":"part-text","type":"text","text":"Tests passed","time":{"start":1780000001600i64,"end":1780000001700i64}},
-                    {"id":"part-reasoning","type":"reasoning","text":"private"}
-                ]
-            }]),
+            transcript,
             json!({}),
             &config("http://profile.test".into()),
         );
@@ -9425,12 +9539,12 @@ mod tests {
                 .map(|event| &event.id)
                 .collect::<Vec<_>>()
         );
-        assert!(response.events[0]
+        assert!(response.events[1]
             .detail
             .as_deref()
             .unwrap()
             .contains("curl"));
-        assert!(response.events[0].detail.as_deref().unwrap().contains("ok"));
+        assert!(response.events[1].detail.as_deref().unwrap().contains("ok"));
         let serialized_events = serde_json::to_string(&response.events).unwrap();
         for secret in [
             "input-auth-secret",
@@ -9497,6 +9611,39 @@ mod tests {
     }
 
     #[test]
+    fn activity_tool_summaries_are_compact_and_recognizable() {
+        assert_eq!(
+            summarize_tool_output(
+                "read",
+                &Value::String("<content>\n1: before\n2: after\n</content>".into())
+            )
+            .as_deref(),
+            Some("2 lines read")
+        );
+        assert_eq!(
+            summarize_tool_input("bash", &json!({"command":"go test ./relay/..."})).as_deref(),
+            Some("go test ./relay/...")
+        );
+        assert_eq!(
+            summarize_tool_output(
+                "bash",
+                &Value::String("ok relay 1.2s\n61 tests passed".into())
+            )
+            .as_deref(),
+            Some("61 tests passed")
+        );
+        assert_eq!(
+            summarize_tool_output("edit", &Value::String("Edit applied successfully.".into()))
+                .as_deref(),
+            Some("Change applied successfully")
+        );
+        assert_eq!(
+            summarize_tool_output("grep", &Value::String("6 matches in 3 files".into())).as_deref(),
+            Some("6 matches in 3 files")
+        );
+    }
+
+    #[test]
     fn merged_activity_window_reports_event_cap_truncation() {
         let mut events = (0..10)
             .map(|index| ActivityEvent {
@@ -9504,6 +9651,7 @@ mod tests {
                 at: format!("2026-01-01T00:00:{index:02}Z"),
                 kind: "tool".into(),
                 title: "Tool".into(),
+                tool: Some("bash".into()),
                 detail: None,
                 status: Some("completed".into()),
             })
