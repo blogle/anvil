@@ -33,6 +33,115 @@ pub enum WorkState {
     Completed,
 }
 
+/// Compact, versioned agent-facing batch projection. The service adapter supplies
+/// authoritative task snapshots and the existing durable change cursor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchDigest {
+    pub v: u8,
+    pub batch: String,
+    pub cursor: String,
+    pub counts: BatchCounts,
+    pub tasks: Vec<DigestTask>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchCounts {
+    pub total: u32,
+    pub active: u32,
+    pub review: u32,
+    pub failed: u32,
+    pub done: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DigestTask {
+    pub id: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr: Option<u64>,
+    pub detail: String,
+    pub review: String,
+    pub messages: String,
+    pub logs: String,
+    pub diff: String,
+}
+
+/// Minimal seam for the batch service; deliberately excludes prompts and artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchTaskFact {
+    pub id: String,
+    pub state: String,
+    pub changed_at: u64,
+    pub op: Option<String>,
+    pub attempt: Option<String>,
+    pub reason: Option<String>,
+    pub branch: Option<String>,
+    pub pr: Option<u64>,
+}
+
+/// Build full or changed-since compact projection. Cursor is the durable stream offset;
+/// filter_attention keeps failed/retrying/review tasks without changing cursor semantics.
+pub fn batch_digest(
+    batch: &str,
+    cursor: &str,
+    tasks: &[BatchTaskFact],
+    since: Option<u64>,
+    filter_attention: bool,
+) -> BatchDigest {
+    let mut counts = BatchCounts {
+        total: tasks.len() as u32,
+        ..Default::default()
+    };
+    for task in tasks {
+        match task.state.as_str() {
+            "active" | "running" => counts.active += 1,
+            "review" | "ready_for_review" => counts.review += 1,
+            "failed" => counts.failed += 1,
+            "done" | "completed" => counts.done += 1,
+            _ => {}
+        }
+    }
+    let rows = tasks
+        .iter()
+        .filter(|t| {
+            since.is_none_or(|offset| t.changed_at > offset)
+                && (!filter_attention
+                    || t.reason.is_some()
+                    || t.attempt.is_some()
+                    || matches!(t.state.as_str(), "failed" | "review" | "ready_for_review"))
+        })
+        .map(|t| DigestTask {
+            id: t.id.clone(),
+            state: t.state.clone(),
+            op: t.op.clone(),
+            attempt: t.attempt.clone(),
+            reason: t.reason.clone(),
+            branch: t.branch.clone(),
+            pr: t.pr,
+            detail: format!("tasks/{}/detail", t.id),
+            review: format!("tasks/{}/review", t.id),
+            messages: format!("tasks/{}/messages", t.id),
+            logs: format!("tasks/{}/logs", t.id),
+            diff: format!("tasks/{}/diff", t.id),
+        })
+        .collect();
+    BatchDigest {
+        v: 1,
+        batch: batch.into(),
+        cursor: cursor.into(),
+        counts,
+        tasks: rows,
+    }
+}
+
 impl WorkState {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -624,6 +733,58 @@ pub fn parse_preview_hostname(hostname: &str, base_domain: &str) -> Option<(Sess
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture(n: usize) -> Vec<BatchTaskFact> {
+        (0..n)
+            .map(|i| BatchTaskFact {
+                id: format!("task-{i:03}"),
+                state: if i % 25 == 0 {
+                    "failed"
+                } else if i % 10 == 0 {
+                    "review"
+                } else {
+                    "active"
+                }
+                .into(),
+                changed_at: i as u64,
+                op: (i % 10 != 0 && i % 25 != 0).then(|| "edit".into()),
+                attempt: (i % 25 == 0).then(|| "2/3".into()),
+                reason: (i % 25 == 0).then(|| "worker_error".into()),
+                branch: (i % 10 == 0).then(|| format!("anvil/task-{i:03}")),
+                pr: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn batch_digest_size_regressions_and_delta_semantics() {
+        let one = batch_digest("batch-x", "c100", &fixture(1), None, false);
+        let twenty = batch_digest("batch-x", "c100", &fixture(20), None, false);
+        let fifty = batch_digest("batch-x", "c100", &fixture(50), None, false);
+        let hundred_tasks = fixture(100);
+        let hundred = batch_digest("batch-x", "c100", &hundred_tasks, None, false);
+        let sizes = [one, twenty, fifty, hundred].map(|d| serde_json::to_vec(&d).unwrap().len());
+        // Budgets allow natural IDs/state fields but reject verbose or null-heavy expansion.
+        assert!(sizes[0] < 700, "1 task: {} bytes", sizes[0]);
+        assert!(sizes[1] < 5_000, "20 tasks: {} bytes", sizes[1]);
+        assert!(sizes[2] < 11_000, "50 tasks: {} bytes", sizes[2]);
+        assert!(sizes[3] < 22_000, "100 tasks: {} bytes", sizes[3]);
+        let no_change = batch_digest("batch-x", "c101", &hundred_tasks, Some(99), false);
+        assert!(no_change.tasks.is_empty());
+        let two_change = batch_digest("batch-x", "c101", &hundred_tasks, Some(97), false);
+        assert_eq!(
+            two_change
+                .tasks
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            ["task-098", "task-099"]
+        );
+        let attention = batch_digest("batch-x", "c100", &hundred_tasks, None, true);
+        assert!(attention.tasks.iter().all(|t| t.reason.is_some() || t.state == "review"));
+        assert!(!serde_json::to_string(&hundred).unwrap().contains("prompt"));
+        assert!(!serde_json::to_string(&hundred).unwrap().contains("transcript"));
+    }
 
     // ── Project ──────────────────────────────────────────────────────
 
