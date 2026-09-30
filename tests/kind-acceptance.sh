@@ -41,6 +41,7 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
+trap 'status=$?; printf "Kind acceptance failed at %s:%s: %s\n" "${BASH_SOURCE[0]}" "${BASH_LINENO[0]:-?}" "$BASH_COMMAND" >&2; exit "$status"' ERR
 
 poll() {
   local url="$1" deadline=$((SECONDS + 120))
@@ -51,6 +52,17 @@ poll() {
     fi
     sleep 0.2
   done
+}
+
+wait_for_sandbox_pod() {
+  local sandbox_name="$1" deadline=$((SECONDS + 120)) pod=""
+  while (( SECONDS < deadline )); do
+    pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$sandbox_name" -o json 2>/dev/null | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
+    [ -n "$pod" ] && { printf '%s\n' "$pod"; return 0; }
+    sleep 0.2
+  done
+  printf 'timed out waiting for a ready pod endpoint for %s\n' "$sandbox_name" >&2
+  return 1
 }
 
 kind create cluster --name "$cluster" --kubeconfig "$kubeconfig" --wait 120s
@@ -322,28 +334,16 @@ api_a_id="$(create_anvil_session)"
 api_b_id="$(create_anvil_session)"
 api_a_name="anvil-$api_a_id"
 api_b_name="anvil-$api_b_id"
+# The shared PVC must be writable for the daemon; sandbox store/socket mounts stay read-only.
 for name in "$api_a_name" "$api_b_name"; do
   kubectl --kubeconfig "$kubeconfig" -n "$namespace" get sandbox "$name" -o json | jq -e '
     .spec.podTemplate.spec as $pod |
-    any($pod.volumes[]; .name == "shared-nix" and .persistentVolumeClaim.claimName == "anvil-nix" and .persistentVolumeClaim.readOnly == true) and
+    any($pod.volumes[]; .name == "shared-nix" and .persistentVolumeClaim.claimName == "anvil-nix" and .persistentVolumeClaim.readOnly != true) and
     ([$pod.containers[] | select(.name == "sandbox") | .volumeMounts[] | select(.name == "shared-nix")] | length == 2 and
       all(.[]; .readOnly == true and ((.mountPath == "/nix/store" and .subPath == "store") or (.mountPath == "/nix/var/nix/daemon-socket" and .subPath == "var/nix/daemon-socket"))))' >/dev/null
 done
-sandbox_endpoint_pod() {
-  local name="$1" pod="" deadline=$((SECONDS + 120))
-  while (( SECONDS < deadline )); do
-    pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$name" -o json 2>/dev/null | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
-    if [ -n "$pod" ]; then
-      printf '%s\n' "$pod"
-      return 0
-    fi
-    sleep 0.2
-  done
-  printf 'timed out waiting for sandbox endpoint %s\n' "$name" >&2
-  return 1
-}
-api_a_pod="$(sandbox_endpoint_pod "$api_a_name")"
-api_b_pod="$(sandbox_endpoint_pod "$api_b_name")"
+api_a_pod="$(wait_for_sandbox_pod "$api_a_name")"
+api_b_pod="$(wait_for_sandbox_pod "$api_b_name")"
 agent_exec() {
   local pod="$1"
   shift
