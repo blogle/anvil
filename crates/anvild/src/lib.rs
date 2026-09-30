@@ -539,6 +539,149 @@ pub trait SandboxApi: Send + Sync + 'static {
     }
 }
 
+/// Central persistence boundary: every successful authoritative SandboxApi mutation updates
+/// the controller materialization and its change stream before returning to orchestration.
+struct MaterializingSandboxApi {
+    inner: Arc<dyn SandboxApi>,
+    store: Arc<Result<store::ControllerStore, String>>,
+    locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+}
+
+impl MaterializingSandboxApi {
+    fn lock(&self, id: &str) -> Arc<AsyncMutex<()>> {
+        self.locks
+            .lock()
+            .expect("materialization lock map poisoned")
+            .entry(id.to_owned())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    async fn persist(&self, id: &str) -> Result<(), ServiceError> {
+        let record = self.inner.get(id).await?;
+        self.persist_record(&record)
+    }
+
+    fn persist_record(&self, record: &SandboxRecord) -> Result<(), ServiceError> {
+        let id = &record.session.id;
+        let value = normalized_sandbox_value(record);
+        self.store
+            .as_ref()
+            .as_ref()
+            .map_err(|error| ServiceError::Store(error.clone()))?
+            .materialize("session", id, Some(&value))
+            .map_err(|error| ServiceError::Store(error.to_string()))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SandboxApi for MaterializingSandboxApi {
+    async fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError> {
+        let records = self.inner.list().await?;
+        let mut current_records = Vec::with_capacity(records.len());
+        for record in &records {
+            let lock = self.lock(&record.session.id);
+            let _guard = lock.lock().await;
+            let current = match self.inner.get(&record.session.id).await {
+                Ok(current) => current,
+                Err(ServiceError::NotFound) => continue,
+                Err(error) => return Err(error),
+            };
+            self.persist_record(&current)?;
+            current_records.push(current);
+        }
+        Ok(current_records)
+    }
+    async fn get(&self, id: &str) -> Result<SandboxRecord, ServiceError> {
+        let lock = self.lock(id);
+        let _guard = lock.lock().await;
+        let record = self.inner.get(id).await?;
+        self.persist_record(&record)?;
+        Ok(record)
+    }
+    async fn create(
+        &self,
+        id: &str,
+        request: &CreateRequest,
+        env: &[(String, String)],
+        state: &WorkStateRecord,
+    ) -> Result<Session, ServiceError> {
+        let lock = self.lock(id);
+        let _guard = lock.lock().await;
+        let session = self.inner.create(id, request, env, state).await?;
+        self.persist(id).await?;
+        Ok(session)
+    }
+    async fn suspend(&self, id: &str) -> Result<(), ServiceError> {
+        let lock = self.lock(id);
+        let _guard = lock.lock().await;
+        self.inner.suspend(id).await?;
+        self.persist(id).await
+    }
+    async fn resume(&self, id: &str) -> Result<(), ServiceError> {
+        let lock = self.lock(id);
+        let _guard = lock.lock().await;
+        self.inner.resume(id).await?;
+        self.persist(id).await
+    }
+    async fn delete(&self, id: &str) -> Result<(), ServiceError> {
+        let lock = self.lock(id);
+        let _guard = lock.lock().await;
+        self.inner.delete(id).await?;
+        self.store
+            .as_ref()
+            .as_ref()
+            .map_err(|error| ServiceError::Store(error.clone()))?
+            .materialize("session", id, None)
+            .map_err(|error| ServiceError::Store(error.to_string()))?;
+        Ok(())
+    }
+    async fn set_opencode_session(&self, id: &str, value: &str) -> Result<(), ServiceError> {
+        let lock = self.lock(id);
+        let _guard = lock.lock().await;
+        self.inner.set_opencode_session(id, value).await?;
+        self.persist(id).await
+    }
+    async fn set_model(&self, id: &str, value: &str) -> Result<(), ServiceError> {
+        let lock = self.lock(id);
+        let _guard = lock.lock().await;
+        self.inner.set_model(id, value).await?;
+        self.persist(id).await
+    }
+    async fn set_ready_at(&self, id: &str, value: &str) -> Result<(), ServiceError> {
+        let lock = self.lock(id);
+        let _guard = lock.lock().await;
+        self.inner.set_ready_at(id, value).await?;
+        self.persist(id).await
+    }
+    async fn set_work_state(&self, id: &str, value: &WorkStateRecord) -> Result<(), ServiceError> {
+        let lock = self.lock(id);
+        let _guard = lock.lock().await;
+        self.inner.set_work_state(id, value).await?;
+        self.persist(id).await
+    }
+    async fn set_binding_state(
+        &self,
+        id: &str,
+        value: &BindingStateRecord,
+    ) -> Result<(), ServiceError> {
+        let lock = self.lock(id);
+        let _guard = lock.lock().await;
+        self.inner.set_binding_state(id, value).await?;
+        self.persist(id).await
+    }
+    async fn set_telemetry(&self, id: &str, value: &SessionTelemetry) -> Result<(), ServiceError> {
+        let lock = self.lock(id);
+        let _guard = lock.lock().await;
+        self.inner.set_telemetry(id, value).await?;
+        self.persist(id).await
+    }
+    async fn recover_startup(&self) -> Result<(), ServiceError> {
+        self.inner.recover_startup().await
+    }
+}
+
 /// Backend-neutral view of one Anvil session. Kubernetes resource details are
 /// decoded by `KubeSandboxApi`; consumers only see Anvil's session semantics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1526,6 +1669,11 @@ impl AppState {
         let store = Arc::new(
             store::ControllerStore::open(&config.store_path).map_err(|error| error.to_string()),
         );
+        let kube: Arc<dyn SandboxApi> = Arc::new(MaterializingSandboxApi {
+            inner: Arc::new(kube),
+            store: store.clone(),
+            locks: Mutex::new(HashMap::new()),
+        });
         let profile = ProfileClient::new(&config.profile_opencode_url)
             .expect("ANVIL_PROFILE_OPENCODE_URL must be a valid URL");
         let capability_signer = config.session_signing_secret.as_deref().and_then(|secret| {
@@ -1551,7 +1699,7 @@ impl AppState {
             history: HistoryStore::new(config.history_path.clone()),
             store,
             config,
-            kube: Arc::new(kube),
+            kube,
             profile,
             pending_logins: Arc::new(Mutex::new(HashMap::new())),
             binding_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -1649,6 +1797,10 @@ impl AppState {
             let _ = stop.1.send(true);
         }
     }
+}
+
+fn normalized_sandbox_value(record: &SandboxRecord) -> Value {
+    json!({"session":record.session,"work_state":record.work_state,"binding_state":record.binding_state,"operating_mode":record.operating_mode,"created_at":record.created_at,"telemetry":record.telemetry})
 }
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -2732,23 +2884,24 @@ async fn changed_since(
     State(s): State<AppState>,
     Query(query): Query<ChangesQuery>,
 ) -> Result<Json<Value>, ServiceError> {
-    let store = s.store().map_err(|error| ServiceError::Store(error.to_owned()))?;
+    let store = s
+        .store()
+        .map_err(|error| ServiceError::Store(error.to_owned()))?;
     if let Some(after) = query.after {
-        let page = store.changes_after(&after, 1000).map_err(|error| ServiceError::Store(error.to_string()))?;
-        return Ok(Json(json!({"schema_version":1,"reset_required":page.reset_required,"cursor":page.cursor,"changes":page.changes})));
+        let page = store
+            .changes_after(&after, 1000)
+            .map_err(|error| ServiceError::Store(error.to_string()))?;
+        return Ok(Json(
+            json!({"schema_version":1,"reset_required":page.reset_required,"cursor":page.cursor,"changes":page.changes}),
+        ));
     }
-    // The initial read is authoritative. It seeds durable normalized records and returns
-    // the cursor after all included rows have been recorded.
-    let records = s.kube.list().await?;
-    let mut snapshot = Vec::with_capacity(records.len());
-    for record in records {
-        let id = record.session.id.clone();
-        let value = json!({"session":record.session,"telemetry":record.telemetry});
-        store.append_change("session", &id, &value).map_err(|error| ServiceError::Store(error.to_string()))?;
-        snapshot.push(value);
-    }
-    let cursor = store.current_cursor().map_err(|error| ServiceError::Store(error.to_string()))?;
-    Ok(Json(json!({"schema_version":1,"reset_required":false,"cursor":cursor,"snapshot":snapshot})))
+    // Both the projection and sequence boundary are read from one SQLite snapshot.
+    let (cursor, snapshot) = store
+        .materialized_snapshot()
+        .map_err(|error| ServiceError::Store(error.to_string()))?;
+    Ok(Json(
+        json!({"schema_version":1,"reset_required":false,"cursor":cursor,"snapshot":snapshot}),
+    ))
 }
 async fn suspend(
     Path(id): Path<String>,
@@ -2964,13 +3117,7 @@ async fn update_telemetry(
     let _guard = lock.lock().await;
     let mut telemetry = state.kube.get(session_id).await?.telemetry;
     update(&mut telemetry);
-    state.kube.set_telemetry(session_id, &telemetry).await?;
-    let session = state.kube.get(session_id).await?.session;
-    let normalized = json!({"session":session,"telemetry":telemetry});
-    state.store().map_err(|error| ServiceError::Store(error.to_owned()))?
-        .append_change("session", session_id, &normalized)
-        .map_err(|error| ServiceError::Store(error.to_string()))?;
-    Ok(())
+    state.kube.set_telemetry(session_id, &telemetry).await
 }
 
 async fn complete(
