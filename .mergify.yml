@@ -9,6 +9,8 @@ queue_rules:
     batch_max_wait_time: 2 min
     queue_conditions:
       - base = main
-      - check-success = PR checks
+      - check-success = PR admission
+      - check-success = Render Kubernetes manifests
     merge_conditions:
       - check-success = Integration E2E
+      - check-success = Batch image and Kind
