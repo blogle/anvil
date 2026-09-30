@@ -10,6 +10,8 @@
 let
   credentialHelper = pkgs.writeShellScriptBin "anvil-credential"
     (builtins.readFile credentialHelperSource);
+  gitIdentity = pkgs.writeShellScriptBin "anvil-git-identity"
+    (builtins.readFile ./../runtime/git-identity);
   ghWrapper = pkgs.writeShellScriptBin "gh" ''
     set -euo pipefail
     : "''${ANVIL_SESSION_ID:?ANVIL_SESSION_ID is required}"
@@ -114,7 +116,7 @@ let
     pathsToLink = [ "/bin" ];
   };
   sandboxRuntimeFiles = [
-    nixConf credentialHelper ghWrapper sandboxUsrBin sandboxBin
+    nixConf credentialHelper gitIdentity ghWrapper sandboxUsrBin sandboxBin
   ] ++ userFiles ++ [ sandboxMutableHome sandboxMutableTmp ];
   sandboxBaseLayer = nix2containerPkgs.nix2container.buildLayer {
     deps = sandboxBaseTools;

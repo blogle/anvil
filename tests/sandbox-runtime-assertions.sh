@@ -39,7 +39,7 @@ if [ -n "${ANVIL_RUNTIME_EXEC:-}" ]; then
   runtime_exec 'test "$XDG_RUNTIME_DIR" = /home/anvil/.local/state/runtime && test -d "$XDG_RUNTIME_DIR"'
   runtime_exec 'printf "#!/usr/bin/env bash\nprintf env-ok\n" >/tmp/anvil-env-test && chmod +x /tmp/anvil-env-test && test "$(/tmp/anvil-env-test)" = env-ok'
   runtime_exec 'test "$DISPLAY" = :99 && pgrep -f "Xvfb :99" >/dev/null && dom="$(chromium --headless --disable-gpu --dump-dom "data:text/html,<title>anvil-browser-ok</title>")" && [[ "$dom" == *anvil-browser-ok* ]]'
-  runtime_exec 'test "$(git config --global user.name)" = Anvil && test -n "$(git config --global user.email)"'
+  runtime_exec 'test "$(git config --global user.name)" = Anvil && test "$(git config --global user.email)" = anvil@anvil.local && ! git config --global user.email | grep -q "@users.noreply.github.com"'
   runtime_exec 'test "$(stat -c %u /nix/store)" = 0 && test ! -w /nix/store && test ! -w /nix/var && ! pgrep -x nix-daemon >/dev/null'
   if [ "${ANVIL_SHARED_NIX:-0}" = 1 ]; then
     runtime_exec 'test -S /nix/var/nix/daemon-socket/socket && nix store info >/dev/null && nix develop --command just check'

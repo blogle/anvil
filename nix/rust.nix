@@ -8,7 +8,9 @@ let
     filter = path: type:
       craneLib.filterCargoSources path type
       || pkgs.lib.hasSuffix "/web" (toString path)
-      || pkgs.lib.hasInfix "/web/" (toString path);
+      || pkgs.lib.hasInfix "/web/" (toString path)
+      || pkgs.lib.hasSuffix "/runtime" (toString path)
+      || pkgs.lib.hasSuffix "/runtime/git-identity" (toString path);
   };
 
   baseArgs = {
