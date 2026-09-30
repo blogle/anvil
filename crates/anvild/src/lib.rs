@@ -9526,7 +9526,11 @@ mod tests {
             .contains("cargo test"));
         assert!(response.events[0].detail.as_deref().unwrap().contains("ok"));
         let serialized_events = serde_json::to_string(&response.events).unwrap();
-        for secret in ["input-auth-secret", "input-api-secret", "output-token-secret"] {
+        for secret in [
+            "input-auth-secret",
+            "input-api-secret",
+            "output-token-secret",
+        ] {
             assert!(!serialized_events.contains(secret));
         }
     }
@@ -9655,10 +9659,7 @@ mod tests {
             op.session_message_page("ses-window", Some("opaque-cursor"))
                 .await
                 .unwrap(),
-            (
-                json!([{"id":"older-message"}]),
-                Some("next-opaque".into())
-            )
+            (json!([{"id":"older-message"}]), Some("next-opaque".into()))
         );
         page.assert();
     }
