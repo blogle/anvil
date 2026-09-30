@@ -5377,6 +5377,11 @@ mod tests {
         .unwrap();
         assert_eq!(bound["attempt_id"], attempt_id);
         assert_eq!(bound["session_id"], "session-runtime-id");
+        upstream.mock(|when, then| {
+            when.method(GET);
+            then.status(200)
+                .json_body(json!({"sha":"0123456789abcdef0123456789abcdef01234567"}));
+        });
         let independent = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":1,"tasks":[{"task_id":"build","prompt":"different logical work"}]});
         let independent_response = app
             .clone()
