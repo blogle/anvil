@@ -6353,7 +6353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_rest_accepts_replays_queries_attempts_and_rejects_conflicts() {
+    async fn public_wide_batch_api_is_idempotent_durable_and_base_stable() {
         let upstream = MockServer::start_async().await;
         let resolution = upstream.mock(|when, then| {
             when.method(GET);
@@ -6365,8 +6365,10 @@ mod tests {
         config.github_api_url = upstream.base_url();
         config.store_path = directory.path().join("controller.sqlite3");
         let reopen_config = config.clone();
-        let app = router(AppState::new(config, FakeSandbox));
-        let plan = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":2,"tasks":[{"task_id":"build","prompt":"compile it","dependencies":[],"policy":{}}]});
+        let app = router(AppState::new(config.clone(), FakeSandbox));
+        let plan = wide_batch_fixture_plan(100);
+        let request_bytes = serde_json::to_vec(&plan).unwrap().len();
+        assert!(request_bytes < 64 * 1024);
         let submit = |plan: Value, key: &'static str| {
             Request::builder()
                 .method("POST")
@@ -6394,14 +6396,13 @@ mod tests {
         assert!([StatusCode::CREATED, StatusCode::OK].contains(&first.status()));
         assert!([StatusCode::CREATED, StatusCode::OK].contains(&concurrent.status()));
         assert_ne!(first.status(), concurrent.status());
-        let first_body: Value = serde_json::from_slice(
-            &axum::body::to_bytes(first.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let first_bytes = axum::body::to_bytes(first.into_body(), 64 * 1024)
+            .await
+            .expect("100-task batch acceptance response must fit its 64 KiB budget");
+        assert!(first_bytes.len() < 64 * 1024);
+        let first_body: Value = serde_json::from_slice(&first_bytes).unwrap();
         let concurrent_body: Value = serde_json::from_slice(
-            &axum::body::to_bytes(concurrent.into_body(), usize::MAX)
+            &axum::body::to_bytes(concurrent.into_body(), 64 * 1024)
                 .await
                 .unwrap(),
         )
@@ -6430,7 +6431,33 @@ mod tests {
         assert_eq!(capacity["queued_runnable"], 1);
         assert_eq!(capacity["available_slots"], 4);
         assert_eq!(capacity["batches"][0]["active"], 0);
-        assert_eq!(capacity["batches"][0]["queued"], 1);
+        assert_eq!(capacity["batches"][0]["queued"], 100);
+        assert_eq!(first_body["accepted_task_ids"].as_array().unwrap().len(), 100);
+        let accepted_ids = first_body["accepted_task_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(accepted_ids.len(), 100);
+        assert_eq!(first_body["queued_count"], 100);
+        assert_eq!(first_body["runnable_count"], 1);
+
+        for (count, key) in [(20, "budget-20"), (50, "budget-50")] {
+            let budget_plan = wide_batch_fixture_plan(count);
+            let request_bytes = serde_json::to_vec(&budget_plan).unwrap().len();
+            let response = app
+                .clone()
+                .oneshot(submit(budget_plan, key))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("batch acceptance response must fit its 64 KiB budget");
+            assert!(request_bytes < 64 * 1024);
+            assert!(bytes.len() < 64 * 1024);
+        }
         let independent = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":1,"tasks":[{"task_id":"build","prompt":"different logical work"}]});
         let independent_response = app
             .clone()
@@ -6468,7 +6495,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first_body, replay_body);
-        let conflict_plan = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":2,"tasks":[{"task_id":"build","prompt":"different work","dependencies":[],"policy":{}}]});
+        let mut conflict_plan = plan.clone();
+        conflict_plan["tasks"][0]["prompt"] = json!("conflicting work under the same key");
         let conflict = app
             .clone()
             .oneshot(submit(conflict_plan, "stable-key"))
@@ -6477,27 +6505,46 @@ mod tests {
         assert_eq!(conflict.status(), StatusCode::CONFLICT);
         let batch_id = first_body["batch_id"].as_str().unwrap();
         let task_id = first_body["accepted_task_ids"][0].as_str().unwrap();
-        for (path, expected) in [
-            (format!("/v1/batches/{batch_id}"), first_body.clone()),
-            (format!("/v1/tasks/{task_id}"), json!({"task_id":task_id})),
-        ] {
+        let batch_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/batches/{batch_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch_response.status(), StatusCode::OK);
+        let persisted_batch: Value = serde_json::from_slice(
+            &axum::body::to_bytes(batch_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted_batch, first_body);
+        for accepted_task_id in first_body["accepted_task_ids"].as_array().unwrap() {
+            let accepted_task_id = accepted_task_id.as_str().unwrap();
             let response = app
                 .clone()
-                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/tasks/{accepted_task_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
-            let body: Value = serde_json::from_slice(
-                &axum::body::to_bytes(response.into_body(), usize::MAX)
+            let task: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 16 * 1024)
                     .await
                     .unwrap(),
             )
             .unwrap();
-            if expected.get("batch_id").is_some() {
-                assert_eq!(body, expected);
-            } else {
-                assert_eq!(body["task_id"], task_id);
-            }
+            assert_eq!(task["base_commit"], first_body["resolved_base_id"]);
+            assert_eq!(task["state"], "queued");
+            assert!(task.get("task_id").is_some());
         }
         for ordinal in 1..=2 {
             let key = format!("attempt-key-{ordinal}");
@@ -6596,6 +6643,7 @@ mod tests {
             .unwrap();
         assert_eq!(conflict_attempt.status(), StatusCode::CONFLICT);
         let attempt_id = attempts["attempts"][0]["attempt_id"].as_str().unwrap();
+        assert_eq!(attempts["attempts"][0]["state"], "queued");
         let get_attempt = app
             .clone()
             .oneshot(
@@ -6607,6 +6655,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_attempt.status(), StatusCode::OK);
+        let attempt: Value = serde_json::from_slice(
+            &axum::body::to_bytes(get_attempt.into_body(), 4 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(attempt["attempt_id"], attempt_id);
+        assert_eq!(attempt["state"], "queued");
+        assert!(attempt.get("messages").is_none());
+        assert!(attempt.get("diff").is_none());
+        assert!(attempt.get("logs").is_none());
         let bind_session = app
             .clone()
             .oneshot(
@@ -6631,12 +6690,72 @@ mod tests {
         assert_eq!(bound["session_id"], "session-runtime-id");
         let duplicate = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":2,"tasks":[{"task_id":"x","prompt":"a"},{"task_id":"x","prompt":"b"}]});
         let rejected = app
+            .clone()
             .oneshot(submit(duplicate, "duplicate-key"))
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 
+        drop(app);
         let reopened = router(AppState::new(reopen_config, FakeSandbox));
+        let persisted = reopened
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/batches/{batch_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(persisted.status(), StatusCode::OK);
+        let persisted: Value = serde_json::from_slice(
+            &axum::body::to_bytes(persisted.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted, first_body);
+        for accepted_task_id in first_body["accepted_task_ids"].as_array().unwrap() {
+            let accepted_task_id = accepted_task_id.as_str().unwrap();
+            let task_after_restart = reopened
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/tasks/{accepted_task_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(task_after_restart.status(), StatusCode::OK);
+            let task_after_restart: Value = serde_json::from_slice(
+                &axum::body::to_bytes(task_after_restart.into_body(), 16 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(task_after_restart["base_commit"], first_body["resolved_base_id"]);
+        }
+        let persisted_task_id = first_body["accepted_task_ids"][0].as_str().unwrap();
+        let attempts_after_restart = reopened
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/tasks/{persisted_task_id}/attempts"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let attempts_after_restart: Value = serde_json::from_slice(
+            &axum::body::to_bytes(attempts_after_restart.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(attempts_after_restart["attempts"].as_array().unwrap().len(), 2);
+        assert_eq!(attempts_after_restart["attempts"][0]["attempt_id"], attempt_id);
         let restart_replay = reopened
             .clone()
             .oneshot(submit_raw(plan.to_string(), "stable-key"))
@@ -6678,6 +6797,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unkeyed_attempt.status(), StatusCode::CREATED);
+        let retry_after_restart = reopened
+            .clone()
+            .oneshot(submit(plan, "stable-key"))
+            .await
+            .unwrap();
+        assert_eq!(retry_after_restart.status(), StatusCode::OK);
+        let retry_after_restart: Value = serde_json::from_slice(
+            &axum::body::to_bytes(retry_after_restart.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(retry_after_restart, first_body);
     }
 
     #[tokio::test]
@@ -6842,6 +6974,31 @@ mod tests {
 
     struct LifecycleSandbox {
         record: Arc<Mutex<SandboxRecord>>,
+    }
+
+    fn wide_batch_fixture_plan(count: usize) -> Value {
+        assert!((20..=100).contains(&count));
+        let tasks = (0..count)
+            .map(|index| {
+                json!({
+                    "task_id": format!("task-{index:03}"),
+                    "prompt": format!("Deterministic acceptance work item {index:03}"),
+                    "dependencies": if index == 0 {
+                        vec![]
+                    } else {
+                        vec![format!("task-{:03}", index - 1)]
+                    },
+                    "policy": {}
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "project": format!("wide-acceptance-{count}"),
+            "repository": "https://github.com/example/demo.git",
+            "ref": "main",
+            "concurrency": 8,
+            "tasks": tasks
+        })
     }
 
     async fn fixture_session_exists() -> Json<Value> {
@@ -7607,10 +7764,13 @@ mod tests {
             .unwrap();
         drop(old_store);
 
-        let backend = LifecycleSandbox {
-            record: Arc::new(Mutex::new(live)),
-        };
-        let state = AppState::new(test_config, backend);
+        let backend_record = Arc::new(Mutex::new(live.clone()));
+        let state = AppState::new(
+            test_config.clone(),
+            LifecycleSandbox {
+                record: backend_record.clone(),
+            },
+        );
         state.initialize().await.unwrap();
         let app = router(state.clone());
         let response = app
@@ -7621,6 +7781,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let initial = json_response(response).await;
         let cursor = initial["cursor"].as_str().unwrap().to_owned();
+        assert_eq!(initial["snapshot"].as_array().unwrap().len(), 1);
         assert_eq!(
             initial["snapshot"][0]["record"]["session"]["environment_state"],
             "ready"
@@ -7636,6 +7797,7 @@ mod tests {
             .await
             .unwrap();
         let response = app
+            .clone()
             .oneshot(
                 Request::get(format!("/v1/changes?after={cursor}"))
                     .body(Body::empty())
@@ -7650,6 +7812,47 @@ mod tests {
             delta["changes"][0]["change"]["record"]["session"]["session_binding_state"],
             "recovered"
         );
+        assert!(serde_json::to_vec(&delta).unwrap().len() < 4 * 1024);
+
+        let next_cursor = delta["cursor"].as_str().unwrap().to_owned();
+        let no_change = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/v1/changes?after={next_cursor}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let no_change_bytes = axum::body::to_bytes(no_change.into_body(), 1024)
+            .await
+            .unwrap();
+        let no_change: Value = serde_json::from_slice(&no_change_bytes).unwrap();
+        assert!(no_change["changes"].as_array().unwrap().is_empty());
+        assert_eq!(no_change["cursor"], next_cursor);
+        assert!(no_change_bytes.len() < 256);
+
+        drop(app);
+        drop(state);
+        let reopened = router(AppState::new(
+            test_config,
+            LifecycleSandbox {
+                record: backend_record,
+            },
+        ));
+        let after_restart = reopened
+            .oneshot(
+                Request::get(format!("/v1/changes?after={next_cursor}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_restart.status(), StatusCode::OK);
+        let after_restart: Value = json_response(after_restart).await;
+        assert!(!after_restart["reset_required"].as_bool().unwrap());
+        assert_eq!(after_restart["cursor"], next_cursor);
+        assert!(after_restart["changes"].as_array().unwrap().is_empty());
     }
 
     #[test]
