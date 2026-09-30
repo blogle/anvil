@@ -34,7 +34,10 @@ use std::{
     collections::HashMap,
     env,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use thiserror::Error;
@@ -1658,6 +1661,8 @@ pub struct AppState {
     binding_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     transition_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     lifecycle_watchers: LifecycleWatchers,
+    materializations_reconciled: Arc<AtomicBool>,
+    materialization_reconcile_lock: Arc<AsyncMutex<()>>,
     capability_signer: Option<github::CapabilitySigner>,
     github: Option<github::GithubBroker>,
 }
@@ -1705,6 +1710,8 @@ impl AppState {
             binding_locks: Arc::new(Mutex::new(HashMap::new())),
             transition_locks: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_watchers: Arc::new(Mutex::new(HashMap::new())),
+            materializations_reconciled: Arc::new(AtomicBool::new(false)),
+            materialization_reconcile_lock: Arc::new(AsyncMutex::new(())),
             capability_signer,
             github,
         }
@@ -1732,7 +1739,7 @@ impl AppState {
         self.store()
             .map_err(|error| ServiceError::Store(error.to_string()))?;
         self.kube.recover_startup().await?;
-        for record in self.kube.list().await? {
+        for record in self.reconcile_materializations().await? {
             let id = record.session.id.clone();
             if record.session.environment_state == "ready"
                 && record.session.opencode_session_id.is_some()
@@ -1745,6 +1752,17 @@ impl AppState {
             }
         }
         Ok(())
+    }
+
+    /// Reconcile durable projections from live Sandbox state once per process before a
+    /// full snapshot can be served. The SandboxApi decorator records each refreshed record
+    /// under its per-resource lock and commits it with its ordered change row.
+    async fn reconcile_materializations(&self) -> Result<Vec<SandboxRecord>, ServiceError> {
+        let _guard = self.materialization_reconcile_lock.lock().await;
+        let records = self.kube.list().await?;
+        self.materializations_reconciled
+            .store(true, Ordering::Release);
+        Ok(records)
     }
 
     pub fn store(&self) -> Result<&store::ControllerStore, &str> {
@@ -2895,6 +2913,9 @@ async fn changed_since(
         return Ok(Json(
             json!({"schema_version":1,"reset_required":page.reset_required,"cursor":page.cursor,"changes":page.changes}),
         ));
+    }
+    if !s.materializations_reconciled.load(Ordering::Acquire) {
+        s.reconcile_materializations().await?;
     }
     // Both the projection and sequence boundary are read from one SQLite snapshot.
     let (cursor, snapshot) = store
@@ -5930,6 +5951,73 @@ mod tests {
             state.initialize().await,
             Err(ServiceError::Store(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn first_snapshot_after_restart_reconciles_stale_materialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("controller.sqlite3");
+        let mut test_config = config("http://profile".into());
+        test_config.store_path = db_path.clone();
+
+        let mut live = active_work_record(activity_session());
+        live.session.opencode_session_id = None;
+        live.session.environment_state = "ready".into();
+        let mut stale = live.clone();
+        stale.session.environment_state = "provisioning".into();
+        let old_store = store::ControllerStore::open(&db_path).unwrap();
+        old_store
+            .materialize(
+                "session",
+                &live.session.id,
+                Some(&normalized_sandbox_value(&stale)),
+            )
+            .unwrap();
+        drop(old_store);
+
+        let backend = LifecycleSandbox {
+            record: Arc::new(Mutex::new(live)),
+        };
+        let state = AppState::new(test_config, backend);
+        state.initialize().await.unwrap();
+        let app = router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(Request::get("/v1/changes").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let initial = json_response(response).await;
+        let cursor = initial["cursor"].as_str().unwrap().to_owned();
+        assert_eq!(
+            initial["snapshot"][0]["record"]["session"]["environment_state"],
+            "ready"
+        );
+
+        let current = state.kube.get("demo-12345678").await.unwrap();
+        let mut binding = current.binding_state;
+        binding.state = "recovered".into();
+        binding.checked_at = "2026-01-01T10:01:00Z".into();
+        state
+            .kube
+            .set_binding_state("demo-12345678", &binding)
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::get(format!("/v1/changes?after={cursor}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let delta = json_response(response).await;
+        assert!(!delta["reset_required"].as_bool().unwrap());
+        assert_eq!(delta["changes"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            delta["changes"][0]["change"]["record"]["session"]["session_binding_state"],
+            "recovered"
+        );
     }
 
     #[test]
