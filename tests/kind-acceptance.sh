@@ -54,6 +54,17 @@ poll() {
   done
 }
 
+wait_for_sandbox_pod() {
+  local sandbox_name="$1" deadline=$((SECONDS + 120)) pod=""
+  while (( SECONDS < deadline )); do
+    pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$sandbox_name" -o json 2>/dev/null | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
+    [ -n "$pod" ] && { printf '%s\n' "$pod"; return 0; }
+    sleep 0.2
+  done
+  printf 'timed out waiting for a ready pod endpoint for %s\n' "$sandbox_name" >&2
+  return 1
+}
+
 kind create cluster --name "$cluster" --kubeconfig "$kubeconfig" --wait 120s
 created=1
 
@@ -331,9 +342,8 @@ for name in "$api_a_name" "$api_b_name"; do
     ([$pod.containers[] | select(.name == "sandbox") | .volumeMounts[] | select(.name == "shared-nix")] | length == 2 and
       all(.[]; .readOnly == true and ((.mountPath == "/nix/store" and .subPath == "store") or (.mountPath == "/nix/var/nix/daemon-socket" and .subPath == "var/nix/daemon-socket"))))' >/dev/null
 done
-api_a_pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$api_a_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
-api_b_pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$api_b_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
-test -n "$api_a_pod" && test -n "$api_b_pod"
+api_a_pod="$(wait_for_sandbox_pod "$api_a_name")"
+api_b_pod="$(wait_for_sandbox_pod "$api_b_name")"
 agent_exec() {
   local pod="$1"
   shift
