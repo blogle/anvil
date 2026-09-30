@@ -323,10 +323,11 @@ api_a_id="$(create_anvil_session)"
 api_b_id="$(create_anvil_session)"
 api_a_name="anvil-$api_a_id"
 api_b_name="anvil-$api_b_id"
+# The shared PVC must be writable for the daemon; sandbox store/socket mounts stay read-only.
 for name in "$api_a_name" "$api_b_name"; do
   kubectl --kubeconfig "$kubeconfig" -n "$namespace" get sandbox "$name" -o json | jq -e '
     .spec.podTemplate.spec as $pod |
-    any($pod.volumes[]; .name == "shared-nix" and .persistentVolumeClaim.claimName == "anvil-nix" and .persistentVolumeClaim.readOnly == true) and
+    any($pod.volumes[]; .name == "shared-nix" and .persistentVolumeClaim.claimName == "anvil-nix" and .persistentVolumeClaim.readOnly != true) and
     ([$pod.containers[] | select(.name == "sandbox") | .volumeMounts[] | select(.name == "shared-nix")] | length == 2 and
       all(.[]; .readOnly == true and ((.mountPath == "/nix/store" and .subPath == "store") or (.mountPath == "/nix/var/nix/daemon-socket" and .subPath == "var/nix/daemon-socket"))))' >/dev/null
 done
