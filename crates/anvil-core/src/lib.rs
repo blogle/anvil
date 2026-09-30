@@ -782,7 +782,8 @@ mod tests {
         let fifty = batch_digest("batch-x", "cursor:opaque:100", &fixture(50), false);
         let hundred_tasks = fixture(100);
         let hundred = batch_digest("batch-x", "cursor:opaque:100", &hundred_tasks, false);
-        let sizes = [one, twenty, fifty, hundred].map(|d| serde_json::to_vec(&d).unwrap().len());
+        let sizes = [&one, &twenty, &fifty, &hundred]
+            .map(|digest| serde_json::to_vec(digest).unwrap().len());
         // Budgets allow natural IDs/state fields but reject verbose or null-heavy expansion.
         assert!(sizes[0] < 700, "1 task: {} bytes", sizes[0]);
         assert!(sizes[1] < 5_000, "20 tasks: {} bytes", sizes[1]);
