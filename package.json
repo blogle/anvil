@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test web/ui-state.test.js"
+    "test": "node --test web/ui-state.test.js",
+    "test:dom": "node --test web/session-row-dom.test.js"
   }
 }

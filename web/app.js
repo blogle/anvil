@@ -1,4 +1,4 @@
-import { applyServerRefresh, detailRenderSignature, formatElapsedValue, operatorState, parseRoute, reconcileSessionRows, sessionUiState } from "./ui-state.js"
+import { applyServerRefresh, detailRenderSignature, formatElapsedValue, operatorState, parseRoute, patchSessionRows, reconcileSessionRows, sessionRowMarkup, sessionUiState, updateSessionRowElapsed } from "./ui-state.js"
 
 const app = document.querySelector("#app")
 const state = {
@@ -146,16 +146,9 @@ function updateSidebar() {
     })
     rows.forEach((row) => {
       const session = items.find((item) => item.id === row.dataset.session)
-      const elapsed = row.querySelector("[data-live-state-elapsed]")
-      const changedAt = sessionActivity(session.id)?.work_state_changed_at || ""
-      if (elapsed && elapsed.dataset.liveStateElapsed !== String(changedAt)) {
-        elapsed.dataset.liveStateElapsed = changedAt
-        elapsed.textContent = formatStateElapsed(sessionActivity(session.id))
-      }
+      updateSessionRowElapsed(row, sessionActivity(session.id)?.work_state_changed_at, formatStateElapsed(sessionActivity(session.id)))
     })
-    if (rows.length !== list.children.length || rows.some((row, index) => row !== list.children[index])) {
-      list.replaceChildren(...rows)
-    }
+    patchSessionRows(list, rows)
   }
   if (focused) sidebar.querySelector(`[data-focus-key="${CSS.escape(focused)}"]`)?.focus({ preventScroll: true })
 }
@@ -163,7 +156,10 @@ function updateSidebar() {
 function renderSessionRow(session) {
   const activity = sessionActivity(session.id)
   const status = operatorState(activity)
-  return `<button class="session-row ${state.selected === session.id ? "selected" : ""}" data-focus-key="session-${escapeHtml(session.id)}" data-session="${escapeHtml(session.id)}" aria-current="${state.selected === session.id ? "true" : "false"}"><div class="session-title">${escapeHtml(titleFor(session))}</div><div class="session-meta"><span>${escapeHtml(session.project)}</span><span>·</span><span><code>${escapeHtml(session.work_branch)}</code></span></div><div class="session-state state-${escapeHtml(status)}"><span class="status-dot"></span><span>${stateLabel(status)}</span><span class="row-detail">· <span data-live-state-elapsed="${escapeHtml(activity?.work_state_changed_at)}">${formatStateElapsed(activity)}</span></span></div></button>`
+  return sessionRowMarkup({
+    session, status, statusText: stateLabel(status), elapsedSince: activity?.work_state_changed_at,
+    elapsedText: formatStateElapsed(activity), selected: state.selected === session.id, title: titleFor(session),
+  })
 }
 
 function captureDetailInteraction() {
@@ -386,7 +382,7 @@ function updateClocks() {
     element.textContent = formatElapsedValue(element.dataset.liveElapsed, end || Date.now())
   })
   document.querySelectorAll("[data-live-state-elapsed]").forEach((element) => {
-    element.textContent = formatElapsedValue(element.dataset.liveStateElapsed)
+    updateSessionRowElapsed(element, element.dataset.liveStateElapsed, formatElapsedValue(element.dataset.liveStateElapsed), true)
   })
   document.querySelectorAll("[data-live-relative]").forEach((element) => {
     element.textContent = `Last activity ${relativeTime(element.dataset.liveRelative)}`
