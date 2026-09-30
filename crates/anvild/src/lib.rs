@@ -2047,6 +2047,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/assets/app.js", get(asset_js))
         .route("/assets/ui-state.js", get(asset_ui_state_js))
+        .route("/assets/files-state.js", get(asset_files_state_js))
         .route("/assets/files-view.js", get(asset_files_view_js))
         .route("/assets/styles.css", get(asset_css))
         .route("/", get(index))
@@ -3190,6 +3191,17 @@ async fn asset_ui_state_js() -> Response {
             "text/javascript; charset=utf-8",
         )],
         include_str!("../../../web/ui-state.js"),
+    )
+        .into_response()
+}
+
+async fn asset_files_state_js() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/javascript; charset=utf-8",
+        )],
+        include_str!("../../../web/files-state.js"),
     )
         .into_response()
 }
@@ -8776,6 +8788,7 @@ mod tests {
         );
 
         let response = app
+            .clone()
             .oneshot(
                 Request::get("/assets/ui-state.js")
                     .body(Body::empty())
@@ -8788,6 +8801,24 @@ mod tests {
             response.headers()["content-type"],
             "text/javascript; charset=utf-8"
         );
+
+        let response = app
+            .oneshot(
+                Request::get("/assets/files-state.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("createFilesDiffState"));
     }
 
     #[test]
