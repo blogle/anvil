@@ -5879,7 +5879,18 @@ mod tests {
         assert_eq!(accepted_ids.len(), 100);
         assert_eq!(first_body["queued_count"], 100);
         assert_eq!(first_body["runnable_count"], 1);
-        for detail_field in ["prompt", "prompts", "messages", "logs", "diff", "diffs"] {
+        for detail_field in [
+            "prompt",
+            "prompts",
+            "messages",
+            "transcript",
+            "transcripts",
+            "events",
+            "raw_events",
+            "logs",
+            "diff",
+            "diffs",
+        ] {
             assert!(
                 first_body.get(detail_field).is_none(),
                 "compact batch acceptance must not include {detail_field}"
