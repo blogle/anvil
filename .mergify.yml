@@ -9,6 +9,10 @@ queue_rules:
     batch_max_wait_time: 2 min
     queue_conditions:
       - base = main
+      - -draft
+      - -conflict
+      - '#commits-behind = 0'
+      - linear-history
       - check-success = PR admission
       - check-success = Render Kubernetes manifests
     merge_conditions:
