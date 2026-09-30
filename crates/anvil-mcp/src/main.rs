@@ -616,7 +616,7 @@ mod tests {
         });
         let mcp = AnvilMcp::new(reqwest::Url::parse(&format!("{}/", server.base_url())).unwrap())
             .unwrap();
-        let error = mcp
+        let result = mcp
             .anvil_submit_batch(Parameters(BatchSubmission {
                 project: "demo".into(),
                 repository: "https://github.com/example/demo".into(),
@@ -627,8 +627,10 @@ mod tests {
                 tasks: vec![],
                 idempotency_key: "key".into(),
             }))
-            .await
-            .unwrap_err();
+            .await;
+        let Err(error) = result else {
+            panic!("HTTP conflict must become an MCP tool error")
+        };
         assert!(error.message.contains("409"));
         assert_eq!(error.data.unwrap()["http_status"], 409);
     }
