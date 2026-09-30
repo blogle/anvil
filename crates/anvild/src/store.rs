@@ -559,6 +559,9 @@ fn same_logical_work(left: &Value, right: &Value) -> bool {
         "dependencies",
         "owner",
         "policy",
+        "pr_policy",
+        "evidence_contract",
+        "batch_policies",
     ]
     .into_iter()
     .all(|field| canonical_json(&left[field]) == canonical_json(&right[field]))
