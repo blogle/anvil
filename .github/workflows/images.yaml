@@ -88,7 +88,20 @@ jobs:
           build_root sandbox .#anvil-sandbox-image & sandbox_pid=$!
           build_root daemon .#anvil-nix-daemon-image & daemon_pid=$!
           build_root upgrade .#anvil-nix-daemon-upgrade-test-image & upgrade_pid=$!
-          wait "$anvil_pid" "$sandbox_pid" "$daemon_pid" "$upgrade_pid"
+          build_failed=0
+          for pid in "$anvil_pid" "$sandbox_pid" "$daemon_pid" "$upgrade_pid"; do
+            wait "$pid" || build_failed=1
+          done
+          if [ "$build_failed" -ne 0 ]; then
+            echo 'one or more OCI image builds failed; skipping image conversion' >&2
+            exit 1
+          fi
+          for name in anvil sandbox daemon upgrade; do
+            if [ ! -s "paths/$name" ]; then
+              echo "image build produced no output path: $name" >&2
+              exit 1
+            fi
+          done
 
           convert_image() {
             name="$1"
