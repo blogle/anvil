@@ -1,0 +1,14 @@
+merge_queue:
+  max_parallel_checks: 2
+
+queue_rules:
+  - name: main
+    batch_size:
+      min: 1
+      max: 5
+    batch_max_wait_time: 2 min
+    queue_conditions:
+      - base = main
+      - check-success = PR checks
+    merge_conditions:
+      - check-success = Integration E2E
