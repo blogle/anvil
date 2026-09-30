@@ -5866,7 +5866,10 @@ mod tests {
             first_body["resolved_base_id"],
             "0123456789abcdef0123456789abcdef01234567"
         );
-        assert_eq!(first_body["accepted_task_ids"].as_array().unwrap().len(), 100);
+        assert_eq!(
+            first_body["accepted_task_ids"].as_array().unwrap().len(),
+            100
+        );
         let accepted_ids = first_body["accepted_task_ids"]
             .as_array()
             .unwrap()
@@ -5876,15 +5879,17 @@ mod tests {
         assert_eq!(accepted_ids.len(), 100);
         assert_eq!(first_body["queued_count"], 100);
         assert_eq!(first_body["runnable_count"], 1);
+        for detail_field in ["prompt", "prompts", "messages", "logs", "diff", "diffs"] {
+            assert!(
+                first_body.get(detail_field).is_none(),
+                "compact batch acceptance must not include {detail_field}"
+            );
+        }
 
         for (count, key) in [(20, "budget-20"), (50, "budget-50")] {
             let budget_plan = wide_batch_fixture_plan(count);
             let request_bytes = serde_json::to_vec(&budget_plan).unwrap().len();
-            let response = app
-                .clone()
-                .oneshot(submit(budget_plan, key))
-                .await
-                .unwrap();
+            let response = app.clone().oneshot(submit(budget_plan, key)).await.unwrap();
             assert_eq!(response.status(), StatusCode::CREATED);
             let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
                 .await
