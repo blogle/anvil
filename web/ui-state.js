@@ -31,6 +31,18 @@ export function applyServerRefresh(state, sessions, activities) {
   return next
 }
 
+export function reconcileSessionRows(existingRows, sessions, signatureFor, createRow) {
+  const existing = new Map(existingRows.map((row) => [row.dataset.session, row]))
+  return sessions.map((session) => {
+    const signature = signatureFor(session)
+    const row = existing.get(session.id)
+    if (row && row.dataset.rowSignature === signature) return row
+    const replacement = createRow(session)
+    replacement.dataset.rowSignature = signature
+    return replacement
+  })
+}
+
 export function detailRenderSignature(value) {
   if (value === null || typeof value !== "object") return value
   if (Array.isArray(value)) return value.map(detailRenderSignature)
