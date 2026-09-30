@@ -960,7 +960,7 @@ mod tests {
         let mut configured = test_config();
         configured.git_committer_name = "Anvil".into();
         configured.git_committer_email = "anvil@noreply.thejeffer.net".into();
-        let api = fixture.api_with_config(configured);
+        let api = fixture.api_with_config(configured.clone());
         let initial_work_state = initial_work_state();
         let mut request = fixture.request("demo");
         request.author_name = Some("Invoking Developer".into());
@@ -1055,7 +1055,7 @@ mod tests {
             state.child.take();
         }
         drop(api);
-        let restarted = fixture.api();
+        let restarted = fixture.api_with_config(configured);
         restarted.recover_startup().await.unwrap();
         let third_pid: u32 = std::fs::read_to_string(directory.join("worker.pid"))
             .unwrap()
@@ -1071,7 +1071,7 @@ mod tests {
         assert_eq!(recovered.session.environment_state, "ready");
         assert_eq!(
             std::fs::read_to_string(directory.join("sandbox-env.json")).unwrap(),
-            r#"[["ANVIL_TEST_ENV","retained"]]"#
+            r#"[["ANVIL_TEST_ENV","retained"],["ANVIL_GIT_AUTHOR_NAME","Invoking Developer"],["ANVIL_GIT_AUTHOR_EMAIL","developer@example.test"]]"#
         );
         restarted.delete(&session.id).await.unwrap();
         assert!(!directory.exists());
