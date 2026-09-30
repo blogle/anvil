@@ -1,5 +1,6 @@
 import { applyServerRefresh, detailRenderSignature, formatElapsedValue, operatorState, parseRoute, patchSessionRows, reconcileSessionRows, sessionRowMarkup, sessionUiState, updateSessionRowElapsed } from "./ui-state.js"
-import { renderFilesResult } from "./files-view.js"
+import { renderFilesResult, updateFilesPanel } from "./files-view.js"
+import { createFilesDiffState, FILE_DIFF_REFRESH_MS, isFilesTabActive } from "./files-state.js"
 
 const app = document.querySelector("#app")
 const state = {
@@ -12,7 +13,7 @@ const state = {
   loading: true,
   refreshInFlight: false,
   refreshGeneration: 0,
-  fileDiffs: new Map(),
+  fileDiffs: null,
 }
 
 function routeFor(sessionId) {
@@ -32,7 +33,9 @@ function navigate(sessionId, push = true) {
 }
 
 function applyRoute() {
+  const previous = state.selected
   state.selected = parseRoute(location.hash)
+  if (previous && previous !== state.selected) state.fileDiffs.invalidate(previous)
   document.querySelector(".app-shell")?.classList.toggle("mobile-detail", Boolean(state.selected))
   updateSidebar()
   updateDetail()
@@ -43,6 +46,7 @@ const api = async (path, options) => {
   if (!response.ok) throw new Error((await response.json().catch(() => null))?.error?.message || `Request failed (${response.status})`)
   return response.status === 204 ? null : response.json()
 }
+state.fileDiffs = createFilesDiffState((id) => api(`/v1/sessions/${encodeURIComponent(id)}/diff`))
 
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character])
 const timestamp = (value) => {
@@ -208,10 +212,6 @@ function updateDetail() {
   const session = activity?.session || state.sessions.find((item) => item.id === state.selected)
   const signature = JSON.stringify(detailRenderSignature({ selected: state.selected, activity, session }))
   if (detail.dataset.detailSignature === signature) {
-    if (session) {
-      const filesPanel = detail.querySelector("#files-panel")
-      if (filesPanel) filesPanel.innerHTML = renderFiles(session)
-    }
     updateDetailTab()
     return
   }
@@ -265,6 +265,18 @@ function renderFiles(session) {
   return renderFilesResult(state.fileDiffs.get(session.id))
 }
 
+function refreshSelectedFiles(force = false) {
+  const sessionId = state.selected
+  const ui = selectedUi()
+  const session = state.sessions.find((item) => item.id === sessionId)
+  if (document.visibilityState === "hidden" || !isFilesTabActive(session, ui?.tab)) return
+  state.fileDiffs.refresh(sessionId, { force }).then(({ changed, result }) => {
+    if (!changed || state.selected !== sessionId || selectedUi()?.tab !== "files") return
+    const panel = document.querySelector("#files-panel")
+    if (panel) updateFilesPanel(panel, result)
+  })
+}
+
 function relativeTime(value) {
   const date = timestamp(value)
   if (!date) return "recently"
@@ -314,16 +326,11 @@ async function handleClick(event) {
   if (tab) {
     const ui = selectedUi()
     if (ui) {
+      const previousTab = ui.tab
       ui.tab = tab.dataset.tab
+      if (previousTab === "files" && ui.tab !== "files") state.fileDiffs.invalidate(state.selected)
       updateDetailTab()
-      if (ui.tab === "files" && !state.fileDiffs.has(state.selected)) {
-        const id = state.selected
-        state.fileDiffs.set(id, { status: "loading" })
-        updateDetail()
-        api(`/v1/sessions/${encodeURIComponent(id)}/diff`).then((result) => state.fileDiffs.set(id, result)).catch((error) => state.fileDiffs.set(id, { status: "unavailable", message: error.message })).finally(() => {
-          if (state.selected === id) updateDetail()
-        })
-      }
+      if (ui.tab === "files") refreshSelectedFiles(true)
     }
     return
   }
@@ -410,10 +417,11 @@ function updateClocks() {
 
 window.addEventListener("hashchange", applyRoute)
 window.addEventListener("popstate", applyRoute)
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") refresh() })
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { refresh(); refreshSelectedFiles(true) } })
 ensureShell()
 updateSidebar()
 updateDetail()
 refresh()
 setInterval(refresh, 4000)
+setInterval(() => refreshSelectedFiles(), FILE_DIFF_REFRESH_MS)
 setInterval(updateClocks, 1000)
