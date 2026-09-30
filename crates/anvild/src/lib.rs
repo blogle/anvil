@@ -9523,7 +9523,7 @@ mod tests {
             .detail
             .as_deref()
             .unwrap()
-            .contains("cargo test"));
+            .contains("curl"));
         assert!(response.events[0].detail.as_deref().unwrap().contains("ok"));
         let serialized_events = serde_json::to_string(&response.events).unwrap();
         for secret in [
