@@ -56,6 +56,8 @@ struct BatchTask {
     dependencies: Vec<String>,
     owner: Option<String>,
     policy: Option<Value>,
+    pr_policy: Option<Value>,
+    evidence_contract: Option<Value>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 struct BatchSubmission {
@@ -66,6 +68,7 @@ struct BatchSubmission {
     concurrency: usize,
     #[serde(default)]
     allow_competing_tasks: bool,
+    policies: Option<Value>,
     tasks: Vec<BatchTask>,
     idempotency_key: String,
 }
@@ -227,12 +230,12 @@ impl AnvilMcp {
         &self,
         Parameters(p): Parameters<BatchSubmission>,
     ) -> Result<Json<Value>, ErrorData> {
-        let tasks: Vec<_> = p.tasks.into_iter().map(|task| json!({"task_id":task.task_id,"prompt":task.prompt,"dependencies":task.dependencies,"owner":task.owner,"policy":task.policy.unwrap_or(Value::Null)})).collect();
+        let tasks: Vec<_> = p.tasks.into_iter().map(|task| json!({"task_id":task.task_id,"prompt":task.prompt,"dependencies":task.dependencies,"owner":task.owner,"policy":task.policy.unwrap_or(Value::Null),"pr_policy":task.pr_policy.unwrap_or(Value::Null),"evidence_contract":task.evidence_contract.unwrap_or(Value::Null)})).collect();
         let url = self
             .base
             .join("v1/batches")
             .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
-        let response = self.client.post(url).header("idempotency-key", p.idempotency_key).json(&json!({"project":p.project,"repository":p.repository,"ref":p.reference,"concurrency":p.concurrency,"allow_competing_tasks":p.allow_competing_tasks,"tasks":tasks})).send().await.map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        let response = self.client.post(url).header("idempotency-key", p.idempotency_key).json(&json!({"project":p.project,"repository":p.repository,"ref":p.reference,"concurrency":p.concurrency,"allow_competing_tasks":p.allow_competing_tasks,"policies":p.policies.unwrap_or(Value::Null),"tasks":tasks})).send().await.map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
         let status = response.status();
         let body = response
             .json::<Value>()
@@ -584,12 +587,15 @@ mod tests {
                 reference: "main".into(),
                 concurrency: 1,
                 allow_competing_tasks: false,
+                policies: None,
                 tasks: vec![BatchTask {
                     task_id: "task-1".into(),
                     prompt: "do work".into(),
                     dependencies: vec![],
                     owner: None,
                     policy: None,
+                    pr_policy: None,
+                    evidence_contract: None,
                 }],
                 idempotency_key: "batch-key".into(),
             }))
@@ -617,6 +623,7 @@ mod tests {
                 reference: "main".into(),
                 concurrency: 1,
                 allow_competing_tasks: false,
+                policies: None,
                 tasks: vec![],
                 idempotency_key: "key".into(),
             }))

@@ -1706,6 +1706,8 @@ struct BatchSubmission {
     #[serde(default)]
     allow_competing_tasks: bool,
     #[serde(default)]
+    policies: Value,
+    #[serde(default)]
     tasks: Vec<BatchTaskSubmission>,
 }
 
@@ -1719,6 +1721,10 @@ struct BatchTaskSubmission {
     owner: Option<String>,
     #[serde(default)]
     policy: Value,
+    #[serde(default)]
+    pr_policy: Value,
+    #[serde(default)]
+    evidence_contract: Value,
 }
 
 async fn submit_batch(
@@ -1804,11 +1810,11 @@ async fn submit_batch(
                 .collect();
             (
                 id.clone(),
-                json!({"task_id":id,"requested_task_id":task.task_id,"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"base_id":resolved_base,"base_commit":resolved_base,"prompt":task.prompt,"dependencies":dependencies,"owner":task.owner,"policy":task.policy,"state":"queued"}),
+                json!({"task_id":id,"requested_task_id":task.task_id,"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"base_id":resolved_base,"base_commit":resolved_base,"prompt":task.prompt,"dependencies":dependencies,"owner":task.owner,"policy":task.policy,"pr_policy":task.pr_policy,"evidence_contract":task.evidence_contract,"state":"queued"}),
             )
         })
         .collect();
-    let batch = json!({"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"resolved_base_id":resolved_base,"base_commit":resolved_base,"accepted_task_ids":accepted_ids,"requested_task_ids":request.tasks.iter().map(|task| task.task_id.clone()).collect::<Vec<_>>(),"rejected_task_ids":[],"preflight_results":[],"queued_count":request.tasks.len(),"runnable_count":request.tasks.iter().filter(|task|task.dependencies.is_empty()).count(),"requested_concurrency":request.concurrency,"duplicate_suppression":[]});
+    let batch = json!({"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"resolved_base_id":resolved_base,"base_commit":resolved_base,"default_policies":request.policies,"accepted_task_ids":accepted_ids,"requested_task_ids":request.tasks.iter().map(|task| task.task_id.clone()).collect::<Vec<_>>(),"rejected_task_ids":[],"preflight_results":[],"queued_count":request.tasks.len(),"runnable_count":request.tasks.iter().filter(|task|task.dependencies.is_empty()).count(),"requested_concurrency":request.concurrency,"duplicate_suppression":[]});
     let acceptance = store
         .accept_batch(store::BatchAcceptance {
             key,
