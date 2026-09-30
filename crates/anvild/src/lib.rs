@@ -21,6 +21,8 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
+pub const DEFAULT_GIT_COMMITTER_NAME: &str = "Anvil";
+pub const DEFAULT_GIT_COMMITTER_EMAIL: &str = "anvil@anvil.local";
 use kube::{
     api::{
         Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams, PostParams,
@@ -91,6 +93,8 @@ pub struct Config {
     pub github_app_id: Option<String>,
     pub github_installation_id: Option<u64>,
     pub github_private_key: Option<String>,
+    pub git_committer_name: String,
+    pub git_committer_email: String,
     pub session_signing_secret: Option<String>,
     pub session_capability_ttl: Duration,
     pub github_api_url: String,
@@ -207,6 +211,8 @@ impl Config {
             github_app_id,
             github_installation_id,
             github_private_key,
+            git_committer_name: get("ANVIL_GIT_COMMITTER_NAME", DEFAULT_GIT_COMMITTER_NAME),
+            git_committer_email: get("ANVIL_GIT_COMMITTER_EMAIL", DEFAULT_GIT_COMMITTER_EMAIL),
             session_signing_secret,
             session_capability_ttl: Duration::from_secs(
                 get("ANVIL_SESSION_CAPABILITY_TTL", "86400")
@@ -1266,6 +1272,8 @@ impl SandboxApi for KubeSandboxApi {
             json!({"name":"XDG_STATE_HOME","value":"/home/anvil/.local/state"}),
             json!({"name":"XDG_RUNTIME_DIR","value":"/home/anvil/.local/state/runtime"}),
             json!({"name":"DISPLAY","value":":99"}),
+            json!({"name":"ANVIL_GIT_COMMITTER_NAME","value":self.config.git_committer_name}),
+            json!({"name":"ANVIL_GIT_COMMITTER_EMAIL","value":self.config.git_committer_email}),
         ];
         env.extend(
             sandbox_env
@@ -5010,6 +5018,8 @@ mod tests {
             github_app_id: None,
             github_installation_id: None,
             github_private_key: None,
+            git_committer_name: DEFAULT_GIT_COMMITTER_NAME.into(),
+            git_committer_email: DEFAULT_GIT_COMMITTER_EMAIL.into(),
             session_signing_secret: None,
             session_capability_ttl: Duration::from_secs(86400),
             github_api_url: "https://api.github.com".into(),
@@ -5087,6 +5097,35 @@ mod tests {
         assert!(spec["volumes"][1]["persistentVolumeClaim"]
             .get("readOnly")
             .is_none());
+    }
+
+    #[test]
+    fn sandbox_committer_env_and_real_git_metadata_preserve_author() {
+        let mut config = config("http://profile".into());
+        config.git_committer_name = "Anvil".into();
+        config.git_committer_email = "anvil@noreply.thejeffer.net".into();
+        assert!(!config.git_committer_email.contains("@users.noreply.github.com"));
+        let env = vec![
+            json!({"name":"ANVIL_GIT_COMMITTER_NAME","value":config.git_committer_name}),
+            json!({"name":"ANVIL_GIT_COMMITTER_EMAIL","value":config.git_committer_email}),
+            json!({"name":"ANVIL_GIT_AUTHOR_NAME","value":"Invoking Developer"}),
+            json!({"name":"ANVIL_GIT_AUTHOR_EMAIL","value":"developer@example.test"}),
+        ];
+        let manifest = sandbox_manifest(&config, "sandbox", json!({}), serde_json::Map::new(), json!({}), env);
+        let vars = manifest["spec"]["podTemplate"]["spec"]["containers"][0]["env"].as_array().unwrap();
+        assert!(vars.iter().any(|item| item["name"] == "ANVIL_GIT_COMMITTER_EMAIL" && item["value"] == config.git_committer_email));
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("file"), "content").unwrap();
+        let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(repo.path()).args(args).output().unwrap();
+        assert!(std::process::Command::new("git").args(["init", repo.path().to_str().unwrap()]).status().unwrap().success());
+        assert!(git(&["add", "file"]).status.success());
+        let status = std::process::Command::new("git").arg("-C").arg(repo.path()).args(["-c", "user.name=Anvil", "-c", "user.email=anvil@noreply.thejeffer.net", "commit", "-m", "test"]).env("GIT_AUTHOR_NAME", "Invoking Developer").env("GIT_AUTHOR_EMAIL", "developer@example.test").env("GIT_COMMITTER_NAME", &config.git_committer_name).env("GIT_COMMITTER_EMAIL", &config.git_committer_email).status().unwrap();
+        assert!(status.success());
+        let show = git(&["show", "-s", "--format=%an <%ae>%n%cn <%ce>"]).stdout;
+        let metadata = String::from_utf8(show).unwrap();
+        assert_eq!(metadata.trim(), "Invoking Developer <developer@example.test>\nAnvil <anvil@noreply.thejeffer.net>");
+        assert!(!metadata.contains("@users.noreply.github.com"));
     }
 
     fn activity_session() -> Session {

@@ -235,6 +235,8 @@ impl LocalSandboxApi {
             .env("OPENCODE_CONFIG_DIR", profile.join("config"))
             .env("OPENCODE_DISABLE_CHANNEL_DB", "1")
             .env("DISPLAY", ":99")
+            .env("ANVIL_GIT_COMMITTER_NAME", &self.config.git_committer_name)
+            .env("ANVIL_GIT_COMMITTER_EMAIL", &self.config.git_committer_email)
             .stdin(Stdio::null());
         let worker_log =
             std::fs::File::create(state.directory.join("worker.log")).map_err(local_error)?;
