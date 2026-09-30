@@ -1954,7 +1954,13 @@ async fn create_attempt(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<Value>), ServiceError> {
-    let key = headers.get("idempotency-key").and_then(|value| value.to_str().ok()).filter(|value| !value.trim().is_empty()).ok_or_else(|| ServiceError::Invalid("Idempotency-Key header is required for attempt creation".into()))?;
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ServiceError::Invalid("Idempotency-Key header is required for attempt creation".into())
+        })?;
     let attempt_id = uuid::Uuid::new_v4().to_string();
     let acceptance = state
         .store()
@@ -1962,10 +1968,16 @@ async fn create_attempt(
         .create_attempt(&id, &attempt_id, key)
         .map_err(|error| match error {
             store::StoreError::NotFound => ServiceError::NotFound,
-            store::StoreError::Conflict => ServiceError::Conflict("attempt idempotency key is bound to a different task".into()),
+            store::StoreError::Conflict => ServiceError::Conflict(
+                "attempt idempotency key is bound to a different task".into(),
+            ),
             other => ServiceError::Store(other.to_string()),
         })?;
-    let status = if acceptance.created { StatusCode::CREATED } else { StatusCode::OK };
+    let status = if acceptance.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
     Ok((status, Json(acceptance.attempt)))
 }
 
@@ -5062,63 +5074,198 @@ mod tests {
         let app = router(AppState::new(config, FakeSandbox));
         let plan = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":2,"tasks":[{"task_id":"build","prompt":"compile it","dependencies":[],"policy":{}}]});
         let submit = |plan: Value, key: &'static str| {
-            Request::builder().method("POST").uri("/v1/batches").header("idempotency-key", key).header("content-type", "application/json").body(Body::from(plan.to_string())).unwrap()
+            Request::builder()
+                .method("POST")
+                .uri("/v1/batches")
+                .header("idempotency-key", key)
+                .header("content-type", "application/json")
+                .body(Body::from(plan.to_string()))
+                .unwrap()
         };
-        let first = app.clone().oneshot(submit(plan.clone(), "stable-key")).await.unwrap();
+        let first = app
+            .clone()
+            .oneshot(submit(plan.clone(), "stable-key"))
+            .await
+            .unwrap();
         assert_eq!(first.status(), StatusCode::CREATED);
-        let first_body: Value = serde_json::from_slice(&axum::body::to_bytes(first.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let first_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(first.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(first_body["requested_revision"], "main");
-        assert_eq!(first_body["resolved_base_id"], "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(
+            first_body["resolved_base_id"],
+            "0123456789abcdef0123456789abcdef01234567"
+        );
         resolution.delete_async().await;
         upstream.mock(|when, then| {
             when.method(GET);
             then.status(503);
         });
-        let replay = app.clone().oneshot(submit(plan.clone(), "stable-key")).await.unwrap();
+        let replay = app
+            .clone()
+            .oneshot(submit(plan.clone(), "stable-key"))
+            .await
+            .unwrap();
         assert_eq!(replay.status(), StatusCode::OK);
-        let replay_body: Value = serde_json::from_slice(&axum::body::to_bytes(replay.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let replay_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(replay.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(first_body, replay_body);
         let conflict_plan = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":2,"tasks":[{"task_id":"build","prompt":"different work","dependencies":[],"policy":{}}]});
-        let conflict = app.clone().oneshot(submit(conflict_plan, "stable-key")).await.unwrap();
+        let conflict = app
+            .clone()
+            .oneshot(submit(conflict_plan, "stable-key"))
+            .await
+            .unwrap();
         assert_eq!(conflict.status(), StatusCode::CONFLICT);
         let batch_id = first_body["batch_id"].as_str().unwrap();
         let task_id = first_body["accepted_task_ids"][0].as_str().unwrap();
-        for (path, expected) in [(format!("/v1/batches/{batch_id}"), first_body.clone()), (format!("/v1/tasks/{task_id}"), json!({"task_id":task_id}))] {
-            let response = app.clone().oneshot(Request::builder().uri(path).body(Body::empty()).unwrap()).await.unwrap();
+        for (path, expected) in [
+            (format!("/v1/batches/{batch_id}"), first_body.clone()),
+            (format!("/v1/tasks/{task_id}"), json!({"task_id":task_id})),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
-            let body: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-            if expected.get("batch_id").is_some() { assert_eq!(body, expected); } else { assert_eq!(body["task_id"], task_id); }
+            let body: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            if expected.get("batch_id").is_some() {
+                assert_eq!(body, expected);
+            } else {
+                assert_eq!(body["task_id"], task_id);
+            }
         }
         for ordinal in 1..=2 {
             let key = format!("attempt-key-{ordinal}");
-            let response = app.clone().oneshot(Request::builder().method("POST").uri(format!("/v1/tasks/{task_id}/attempts")).header("idempotency-key", &key).body(Body::empty()).unwrap()).await.unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/tasks/{task_id}/attempts"))
+                        .header("idempotency-key", &key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::CREATED);
-            let body: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+            let body: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
             assert_eq!(body["ordinal"], ordinal);
             if ordinal == 1 {
-                let retry = app.clone().oneshot(Request::builder().method("POST").uri(format!("/v1/tasks/{task_id}/attempts")).header("idempotency-key", &key).body(Body::empty()).unwrap()).await.unwrap();
+                let retry = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(format!("/v1/tasks/{task_id}/attempts"))
+                            .header("idempotency-key", &key)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
                 assert_eq!(retry.status(), StatusCode::OK);
-                let replay: Value = serde_json::from_slice(&axum::body::to_bytes(retry.into_body(), usize::MAX).await.unwrap()).unwrap();
+                let replay: Value = serde_json::from_slice(
+                    &axum::body::to_bytes(retry.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
                 assert_eq!(replay["attempt_id"], body["attempt_id"]);
                 assert_eq!(replay["ordinal"], 1);
             }
         }
-        let listed = app.clone().oneshot(Request::builder().uri(format!("/v1/tasks/{task_id}/attempts")).body(Body::empty()).unwrap()).await.unwrap();
-        let attempts: Value = serde_json::from_slice(&axum::body::to_bytes(listed.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/tasks/{task_id}/attempts"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let attempts: Value = serde_json::from_slice(
+            &axum::body::to_bytes(listed.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(attempts["attempts"].as_array().unwrap().len(), 2);
         let attempt_id = attempts["attempts"][0]["attempt_id"].as_str().unwrap();
-        let get_attempt = app.clone().oneshot(Request::builder().uri(format!("/v1/attempts/{attempt_id}")).body(Body::empty()).unwrap()).await.unwrap();
+        let get_attempt = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/attempts/{attempt_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(get_attempt.status(), StatusCode::OK);
-        let bind_session = app.clone().oneshot(Request::builder().method("POST").uri(format!("/v1/attempts/{attempt_id}")).header("content-type", "application/json").body(Body::from(json!({"session_id":"session-runtime-id"}).to_string())).unwrap()).await.unwrap();
-        let bound: Value = serde_json::from_slice(&axum::body::to_bytes(bind_session.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let bind_session = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/attempts/{attempt_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"session_id":"session-runtime-id"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bound: Value = serde_json::from_slice(
+            &axum::body::to_bytes(bind_session.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(bound["attempt_id"], attempt_id);
         assert_eq!(bound["session_id"], "session-runtime-id");
         let independent = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":1,"tasks":[{"task_id":"build","prompt":"different logical work"}]});
-        let independent_response = app.clone().oneshot(submit(independent, "independent-key")).await.unwrap();
-        let independent_body: Value = serde_json::from_slice(&axum::body::to_bytes(independent_response.into_body(), usize::MAX).await.unwrap()).unwrap();
-        assert_ne!(task_id, independent_body["accepted_task_ids"][0].as_str().unwrap());
+        let independent_response = app
+            .clone()
+            .oneshot(submit(independent, "independent-key"))
+            .await
+            .unwrap();
+        let independent_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(independent_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(
+            task_id,
+            independent_body["accepted_task_ids"][0].as_str().unwrap()
+        );
         let duplicate = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":2,"tasks":[{"task_id":"x","prompt":"a"},{"task_id":"x","prompt":"b"}]});
-        let rejected = app.oneshot(submit(duplicate, "duplicate-key")).await.unwrap();
+        let rejected = app
+            .oneshot(submit(duplicate, "duplicate-key"))
+            .await
+            .unwrap();
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
     }
 
