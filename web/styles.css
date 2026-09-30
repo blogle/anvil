@@ -121,6 +121,11 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .event-request_failed .event-marker { background: var(--danger); box-shadow: 0 0 0 1px var(--danger); }
 .event-title { font-size: 13px; font-weight: 650; }
 .event-detail { margin-top: 6px; color: var(--text-secondary); font-size: 12px; line-height: 1.45; }
+.activity-timeline { max-height: min(68vh, 820px); overflow: auto; padding: 8px 10px 0 0; }
+.activity-detail { max-width: 100%; max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; }
+.event-tool .event-marker { background: #8b6be8; box-shadow: 0 0 0 1px #8b6be8; }
+.event-error .event-marker { background: var(--danger); box-shadow: 0 0 0 1px var(--danger); }
+.activity-status { margin-left: 6px; padding: 2px 6px; border-radius: 9px; background: var(--surface-raised); color: var(--text-secondary); font-size: 10px; font-weight: 500; }
 .request-card { position: relative; margin: -2px 0 26px 96px; padding: 17px 18px 18px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
 .request-card::before { position: absolute; left: -29px; top: 5px; width: 13px; height: 13px; border: 3px solid var(--background); border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 1px var(--accent); content: ""; }
 .request-card.completed::before { background: var(--success); box-shadow: 0 0 0 1px var(--success); }
