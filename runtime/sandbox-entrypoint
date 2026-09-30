@@ -45,17 +45,7 @@ if command -v Xvfb >/dev/null 2>&1 && ! pgrep -f "Xvfb ${DISPLAY}" >/dev/null 2>
   trap 'kill "$xvfb_pid" 2>/dev/null || true' EXIT
 fi
 
-git config --global credential.helper /bin/anvil-credential
-git config --global user.name "${ANVIL_GIT_COMMITTER_NAME:-Anvil}"
-git config --global user.email "${ANVIL_GIT_COMMITTER_EMAIL:-anvil@anvil.local}"
-if [ -n "${ANVIL_GIT_AUTHOR_NAME:-}" ]; then
-  export GIT_AUTHOR_NAME="$ANVIL_GIT_AUTHOR_NAME"
-fi
-if [ -n "${ANVIL_GIT_AUTHOR_EMAIL:-}" ]; then
-  export GIT_AUTHOR_EMAIL="$ANVIL_GIT_AUTHOR_EMAIL"
-fi
-export GIT_COMMITTER_NAME="${ANVIL_GIT_COMMITTER_NAME:-Anvil}"
-export GIT_COMMITTER_EMAIL="${ANVIL_GIT_COMMITTER_EMAIL:-anvil@anvil.local}"
+source /bin/anvil-git-identity
 
 profile_dir=/anvil/profile
 mkdir -p "$profile_dir/config" "$profile_dir/auth"
