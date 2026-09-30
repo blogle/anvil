@@ -183,6 +183,13 @@ impl LocalSandboxApi {
         ] {
             tokio::fs::create_dir_all(path).await.map_err(local_error)?;
         }
+        let git_identity_script = home.join(".anvil-git-identity");
+        tokio::fs::write(
+            &git_identity_script,
+            include_str!("../../../runtime/git-identity"),
+        )
+        .await
+        .map_err(local_error)?;
         let port = state.record.session.opencode_port;
         let port_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
@@ -206,8 +213,13 @@ impl LocalSandboxApi {
                 }
             }
         }
-        let mut command = Command::new(&self.opencode_bin);
+        let mut command = Command::new("bash");
         command
+            .args([
+                "-c",
+                "source \"$ANVIL_GIT_IDENTITY_SCRIPT\"; opencode_bin=\"$ANVIL_OPENCODE_BIN\"; unset ANVIL_GIT_IDENTITY_SCRIPT ANVIL_OPENCODE_BIN; exec \"$opencode_bin\" \"$@\"",
+                "anvil-opencode",
+            ])
             .args([
                 "serve",
                 "--hostname",
@@ -234,7 +246,13 @@ impl LocalSandboxApi {
             .env("OPENCODE_CONFIG", profile.join("config/opencode.jsonc"))
             .env("OPENCODE_CONFIG_DIR", profile.join("config"))
             .env("OPENCODE_DISABLE_CHANNEL_DB", "1")
+            .env("ANVIL_GIT_IDENTITY_SCRIPT", &git_identity_script)
+            .env("ANVIL_OPENCODE_BIN", &self.opencode_bin)
             .env("DISPLAY", ":99")
+            .env_remove("ANVIL_GIT_AUTHOR_NAME")
+            .env_remove("ANVIL_GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
             .stdin(Stdio::null());
         for (key, value) in super::git_committer_environment(&self.config) {
             command.env(key, value);
@@ -851,7 +869,7 @@ mod tests {
             std::fs::write(
                 &fake_opencode,
                 format!(
-                    "#!/bin/sh\nprintf '%s\\n%s\\n' \"$ANVIL_GIT_COMMITTER_NAME\" \"$ANVIL_GIT_COMMITTER_EMAIL\" > '{}/worker-identity'\nexport ANVIL_TEST_FAKE_OPENCODE_PORT=\"$5\"\nexec '{test_binary}' --exact local::tests::fake_opencode_worker_process --nocapture\n",
+                    "#!/bin/sh\ngit commit --allow-empty -m 'local identity probe'\ngit show -s --format='%an <%ae>%n%cn <%ce>' > '{}/worker-identity'\nexport ANVIL_TEST_FAKE_OPENCODE_PORT=\"$5\"\nexec '{test_binary}' --exact local::tests::fake_opencode_worker_process --nocapture\n",
                     root.display()
                 ),
             )
@@ -944,10 +962,13 @@ mod tests {
         configured.git_committer_email = "anvil@noreply.thejeffer.net".into();
         let api = fixture.api_with_config(configured);
         let initial_work_state = initial_work_state();
+        let mut request = fixture.request("demo");
+        request.author_name = Some("Invoking Developer".into());
+        request.author_email = Some("developer@example.test".into());
         let session = api
             .create(
                 "demo-12345678",
-                &fixture.request("demo"),
+                &request,
                 &[("ANVIL_TEST_ENV".into(), "retained".into())],
                 &initial_work_state,
             )
@@ -959,8 +980,11 @@ mod tests {
         let directory = fixture.runtime.join(&session.id);
         assert_eq!(
             std::fs::read_to_string(fixture.root.join("worker-identity")).unwrap(),
-            "Anvil\nanvil@noreply.thejeffer.net\n"
+            "Invoking Developer <developer@example.test>\nAnvil <anvil@noreply.thejeffer.net>\n"
         );
+        assert!(!std::fs::read_to_string(fixture.root.join("worker-identity"))
+            .unwrap()
+            .contains("@users.noreply.github.com"));
         let workspace = directory.join("home/workspace/demo/target.txt");
         assert_eq!(
             std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,

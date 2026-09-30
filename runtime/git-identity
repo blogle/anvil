@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Configure Anvil's automation committer while leaving the session author intact.
-git config --global credential.helper /bin/anvil-credential
 git config --global user.name "${ANVIL_GIT_COMMITTER_NAME:-Anvil}"
 git config --global user.email "${ANVIL_GIT_COMMITTER_EMAIL:-anvil@anvil.local}"
+unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL
 if [ -n "${ANVIL_GIT_AUTHOR_NAME:-}" ]; then
   export GIT_AUTHOR_NAME="$ANVIL_GIT_AUTHOR_NAME"
 fi
