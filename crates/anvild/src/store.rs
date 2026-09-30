@@ -202,10 +202,22 @@ impl ControllerStore {
             }));
         }
         let mut accepted_batch = batch.clone();
-        let mut new_tasks = Vec::new();
+        let mut new_tasks: Vec<(String, Value)> = Vec::new();
         let mut suppressed = Vec::new();
         for (task_id, task) in tasks {
-            let existing: Option<(String, String)> = if allow_competing {
+            let already_in_batch = if allow_competing {
+                None
+            } else {
+                new_tasks.iter().find_map(|(existing_id, existing_task)| {
+                    (existing_task["project"] == task["project"]
+                        && existing_task["repository"] == task["repository"]
+                        && existing_task["prompt"] == task["prompt"])
+                        .then(|| (existing_id.clone(), String::new()))
+                })
+            };
+            let existing: Option<(String, String)> = if already_in_batch.is_some() {
+                already_in_batch
+            } else if allow_competing {
                 None
             } else {
                 let mut statement = tx.prepare("SELECT resource_id,payload_json FROM orchestration_resources WHERE resource_type='task' AND json_extract(payload_json,'$.project')=?1 AND json_extract(payload_json,'$.repository')=?2 AND json_extract(payload_json,'$.prompt')=?3 AND json_extract(payload_json,'$.state') IN ('queued','running') LIMIT 1")?;
@@ -225,11 +237,24 @@ impl ControllerStore {
                     serde_json::json!({"requested_task_id":task_id,"existing_task_id":existing_id}),
                 );
             } else {
-                new_tasks.push((task_id, task));
+                new_tasks.push((task_id.clone(), task.clone()));
             }
         }
+        let aliases: std::collections::HashMap<_, _> = suppressed
+            .iter()
+            .filter_map(|entry| {
+                Some((
+                    entry["requested_task_id"].as_str()?.to_owned(),
+                    entry["existing_task_id"].as_str()?.to_owned(),
+                ))
+            })
+            .collect();
         if !suppressed.is_empty() {
             accepted_batch["queued_count"] = serde_json::json!(new_tasks.len());
+            accepted_batch["runnable_count"] = serde_json::json!(new_tasks
+                .iter()
+                .filter(|(_, task)| task["dependencies"].as_array().is_none_or(Vec::is_empty))
+                .count());
             if let Some(ids) = accepted_batch
                 .get_mut("accepted_task_ids")
                 .and_then(Value::as_array_mut)
@@ -245,8 +270,17 @@ impl ControllerStore {
             accepted_batch["duplicate_suppression"] = Value::Array(suppressed);
         }
         tx.execute("INSERT INTO orchestration_resources (resource_type, resource_id, batch_id, task_id, attempt_id, payload_json, created_at, updated_at) VALUES ('batch',?1,?1,NULL,NULL,?2,?3,?3)", params![batch_id, serde_json::to_string(&accepted_batch)?, now])?;
-        for (task_id, task) in new_tasks {
-            tx.execute("INSERT INTO orchestration_resources (resource_type, resource_id, batch_id, task_id, attempt_id, payload_json, created_at, updated_at) VALUES ('task',?1,?2,?1,NULL,?3,?4,?4)", params![task_id, batch_id, serde_json::to_string(task)?, now])?;
+        tx.execute("INSERT INTO batches(batch_id,project,repository,requested_revision,base_commit,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![batch_id,accepted_batch["project"].as_str().unwrap_or_default(),accepted_batch["repository"].as_str().unwrap_or_default(),accepted_batch["requested_revision"].as_str().unwrap_or_default(),accepted_batch["base_commit"].as_str().unwrap_or_default(),serde_json::to_string(&accepted_batch)?,now])?;
+        for (task_id, mut task) in new_tasks {
+            if let Some(dependencies) = task["dependencies"].as_array_mut() {
+                for dependency in dependencies {
+                    if let Some(replacement) = dependency.as_str().and_then(|id| aliases.get(id)) {
+                        *dependency = Value::String(replacement.clone());
+                    }
+                }
+            }
+            tx.execute("INSERT INTO tasks(task_id,batch_id,client_task_id,project,repository,prompt,state,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,'queued',?7,?8)", params![task_id,batch_id,task["requested_task_id"].as_str().unwrap_or(&task_id),task["project"].as_str().unwrap_or_default(),task["repository"].as_str().unwrap_or_default(),task["prompt"].as_str().unwrap_or_default(),serde_json::to_string(&task)?,now])?;
+            tx.execute("INSERT INTO orchestration_resources (resource_type, resource_id, batch_id, task_id, attempt_id, payload_json, created_at, updated_at) VALUES ('task',?1,?2,?1,NULL,?3,?4,?4)", params![task_id, batch_id, serde_json::to_string(&task)?, now])?;
         }
         tx.execute("INSERT INTO idempotency_records (idempotency_key, operation_kind, scope, request_hash, canonicalization_version, result_reference, result_json, state, created_at, updated_at) VALUES (?1,'submit_batch',?2,?3,?4,?5,?6,'accepted',?7,?7)", params![key, scope, hash, CANONICALIZATION_VERSION, batch_id, serde_json::to_string(&accepted_batch)?, now])?;
         tx.commit()?;
@@ -267,7 +301,13 @@ impl ControllerStore {
             .connection
             .lock()
             .expect("controller store lock poisoned");
-        connection.query_row("SELECT payload_json FROM orchestration_resources WHERE resource_type=?1 AND resource_id=?2", params![resource_type, id], |row| row.get::<_, String>(0)).optional()?.map(|value| serde_json::from_str(&value).map_err(StoreError::from)).transpose()
+        let query = match resource_type {
+            "batch" => "SELECT payload_json FROM batches WHERE batch_id=?1",
+            "task" => "SELECT payload_json FROM tasks WHERE task_id=?1",
+            "attempt" => "SELECT payload_json FROM attempts WHERE attempt_id=?1",
+            _ => return Ok(None),
+        };
+        connection.query_row(query, [id], |row| row.get::<_, String>(0)).optional()?.map(|value| serde_json::from_str(&value).map_err(StoreError::from)).transpose()
     }
 
     /// Create the next durable execution attempt for an already accepted logical task.
@@ -277,7 +317,7 @@ impl ControllerStore {
             .lock()
             .expect("controller store lock poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let task: Option<String> = tx.query_row("SELECT payload_json FROM orchestration_resources WHERE resource_type='task' AND resource_id=?1", [task_id], |row| row.get(0)).optional()?;
+        let task: Option<String> = tx.query_row("SELECT payload_json FROM tasks WHERE task_id=?1", [task_id], |row| row.get(0)).optional()?;
         let Some(task) = task else {
             return Err(StoreError::NotFound);
         };
@@ -456,6 +496,10 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
             "INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?1)",
             [chrono::Utc::now().to_rfc3339()],
         )?;
+    }
+    if version < 4 {
+        tx.execute_batch("CREATE TABLE batches (batch_id TEXT PRIMARY KEY, project TEXT NOT NULL, repository TEXT NOT NULL, requested_revision TEXT NOT NULL, base_commit TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE tasks (task_id TEXT PRIMARY KEY, batch_id TEXT NOT NULL REFERENCES batches(batch_id), client_task_id TEXT NOT NULL, project TEXT NOT NULL, repository TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL); CREATE INDEX tasks_by_batch ON tasks(batch_id); CREATE INDEX active_logical_tasks ON tasks(project,repository,prompt,state); CREATE TABLE attempts_v4 (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), ordinal INTEGER NOT NULL, session_id TEXT UNIQUE, payload_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(task_id,ordinal)); INSERT INTO attempts_v4 SELECT attempt_id,task_id,ordinal,session_id,payload_json,created_at FROM attempts; DROP TABLE attempts; ALTER TABLE attempts_v4 RENAME TO attempts; CREATE INDEX attempts_by_task ON attempts(task_id);")?;
+        tx.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?1)", [chrono::Utc::now().to_rfc3339()])?;
     }
     tx.commit()?;
     Ok(())
@@ -724,7 +768,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
     #[test]
     fn migration_is_repeatable_and_indexed() {
@@ -744,7 +788,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(latest, 3);
+        assert_eq!(latest, 4);
         let index: i64=connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='orchestration_by_attempt'",[],|row|row.get(0)).unwrap();
         assert_eq!(index, 1);
     }
@@ -785,6 +829,7 @@ mod tests {
         );
         assert!(failed.is_err());
         assert_eq!(store.get_resource("batch", "batch-1").unwrap(), None);
+        assert_eq!(store.get_resource("task", "task-1").unwrap(), None);
         assert_eq!(store.get("failure-key").unwrap(), None);
         store
             .connection
@@ -823,6 +868,8 @@ mod tests {
                 .unwrap(),
             Acceptance::Replayed(_)
         ));
+        let batch_count: i64 = reopened.connection.lock().unwrap().query_row("SELECT COUNT(*) FROM batches", [], |row| row.get(0)).unwrap();
+        assert_eq!(batch_count, 1, "retry after simulated client timeout must not create another batch");
         assert!(matches!(
             reopened.accept_batch(
                 "retry-key",
@@ -873,5 +920,22 @@ mod tests {
             "logical-task"
         );
         assert_eq!(reopened.attempts_for_task("logical-task").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn active_logical_collision_suppresses_by_default_and_override_allows_competition() {
+        let (_dir, store) = store();
+        let batch = |id: &str, task_id: &str| serde_json::json!({"batch_id":id,"project":"demo","repository":"https://github.com/example/repo","requested_revision":"main","base_commit":"0123456789abcdef0123456789abcdef01234567","accepted_task_ids":[task_id],"queued_count":1,"duplicate_suppression":[]});
+        let task = |id: &str, client_id: &str| serde_json::json!({"task_id":id,"requested_task_id":client_id,"project":"demo","repository":"https://github.com/example/repo","prompt":"same active work","state":"queued"});
+        let first = store.accept_batch("first", "demo", &serde_json::json!({"n":1}), "batch-1", &batch("batch-1", "task-1"), &[("task-1".into(), task("task-1", "build"))], false).unwrap();
+        assert!(matches!(first, Acceptance::Created(_)));
+        let suppressed = store.accept_batch("second", "demo", &serde_json::json!({"n":2}), "batch-2", &batch("batch-2", "task-2"), &[("task-2".into(), task("task-2", "build"))], false).unwrap();
+        let Acceptance::Created(suppressed) = suppressed else { panic!("new batch expected") };
+        assert_eq!(suppressed.result["accepted_task_ids"][0], "task-1");
+        assert_eq!(suppressed.result["duplicate_suppression"][0]["existing_task_id"], "task-1");
+        assert_eq!(store.get_resource("task", "task-2").unwrap(), None);
+        let competing = store.accept_batch("third", "demo", &serde_json::json!({"n":3}), "batch-3", &batch("batch-3", "task-3"), &[("task-3".into(), task("task-3", "build"))], true).unwrap();
+        assert!(matches!(competing, Acceptance::Created(_)));
+        assert!(store.get_resource("task", "task-3").unwrap().is_some());
     }
 }
