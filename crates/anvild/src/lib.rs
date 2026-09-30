@@ -5733,7 +5733,7 @@ fn build_activity(
                     let title = state
                         .and_then(|value| value.get("title"))
                         .and_then(Value::as_str)
-                        .map(|value| redact_activity_text(value))
+                        .map(redact_activity_text)
                         .unwrap_or_else(|| format!("{} tool", redact_activity_text(tool)))
                         .chars()
                         .take(250)
