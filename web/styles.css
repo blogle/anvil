@@ -121,8 +121,17 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .event-request_failed .event-marker { background: var(--danger); box-shadow: 0 0 0 1px var(--danger); }
 .event-title { font-size: 13px; font-weight: 650; }
 .event-detail { margin-top: 6px; color: var(--text-secondary); font-size: 12px; line-height: 1.45; }
-.activity-timeline { max-height: min(68vh, 820px); overflow: auto; padding: 8px 10px 0 0; }
-.activity-detail { max-width: 100%; max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; }
+.activity-transcript { max-height: min(68vh, 820px); overflow: auto; border-top: 1px solid var(--border); }
+.transcript-row { display: grid; grid-template-columns: 64px 66px minmax(0, 1fr); align-items: start; gap: 12px; padding: 10px 4px 10px 0; border-bottom: 1px solid var(--border); }
+.transcript-kind { display: inline-flex; justify-content: center; width: fit-content; min-width: 48px; margin-top: 1px; padding: 3px 5px; border-radius: 4px; color: var(--text-muted); background: var(--surface-raised); font-size: 9px; font-weight: 750; letter-spacing: 0.055em; line-height: 1.2; }
+.kind-prompt { color: #f0b77e; background: rgba(210, 130, 72, 0.12); }
+.kind-message { color: #91b8e9; background: rgba(91, 139, 203, 0.12); }
+.kind-tool { color: #c2a7f5; background: rgba(139, 107, 232, 0.13); }
+.kind-error { color: var(--danger); background: rgba(228, 135, 135, 0.12); }
+.transcript-copy { min-width: 0; }
+.transcript-title { color: var(--text-primary); font-size: 12px; font-weight: 650; line-height: 1.4; overflow-wrap: anywhere; }
+.transcript-prose { margin-top: 2px; color: var(--text-secondary); font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.transcript-detail { max-width: 100%; max-height: 96px; overflow: auto; margin: 4px 0 0; color: var(--text-secondary); font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere; }
 .event-tool .event-marker { background: #8b6be8; box-shadow: 0 0 0 1px #8b6be8; }
 .event-error .event-marker { background: var(--danger); box-shadow: 0 0 0 1px var(--danger); }
 .activity-status { margin-left: 6px; padding: 2px 6px; border-radius: 9px; background: var(--surface-raised); color: var(--text-secondary); font-size: 10px; font-weight: 500; }
@@ -166,6 +175,7 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
   .request-card { margin-left: 0; }
   .request-card::before { display: none; }
   .timeline-event { grid-template-columns: 57px 1fr; gap: 14px; }
+  .transcript-row { grid-template-columns: 48px 54px minmax(0, 1fr); gap: 7px; padding: 9px 0; }
   .event-body { padding-left: 17px; }
   .event-time { font-size: 10px; }
   .runtime-grid { grid-template-columns: 1fr; }
