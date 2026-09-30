@@ -247,24 +247,65 @@ impl AnvilMcp {
         Ok(Json(body))
     }
     #[rmcp::tool(description = "Get an accepted durable batch by ID.")]
-    async fn anvil_get_batch(&self, Parameters(p): Parameters<ResourceId>) -> Result<Json<Value>, ErrorData> {
-        Ok(Json(self.call(Method::GET, &format!("v1/batches/{}", p.id), None).await?))
+    async fn anvil_get_batch(
+        &self,
+        Parameters(p): Parameters<ResourceId>,
+    ) -> Result<Json<Value>, ErrorData> {
+        Ok(Json(
+            self.call(Method::GET, &format!("v1/batches/{}", p.id), None)
+                .await?,
+        ))
     }
     #[rmcp::tool(description = "Get an accepted logical task by ID.")]
-    async fn anvil_get_task(&self, Parameters(p): Parameters<ResourceId>) -> Result<Json<Value>, ErrorData> {
-        Ok(Json(self.call(Method::GET, &format!("v1/tasks/{}", p.id), None).await?))
+    async fn anvil_get_task(
+        &self,
+        Parameters(p): Parameters<ResourceId>,
+    ) -> Result<Json<Value>, ErrorData> {
+        Ok(Json(
+            self.call(Method::GET, &format!("v1/tasks/{}", p.id), None)
+                .await?,
+        ))
     }
     #[rmcp::tool(description = "Get a durable execution attempt by ID.")]
-    async fn anvil_get_attempt(&self, Parameters(p): Parameters<ResourceId>) -> Result<Json<Value>, ErrorData> {
-        Ok(Json(self.call(Method::GET, &format!("v1/attempts/{}", p.id), None).await?))
+    async fn anvil_get_attempt(
+        &self,
+        Parameters(p): Parameters<ResourceId>,
+    ) -> Result<Json<Value>, ErrorData> {
+        Ok(Json(
+            self.call(Method::GET, &format!("v1/attempts/{}", p.id), None)
+                .await?,
+        ))
     }
-    #[rmcp::tool(description = "Create a replacement execution attempt for an existing logical task.")]
-    async fn anvil_create_attempt(&self, Parameters(p): Parameters<TaskResourceId>) -> Result<Json<Value>, ErrorData> {
-        let url = self.base.join(&format!("v1/tasks/{}/attempts", p.task_id)).map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
-        let response = self.client.post(url).header("idempotency-key", p.idempotency_key).json(&json!({})).send().await.map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+    #[rmcp::tool(
+        description = "Create a replacement execution attempt for an existing logical task."
+    )]
+    async fn anvil_create_attempt(
+        &self,
+        Parameters(p): Parameters<TaskResourceId>,
+    ) -> Result<Json<Value>, ErrorData> {
+        let url = self
+            .base
+            .join(&format!("v1/tasks/{}/attempts", p.task_id))
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        let response = self
+            .client
+            .post(url)
+            .header("idempotency-key", p.idempotency_key)
+            .json(&json!({}))
+            .send()
+            .await
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
         let status = response.status();
-        let body = response.json::<Value>().await.map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
-        if !status.is_success() { return Err(ErrorData::internal_error(format!("Anvil API returned {status}"), Some(json!({"http_status":status.as_u16(),"error":body})))); }
+        let body = response
+            .json::<Value>()
+            .await
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        if !status.is_success() {
+            return Err(ErrorData::internal_error(
+                format!("Anvil API returned {status}"),
+                Some(json!({"http_status":status.as_u16(),"error":body})),
+            ));
+        }
         Ok(Json(body))
     }
     #[rmcp::tool(description = "List available Anvil development sessions.")]
@@ -564,14 +605,23 @@ mod tests {
         let server = MockServer::start_async().await;
         server.mock(|when, then| {
             when.method(httpmock::Method::POST).path("/v1/batches");
-            then.status(409).json_body(json!({"error":{"message":"different batch plan"}}));
+            then.status(409)
+                .json_body(json!({"error":{"message":"different batch plan"}}));
         });
-        let mcp = AnvilMcp::new(reqwest::Url::parse(&format!("{}/", server.base_url())).unwrap()).unwrap();
-        let error = mcp.anvil_submit_batch(Parameters(BatchSubmission {
-            project: "demo".into(), repository: "https://github.com/example/demo".into(),
-            reference: "main".into(), concurrency: 1, allow_competing_tasks: false,
-            tasks: vec![], idempotency_key: "key".into(),
-        })).await.unwrap_err();
+        let mcp = AnvilMcp::new(reqwest::Url::parse(&format!("{}/", server.base_url())).unwrap())
+            .unwrap();
+        let error = mcp
+            .anvil_submit_batch(Parameters(BatchSubmission {
+                project: "demo".into(),
+                repository: "https://github.com/example/demo".into(),
+                reference: "main".into(),
+                concurrency: 1,
+                allow_competing_tasks: false,
+                tasks: vec![],
+                idempotency_key: "key".into(),
+            }))
+            .await
+            .unwrap_err();
         assert!(error.message.contains("409"));
         assert_eq!(error.data.unwrap()["http_status"], 409);
     }
@@ -593,13 +643,48 @@ mod tests {
             when.method(httpmock::Method::POST)
                 .path("/v1/tasks/task-1/attempts")
                 .header("idempotency-key", "attempt-key");
-            then.status(201).json_body(json!({"attempt_id":"attempt-2","ordinal":2}));
+            then.status(201)
+                .json_body(json!({"attempt_id":"attempt-2","ordinal":2}));
         });
-        let mcp = AnvilMcp::new(reqwest::Url::parse(&format!("{}/", server.base_url())).unwrap()).unwrap();
-        assert_eq!(mcp.anvil_get_batch(Parameters(ResourceId { id: "batch-1".into() })).await.unwrap().0["batch_id"], "batch-1");
-        assert_eq!(mcp.anvil_get_task(Parameters(ResourceId { id: "task-1".into() })).await.unwrap().0["task_id"], "task-1");
-        assert_eq!(mcp.anvil_get_attempt(Parameters(ResourceId { id: "attempt-1".into() })).await.unwrap().0["attempt_id"], "attempt-1");
-        assert_eq!(mcp.anvil_create_attempt(Parameters(TaskResourceId { task_id: "task-1".into(), idempotency_key: "attempt-key".into() })).await.unwrap().0["ordinal"], 2);
+        let mcp = AnvilMcp::new(reqwest::Url::parse(&format!("{}/", server.base_url())).unwrap())
+            .unwrap();
+        assert_eq!(
+            mcp.anvil_get_batch(Parameters(ResourceId {
+                id: "batch-1".into()
+            }))
+            .await
+            .unwrap()
+            .0["batch_id"],
+            "batch-1"
+        );
+        assert_eq!(
+            mcp.anvil_get_task(Parameters(ResourceId {
+                id: "task-1".into()
+            }))
+            .await
+            .unwrap()
+            .0["task_id"],
+            "task-1"
+        );
+        assert_eq!(
+            mcp.anvil_get_attempt(Parameters(ResourceId {
+                id: "attempt-1".into()
+            }))
+            .await
+            .unwrap()
+            .0["attempt_id"],
+            "attempt-1"
+        );
+        assert_eq!(
+            mcp.anvil_create_attempt(Parameters(TaskResourceId {
+                task_id: "task-1".into(),
+                idempotency_key: "attempt-key".into()
+            }))
+            .await
+            .unwrap()
+            .0["ordinal"],
+            2
+        );
     }
 
     #[test]

@@ -237,7 +237,11 @@ impl ControllerStore {
             } else {
                 let mut statement = tx.prepare("SELECT resource_id,payload_json FROM orchestration_resources WHERE resource_type='task' AND json_extract(payload_json,'$.project')=?1 AND json_extract(payload_json,'$.repository')=?2 AND json_extract(payload_json,'$.prompt')=?3 AND json_extract(payload_json,'$.state') IN ('queued','running')")?;
                 let matches = statement.query_map(
-                    params![task["project"].as_str(), task["repository"].as_str(), task["prompt"].as_str()],
+                    params![
+                        task["project"].as_str(),
+                        task["repository"].as_str(),
+                        task["prompt"].as_str()
+                    ],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )?;
                 let mut collision = None;
@@ -325,19 +329,44 @@ impl ControllerStore {
     ) -> Result<Option<AcceptedResult>, StoreError> {
         let canonical = canonical_json(request);
         let hash = format!("{:x}", Sha256::digest(canonical.as_bytes()));
-        let connection = self.connection.lock().expect("controller store lock poisoned");
+        let connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
         let existing = connection.query_row(
             "SELECT operation_kind,scope,request_hash,canonicalization_version,result_reference,result_json,state,created_at,updated_at FROM idempotency_records WHERE idempotency_key=?1",
             [key],
             |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,String>(7)?,row.get::<_,String>(8)?)),
         ).optional()?;
-        let Some((kind, stored_scope, stored_hash, version, reference, json, state, created_at, updated_at)) = existing else { return Ok(None); };
-        if version != CANONICALIZATION_VERSION { return Err(StoreError::UnsupportedCanonicalization(version)); }
-        if kind != "submit_batch" || stored_scope != scope || stored_hash != hash { return Err(StoreError::Conflict); }
+        let Some((
+            kind,
+            stored_scope,
+            stored_hash,
+            version,
+            reference,
+            json,
+            state,
+            created_at,
+            updated_at,
+        )) = existing
+        else {
+            return Ok(None);
+        };
+        if version != CANONICALIZATION_VERSION {
+            return Err(StoreError::UnsupportedCanonicalization(version));
+        }
+        if kind != "submit_batch" || stored_scope != scope || stored_hash != hash {
+            return Err(StoreError::Conflict);
+        }
         Ok(Some(AcceptedResult {
-            idempotency_key: key.into(), operation_kind: kind, scope: stored_scope,
-            result_reference: reference, result: serde_json::from_str(&json)?,
-            state: parse_state(&state)?, created_at, updated_at,
+            idempotency_key: key.into(),
+            operation_kind: kind,
+            scope: stored_scope,
+            result_reference: reference,
+            result: serde_json::from_str(&json)?,
+            state: parse_state(&state)?,
+            created_at,
+            updated_at,
         }))
     }
 
@@ -352,7 +381,11 @@ impl ControllerStore {
             "attempt" => "SELECT payload_json FROM attempts WHERE attempt_id=?1",
             _ => return Ok(None),
         };
-        connection.query_row(query, [id], |row| row.get::<_, String>(0)).optional()?.map(|value| serde_json::from_str(&value).map_err(StoreError::from)).transpose()
+        connection
+            .query_row(query, [id], |row| row.get::<_, String>(0))
+            .optional()?
+            .map(|value| serde_json::from_str(&value).map_err(StoreError::from))
+            .transpose()
     }
 
     /// Create the next durable execution attempt for an already accepted logical task.
@@ -367,14 +400,35 @@ impl ControllerStore {
             .lock()
             .expect("controller store lock poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let replay: Option<(String, String)> = tx.query_row("SELECT task_id,attempt_id FROM attempt_submissions WHERE idempotency_key=?1", [idempotency_key], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+        let replay: Option<(String, String)> = tx
+            .query_row(
+                "SELECT task_id,attempt_id FROM attempt_submissions WHERE idempotency_key=?1",
+                [idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
         if let Some((bound_task, bound_attempt)) = replay {
-            if bound_task != task_id { return Err(StoreError::Conflict); }
-            let json: String = tx.query_row("SELECT payload_json FROM attempts WHERE attempt_id=?1", [bound_attempt], |row| row.get(0))?;
+            if bound_task != task_id {
+                return Err(StoreError::Conflict);
+            }
+            let json: String = tx.query_row(
+                "SELECT payload_json FROM attempts WHERE attempt_id=?1",
+                [bound_attempt],
+                |row| row.get(0),
+            )?;
             tx.commit()?;
-            return Ok(AttemptAcceptance { attempt: serde_json::from_str(&json)?, created: false });
+            return Ok(AttemptAcceptance {
+                attempt: serde_json::from_str(&json)?,
+                created: false,
+            });
         }
-        let task: Option<String> = tx.query_row("SELECT payload_json FROM tasks WHERE task_id=?1", [task_id], |row| row.get(0)).optional()?;
+        let task: Option<String> = tx
+            .query_row(
+                "SELECT payload_json FROM tasks WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
         let Some(task) = task else {
             return Err(StoreError::NotFound);
         };
@@ -386,11 +440,17 @@ impl ControllerStore {
         let now = chrono::Utc::now().to_rfc3339();
         let attempt = serde_json::json!({"attempt_id":attempt_id,"task_id":task_id,"ordinal":ordinal,"session_id":null,"state":"queued","created_at":now});
         tx.execute("INSERT INTO attempts(attempt_id,task_id,ordinal,session_id,payload_json,created_at) VALUES(?1,?2,?3,NULL,?4,?5)", params![attempt_id,task_id,ordinal,serde_json::to_string(&attempt)?,now])?;
-        tx.execute("INSERT INTO attempt_submissions(idempotency_key,task_id,attempt_id) VALUES(?1,?2,?3)", params![idempotency_key,task_id,attempt_id])?;
+        tx.execute(
+            "INSERT INTO attempt_submissions(idempotency_key,task_id,attempt_id) VALUES(?1,?2,?3)",
+            params![idempotency_key, task_id, attempt_id],
+        )?;
         tx.execute("INSERT INTO orchestration_resources(resource_type,resource_id,batch_id,task_id,attempt_id,payload_json,created_at,updated_at) SELECT 'attempt',?1,batch_id,?2,?1,?3,?4,?4 FROM orchestration_resources WHERE resource_type='task' AND resource_id=?2", params![attempt_id,task_id,serde_json::to_string(&attempt)?,now])?;
         let _: Value = serde_json::from_str(&task)?;
         tx.commit()?;
-        Ok(AttemptAcceptance { attempt, created: true })
+        Ok(AttemptAcceptance {
+            attempt,
+            created: true,
+        })
     }
 
     pub fn attempts_for_task(&self, task_id: &str) -> Result<Vec<Value>, StoreError> {
@@ -491,9 +551,17 @@ impl ControllerStore {
 /// prompt, dependency/ownership metadata, and policy. Same prompt on a different
 /// base or under a different contract is distinct work.
 fn same_logical_work(left: &Value, right: &Value) -> bool {
-    ["project", "repository", "base_commit", "prompt", "dependencies", "owner", "policy"]
-        .into_iter()
-        .all(|field| canonical_json(&left[field]) == canonical_json(&right[field]))
+    [
+        "project",
+        "repository",
+        "base_commit",
+        "prompt",
+        "dependencies",
+        "owner",
+        "policy",
+    ]
+    .into_iter()
+    .all(|field| canonical_json(&left[field]) == canonical_json(&right[field]))
 }
 
 fn parse_state(state: &str) -> Result<IdempotencyState, StoreError> {
@@ -566,11 +634,17 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
     }
     if version < 4 {
         tx.execute_batch("CREATE TABLE batches (batch_id TEXT PRIMARY KEY, project TEXT NOT NULL, repository TEXT NOT NULL, requested_revision TEXT NOT NULL, base_commit TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE tasks (task_id TEXT PRIMARY KEY, batch_id TEXT NOT NULL REFERENCES batches(batch_id), client_task_id TEXT NOT NULL, project TEXT NOT NULL, repository TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL); CREATE INDEX tasks_by_batch ON tasks(batch_id); CREATE INDEX active_logical_tasks ON tasks(project,repository,prompt,state); CREATE TABLE attempts_v4 (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), ordinal INTEGER NOT NULL, session_id TEXT UNIQUE, payload_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(task_id,ordinal)); INSERT INTO attempts_v4 SELECT attempt_id,task_id,ordinal,session_id,payload_json,created_at FROM attempts; DROP TABLE attempts; ALTER TABLE attempts_v4 RENAME TO attempts; CREATE INDEX attempts_by_task ON attempts(task_id);")?;
-        tx.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?1)", [chrono::Utc::now().to_rfc3339()])?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?1)",
+            [chrono::Utc::now().to_rfc3339()],
+        )?;
     }
     if version < 5 {
         tx.execute_batch("CREATE TABLE attempt_submissions (idempotency_key TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(attempt_id));")?;
-        tx.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?1)", [chrono::Utc::now().to_rfc3339()])?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?1)",
+            [chrono::Utc::now().to_rfc3339()],
+        )?;
     }
     tx.commit()?;
     Ok(())
@@ -920,28 +994,61 @@ mod tests {
         let request = serde_json::json!({"plan":{"tasks":["task-1"]}});
         let batch = serde_json::json!({"batch_id":"batch-2","base_commit":"a"});
         let tasks = vec![("task-1".to_owned(), serde_json::json!({"task_id":"task-1"}))];
-        let first = accept_batch(&store, BatchAcceptance {
-            key: "retry-key", scope: "project", request: &request, batch_id: "batch-2",
-            batch: &batch, tasks: &tasks, allow_competing: false,
-        }).unwrap();
+        let first = accept_batch(
+            &store,
+            BatchAcceptance {
+                key: "retry-key",
+                scope: "project",
+                request: &request,
+                batch_id: "batch-2",
+                batch: &batch,
+                tasks: &tasks,
+                allow_competing: false,
+            },
+        )
+        .unwrap();
         assert!(matches!(first, Acceptance::Created(_)));
         drop(store);
         let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
         assert!(matches!(
-            accept_batch(&reopened, BatchAcceptance {
-                    key: "retry-key", scope: "project", request: &request, batch_id: "ignored",
-                    batch: &Value::Null, tasks: &[], allow_competing: false,
-                })
-                .unwrap(),
+            accept_batch(
+                &reopened,
+                BatchAcceptance {
+                    key: "retry-key",
+                    scope: "project",
+                    request: &request,
+                    batch_id: "ignored",
+                    batch: &Value::Null,
+                    tasks: &[],
+                    allow_competing: false,
+                }
+            )
+            .unwrap(),
             Acceptance::Replayed(_)
         ));
-        let batch_count: i64 = reopened.connection.lock().unwrap().query_row("SELECT COUNT(*) FROM batches", [], |row| row.get(0)).unwrap();
-        assert_eq!(batch_count, 1, "retry after simulated client timeout must not create another batch");
+        let batch_count: i64 = reopened
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM batches", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            batch_count, 1,
+            "retry after simulated client timeout must not create another batch"
+        );
         assert!(matches!(
-            accept_batch(&reopened, BatchAcceptance {
-                key: "retry-key", scope: "project", request: &serde_json::json!({"plan":{"tasks":["other"]}}),
-                batch_id: "ignored", batch: &Value::Null, tasks: &[], allow_competing: false,
-            }),
+            accept_batch(
+                &reopened,
+                BatchAcceptance {
+                    key: "retry-key",
+                    scope: "project",
+                    request: &serde_json::json!({"plan":{"tasks":["other"]}}),
+                    batch_id: "ignored",
+                    batch: &Value::Null,
+                    tasks: &[],
+                    allow_competing: false,
+                }
+            ),
             Err(StoreError::Conflict)
         ));
         assert_eq!(
@@ -953,17 +1060,36 @@ mod tests {
     #[test]
     fn replacement_attempt_increments_attempt_identity_without_new_task() {
         let (dir, store) = store();
-        accept_batch(&store, BatchAcceptance {
-            key: "batch-key", scope: "project", request: &serde_json::json!({"x":1}),
-            batch_id: "batch", batch: &serde_json::json!({"batch_id":"batch"}),
-            tasks: &[("logical-task".into(), serde_json::json!({"task_id":"logical-task"}))],
-            allow_competing: false,
-        }).unwrap();
-        let first = store.create_attempt("logical-task", "attempt-1", "attempt-key-1").unwrap();
-        let first_replay = store.create_attempt("logical-task", "attempt-ignored", "attempt-key-1").unwrap();
+        accept_batch(
+            &store,
+            BatchAcceptance {
+                key: "batch-key",
+                scope: "project",
+                request: &serde_json::json!({"x":1}),
+                batch_id: "batch",
+                batch: &serde_json::json!({"batch_id":"batch"}),
+                tasks: &[(
+                    "logical-task".into(),
+                    serde_json::json!({"task_id":"logical-task"}),
+                )],
+                allow_competing: false,
+            },
+        )
+        .unwrap();
+        let first = store
+            .create_attempt("logical-task", "attempt-1", "attempt-key-1")
+            .unwrap();
+        let first_replay = store
+            .create_attempt("logical-task", "attempt-ignored", "attempt-key-1")
+            .unwrap();
         assert!(!first_replay.created);
-        assert_eq!(first_replay.attempt["attempt_id"], first.attempt["attempt_id"]);
-        let second = store.create_attempt("logical-task", "attempt-2", "attempt-key-2").unwrap();
+        assert_eq!(
+            first_replay.attempt["attempt_id"],
+            first.attempt["attempt_id"]
+        );
+        let second = store
+            .create_attempt("logical-task", "attempt-2", "attempt-key-2")
+            .unwrap();
         assert_eq!(first.attempt["ordinal"], 1);
         assert_eq!(second.attempt["ordinal"], 2);
         assert_eq!(store.attempts_for_task("logical-task").unwrap().len(), 2);
@@ -986,17 +1112,70 @@ mod tests {
         let base_b = "abcdef0123456789abcdef0123456789abcdef01";
         let batch = |id: &str, task_id: &str, base: &str| serde_json::json!({"batch_id":id,"project":"demo","repository":"https://github.com/example/repo","requested_revision":"main","base_commit":base,"accepted_task_ids":[task_id],"queued_count":1,"duplicate_suppression":[]});
         let task = |id: &str, client_id: &str, base: &str| serde_json::json!({"task_id":id,"requested_task_id":client_id,"project":"demo","repository":"https://github.com/example/repo","base_commit":base,"prompt":"same active work","dependencies":[],"owner":null,"policy":{},"state":"queued"});
-        let first = accept_batch(&store, BatchAcceptance { key: "first", scope: "demo", request: &serde_json::json!({"n":1}), batch_id: "batch-1", batch: &batch("batch-1", "task-1", base_a), tasks: &[("task-1".into(), task("task-1", "build", base_a))], allow_competing: false }).unwrap();
+        let first = accept_batch(
+            &store,
+            BatchAcceptance {
+                key: "first",
+                scope: "demo",
+                request: &serde_json::json!({"n":1}),
+                batch_id: "batch-1",
+                batch: &batch("batch-1", "task-1", base_a),
+                tasks: &[("task-1".into(), task("task-1", "build", base_a))],
+                allow_competing: false,
+            },
+        )
+        .unwrap();
         assert!(matches!(first, Acceptance::Created(_)));
-        let suppressed = accept_batch(&store, BatchAcceptance { key: "second", scope: "demo", request: &serde_json::json!({"n":2}), batch_id: "batch-2", batch: &batch("batch-2", "task-2", base_a), tasks: &[("task-2".into(), task("task-2", "build", base_a))], allow_competing: false }).unwrap();
-        let Acceptance::Created(suppressed) = suppressed else { panic!("new batch expected") };
+        let suppressed = accept_batch(
+            &store,
+            BatchAcceptance {
+                key: "second",
+                scope: "demo",
+                request: &serde_json::json!({"n":2}),
+                batch_id: "batch-2",
+                batch: &batch("batch-2", "task-2", base_a),
+                tasks: &[("task-2".into(), task("task-2", "build", base_a))],
+                allow_competing: false,
+            },
+        )
+        .unwrap();
+        let Acceptance::Created(suppressed) = suppressed else {
+            panic!("new batch expected")
+        };
         assert_eq!(suppressed.result["accepted_task_ids"][0], "task-1");
-        assert_eq!(suppressed.result["duplicate_suppression"][0]["existing_task_id"], "task-1");
+        assert_eq!(
+            suppressed.result["duplicate_suppression"][0]["existing_task_id"],
+            "task-1"
+        );
         assert_eq!(store.get_resource("task", "task-2").unwrap(), None);
-        let different_base = accept_batch(&store, BatchAcceptance { key: "different-base", scope: "demo", request: &serde_json::json!({"n":4}), batch_id: "batch-4", batch: &batch("batch-4", "task-4", base_b), tasks: &[("task-4".into(), task("task-4", "build", base_b))], allow_competing: false }).unwrap();
+        let different_base = accept_batch(
+            &store,
+            BatchAcceptance {
+                key: "different-base",
+                scope: "demo",
+                request: &serde_json::json!({"n":4}),
+                batch_id: "batch-4",
+                batch: &batch("batch-4", "task-4", base_b),
+                tasks: &[("task-4".into(), task("task-4", "build", base_b))],
+                allow_competing: false,
+            },
+        )
+        .unwrap();
         assert!(matches!(different_base, Acceptance::Created(_)));
         assert!(store.get_resource("task", "task-4").unwrap().is_some());
-        let competing = accept_batch(&store, BatchAcceptance { key: "third", scope: "demo", request: &serde_json::json!({"n":3}), batch_id: "batch-3", batch: &batch("batch-3", "task-3", base_a), tasks: &[("task-3".into(), task("task-3", "build", base_a))], allow_competing: true }).unwrap();
+        let competing = accept_batch(
+            &store,
+            BatchAcceptance {
+                key: "third",
+                scope: "demo",
+                request: &serde_json::json!({"n":3}),
+                batch_id: "batch-3",
+                batch: &batch("batch-3", "task-3", base_a),
+                tasks: &[("task-3".into(), task("task-3", "build", base_a))],
+                allow_competing: true,
+            },
+        )
+        .unwrap();
         assert!(matches!(competing, Acceptance::Created(_)));
         assert!(store.get_resource("task", "task-3").unwrap().is_some());
     }
