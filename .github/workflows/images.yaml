@@ -37,8 +37,8 @@ jobs:
           printf 'render-and-contract-seconds=%s\n' "$((SECONDS - start))"
 
   pr-artifacts:
-    name: Build PR image artifacts
-    if: github.event_name == 'pull_request'
+    name: Build batch image artifacts
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'mergify/merge-queue/')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -88,7 +88,20 @@ jobs:
           build_root sandbox .#anvil-sandbox-image & sandbox_pid=$!
           build_root daemon .#anvil-nix-daemon-image & daemon_pid=$!
           build_root upgrade .#anvil-nix-daemon-upgrade-test-image & upgrade_pid=$!
-          wait "$anvil_pid" "$sandbox_pid" "$daemon_pid" "$upgrade_pid"
+          build_failed=0
+          for pid in "$anvil_pid" "$sandbox_pid" "$daemon_pid" "$upgrade_pid"; do
+            wait "$pid" || build_failed=1
+          done
+          if [ "$build_failed" -ne 0 ]; then
+            echo 'one or more OCI image builds failed; skipping image conversion' >&2
+            exit 1
+          fi
+          for name in anvil sandbox daemon upgrade; do
+            if [ ! -s "paths/$name" ]; then
+              echo "image build produced no output path: $name" >&2
+              exit 1
+            fi
+          done
 
           convert_image() {
             name="$1"
@@ -97,7 +110,7 @@ jobs:
             start=$SECONDS
             started_at="$(date -u +%FT%TZ)"
             printf '%s-convert-start=%s\n' "$name" "$started_at"
-            nix --option build-users-group "" develop .#kind-ci --command skopeo --insecure-policy copy "$source" "$target"
+            nix develop .#kind-ci --command skopeo --insecure-policy copy "$source" "$target"
             ended_at="$(date -u +%FT%TZ)"
             printf '%s-convert-end=%s\n' "$name" "$ended_at"
             printf '%s-convert-seconds=%s\n' "$name" "$((SECONDS - start))"
@@ -113,7 +126,7 @@ jobs:
           convert_image upgrade "nix:$(<paths/upgrade)" docker-archive:image-artifacts/anvil-nix-daemon-upgrade-test-image.tar:ghcr.io/blogle/anvil-nix-daemon:kind-upgrade
 
           (cd image-artifacts && sha256sum *.tar > SHA256SUMS)
-          nix --option build-users-group "" develop .#kind-ci --command bash -c '
+          nix develop .#kind-ci --command bash -c '
             set -euo pipefail
             cd image-artifacts
             sha256sum -c SHA256SUMS
@@ -151,8 +164,8 @@ jobs:
           if-no-files-found: error
 
   pr-build:
-    name: Build and inspect PR images
-    if: github.event_name == 'pull_request'
+    name: Build and inspect batch images
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'mergify/merge-queue/')
     needs: pr-artifacts
     runs-on: ubuntu-latest
     permissions:
@@ -176,7 +189,7 @@ jobs:
 
   kind-fidelity:
     name: Isolated Agent Sandbox Kubernetes lane
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'mergify/merge-queue/')
     needs: pr-artifacts
     runs-on: ubuntu-latest
     steps:
@@ -191,7 +204,34 @@ jobs:
       - name: Isolated Agent Sandbox Kubernetes lane
         run: |
           time ANVIL_KIND_ARTIFACT_DIR="$GITHUB_WORKSPACE/image-artifacts" \
-            nix --option build-users-group "" develop .#kind-ci --command just e2e-k8s
+            nix develop .#kind-ci --command just e2e-k8s
+
+
+  batch-image-gate:
+    name: Batch image and Kind
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      startsWith(github.head_ref, 'mergify/merge-queue/')
+    needs:
+      - validate
+      - pr-artifacts
+      - pr-build
+      - kind-fidelity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all batch image checks
+        env:
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          ARTIFACTS_RESULT: ${{ needs.pr-artifacts.result }}
+          INSPECT_RESULT: ${{ needs.pr-build.result }}
+          KIND_RESULT: ${{ needs.kind-fidelity.result }}
+        run: |
+          set -euo pipefail
+          test "$VALIDATE_RESULT" = success
+          test "$ARTIFACTS_RESULT" = success
+          test "$INSPECT_RESULT" = success
+          test "$KIND_RESULT" = success
 
   publish:
     name: Build, inspect, and publish images
