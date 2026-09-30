@@ -5055,7 +5055,11 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(resolved, "0123456789abcdef0123456789abcdef01234567");
-            assert_ne!(resolved, revision);
+            if revision.len() == 40 {
+                assert_eq!(resolved, revision);
+            } else {
+                assert_ne!(resolved, revision);
+            }
         }
     }
 
