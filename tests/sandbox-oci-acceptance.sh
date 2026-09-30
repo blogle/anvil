@@ -40,8 +40,7 @@ export XDG_RUNTIME_DIR="$XDG_STATE_HOME/runtime" DISPLAY=:99 ANVIL_PROJECT=anvil
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 Xvfb "$DISPLAY" -screen 0 1280x1024x24 -nolisten tcp >/tmp/anvil-xvfb.log 2>&1 &
-git config --global user.name Anvil
-git config --global user.email anvil@users.noreply.github.com
+source /bin/anvil-git-identity
 ANVIL_RUNTIME_EXEC() { /bin/bash -lc "$1"; }
 export -f ANVIL_RUNTIME_EXEC
 exec setpriv --reuid=1000 --regid=1000 --init-groups -- /bin/bash -lc \

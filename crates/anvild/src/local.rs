@@ -183,6 +183,13 @@ impl LocalSandboxApi {
         ] {
             tokio::fs::create_dir_all(path).await.map_err(local_error)?;
         }
+        let git_identity_script = home.join(".anvil-git-identity");
+        tokio::fs::write(
+            &git_identity_script,
+            include_str!("../../../runtime/git-identity"),
+        )
+        .await
+        .map_err(local_error)?;
         let port = state.record.session.opencode_port;
         let port_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
@@ -206,8 +213,13 @@ impl LocalSandboxApi {
                 }
             }
         }
-        let mut command = Command::new(&self.opencode_bin);
+        let mut command = Command::new("bash");
         command
+            .args([
+                "-c",
+                "source \"$ANVIL_GIT_IDENTITY_SCRIPT\"; opencode_bin=\"$ANVIL_OPENCODE_BIN\"; unset ANVIL_GIT_IDENTITY_SCRIPT ANVIL_OPENCODE_BIN; exec \"$opencode_bin\" \"$@\"",
+                "anvil-opencode",
+            ])
             .args([
                 "serve",
                 "--hostname",
@@ -234,8 +246,17 @@ impl LocalSandboxApi {
             .env("OPENCODE_CONFIG", profile.join("config/opencode.jsonc"))
             .env("OPENCODE_CONFIG_DIR", profile.join("config"))
             .env("OPENCODE_DISABLE_CHANNEL_DB", "1")
+            .env("ANVIL_GIT_IDENTITY_SCRIPT", &git_identity_script)
+            .env("ANVIL_OPENCODE_BIN", &self.opencode_bin)
             .env("DISPLAY", ":99")
+            .env_remove("ANVIL_GIT_AUTHOR_NAME")
+            .env_remove("ANVIL_GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
             .stdin(Stdio::null());
+        for (key, value) in super::git_committer_environment(&self.config) {
+            command.env(key, value);
+        }
         let worker_log =
             std::fs::File::create(state.directory.join("worker.log")).map_err(local_error)?;
         command
@@ -780,6 +801,8 @@ mod tests {
             github_app_id: None,
             github_installation_id: None,
             github_private_key: None,
+            git_committer_name: crate::DEFAULT_GIT_COMMITTER_NAME.into(),
+            git_committer_email: crate::DEFAULT_GIT_COMMITTER_EMAIL.into(),
             session_signing_secret: None,
             session_capability_ttl: Duration::from_secs(60),
             github_api_url: "https://api.github.com".into(),
@@ -846,7 +869,8 @@ mod tests {
             std::fs::write(
                 &fake_opencode,
                 format!(
-                    "#!/bin/sh\nexport ANVIL_TEST_FAKE_OPENCODE_PORT=\"$5\"\nexec '{test_binary}' --exact local::tests::fake_opencode_worker_process --nocapture\n"
+                    "#!/bin/sh\ngit commit --allow-empty -m 'local identity probe'\ngit show -s --format='%an <%ae>%n%cn <%ce>' > '{}/worker-identity'\nexport ANVIL_TEST_FAKE_OPENCODE_PORT=\"$5\"\nexec '{test_binary}' --exact local::tests::fake_opencode_worker_process --nocapture\n",
+                    root.display()
                 ),
             )
             .unwrap();
@@ -864,8 +888,12 @@ mod tests {
         }
 
         fn api(&self) -> LocalSandboxApi {
+            self.api_with_config(test_config())
+        }
+
+        fn api_with_config(&self, config: Config) -> LocalSandboxApi {
             LocalSandboxApi::with_paths(
-                test_config(),
+                config,
                 self.runtime.clone(),
                 self.fake_opencode.clone(),
                 self.profile.clone(),
@@ -929,13 +957,25 @@ mod tests {
     async fn local_backend_preserves_workspace_and_conversation_across_suspend_resume_and_restart()
     {
         let fixture = Fixture::new();
-        let api = fixture.api();
+        let mut configured = test_config();
+        configured.git_committer_name = "Anvil".into();
+        configured.git_committer_email = "anvil@noreply.thejeffer.net".into();
+        let api = fixture.api_with_config(configured.clone());
         let initial_work_state = initial_work_state();
+        let mut request = fixture.request("demo");
+        request.author_name = Some("Invoking Developer".into());
+        request.author_email = Some("developer@example.test".into());
+        let author_environment = crate::git_author_environment(
+            request.author_name.as_deref(),
+            request.author_email.as_deref(),
+        );
+        let mut sandbox_environment = vec![("ANVIL_TEST_ENV".into(), "retained".into())];
+        sandbox_environment.extend(author_environment);
         let session = api
             .create(
                 "demo-12345678",
-                &fixture.request("demo"),
-                &[("ANVIL_TEST_ENV".into(), "retained".into())],
+                &request,
+                &sandbox_environment,
                 &initial_work_state,
             )
             .await
@@ -944,6 +984,15 @@ mod tests {
             .await
             .unwrap();
         let directory = fixture.runtime.join(&session.id);
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("worker-identity")).unwrap(),
+            "Invoking Developer <developer@example.test>\nAnvil <anvil@noreply.thejeffer.net>\n"
+        );
+        assert!(
+            !std::fs::read_to_string(fixture.root.join("worker-identity"))
+                .unwrap()
+                .contains("@users.noreply.github.com")
+        );
         let workspace = directory.join("home/workspace/demo/target.txt");
         assert_eq!(
             std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
@@ -1006,7 +1055,7 @@ mod tests {
             state.child.take();
         }
         drop(api);
-        let restarted = fixture.api();
+        let restarted = fixture.api_with_config(configured);
         restarted.recover_startup().await.unwrap();
         let third_pid: u32 = std::fs::read_to_string(directory.join("worker.pid"))
             .unwrap()
@@ -1022,7 +1071,7 @@ mod tests {
         assert_eq!(recovered.session.environment_state, "ready");
         assert_eq!(
             std::fs::read_to_string(directory.join("sandbox-env.json")).unwrap(),
-            r#"[["ANVIL_TEST_ENV","retained"]]"#
+            r#"[["ANVIL_TEST_ENV","retained"],["ANVIL_GIT_AUTHOR_NAME","Invoking Developer"],["ANVIL_GIT_AUTHOR_EMAIL","developer@example.test"]]"#
         );
         restarted.delete(&session.id).await.unwrap();
         assert!(!directory.exists());
