@@ -156,7 +156,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       lane: ${{ steps.plan.outputs.lane }}
-      requires-kind: ${{ steps.plan.outputs.requires-kind }}
+      requires_kind: ${{ steps.plan.outputs.requires_kind }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -178,7 +178,7 @@ jobs:
           done < <(git diff --name-only "$BASE_SHA...$HEAD_SHA")
           {
             printf 'lane=%s\n' "$lane"
-            printf 'requires-kind=%s\n' "$requires_kind"
+            printf 'requires_kind=%s\n' "$requires_kind"
           } >> "$GITHUB_OUTPUT"
 
   pr-build:
@@ -207,7 +207,7 @@ jobs:
 
   kind-fidelity:
     name: Isolated Agent Sandbox Kubernetes lane
-    if: github.event_name == 'pull_request' && needs.kind-plan.outputs.requires-kind == 'true'
+    if: github.event_name == 'pull_request' && needs.kind-plan.outputs.requires_kind == 'true'
     needs: [pr-artifacts, kind-plan]
     concurrency:
       group: anvil-kind-fidelity-${{ needs.kind-plan.outputs.lane }}
