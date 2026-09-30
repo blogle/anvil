@@ -1,0 +1,23 @@
+merge_queue:
+  max_parallel_checks: 2
+
+queue_rules:
+  - name: main
+    batch_size:
+      min: 1
+      max: 5
+    batch_max_wait_time: 2 min
+    queue_conditions:
+      - base = main
+      - check-success = PR admission
+      - check-success = Render Kubernetes manifests
+    merge_conditions:
+      - check-success = Integration E2E
+      - check-success = Batch image and Kind
+
+pull_request_rules:
+  - name: Keep pull requests up to date with main
+    conditions:
+      - base = main
+    actions:
+      update:
