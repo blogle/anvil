@@ -5302,8 +5302,8 @@ fn bounded_message_items(value: Value, limit: usize) -> (Vec<Value>, Option<Acti
     (messages, Some(window))
 }
 
-fn activity_redaction_patterns() -> &'static [Regex; 2] {
-    static PATTERNS: OnceLock<[Regex; 2]> = OnceLock::new();
+fn activity_redaction_patterns() -> &'static [Regex; 4] {
+    static PATTERNS: OnceLock<[Regex; 4]> = OnceLock::new();
     PATTERNS.get_or_init(|| {
         [
             Regex::new(
@@ -5314,6 +5314,14 @@ fn activity_redaction_patterns() -> &'static [Regex; 2] {
                 r#"(?i)((?:[a-z0-9-]+[_-])?(?:authorization|proxy-authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|private[_-]?key|client[_-]?secret)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"#,
             )
             .expect("valid credential-field redaction regex"),
+            Regex::new(
+                r#"(?i)(--?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|client[_-]?secret)\s+)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"#,
+            )
+            .expect("valid credential-option redaction regex"),
+            Regex::new(
+                r#"(?i)((?:set-cookie|cookie)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,\"']+)"#,
+            )
+                .expect("valid cookie-header redaction regex"),
         ]
     })
 }
@@ -5338,7 +5346,9 @@ fn sensitive_activity_key(key: &str) -> bool {
 fn redact_activity_text(value: &str) -> String {
     let patterns = activity_redaction_patterns();
     let value = patterns[0].replace_all(value, "$1$2[REDACTED]");
-    patterns[1].replace_all(&value, "$1[REDACTED]").into_owned()
+    let value = patterns[1].replace_all(&value, "$1[REDACTED]");
+    let value = patterns[2].replace_all(&value, "$1[REDACTED]");
+    patterns[3].replace_all(&value, "$1[REDACTED]").into_owned()
 }
 
 fn redact_activity_value(value: &Value) -> Value {
@@ -9460,13 +9470,15 @@ mod tests {
     #[test]
     fn activity_redacts_sensitive_fields_and_header_values_server_side() {
         let payload = json!({
-            "command":"curl -H 'Authorization: Bearer header-token-value' https://example.test",
+            "command":"curl -H 'Authorization: Bearer header-token-value' -H 'Cookie: session-cookie-value' --token cli-token-value https://example.test",
             "environment":{"GITHUB_TOKEN":"ghp-secret-value","api_key":"api-key-value","password":"pw-value"},
             "output":"Authorization: Bearer output-token-value token=inline-token-value secret=inline-secret-value"
         });
         let safe = safe_activity_text(&payload, 2000);
         for secret in [
             "header-token-value",
+            "session-cookie-value",
+            "cli-token-value",
             "ghp-secret-value",
             "api-key-value",
             "pw-value",
