@@ -368,6 +368,8 @@ pub struct SessionActivity {
     pub lifecycle: Vec<LifecycleEvent>,
     #[serde(default)]
     pub events: Vec<ActivityEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_window: Option<ActivityEventWindow>,
     pub preview_url: Option<String>,
     pub opencode_url: Option<String>,
     pub attach_command: String,
@@ -397,6 +399,19 @@ pub struct ActivityEvent {
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+}
+
+/// Describes the bounded, newest-message window used to reconstruct activity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityEventWindow {
+    pub message_limit: u32,
+    pub returned_messages: u32,
+    #[serde(default)]
+    pub loaded_messages: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// True when the bounded 500-event projection omitted entries.
+    pub truncated: bool,
 }
 
 /// Anvil-owned, versioned projection of OpenCode execution telemetry.
