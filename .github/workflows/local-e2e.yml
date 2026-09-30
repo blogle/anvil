@@ -37,8 +37,19 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Configure GitHub Actions sccache backend
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: v0.16.0
+      - name: Enable sccache for hosted CI Cargo checks
+        run: |
+          echo 'SCCACHE_GHA_ENABLED=true' >> "$GITHUB_ENV"
+          echo 'RUSTC_WRAPPER=sccache' >> "$GITHUB_ENV"
       - name: Rust checks
         run: time nix develop --command just check
+      - name: Report sccache statistics
+        if: always()
+        run: ${SCCACHE_PATH:-sccache} --show-stats
       - name: Deterministic process E2E (repeat for determinism)
         run: |
           time nix develop --command just e2e
