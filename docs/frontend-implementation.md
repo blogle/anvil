@@ -10,13 +10,12 @@ The frontend read model is `GET /v1/sessions/:id/activity`. Lightweight state
 polls omit conversation parts. The selected session additionally requests
 `?include_events=true`, which combines:
 
-- Sandbox metadata, phase, creation time, and the durable ready timestamp.
-- OpenCode user and assistant messages, preserving exact submitted prompts.
-- OpenCode status and tool parts for active request state and trustworthy current
-  operation text when available.
-- User-visible assistant text, tool input/output summaries, errors, and lifecycle
-  transitions, ordered by authoritative timestamps and stable OpenCode
-  message/part identity.
+- Sandbox metadata, phase, and status axes for the session header and Runtime.
+- A conversation/execution transcript containing submitted user prompts,
+  user-visible assistant prose, concise tool operations/results, and errors.
+  Entries use authoritative timestamps and stable OpenCode message/part identity.
+- Routine controller and infrastructure lifecycle transitions remain on the
+  secondary Trail tab; they are not mixed into the primary Activity transcript.
 - Existing preview URL generation for the OpenCode endpoint and the exact
   `anvilctl sessions attach <id>` command.
 
