@@ -79,6 +79,13 @@ pub struct ControllerStore {
     connection: Arc<Mutex<Connection>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangePage {
+    pub cursor: String,
+    pub changes: Vec<Value>,
+    pub reset_required: bool,
+}
+
 impl ControllerStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
@@ -94,6 +101,62 @@ impl ControllerStore {
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
+    }
+
+    /// Append an Anvil-normalized materialization. Sequence allocation and insertion are one
+    /// SQLite transaction; callers must never pass upstream event payloads here.
+    pub fn append_change(&self, resource_type: &str, resource_id: &str, value: &Value) -> Result<String, StoreError> {
+        let mut connection = self.connection.lock().expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let latest: Option<String> = tx.query_row(
+            "SELECT payload_json FROM orchestration_changes WHERE resource_type=?1 AND resource_id=?2 ORDER BY sequence DESC LIMIT 1",
+            params![resource_type, resource_id], |row| row.get(0)).optional()?;
+        let payload = serde_json::to_string(value)?;
+        if latest.as_deref() == Some(&payload) {
+            let seq: i64 = tx.query_row("SELECT COALESCE(MAX(sequence),0) FROM orchestration_changes", [], |row| row.get(0))?;
+            tx.commit()?;
+            return Ok(encode_cursor(seq));
+        }
+        tx.execute("INSERT INTO orchestration_changes(resource_type, resource_id, payload_json) VALUES (?1,?2,?3)", params![resource_type, resource_id, payload])?;
+        let seq = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(encode_cursor(seq))
+    }
+
+    /// Read strictly after the supplied cursor. Reusing a cursor is deterministic and
+    /// exclusive; cursors beyond the stream or malformed cursors require a full reset.
+    pub fn changes_after(&self, cursor: &str, limit: usize) -> Result<ChangePage, StoreError> {
+        let Some(after) = decode_cursor(cursor) else {
+            return Ok(ChangePage { cursor: String::new(), changes: vec![], reset_required: true });
+        };
+        let connection = self.connection.lock().expect("controller store lock poisoned");
+        let latest: i64 = connection.query_row("SELECT COALESCE(MAX(sequence),0) FROM orchestration_changes", [], |row| row.get(0))?;
+        let earliest: i64 = connection.query_row("SELECT COALESCE(MIN(sequence),0) FROM orchestration_changes", [], |row| row.get(0))?;
+        if after > latest || (after > 0 && earliest > after.saturating_add(1)) {
+            return Ok(ChangePage { cursor: encode_cursor(latest), changes: vec![], reset_required: true });
+        }
+        let mut statement = connection.prepare("SELECT sequence, resource_type, resource_id, payload_json FROM orchestration_changes WHERE sequence>?1 ORDER BY sequence LIMIT ?2")?;
+        let rows = statement.query_map(params![after, limit as i64], |row| {
+            let sequence: i64 = row.get(0)?;
+            let resource_type: String = row.get(1)?;
+            let resource_id: String = row.get(2)?;
+            let payload: String = row.get(3)?;
+            Ok((sequence, resource_type, resource_id, payload))
+        })?;
+        let mut changes = Vec::new();
+        let mut last = after;
+        for row in rows {
+            let (sequence, resource_type, resource_id, payload) = row?;
+            last = sequence;
+            changes.push(serde_json::json!({"resource_type":resource_type,"resource_id":resource_id,"record":serde_json::from_str::<Value>(&payload)?}));
+        }
+        Ok(ChangePage { cursor: encode_cursor(last), changes, reset_required: false })
+    }
+
+    pub fn current_cursor(&self) -> Result<String, StoreError> {
+        let connection = self.connection.lock().expect("controller store lock poisoned");
+        let seq: i64 = connection.query_row("SELECT COALESCE(MAX(sequence),0) FROM orchestration_changes", [], |row| row.get(0))?;
+        Ok(encode_cursor(seq))
     }
 
     /// Record acceptance atomically with its authoritative result. Provisioning must occur after this returns.
@@ -627,6 +690,12 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
             "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?1)",
             [chrono::Utc::now().to_rfc3339()],
         )?;
+        version = 2;
+    }
+    if version < 3 {
+        tx.execute_batch("CREATE TABLE orchestration_changes (sequence INTEGER PRIMARY KEY AUTOINCREMENT, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, payload_json TEXT NOT NULL);
+            CREATE INDEX orchestration_changes_by_resource ON orchestration_changes(resource_type, resource_id, sequence);")?;
+        tx.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?1)", [chrono::Utc::now().to_rfc3339()])?;
     }
     if version < 3 {
         tx.execute_batch("CREATE TABLE attempts (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, ordinal INTEGER NOT NULL, session_id TEXT UNIQUE, payload_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(task_id, ordinal)); CREATE INDEX attempts_by_task ON attempts(task_id);")?;
@@ -651,6 +720,12 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
     }
     tx.commit()?;
     Ok(())
+}
+
+fn encode_cursor(sequence: i64) -> String { format!("anv1.{sequence}") }
+fn decode_cursor(cursor: &str) -> Option<i64> {
+    let sequence = cursor.strip_prefix("anv1.")?.parse::<i64>().ok()?;
+    (sequence >= 0).then_some(sequence)
 }
 
 fn canonical_json(value: &Value) -> String {
@@ -1181,5 +1256,32 @@ mod tests {
         .unwrap();
         assert!(matches!(competing, Acceptance::Created(_)));
         assert!(store.get_resource("task", "task-3").unwrap().is_some());
+    }
+
+    #[test]
+    fn cursor_changes_are_exclusive_durable_and_normalized() {
+        let (dir, store) = store();
+        let initial = store.append_change("session", "s1", &serde_json::json!({"state":"idle"})).unwrap();
+        assert_eq!(store.changes_after(&initial, 100).unwrap().changes.len(), 0);
+        let next = store.append_change("session", "s1", &serde_json::json!({"state":"running"})).unwrap();
+        let page = store.changes_after(&initial, 100).unwrap();
+        assert_eq!(page.changes.len(), 1);
+        assert_eq!(page.cursor, next);
+        assert_eq!(store.changes_after(&initial, 100).unwrap(), page);
+        drop(store);
+        let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
+        assert_eq!(reopened.changes_after(&initial, 100).unwrap(), page);
+        assert!(reopened.changes_after("not-a-cursor", 100).unwrap().reset_required);
+        assert!(reopened.changes_after("anv1.999", 100).unwrap().reset_required);
+    }
+
+    #[test]
+    fn normalized_changes_coalesce_identical_materializations() {
+        let (_dir, store) = store();
+        let payload = serde_json::json!({"execution":"busy"});
+        let first = store.append_change("session", "s1", &payload).unwrap();
+        let repeated = store.append_change("session", "s1", &payload).unwrap();
+        assert_eq!(first, repeated);
+        assert_eq!(store.changes_after("anv1.0", 100).unwrap().changes.len(), 1);
     }
 }

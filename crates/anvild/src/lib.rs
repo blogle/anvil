@@ -1677,6 +1677,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sessions/:id/resume", post(resume))
         .route("/v1/sessions/:id/previews/:port", get(preview))
         .route("/v1/sessions/:id/activity", get(activity))
+        .route("/v1/changes", get(changed_since))
         .route(
             "/v1/sessions/:id/credentials/github",
             post(github_credentials),
@@ -2719,6 +2720,36 @@ async fn activity(
     }
     Ok(Json(activity))
 }
+
+#[derive(Debug, Deserialize)]
+struct ChangesQuery {
+    after: Option<String>,
+}
+
+/// Durable cursor stream of Anvil-normalized session telemetry. Cursors are exclusive;
+/// invalid or expired cursors explicitly request a fresh authoritative snapshot.
+async fn changed_since(
+    State(s): State<AppState>,
+    Query(query): Query<ChangesQuery>,
+) -> Result<Json<Value>, ServiceError> {
+    let store = s.store().map_err(|error| ServiceError::Store(error.to_owned()))?;
+    if let Some(after) = query.after {
+        let page = store.changes_after(&after, 1000).map_err(|error| ServiceError::Store(error.to_string()))?;
+        return Ok(Json(json!({"schema_version":1,"reset_required":page.reset_required,"cursor":page.cursor,"changes":page.changes})));
+    }
+    // The initial read is authoritative. It seeds durable normalized records and returns
+    // the cursor after all included rows have been recorded.
+    let records = s.kube.list().await?;
+    let mut snapshot = Vec::with_capacity(records.len());
+    for record in records {
+        let id = record.session.id.clone();
+        let value = json!({"session":record.session,"telemetry":record.telemetry});
+        store.append_change("session", &id, &value).map_err(|error| ServiceError::Store(error.to_string()))?;
+        snapshot.push(value);
+    }
+    let cursor = store.current_cursor().map_err(|error| ServiceError::Store(error.to_string()))?;
+    Ok(Json(json!({"schema_version":1,"reset_required":false,"cursor":cursor,"snapshot":snapshot})))
+}
 async fn suspend(
     Path(id): Path<String>,
     State(s): State<AppState>,
@@ -2933,7 +2964,13 @@ async fn update_telemetry(
     let _guard = lock.lock().await;
     let mut telemetry = state.kube.get(session_id).await?.telemetry;
     update(&mut telemetry);
-    state.kube.set_telemetry(session_id, &telemetry).await
+    state.kube.set_telemetry(session_id, &telemetry).await?;
+    let session = state.kube.get(session_id).await?.session;
+    let normalized = json!({"session":session,"telemetry":telemetry});
+    state.store().map_err(|error| ServiceError::Store(error.to_owned()))?
+        .append_change("session", session_id, &normalized)
+        .map_err(|error| ServiceError::Store(error.to_string()))?;
+    Ok(())
 }
 
 async fn complete(
