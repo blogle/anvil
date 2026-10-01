@@ -1866,6 +1866,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sessions", post(create).get(enumerate))
         .route("/v1/batches", post(submit_batch))
         .route("/v1/batches/:id", get(get_batch))
+        .route("/v1/batches/:id/digest", get(get_batch_digest))
         .route("/v1/tasks/:id", get(get_task))
         .route(
             "/v1/tasks/:id/attempts",
@@ -2194,6 +2195,336 @@ async fn get_batch(
         .map_err(|error| ServiceError::Store(error.to_string()))?
         .map(Json)
         .ok_or(ServiceError::NotFound)
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchDigestQuery {
+    /// Same opaque, exclusive cursor accepted by GET /v1/changes?after=.
+    after: Option<String>,
+    #[serde(default)]
+    attention_only: bool,
+    view: Option<String>,
+}
+
+async fn get_batch_digest(
+    State(state): State<AppState>,
+    Path(batch_id): Path<String>,
+    Query(query): Query<BatchDigestQuery>,
+) -> Result<Response, ServiceError> {
+    if query
+        .view
+        .as_deref()
+        .is_some_and(|view| view != "agent" && view != "human")
+    {
+        return Err(ServiceError::Invalid("view must be agent or human".into()));
+    }
+    let store = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.to_owned()))?;
+
+    // The existing global durable stream is scanned to its end before attention
+    // filtering. Thus filtered rows still advance exactly the same opaque cursor.
+    let (next_cursor, changed_tasks, reset_required) = if let Some(after) = query.after.as_deref() {
+        scan_batch_changes(store, &batch_id, after)?
+    } else {
+        (String::new(), None, false)
+    };
+    let (snapshot_cursor, resources) = store
+        .batch_snapshot(&batch_id)
+        .map_err(|error| ServiceError::Store(error.to_string()))?;
+    let _batch = resources
+        .iter()
+        .find(|resource| resource["resource_type"] == "batch")
+        .map(|resource| resource["record"].clone())
+        .ok_or(ServiceError::NotFound)?;
+    let task_rows = project_digest_tasks(&resources, changed_tasks.as_ref(), query.attention_only);
+    let counts = digest_counts(&resources);
+    let cursor = if query.after.is_some() {
+        next_cursor
+    } else {
+        snapshot_cursor
+    };
+    let mut digest = json!({
+        "schema_version":1,
+        "batch_id":batch_id,
+        "cursor":cursor,
+        "counts":counts,
+        "tasks":task_rows,
+    });
+    if reset_required {
+        digest["reset_required"] = Value::Bool(true);
+        digest["tasks"] = json!([]);
+    }
+    if query.view.as_deref() == Some("human") {
+        let text = render_batch_digest(&digest);
+        return Ok(Json(json!({
+            "schema_version":1,
+            "batch_id":digest["batch_id"],
+            "cursor":digest["cursor"],
+            "reset_required":digest.get("reset_required").cloned().unwrap_or(Value::Bool(false)),
+            "text":text,
+        }))
+        .into_response());
+    }
+    Ok(Json(digest).into_response())
+}
+
+fn scan_batch_changes(
+    store: &store::ControllerStore,
+    batch_id: &str,
+    after: &str,
+) -> Result<(String, Option<std::collections::BTreeSet<String>>, bool), ServiceError> {
+    const PAGE_SIZE: usize = 1000;
+    let mut cursor = after.to_owned();
+    let mut changed = std::collections::BTreeSet::new();
+    loop {
+        let page = store
+            .changes_after(&cursor, PAGE_SIZE)
+            .map_err(|error| ServiceError::Store(error.to_string()))?;
+        if page.reset_required {
+            return Ok((page.cursor, None, true));
+        }
+        for change in &page.changes {
+            let resource_type = change["resource_type"].as_str().unwrap_or_default();
+            match resource_type {
+                "task" => {
+                    let record = &change["change"]["record"];
+                    if record["batch_id"].as_str() == Some(batch_id) {
+                        if let Some(id) = change["resource_id"].as_str() {
+                            changed.insert(id.to_owned());
+                        }
+                    }
+                }
+                "attempt" => {
+                    let task_id = change["change"]["record"]["task_id"].as_str();
+                    if let Some(task_id) = task_id {
+                        let task = store
+                            .get_resource("task", task_id)
+                            .map_err(|error| ServiceError::Store(error.to_string()))?;
+                        if task.as_ref().and_then(|record| record["batch_id"].as_str())
+                            == Some(batch_id)
+                        {
+                            changed.insert(task_id.to_owned());
+                        }
+                    }
+                }
+                "session" => {
+                    if let Some(session_id) = change["resource_id"].as_str() {
+                        let tasks = store
+                            .tasks_for_session(session_id)
+                            .map_err(|error| ServiceError::Store(error.to_string()))?;
+                        changed.extend(tasks.into_iter().filter_map(|(task_id, owner_batch)| {
+                            (owner_batch == batch_id).then_some(task_id)
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+        cursor = page.cursor;
+        if page.changes.len() < PAGE_SIZE {
+            break;
+        }
+    }
+    Ok((cursor, Some(changed), false))
+}
+
+fn digest_counts(resources: &[Value]) -> Value {
+    let tasks: Vec<_> = resources
+        .iter()
+        .filter(|resource| resource["resource_type"] == "task")
+        .collect();
+    let mut counts = serde_json::Map::new();
+    counts.insert("total".into(), json!(tasks.len()));
+    counts.insert("queued".into(), json!(0));
+    counts.insert("active".into(), json!(0));
+    counts.insert("review".into(), json!(0));
+    counts.insert("failed".into(), json!(0));
+    counts.insert("done".into(), json!(0));
+    for task in tasks {
+        let state = task["record"]["state"].as_str().unwrap_or("unknown");
+        let bucket = match state {
+            "queued" | "pending" => "queued",
+            "running" | "provisioning" | "active" => "active",
+            "review" | "ready_for_review" => "review",
+            "failed" | "error" => "failed",
+            "completed" | "done" | "cancelled" | "skipped" => "done",
+            _ => continue,
+        };
+        counts[bucket] = json!(counts[bucket].as_u64().unwrap_or_default() + 1);
+    }
+    Value::Object(counts)
+}
+
+fn project_digest_tasks(
+    resources: &[Value],
+    changed: Option<&std::collections::BTreeSet<String>>,
+    attention_only: bool,
+) -> Vec<Value> {
+    let operation_by_session: HashMap<_, _> = resources
+        .iter()
+        .filter(|resource| resource["resource_type"] == "session")
+        .filter_map(|resource| {
+            Some((
+                resource["resource_id"].as_str()?.to_owned(),
+                resource["record"]["telemetry"]["current_operation"]["name"]
+                    .as_str()?
+                    .to_owned(),
+            ))
+        })
+        .collect();
+    let attempts_by_task = resources
+        .iter()
+        .filter(|resource| resource["resource_type"] == "attempt")
+        .fold(
+            HashMap::<String, Vec<&Value>>::new(),
+            |mut map, resource| {
+                if let Some(task_id) = resource["record"]["task_id"].as_str() {
+                    map.entry(task_id.to_owned())
+                        .or_default()
+                        .push(&resource["record"]);
+                }
+                map
+            },
+        );
+    let mut tasks: Vec<_> = resources
+        .iter()
+        .filter(|resource| resource["resource_type"] == "task")
+        .filter(|resource| {
+            changed.is_none_or(|ids| {
+                ids.contains(resource["resource_id"].as_str().unwrap_or_default())
+            })
+        })
+        .map(|resource| {
+            let task_id = resource["resource_id"].as_str().unwrap_or_default();
+            let task = &resource["record"];
+            let attempts = attempts_by_task.get(task_id).cloned().unwrap_or_default();
+            let mut row = serde_json::Map::new();
+            row.insert("id".into(), json!(task_id));
+            row.insert(
+                "state".into(),
+                task.get("state")
+                    .cloned()
+                    .unwrap_or_else(|| json!("unknown")),
+            );
+            if !attempts.is_empty() {
+                let latest = attempts
+                    .iter()
+                    .max_by_key(|attempt| attempt["ordinal"].as_u64().unwrap_or_default());
+                if let Some(latest) = latest {
+                    if let Some(attempt_id) = latest["attempt_id"].as_str() {
+                        row.insert("attempt_id".into(), json!(attempt_id));
+                    }
+                    if let Some(session_id) = latest["session_id"].as_str() {
+                        row.insert("session_id".into(), json!(session_id));
+                        if let Some(operation) = operation_by_session.get(session_id) {
+                            row.insert("op".into(), json!(operation));
+                        }
+                    }
+                    let latest_state = latest["state"].as_str().unwrap_or_default();
+                    let exceptional = attempts.len() > 1
+                        || matches!(latest_state, "failed" | "error")
+                        || latest.get("exception_reason").is_some();
+                    if exceptional {
+                        row.insert(
+                            "retry".into(),
+                            json!({"n":attempts.len(),"state":latest_state}),
+                        );
+                    }
+                }
+            }
+            let reason = task
+                .get("exception_reason")
+                .or_else(|| task.get("failure_reason"))
+                .filter(|value| value.is_string())
+                .or_else(|| {
+                    attempts
+                        .iter()
+                        .rev()
+                        .find_map(|attempt| attempt.get("exception_reason"))
+                        .filter(|value| value.is_string())
+                });
+            if let Some(reason) = reason {
+                row.insert(
+                    "reason".into(),
+                    json!(digest_exception_reason(reason.as_str().unwrap_or_default())),
+                );
+            }
+            if let Some(duration_ms) =
+                task.get("duration_ms").and_then(Value::as_u64).or_else(|| {
+                    attempts
+                        .iter()
+                        .rev()
+                        .find_map(|attempt| attempt.get("duration_ms").and_then(Value::as_u64))
+                })
+            {
+                row.insert("duration_ms".into(), json!(duration_ms));
+            }
+            Value::Object(row)
+        })
+        .collect();
+    tasks.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+    if attention_only {
+        tasks.retain(|task| {
+            task.get("reason").is_some()
+                || task.get("retry").is_some()
+                || matches!(
+                    task["state"].as_str(),
+                    Some("failed" | "error" | "review" | "ready_for_review")
+                )
+        });
+    }
+    tasks
+}
+
+fn digest_exception_reason(reason: &str) -> &'static str {
+    match reason {
+        "dependency_failed" => "dependency_failed",
+        "attempt_failed" => "attempt_failed",
+        "worker_error" => "worker_error",
+        "provision_failed" => "provision_failed",
+        "cancelled" => "cancelled",
+        _ => "other",
+    }
+}
+
+fn render_batch_digest(digest: &Value) -> String {
+    let counts = &digest["counts"];
+    let mut text = format!(
+        "Batch {} — {} tasks: {} queued, {} active, {} review, {} failed, {} done\n",
+        digest["batch_id"].as_str().unwrap_or_default(),
+        counts["total"].as_u64().unwrap_or_default(),
+        counts["queued"].as_u64().unwrap_or_default(),
+        counts["active"].as_u64().unwrap_or_default(),
+        counts["review"].as_u64().unwrap_or_default(),
+        counts["failed"].as_u64().unwrap_or_default(),
+        counts["done"].as_u64().unwrap_or_default(),
+    );
+    for task in digest["tasks"].as_array().into_iter().flatten() {
+        let state = task["state"]
+            .as_str()
+            .unwrap_or("unknown")
+            .replace('_', " ");
+        text.push_str(&format!(
+            "- {}: {state}",
+            task["id"].as_str().unwrap_or_default()
+        ));
+        if let Some(reason) = task["reason"].as_str() {
+            text.push_str(&format!(" — {}", reason.replace('_', " ")));
+        }
+        if let Some(retry) = task.get("retry") {
+            text.push_str(&format!(
+                " · attempt {}/{}",
+                retry["n"].as_u64().unwrap_or_default(),
+                retry["n"].as_u64().unwrap_or_default()
+            ));
+        }
+        if let Some(duration_ms) = task["duration_ms"].as_u64() {
+            text.push_str(&format!(" · {:.1}s", duration_ms as f64 / 1000.0));
+        }
+        text.push('\n');
+    }
+    text
 }
 
 async fn get_task(
@@ -5334,6 +5665,75 @@ mod tests {
     use std::collections::BTreeMap;
     use tower::ServiceExt;
 
+    fn seed_digest_batch(
+        store: &store::ControllerStore,
+        batch_id: &str,
+        count: usize,
+    ) -> Vec<String> {
+        let task_ids: Vec<_> = (0..count)
+            .map(|index| format!("{batch_id}-task-{index:03}"))
+            .collect();
+        let tasks: Vec<_> = task_ids
+            .iter()
+            .enumerate()
+            .map(|(index, task_id)| {
+                (
+                    task_id.clone(),
+                    json!({
+                        "task_id":task_id,
+                        "requested_task_id":format!("client-{index:03}"),
+                        "batch_id":batch_id,
+                        "project":"digest-fixture",
+                        "repository":"https://example.test/repo.git",
+                        "base_commit":"0123456789abcdef0123456789abcdef01234567",
+                        "prompt":format!("do not return fixture prompt {}", "x".repeat(256)),
+                        "state":if index % 25 == 0 {"failed"} else {"queued"},
+                        "failure_reason":if index % 25 == 0 {Some("dependency_failed")} else {None},
+                        "duration_ms":if index == 0 {Some(1500_u64)} else {None},
+                        "dependencies":[],
+                    }),
+                )
+            })
+            .collect();
+        let batch = json!({
+            "batch_id":batch_id,
+            "project":"digest-fixture",
+            "repository":"https://example.test/repo.git",
+            "requested_revision":"main",
+            "base_commit":"0123456789abcdef0123456789abcdef01234567",
+            "accepted_task_ids":task_ids,
+            "requested_task_ids":[],
+            "queued_count":count,
+            "runnable_count":count,
+        });
+        store
+            .accept_batch(store::BatchAcceptance {
+                key: &format!("{batch_id}-key"),
+                scope: "digest-fixture",
+                request: &json!({"batch":batch_id,"count":count}),
+                batch_id,
+                batch: &batch,
+                tasks: &tasks,
+                allow_competing: true,
+            })
+            .unwrap();
+        task_ids
+    }
+
+    async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&body).unwrap();
+        (status, value)
+    }
+
     #[tokio::test]
     async fn batch_base_resolution_freezes_branch_tag_and_full_sha() {
         let server = MockServer::start_async().await;
@@ -5634,6 +6034,150 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn integrated_batch_digest_budgets_delta_filter_restart_and_details() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("controller.sqlite3");
+        let store = store::ControllerStore::open(&db_path).unwrap();
+        for count in [1, 20, 50, 100] {
+            seed_digest_batch(&store, &format!("fixture-{count}"), count);
+        }
+        let ids = seed_digest_batch(&store, "digest-100", 100);
+        drop(store);
+
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = db_path.clone();
+        let app = router(AppState::new(config.clone(), FakeSandbox));
+        let mut measured = Vec::new();
+        for count in [1, 20, 50, 100] {
+            let (status, digest) =
+                get_json(&app, &format!("/v1/batches/fixture-{count}/digest")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(digest["schema_version"], 1);
+            assert_eq!(digest["batch_id"], format!("fixture-{count}"));
+            assert_eq!(digest["counts"]["total"], count);
+            assert_eq!(digest["tasks"].as_array().unwrap().len(), count);
+            let serialized = serde_json::to_vec(&digest).unwrap();
+            measured.push(serialized.len());
+            assert!(!String::from_utf8_lossy(&serialized).contains("do not return fixture prompt"));
+            assert!(!String::from_utf8_lossy(&serialized).contains("transcript"));
+            assert!(!String::from_utf8_lossy(&serialized).contains("full_diff"));
+            assert!(!String::from_utf8_lossy(&serialized).contains("raw_event"));
+        }
+        eprintln!("batch digest snapshot bytes (1/20/50/100): {measured:?}");
+        assert!(measured[0] < 600, "1 task: {} bytes", measured[0]);
+        assert!(measured[1] < 1_800, "20 tasks: {} bytes", measured[1]);
+        assert!(measured[2] < 4_000, "50 tasks: {} bytes", measured[2]);
+        assert!(measured[3] < 8_000, "100 tasks: {} bytes", measured[3]);
+
+        let (status, initial) = get_json(&app, "/v1/batches/digest-100/digest").await;
+        assert_eq!(status, StatusCode::OK);
+        let cursor = initial["cursor"].as_str().unwrap().to_owned();
+        assert!(cursor.starts_with("anv1."));
+        assert_eq!(initial["tasks"][0]["reason"], "dependency_failed");
+        assert_eq!(initial["tasks"][0]["id"], ids[0]);
+        let human = get_json(&app, "/v1/batches/digest-100/digest?view=human")
+            .await
+            .1;
+        assert!(human["text"].as_str().unwrap().contains("Batch digest-100"));
+        assert!(human["text"]
+            .as_str()
+            .unwrap()
+            .contains("dependency failed"));
+        assert!(human["text"].as_str().unwrap().contains("1.5s"));
+
+        // Prove the row's Task ID and Attempt IDs resolve through existing detail routes.
+        let task_detail = get_json(&app, &format!("/v1/tasks/{}", ids[42])).await;
+        assert_eq!(task_detail.0, StatusCode::OK);
+        assert_eq!(task_detail.1["task_id"], ids[42]);
+        let task_attempts = get_json(&app, &format!("/v1/tasks/{}/attempts", ids[42])).await;
+        assert_eq!(task_attempts.0, StatusCode::OK);
+        assert!(task_attempts.1["attempts"].as_array().unwrap().is_empty());
+
+        // Simulate controller restart: issue cursors before closing the serving app,
+        // write two logical Task changes after reopening the same durable store, then poll.
+        drop(app);
+        let reopened = store::ControllerStore::open(&db_path).unwrap();
+        reopened
+            .create_attempt(&ids[42], "attempt-42-1", "attempt-key-42-1")
+            .unwrap();
+        reopened
+            .create_attempt(&ids[42], "attempt-42-2", "attempt-key-42-2")
+            .unwrap();
+        reopened
+            .bind_attempt_session("attempt-42-2", "session-42")
+            .unwrap();
+        reopened
+            .materialize(
+                "session",
+                "session-42",
+                Some(&json!({
+                    "session":{"id":"session-42"},
+                    "telemetry":{"current_operation":{"kind":"tool","name":"cargo check"}},
+                })),
+            )
+            .unwrap();
+        reopened
+            .create_attempt(&ids[78], "attempt-78-1", "attempt-key-78-1")
+            .unwrap();
+        drop(reopened);
+
+        let app = router(AppState::new(config, FakeSandbox));
+        let delta_uri = format!("/v1/batches/digest-100/digest?after={cursor}");
+        let (status, delta) = get_json(&app, &delta_uri).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(delta["cursor"], cursor);
+        let changed: Vec<_> = delta["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|task| task["id"].as_str())
+            .collect();
+        assert_eq!(changed, [ids[42].as_str(), ids[78].as_str()]);
+        assert_eq!(delta["tasks"][0]["retry"]["n"], 2);
+        assert_eq!(delta["tasks"][0]["attempt_id"], "attempt-42-2");
+        assert_eq!(delta["tasks"][0]["op"], "cargo check");
+        let attempt_id = delta["tasks"][0]["attempt_id"].as_str().unwrap();
+        let attempt_detail = get_json(&app, &format!("/v1/attempts/{attempt_id}")).await;
+        assert_eq!(attempt_detail.0, StatusCode::OK);
+        assert_eq!(attempt_detail.1["attempt_id"], attempt_id);
+        let delta_size = serde_json::to_vec(&delta).unwrap().len();
+        eprintln!("digest two-task delta bytes: {delta_size}");
+        assert!(delta_size < 1000, "2 changed tasks: {delta_size} bytes");
+
+        // Filtering happens after durable stream consumption: task 78 is omitted but the
+        // returned cursor still passes all three changes, so the next poll is empty.
+        let (status, filtered) = get_json(
+            &app,
+            &format!("/v1/batches/digest-100/digest?after={cursor}&attention_only=true"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(filtered["cursor"], delta["cursor"]);
+        assert_eq!(filtered["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(filtered["tasks"][0]["id"], ids[42]);
+        let (status, empty) = get_json(
+            &app,
+            &format!(
+                "/v1/batches/digest-100/digest?after={}",
+                delta["cursor"].as_str().unwrap()
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(empty["tasks"].as_array().unwrap().is_empty());
+        assert_eq!(empty["cursor"], delta["cursor"]);
+        let empty_size = serde_json::to_vec(&empty).unwrap().len();
+        eprintln!("digest no-change delta bytes: {empty_size}");
+        assert!(empty_size < 300);
+
+        let reset = get_json(&app, "/v1/batches/digest-100/digest?after=invalid-cursor")
+            .await
+            .1;
+        assert_eq!(reset["reset_required"], true);
+        assert!(reset["tasks"].as_array().unwrap().is_empty());
     }
 
     struct FakeSandbox;

@@ -136,6 +136,118 @@ impl ControllerStore {
         Ok(encode_cursor(seq))
     }
 
+    /// Read the canonical durable batch resources and stream boundary from one SQLite snapshot.
+    pub fn batch_snapshot(&self, batch_id: &str) -> Result<(String, Vec<Value>), StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let cursor = tx.query_row(
+            "SELECT COALESCE(MAX(sequence),0) FROM orchestration_changes",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let mut statement = tx.prepare(
+            "SELECT resource_type,resource_id,payload_json FROM orchestration_resources
+             WHERE batch_id=?1 ORDER BY CASE resource_type WHEN 'batch' THEN 0 WHEN 'task' THEN 1 ELSE 2 END, resource_id",
+        )?;
+        let rows = statement.query_map([batch_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut resources = Vec::new();
+        let mut task_ids = std::collections::BTreeSet::new();
+        for row in rows {
+            let (resource_type, resource_id, payload) = row?;
+            if resource_type == "task" {
+                task_ids.insert(resource_id.clone());
+            }
+            let record: Value = serde_json::from_str(&payload)?;
+            resources.push(serde_json::json!({
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "record": record,
+            }));
+        }
+        if let Some(batch) = resources
+            .iter()
+            .find(|resource| resource["resource_type"] == "batch")
+        {
+            if let Some(ids) = batch["record"]["accepted_task_ids"].as_array() {
+                task_ids.extend(ids.iter().filter_map(Value::as_str).map(str::to_owned));
+            }
+        }
+        for task_id in task_ids {
+            let task_exists = resources.iter().any(|resource| {
+                resource["resource_type"] == "task" && resource["resource_id"] == task_id
+            });
+            if !task_exists {
+                let task: Option<String> = tx
+                    .query_row(
+                        "SELECT payload_json FROM orchestration_resources WHERE resource_type='task' AND resource_id=?1",
+                        [&task_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(task) = task {
+                    resources.push(serde_json::json!({
+                        "resource_type":"task",
+                        "resource_id":task_id,
+                        "record":serde_json::from_str::<Value>(&task)?,
+                    }));
+                }
+            }
+            let mut attempts = tx.prepare(
+                "SELECT resource_id,payload_json FROM orchestration_resources WHERE resource_type='attempt' AND task_id=?1 ORDER BY resource_id",
+            )?;
+            let rows = attempts.query_map([&task_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (attempt_id, attempt) = row?;
+                if resources.iter().any(|resource| {
+                    resource["resource_type"] == "attempt" && resource["resource_id"] == attempt_id
+                }) {
+                    continue;
+                }
+                resources.push(serde_json::json!({
+                    "resource_type":"attempt",
+                    "resource_id":attempt_id,
+                    "record":serde_json::from_str::<Value>(&attempt)?,
+                }));
+            }
+        }
+        let session_ids: std::collections::BTreeSet<_> = resources
+            .iter()
+            .filter(|resource| resource["resource_type"] == "attempt")
+            .filter_map(|resource| resource["record"]["session_id"].as_str())
+            .map(str::to_owned)
+            .collect();
+        for session_id in session_ids {
+            let session: Option<String> = tx
+                .query_row(
+                    "SELECT payload_json FROM orchestration_materializations WHERE resource_type='session' AND resource_id=?1 AND payload_json IS NOT NULL",
+                    [&session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(session) = session {
+                resources.push(serde_json::json!({
+                    "resource_type":"session",
+                    "resource_id":session_id,
+                    "record":serde_json::from_str::<Value>(&session)?,
+                }));
+            }
+        }
+        drop(statement);
+        tx.commit()?;
+        Ok((encode_cursor(cursor), resources))
+    }
+
     /// Read a full materialized snapshot and its boundary from a single SQLite read transaction.
     /// The change log is intentionally unbounded in this version; pruning must advance an
     /// explicit retention floor before old cursors can be considered expired.
@@ -436,6 +548,7 @@ impl ControllerStore {
         }
         tx.execute("INSERT INTO orchestration_resources (resource_type, resource_id, batch_id, task_id, attempt_id, payload_json, created_at, updated_at) VALUES ('batch',?1,?1,NULL,NULL,?2,?3,?3)", params![batch_id, serde_json::to_string(&accepted_batch)?, now])?;
         tx.execute("INSERT INTO batches(batch_id,project,repository,requested_revision,base_commit,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![batch_id,accepted_batch["project"].as_str().unwrap_or_default(),accepted_batch["repository"].as_str().unwrap_or_default(),accepted_batch["requested_revision"].as_str().unwrap_or_default(),accepted_batch["base_commit"].as_str().unwrap_or_default(),serde_json::to_string(&accepted_batch)?,now])?;
+        append_resource_change(&tx, "batch", batch_id, &accepted_batch)?;
         for (task_id, mut task) in new_tasks {
             if let Some(dependencies) = task["dependencies"].as_array_mut() {
                 for dependency in dependencies {
@@ -446,6 +559,7 @@ impl ControllerStore {
             }
             tx.execute("INSERT INTO tasks(task_id,batch_id,client_task_id,project,repository,prompt,state,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,'queued',?7,?8)", params![task_id,batch_id,task["requested_task_id"].as_str().unwrap_or(&task_id),task["project"].as_str().unwrap_or_default(),task["repository"].as_str().unwrap_or_default(),task["prompt"].as_str().unwrap_or_default(),serde_json::to_string(&task)?,now])?;
             tx.execute("INSERT INTO orchestration_resources (resource_type, resource_id, batch_id, task_id, attempt_id, payload_json, created_at, updated_at) VALUES ('task',?1,?2,?1,NULL,?3,?4,?4)", params![task_id, batch_id, serde_json::to_string(&task)?, now])?;
+            append_resource_change(&tx, "task", &task_id, &task)?;
         }
         tx.execute("INSERT INTO idempotency_records (idempotency_key, operation_kind, scope, request_hash, canonicalization_version, result_reference, result_json, state, created_at, updated_at) VALUES (?1,'submit_batch',?2,?3,?4,?5,?6,'accepted',?7,?7)", params![key, scope, hash, CANONICALIZATION_VERSION, batch_id, serde_json::to_string(&accepted_batch)?, now])?;
         tx.commit()?;
@@ -587,6 +701,7 @@ impl ControllerStore {
             params![idempotency_key, task_id, attempt_id],
         )?;
         tx.execute("INSERT INTO orchestration_resources(resource_type,resource_id,batch_id,task_id,attempt_id,payload_json,created_at,updated_at) SELECT 'attempt',?1,batch_id,?2,?1,?3,?4,?4 FROM orchestration_resources WHERE resource_type='task' AND resource_id=?2", params![attempt_id,task_id,serde_json::to_string(&attempt)?,now])?;
+        append_resource_change(&tx, "attempt", attempt_id, &attempt)?;
         let _: Value = serde_json::from_str(&task)?;
         tx.commit()?;
         Ok(AttemptAcceptance {
@@ -606,6 +721,23 @@ impl ControllerStore {
         values
             .map(|value| Ok(serde_json::from_str(&value?)?))
             .collect()
+    }
+
+    pub fn tasks_for_session(&self, session_id: &str) -> Result<Vec<(String, String)>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let mut statement = connection.prepare(
+            "SELECT a.task_id,t.batch_id FROM orchestration_resources a
+             JOIN orchestration_resources t ON t.resource_type='task' AND t.resource_id=a.task_id
+             WHERE a.resource_type='attempt' AND json_extract(a.payload_json,'$.session_id')=?1",
+        )?;
+        let rows = statement.query_map([session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     pub fn bind_attempt_session(
@@ -636,6 +768,7 @@ impl ControllerStore {
             params![attempt_id, session_id, serde_json::to_string(&attempt)?],
         )?;
         tx.execute("UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='attempt' AND resource_id=?1", params![attempt_id,serde_json::to_string(&attempt)?,chrono::Utc::now().to_rfc3339()])?;
+        append_resource_change(&tx, "attempt", attempt_id, &attempt)?;
         tx.commit()?;
         Ok(attempt)
     }
@@ -734,6 +867,27 @@ fn read_result(connection: &Connection, key: &str) -> Result<Option<AcceptedResu
         },
     )
     .transpose()
+}
+
+fn append_resource_change(
+    tx: &rusqlite::Transaction<'_>,
+    resource_type: &str,
+    resource_id: &str,
+    record: &Value,
+) -> Result<(), StoreError> {
+    let change = serde_json::json!({"deleted":false,"record":record});
+    tx.execute(
+        "INSERT INTO orchestration_changes(resource_type,resource_id,payload_json) VALUES(?1,?2,?3)",
+        params![resource_type, resource_id, serde_json::to_string(&change)?],
+    )?;
+    let sequence = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO orchestration_materializations(resource_type,resource_id,payload_json,last_sequence)
+         VALUES(?1,?2,?3,?4)
+         ON CONFLICT(resource_type,resource_id) DO UPDATE SET payload_json=excluded.payload_json,last_sequence=excluded.last_sequence",
+        params![resource_type, resource_id, serde_json::to_string(record)?, sequence],
+    )?;
+    Ok(())
 }
 
 fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
