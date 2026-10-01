@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { applyServerRefresh, detailRenderSignature, formatElapsedValue, operatorState, parseRoute, sessionUiState } from "./ui-state.js"
+import { applyServerRefresh, detailRenderSignature, formatElapsedValue, operatorState, parseRoute, reconcileSessionRows, sessionUiState } from "./ui-state.js"
 
 test("poll payload preserves local interaction state and selected session", () => {
   const activities = new Map([["demo-12345678", {
@@ -49,6 +49,50 @@ test("fake clock updates elapsed time without changing the interaction model", (
   assert.equal(operatorState({ environment_state: "suspended", execution_state: "recovering", work_state: "in_progress" }), "stopped")
   assert.equal(parseRoute("#session/demo-12345678"), "demo-12345678")
   assert.equal(parseRoute("#settings"), null)
+})
+
+test("fake timer and controlled no-op polls retain ready and working row identity", () => {
+  const sessions = [
+    { id: "review", project: "Demo", work_branch: "main" },
+    { id: "working", project: "Demo", work_branch: "feature" },
+  ]
+  const activities = new Map([
+    ["review", { environment_state: "ready", execution_state: "idle", work_state: "ready_for_review", work_state_changed_at: "2026-09-19T11:58:00Z" }],
+    ["working", { environment_state: "ready", execution_state: "running", work_state: "in_progress", work_state_changed_at: "2026-09-19T11:58:00Z" }],
+  ])
+  const labels = { "ready-for-review": "Ready for review", working: "Working" }
+  const signature = (session, activity) => JSON.stringify([session.project, session.work_branch, operatorState(activity)])
+  const rows = sessions.map((session) => {
+    const status = labels[operatorState(activities.get(session.id))]
+    const row = { dataset: { session: session.id }, status, elapsed: "2m 10s", selected: true, focused: true, hovered: true }
+    row.dataset.rowSignature = signature(session, activities.get(session.id))
+    return row
+  })
+  const fakeTimerTick = (now) => rows.forEach((row) => {
+    row.elapsed = formatElapsedValue(activities.get(row.dataset.session).work_state_changed_at, now)
+  })
+  const poll = (response) => reconcileSessionRows(rows, sessions, (session) => signature(session, response.get(session.id)), (session) => ({
+    dataset: { session: session.id }, status: labels[operatorState(response.get(session.id))], elapsed: "",
+  }))
+
+  fakeTimerTick(Date.parse("2026-09-19T12:00:11Z"))
+  assert.deepEqual(rows.map((row) => row.elapsed), ["2m 11s", "2m 11s"])
+  const response = new Map([...activities].map(([id, activity]) => [id, { ...activity, session_binding_checked_at: "2026-09-19T12:00:12Z" }]))
+  const afterPoll = poll(response)
+  assert.deepEqual(afterPoll, rows)
+  assert.equal(rows[0].status, "Ready for review")
+  assert.equal(rows[0].status.split("Ready for review").length - 1, 1)
+  assert.equal(rows[1].status, "Working")
+  assert.equal(rows[1].status.split("Working").length - 1, 1)
+  assert.ok(rows.every((row) => row.selected && row.focused && row.hovered))
+})
+
+test("no-op polls retain another stable session row", () => {
+  const session = { id: "working", project: "Demo", work_branch: "feature" }
+  const activity = { environment_state: "ready", execution_state: "running", work_state: "in_progress" }
+  const row = { dataset: { session: session.id, rowSignature: JSON.stringify([operatorState(activity)]) } }
+  const retained = reconcileSessionRows([row], [session], () => JSON.stringify([operatorState(activity)]), () => ({ dataset: {} }))[0]
+  assert.equal(retained, row)
 })
 
 test("volatile binding checks do not change the detail render signature", () => {

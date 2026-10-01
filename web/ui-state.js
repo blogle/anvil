@@ -31,6 +31,40 @@ export function applyServerRefresh(state, sessions, activities) {
   return next
 }
 
+export function reconcileSessionRows(existingRows, sessions, signatureFor, createRow) {
+  const existing = new Map(existingRows.map((row) => [row.dataset.session, row]))
+  return sessions.map((session) => {
+    const signature = signatureFor(session)
+    const row = existing.get(session.id)
+    if (row && row.dataset.rowSignature === signature) return row
+    const replacement = createRow(session)
+    replacement.dataset.rowSignature = signature
+    return replacement
+  })
+}
+
+export function patchSessionRows(list, rows) {
+  if (rows.length !== list.children.length || rows.some((row, index) => row !== list.children[index])) {
+    list.replaceChildren(...rows)
+  }
+}
+
+export function updateSessionRowElapsed(row, changedAt, elapsedText, force = false) {
+  const elapsed = row.matches?.("[data-live-state-elapsed]") ? row : row.querySelector("[data-live-state-elapsed]")
+  const timestamp = String(changedAt || "")
+  if (elapsed && (force || elapsed.dataset.liveStateElapsed !== timestamp)) {
+    elapsed.dataset.liveStateElapsed = timestamp
+    elapsed.textContent = elapsedText
+  }
+  return elapsed
+}
+
+const escapeRowHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character])
+
+export function sessionRowMarkup({ session, status, statusText, elapsedSince, elapsedText, selected, title }) {
+  return `<button class="session-row ${selected ? "selected" : ""}" data-focus-key="session-${escapeRowHtml(session.id)}" data-session="${escapeRowHtml(session.id)}" aria-current="${selected ? "true" : "false"}"><div class="session-title">${escapeRowHtml(title)}</div><div class="session-meta"><span>${escapeRowHtml(session.project)}</span><span>·</span><span><code>${escapeRowHtml(session.work_branch)}</code></span></div><div class="session-state state-${escapeRowHtml(status)}"><span class="status-dot"></span><span class="session-status-label">${escapeRowHtml(statusText)}</span><span class="row-detail">· <span data-live-state-elapsed="${escapeRowHtml(elapsedSince)}">${escapeRowHtml(elapsedText)}</span></span></div></button>`
+}
+
 export function detailRenderSignature(value) {
   if (value === null || typeof value !== "object") return value
   if (Array.isArray(value)) return value.map(detailRenderSignature)
