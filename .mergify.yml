@@ -13,9 +13,11 @@ queue_rules:
       - -conflict
       - '#commits-behind = 0'
       - linear-history
+      - "#approved-reviews-by >= 1"
       - check-success = PR admission
       - check-success = Render Kubernetes manifests
     merge_conditions:
+      - "#approved-reviews-by >= 1"
       - check-success = Integration E2E
       - check-success = Batch image and Kind
 
@@ -23,7 +25,17 @@ pull_request_rules:
   - name: Keep pull requests rebased on main
     conditions:
       - base = main
-      - -draft
+      - -conflict
     actions:
       rebase:
         bot_account: blogle
+
+  - name: Queue approved ready pull requests
+    conditions:
+      - base = main
+      - -draft
+      - -conflict
+      - "#approved-reviews-by >= 1"
+    actions:
+      queue:
+        name: main
