@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+
+anvil_session_capability_path() {
+  local state_home="${XDG_STATE_HOME:-${HOME:-/home/anvil}/.local/state}"
+  printf '%s/anvil/github-session-capability' "$state_home"
+}
+
+anvil_session_capability_load() {
+  local capability_file capability
+  capability_file="$(anvil_session_capability_path)"
+  if [ -s "$capability_file" ]; then
+    IFS= read -r capability < "$capability_file" || true
+    printf '%s' "$capability"
+  else
+    printf '%s' "${ANVIL_SESSION_CREDENTIAL:-}"
+  fi
+}
+
+anvil_session_capability_store() {
+  local capability="${1:-}" capability_file capability_dir temporary_file
+  [ -n "$capability" ] || return 0
+
+  capability_file="$(anvil_session_capability_path)"
+  capability_dir="${capability_file%/*}"
+  mkdir -p "$capability_dir"
+  chmod 700 "$capability_dir"
+  temporary_file="$(mktemp "${capability_file}.XXXXXX")"
+  (umask 077; printf '%s\n' "$capability" > "$temporary_file")
+  chmod 600 "$temporary_file"
+  mv -f "$temporary_file" "$capability_file"
+}

@@ -3,6 +3,7 @@
 , nix2containerBuildPkgs
 , opencode
 , credentialHelperSource
+, sessionCapabilityHelperSource
 , sandboxEntrypointSource
 , importSandboxImageK3sSource
 }:
@@ -10,17 +11,21 @@
 let
   credentialHelper = pkgs.writeShellScriptBin "anvil-credential"
     (builtins.readFile credentialHelperSource);
+  sessionCapabilityHelper = pkgs.writeShellScriptBin "anvil-session-capability"
+    (builtins.readFile sessionCapabilityHelperSource);
   gitIdentity = pkgs.writeShellScriptBin "anvil-git-identity"
     (builtins.readFile ./../runtime/git-identity);
   ghWrapper = pkgs.writeShellScriptBin "gh" ''
     set -euo pipefail
     : "''${ANVIL_SESSION_ID:?ANVIL_SESSION_ID is required}"
     : "''${ANVIL_CREDENTIAL_URL:?ANVIL_CREDENTIAL_URL is required}"
-    : "''${ANVIL_SESSION_CREDENTIAL:?ANVIL_SESSION_CREDENTIAL is required}"
+    source /bin/anvil-session-capability
+    session_credential="$(anvil_session_capability_load)"
+    : "''${session_credential:?ANVIL_SESSION_CREDENTIAL is required}"
     curl_config="$(mktemp)"
     trap 'rm -f "$curl_config"' EXIT
     (umask 077; printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/json"\n' \
-      "$ANVIL_SESSION_CREDENTIAL" > "$curl_config")
+      "$session_credential" > "$curl_config")
      response="$(${pkgs.curl}/bin/curl --config "$curl_config" --silent --show-error \
        --request POST \
        --header 'content-type: application/json' \
@@ -46,11 +51,13 @@ let
        exit 1
      fi
      token="$(${pkgs.jq}/bin/jq --raw-output '.token // empty' <<<"$response_body")"
-     if [ -z "$token" ]; then
-       echo "gh: broker returned no GitHub token" >&2
-       exit 1
-     fi
-    exec env GH_TOKEN="$token" ${pkgs.gh}/bin/gh "$@"
+      if [ -z "$token" ]; then
+        echo "gh: broker returned no GitHub token" >&2
+        exit 1
+      fi
+      next_session_credential="$(${pkgs.jq}/bin/jq --raw-output '.session_credential // empty' <<<"$response_body")"
+      anvil_session_capability_store "$next_session_credential"
+     exec env GH_TOKEN="$token" ${pkgs.gh}/bin/gh "$@"
   '';
   nixConf = pkgs.writeTextDir "etc/nix/nix.conf" ''
     experimental-features = nix-command flakes
@@ -116,7 +123,7 @@ let
     pathsToLink = [ "/bin" ];
   };
   sandboxRuntimeFiles = [
-    nixConf credentialHelper gitIdentity ghWrapper sandboxUsrBin sandboxBin
+    nixConf credentialHelper sessionCapabilityHelper gitIdentity ghWrapper sandboxUsrBin sandboxBin
   ] ++ userFiles ++ [ sandboxMutableHome sandboxMutableTmp ];
   sandboxBaseLayer = nix2containerPkgs.nix2container.buildLayer {
     deps = sandboxBaseTools;
