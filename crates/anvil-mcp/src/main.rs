@@ -28,20 +28,28 @@ struct Create {
     model: Option<String>,
     author_name: Option<String>,
     author_email: Option<String>,
+    idempotency_key: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Session {
     session_id: String,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
-struct Message {
+struct MutationSession {
     session_id: String,
-    prompt: String,
+    idempotency_key: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
-struct Recovery {
+struct MutationMessage {
+    session_id: String,
+    prompt: String,
+    idempotency_key: Option<String>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MutationRecovery {
     session_id: String,
     prompt: Option<String>,
+    idempotency_key: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Preview {
@@ -70,7 +78,7 @@ struct BatchSubmission {
     allow_competing_tasks: bool,
     policies: Option<Value>,
     tasks: Vec<BatchTask>,
-    idempotency_key: String,
+    idempotency_key: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ResourceId {
@@ -79,7 +87,7 @@ struct ResourceId {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TaskResourceId {
     task_id: String,
-    idempotency_key: String,
+    idempotency_key: Option<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 struct BatchDigestRequest {
@@ -115,11 +123,24 @@ impl AnvilMcp {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value, ErrorData> {
+        self.call_with_key(method, path, body, None).await
+    }
+
+    async fn call_with_key(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        idempotency_key: Option<&str>,
+    ) -> Result<Value, ErrorData> {
         let url = self
             .base
             .join(path)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        let request = self.client.request(method, url);
+        let mut request = self.client.request(method, url);
+        if let Some(key) = idempotency_key.filter(|key| !key.trim().is_empty()) {
+            request = request.header("Idempotency-Key", key);
+        }
         let response = if let Some(value) = body {
             request.json(&value)
         } else {
@@ -137,10 +158,7 @@ impl AnvilMcp {
             let detail = serde_json::from_slice::<Value>(&bytes).unwrap_or_else(
                 |_| json!({"message": String::from_utf8_lossy(&bytes).into_owned()}),
             );
-            return Err(ErrorData::internal_error(
-                format!("Anvil API returned {status}"),
-                Some(json!({"http_status": status.as_u16(), "error": detail})),
-            ));
+            return Err(api_error(status, detail));
         }
         Ok(if bytes.is_empty() {
             json!({"accepted": true, "session_id": session_id_from_path(path)})
@@ -159,8 +177,11 @@ impl AnvilMcp {
         method: Method,
         path: &str,
         body: Option<Value>,
+        idempotency_key: Option<&str>,
     ) -> Result<Value, ErrorData> {
-        let result = self.call(method.clone(), path, body).await?;
+        let result = self
+            .call_with_key(method.clone(), path, body, idempotency_key)
+            .await?;
         let session_id = session_id_from_path(path);
         if method == Method::DELETE {
             return Ok(json!({
@@ -191,6 +212,19 @@ fn session_id_from_path(path: &str) -> String {
         .and_then(|rest| rest.split('/').next())
         .unwrap_or_default()
         .to_owned()
+}
+
+fn api_error(status: reqwest::StatusCode, detail: Value) -> ErrorData {
+    let data = Some(json!({"http_status":status.as_u16(),"error":detail}));
+    if status == reqwest::StatusCode::CONFLICT {
+        ErrorData::new(
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            format!("Anvil idempotency conflict (HTTP {status})"),
+            data,
+        )
+    } else {
+        ErrorData::internal_error(format!("Anvil API returned {status}"), data)
+    }
 }
 
 #[cfg(test)]
@@ -275,7 +309,14 @@ impl AnvilMcp {
         &self,
         Parameters(p): Parameters<Create>,
     ) -> Result<Json<Value>, ErrorData> {
-        let session = self.call(Method::POST, "v1/sessions", Some(json!({"project":p.project,"repository":p.repository,"ref":p.reference,"prompt":p.prompt,"model":p.model,"author_name":p.author_name,"author_email":p.author_email}))).await?;
+        let session = self
+            .call_with_key(
+                Method::POST,
+                "v1/sessions",
+                Some(json!({"project":p.project,"repository":p.repository,"ref":p.reference,"prompt":p.prompt,"model":p.model,"author_name":p.author_name,"author_email":p.author_email})),
+                p.idempotency_key.as_deref(),
+            )
+            .await?;
         Ok(Json(
             json!({"accepted":true,"session_id":session.get("id").and_then(Value::as_str),"session":session}),
         ))
@@ -292,17 +333,22 @@ impl AnvilMcp {
             .base
             .join("v1/batches")
             .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
-        let response = self.client.post(url).header("idempotency-key", p.idempotency_key).json(&json!({"project":p.project,"repository":p.repository,"ref":p.reference,"concurrency":p.concurrency,"allow_competing_tasks":p.allow_competing_tasks,"policies":p.policies.unwrap_or(Value::Null),"tasks":tasks})).send().await.map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        let mut request = self.client.post(url);
+        if let Some(key) = p
+            .idempotency_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+        {
+            request = request.header("Idempotency-Key", key);
+        }
+        let response = request.json(&json!({"project":p.project,"repository":p.repository,"ref":p.reference,"concurrency":p.concurrency,"allow_competing_tasks":p.allow_competing_tasks,"policies":p.policies.unwrap_or(Value::Null),"tasks":tasks})).send().await.map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
         let status = response.status();
         let body = response
             .json::<Value>()
             .await
             .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
         if !status.is_success() {
-            return Err(ErrorData::internal_error(
-                format!("Anvil API returned {status}"),
-                Some(json!({"http_status":status.as_u16(),"error":body})),
-            ));
+            return Err(api_error(status, body));
         }
         Ok(Json(body))
     }
@@ -347,10 +393,15 @@ impl AnvilMcp {
             .base
             .join(&format!("v1/tasks/{}/attempts", p.task_id))
             .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
-        let response = self
-            .client
-            .post(url)
-            .header("idempotency-key", p.idempotency_key)
+        let mut request = self.client.post(url);
+        if let Some(key) = p
+            .idempotency_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+        {
+            request = request.header("Idempotency-Key", key);
+        }
+        let response = request
             .json(&json!({}))
             .send()
             .await
@@ -361,10 +412,7 @@ impl AnvilMcp {
             .await
             .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
         if !status.is_success() {
-            return Err(ErrorData::internal_error(
-                format!("Anvil API returned {status}"),
-                Some(json!({"http_status":status.as_u16(),"error":body})),
-            ));
+            return Err(api_error(status, body));
         }
         Ok(Json(body))
     }
@@ -403,13 +451,14 @@ impl AnvilMcp {
     )]
     async fn anvil_send_message(
         &self,
-        Parameters(p): Parameters<Message>,
+        Parameters(p): Parameters<MutationMessage>,
     ) -> Result<Json<Value>, ErrorData> {
         Ok(Json(
             self.mutation(
                 Method::POST,
                 &format!("v1/sessions/{}/messages", p.session_id),
                 Some(json!({"prompt":p.prompt})),
+                p.idempotency_key.as_deref(),
             )
             .await?,
         ))
@@ -449,13 +498,14 @@ impl AnvilMcp {
     )]
     async fn anvil_complete_session(
         &self,
-        Parameters(p): Parameters<Session>,
+        Parameters(p): Parameters<MutationSession>,
     ) -> Result<Json<Value>, ErrorData> {
         Ok(Json(
             self.mutation(
                 Method::POST,
                 &format!("v1/sessions/{}/complete", p.session_id),
                 None,
+                p.idempotency_key.as_deref(),
             )
             .await?,
         ))
@@ -491,13 +541,14 @@ impl AnvilMcp {
     #[rmcp::tool(description = "Stop the current OpenCode task in a session.")]
     async fn anvil_abort(
         &self,
-        Parameters(p): Parameters<Session>,
+        Parameters(p): Parameters<MutationSession>,
     ) -> Result<Json<Value>, ErrorData> {
         Ok(Json(
             self.mutation(
                 Method::POST,
                 &format!("v1/sessions/{}/abort", p.session_id),
                 None,
+                p.idempotency_key.as_deref(),
             )
             .await?,
         ))
@@ -507,13 +558,14 @@ impl AnvilMcp {
     )]
     async fn anvil_suspend(
         &self,
-        Parameters(p): Parameters<Session>,
+        Parameters(p): Parameters<MutationSession>,
     ) -> Result<Json<Value>, ErrorData> {
         Ok(Json(
             self.mutation(
                 Method::POST,
                 &format!("v1/sessions/{}/suspend", p.session_id),
                 None,
+                p.idempotency_key.as_deref(),
             )
             .await?,
         ))
@@ -521,13 +573,14 @@ impl AnvilMcp {
     #[rmcp::tool(description = "Resume a previously suspended development session.")]
     async fn anvil_resume(
         &self,
-        Parameters(p): Parameters<Session>,
+        Parameters(p): Parameters<MutationSession>,
     ) -> Result<Json<Value>, ErrorData> {
         Ok(Json(
             self.mutation(
                 Method::POST,
                 &format!("v1/sessions/{}/resume", p.session_id),
                 None,
+                p.idempotency_key.as_deref(),
             )
             .await?,
         ))
@@ -537,13 +590,14 @@ impl AnvilMcp {
     )]
     async fn anvil_rebind_session(
         &self,
-        Parameters(p): Parameters<Recovery>,
+        Parameters(p): Parameters<MutationRecovery>,
     ) -> Result<Json<Value>, ErrorData> {
         Ok(Json(
             self.mutation(
                 Method::POST,
                 &format!("v1/sessions/{}/rebind", p.session_id),
                 Some(json!({"prompt":p.prompt})),
+                p.idempotency_key.as_deref(),
             )
             .await?,
         ))
@@ -553,13 +607,14 @@ impl AnvilMcp {
     )]
     async fn anvil_delete_session(
         &self,
-        Parameters(p): Parameters<Session>,
+        Parameters(p): Parameters<MutationSession>,
     ) -> Result<Json<Value>, ErrorData> {
         Ok(Json(
             self.mutation(
                 Method::DELETE,
                 &format!("v1/sessions/{}", p.session_id),
                 None,
+                p.idempotency_key.as_deref(),
             )
             .await?,
         ))
@@ -618,7 +673,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnvilMcp, BatchDigestRequest, BatchSubmission, BatchTask, Recovery, ResourceId,
+        AnvilMcp, BatchDigestRequest, BatchSubmission, BatchTask, MutationRecovery, ResourceId,
         TaskResourceId, CONTROLLER_OPERATIONS,
     };
     use httpmock::{Method::GET, MockServer};
@@ -654,13 +709,36 @@ mod tests {
                     pr_policy: None,
                     evidence_contract: None,
                 }],
-                idempotency_key: "batch-key".into(),
+                idempotency_key: Some("batch-key".into()),
             }))
             .await
             .unwrap()
             .0;
         assert_eq!(response["batch_id"], "batch-1");
         assert_eq!(response["base_commit"], "a");
+        let replay = mcp
+            .anvil_submit_batch(Parameters(BatchSubmission {
+                project: "demo".into(),
+                repository: "https://github.com/example/demo".into(),
+                reference: "main".into(),
+                concurrency: 1,
+                allow_competing_tasks: false,
+                policies: None,
+                tasks: vec![BatchTask {
+                    task_id: "task-1".into(),
+                    prompt: "do work".into(),
+                    dependencies: vec![],
+                    owner: None,
+                    policy: None,
+                    pr_policy: None,
+                    evidence_contract: None,
+                }],
+                idempotency_key: Some("batch-key".into()),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(replay, response);
     }
 
     #[tokio::test]
@@ -682,13 +760,14 @@ mod tests {
                 allow_competing_tasks: false,
                 policies: None,
                 tasks: vec![],
-                idempotency_key: "key".into(),
+                idempotency_key: Some("key".into()),
             }))
             .await;
         let Err(error) = result else {
             panic!("HTTP conflict must become an MCP tool error")
         };
         assert!(error.message.contains("409"));
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert_eq!(error.data.unwrap()["http_status"], 409);
     }
 
@@ -744,7 +823,7 @@ mod tests {
         assert_eq!(
             mcp.anvil_create_attempt(Parameters(TaskResourceId {
                 task_id: "task-1".into(),
-                idempotency_key: "attempt-key".into()
+                idempotency_key: Some("attempt-key".into())
             }))
             .await
             .unwrap()
@@ -813,6 +892,7 @@ mod tests {
             "anvil_get_activity",
             "anvil_get_status",
             "anvil_create_session",
+            "anvil_create_attempt",
             "anvil_send_message",
             "anvil_suspend",
             "anvil_resume",
@@ -892,6 +972,43 @@ mod tests {
                 "transport is missing {operation}"
             );
         }
+        for mutation in [
+            "anvil_create_session",
+            "anvil_submit_batch",
+            "anvil_create_attempt",
+            "anvil_send_message",
+            "anvil_complete_session",
+            "anvil_abort",
+            "anvil_suspend",
+            "anvil_resume",
+            "anvil_rebind_session",
+            "anvil_delete_session",
+        ] {
+            let tool = tools.iter().find(|tool| tool["name"] == mutation).unwrap();
+            assert!(
+                tool["inputSchema"]["properties"]
+                    .get("idempotency_key")
+                    .is_some(),
+                "{mutation} schema lacks idempotency_key"
+            );
+        }
+        for readonly in [
+            "anvil_get_session",
+            "anvil_get_messages",
+            "anvil_get_status",
+            "anvil_get_diff",
+            "anvil_get_batch",
+            "anvil_get_task",
+            "anvil_get_attempt",
+        ] {
+            let tool = tools.iter().find(|tool| tool["name"] == readonly).unwrap();
+            assert!(
+                tool["inputSchema"]["properties"]
+                    .get("idempotency_key")
+                    .is_none(),
+                "{readonly} should remain read-only"
+            );
+        }
     }
 
     #[tokio::test]
@@ -918,9 +1035,10 @@ mod tests {
         let mcp = AnvilMcp::new(reqwest::Url::parse(&format!("{}/", server.base_url())).unwrap())
             .unwrap();
         let result = mcp
-            .anvil_rebind_session(Parameters(Recovery {
+            .anvil_rebind_session(Parameters(MutationRecovery {
                 session_id: "demo-12345678".into(),
                 prompt: None,
+                idempotency_key: None,
             }))
             .await
             .unwrap()
@@ -929,5 +1047,52 @@ mod tests {
         assert_eq!(result["session_id"], "demo-12345678");
         assert_eq!(result["result"]["session_binding_continuity"], "lost");
         assert_eq!(result["status"]["environment_state"], "ready");
+    }
+
+    #[tokio::test]
+    async fn mutation_forwards_key_and_conflict_is_structured() {
+        let server = MockServer::start_async().await;
+        let accepted = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/sessions/demo/messages")
+                .header("Idempotency-Key", "retry-42")
+                .json_body(json!({"prompt":"hello"}));
+            then.status(200).json_body(json!({"message":"original"}));
+        });
+        let mcp = AnvilMcp::new(reqwest::Url::parse(&format!("{}/", server.base_url())).unwrap())
+            .unwrap();
+        let result = mcp
+            .call_with_key(
+                reqwest::Method::POST,
+                "v1/sessions/demo/messages",
+                Some(json!({"prompt":"hello"})),
+                Some("retry-42"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["message"], "original");
+        accepted.assert();
+
+        let conflict = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/sessions/demo/messages")
+                .header("Idempotency-Key", "retry-42")
+                .json_body(json!({"prompt":"changed"}));
+            then.status(409)
+                .json_body(json!({"error":{"message":"Idempotency-Key conflict"}}));
+        });
+        let error = mcp
+            .call_with_key(
+                reqwest::Method::POST,
+                "v1/sessions/demo/messages",
+                Some(json!({"prompt":"changed"})),
+                Some("retry-42"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("idempotency conflict"));
+        assert_eq!(error.data.as_ref().unwrap()["http_status"], 409);
+        conflict.assert();
     }
 }

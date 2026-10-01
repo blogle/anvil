@@ -13,9 +13,11 @@ use anvil_core::{
 };
 use async_trait::async_trait;
 use axum::{
-    extract::{Path, Query, State},
-    http::HeaderMap,
+    body::Body,
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
+    http::{HeaderMap, Request},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -347,7 +349,12 @@ pub struct CreateRequest {
     pub author_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author_email: Option<String>,
+    #[serde(skip)]
+    session_id_override: Option<String>,
 }
+
+#[derive(Debug, Clone)]
+struct IdempotentSessionId(String);
 #[derive(Debug, Deserialize)]
 pub struct PromptRequest {
     pub prompt: String,
@@ -1699,6 +1706,7 @@ pub struct AppState {
     pending_logins: Arc<Mutex<HashMap<String, PendingLogin>>>,
     binding_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     transition_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    idempotency_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     lifecycle_watchers: LifecycleWatchers,
     materializations_reconciled: Arc<AtomicBool>,
     materialization_reconcile_lock: Arc<AsyncMutex<()>>,
@@ -1748,6 +1756,7 @@ impl AppState {
             pending_logins: Arc::new(Mutex::new(HashMap::new())),
             binding_locks: Arc::new(Mutex::new(HashMap::new())),
             transition_locks: Arc::new(Mutex::new(HashMap::new())),
+            idempotency_locks: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_watchers: Arc::new(Mutex::new(HashMap::new())),
             materializations_reconciled: Arc::new(AtomicBool::new(false)),
             materialization_reconcile_lock: Arc::new(AsyncMutex::new(())),
@@ -1770,6 +1779,15 @@ impl AppState {
             .lock()
             .expect("transition lock map poisoned")
             .entry(id.to_owned())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    fn idempotency_lock(&self, key: &str) -> Arc<AsyncMutex<()>> {
+        self.idempotency_locks
+            .lock()
+            .expect("idempotency lock map poisoned")
+            .entry(key.to_owned())
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone()
     }
@@ -1876,6 +1894,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/attempts/:id",
             get(get_attempt).post(bind_attempt_session),
         )
+        .route("/v1/idempotency/:key", get(idempotency_record))
         .route("/v1/sessions/:id", get(session).delete(remove))
         .route("/v1/sessions/:id/messages", post(prompt).get(messages))
         .route("/v1/sessions/:id/complete", post(complete))
@@ -1903,6 +1922,10 @@ pub fn router(state: AppState) -> Router {
             post(complete_provider_login),
         )
         .route("/v1/opencode/config", get(opencode_config))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            idempotency_middleware,
+        ))
         .with_state(state)
 }
 
@@ -1978,14 +2001,15 @@ async fn submit_batch(
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ServiceError::Invalid("Idempotency-Key header is required".into()))?;
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let semantic_request =
         serde_json::to_value(&request).map_err(|error| ServiceError::Invalid(error.to_string()))?;
     let store = state
         .store()
         .map_err(|error| ServiceError::Store(error.into()))?;
     if let Some(replayed) = store
-        .replay_batch(key, &project.name, &semantic_request)
+        .replay_batch(&key, &project.name, &semantic_request)
         .map_err(|error| match error {
             store::StoreError::Conflict => ServiceError::Conflict(
                 "idempotency key was already used for a different batch plan".into(),
@@ -2028,7 +2052,7 @@ async fn submit_batch(
     let batch = json!({"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"resolved_base_id":resolved_base,"base_commit":resolved_base,"default_policies":request.policies,"accepted_task_ids":accepted_ids,"requested_task_ids":request.tasks.iter().map(|task| task.task_id.clone()).collect::<Vec<_>>(),"rejected_task_ids":[],"preflight_results":[],"queued_count":request.tasks.len(),"runnable_count":request.tasks.iter().filter(|task|task.dependencies.is_empty()).count(),"requested_concurrency":request.concurrency,"duplicate_suppression":[]});
     let acceptance = store
         .accept_batch(store::BatchAcceptance {
-            key,
+            key: &key,
             scope: &project.name,
             request: &semantic_request,
             batch_id: &batch_id,
@@ -2561,14 +2585,13 @@ async fn create_attempt(
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            ServiceError::Invalid("Idempotency-Key header is required for attempt creation".into())
-        })?;
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let attempt_id = uuid::Uuid::new_v4().to_string();
     let acceptance = state
         .store()
         .map_err(|error| ServiceError::Store(error.into()))?
-        .create_attempt(&id, &attempt_id, key)
+        .create_attempt(&id, &attempt_id, &key)
         .map_err(|error| match error {
             store::StoreError::NotFound => ServiceError::NotFound,
             store::StoreError::Conflict => ServiceError::Conflict(
@@ -2620,6 +2643,163 @@ async fn get_attempt(
         .map(Json)
         .ok_or(ServiceError::NotFound)
 }
+
+async fn idempotency_middleware(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let key = request
+        .headers()
+        .get("Idempotency-Key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    // Credential issuance is deliberately excluded: its response is a short-lived secret and
+    // the controller contract must never persist credential material in SQLite.
+    let is_mutation = method == axum::http::Method::POST
+        || method == axum::http::Method::PUT
+        || method == axum::http::Method::PATCH
+        || method == axum::http::Method::DELETE;
+    if key.is_none()
+        || path == "/v1/batches"
+        || (path.starts_with("/v1/tasks/") && path.ends_with("/attempts"))
+        || path.ends_with("/credentials/github")
+        || !is_mutation
+        || !path.starts_with("/v1/")
+    {
+        return next.run(request).await;
+    }
+    let key = key.unwrap();
+    let lock = state.idempotency_lock(&key);
+    let _guard = lock.lock().await;
+    let (mut parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return ServiceError::Invalid(format!("unable to read request body: {error}"))
+                .into_response()
+        }
+    };
+    let semantic = serde_json::from_slice::<Value>(&bytes)
+        .unwrap_or_else(|_| json!({"body":String::from_utf8_lossy(&bytes)}));
+    let mut resource_reference = if path == "/v1/sessions" && method == axum::http::Method::POST {
+        semantic
+            .get("project")
+            .and_then(Value::as_str)
+            .and_then(|project| Project::new(project).ok())
+            .map(|project| SessionId::new(&project).to_string())
+            .unwrap_or_else(|| path.clone())
+    } else {
+        path.clone()
+    };
+    let request_value = json!({"method":method.as_str(),"path":path,"body":semantic});
+    let operation = format!("http:{}", method.as_str().to_ascii_lowercase());
+    let accepted_body = if path == "/v1/sessions" {
+        json!({
+            "accepted":true,
+            "operation":operation,
+            "resource":resource_reference,
+            "id":resource_reference,
+            "session_id":resource_reference
+        })
+    } else {
+        json!({"accepted":true,"operation":operation,"resource":resource_reference})
+    };
+    let initial = json!({"http_status":202,"body":accepted_body});
+    let accepted = match state
+        .store()
+        .map_err(|error| error.to_owned())
+        .and_then(|store| {
+            store
+                .accept(
+                    &key,
+                    &operation,
+                    &path,
+                    &request_value,
+                    &resource_reference,
+                    &initial,
+                )
+                .map_err(|error| error.to_string())
+        }) {
+        Ok(accepted) => accepted,
+        Err(error) if error.contains("different request") => {
+            return ServiceError::Conflict(
+                "Idempotency-Key was already used for a different operation or request".into(),
+            )
+            .into_response()
+        }
+        Err(error) => return ServiceError::Store(error).into_response(),
+    };
+    if let store::Acceptance::Replayed(record) = accepted {
+        if record.state == store::IdempotencyState::Completed
+            || path != "/v1/sessions"
+            || method != axum::http::Method::POST
+        {
+            return stored_http_response(record.result);
+        }
+        resource_reference = record.result_reference;
+        // A crash can leave the durable reservation accepted before session
+        // creation begins. Resume only when its deterministic session id is not
+        // present; otherwise return the accepted reservation without a duplicate.
+        match state.kube.list().await {
+            Ok(sessions)
+                if sessions
+                    .iter()
+                    .any(|session| session.session.id == resource_reference) =>
+            {
+                return stored_http_response(record.result);
+            }
+            Ok(_) => {}
+            Err(error) => return error.into_response(),
+        }
+    }
+    if path == "/v1/sessions" && method == axum::http::Method::POST {
+        parts
+            .extensions
+            .insert(IdempotentSessionId(resource_reference.clone()));
+    }
+    let response = next
+        .run(Request::from_parts(parts, Body::from(bytes)))
+        .await;
+    let status = response.status();
+    let (parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return ServiceError::Store(format!("unable to persist HTTP result: {error}"))
+                .into_response()
+        }
+    };
+    let body_value = serde_json::from_slice::<Value>(&bytes)
+        .unwrap_or_else(|_| json!({"body":String::from_utf8_lossy(&bytes)}));
+    let result = json!({"http_status":status.as_u16(),"body":body_value});
+    if let Ok(store) = state.store() {
+        if store.set_result(&key, &resource_reference, &result).is_ok() {
+            let _ = store.mark_completed(&key);
+        }
+    }
+    Response::from_parts(parts, Body::from(bytes))
+}
+
+fn stored_http_response(result: Value) -> Response {
+    let status = result
+        .get("http_status")
+        .and_then(Value::as_u64)
+        .and_then(|code| StatusCode::from_u16(code as u16).ok())
+        .unwrap_or(StatusCode::ACCEPTED);
+    let body = result
+        .get("body")
+        .cloned()
+        .unwrap_or_else(|| json!({"accepted":true}));
+    if status == StatusCode::NO_CONTENT {
+        return status.into_response();
+    }
+    (status, Json(body)).into_response()
+}
 async fn health() -> Json<Value> {
     Json(json!({"status":"ok"}))
 }
@@ -2664,8 +2844,54 @@ async fn asset_css() -> Response {
 async fn ready() -> StatusCode {
     StatusCode::OK
 }
+
+async fn idempotency_record(
+    Path(key): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ServiceError> {
+    let store = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.to_owned()))?;
+    if let Some(record) = store
+        .get(&key)
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+    {
+        return Ok(Json(json!({
+            "idempotency_key": record.idempotency_key,
+            "operation_kind": record.operation_kind,
+            "scope": record.scope,
+            "result_reference": record.result_reference,
+            "result": record.result,
+            "state": match record.state {
+                store::IdempotencyState::Accepted => "accepted",
+                store::IdempotencyState::Completed => "completed",
+            },
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
+        })));
+    }
+    let attempt = store
+        .get_attempt_submission(&key)
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+        .ok_or(ServiceError::NotFound)?;
+    let timestamp = attempt
+        .get("created_at")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Ok(Json(json!({
+        "idempotency_key": key,
+        "operation_kind": "create_attempt",
+        "scope": attempt["task_id"],
+        "result_reference": attempt["attempt_id"],
+        "result": attempt,
+        "state": "completed",
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    })))
+}
 async fn create(
     State(s): State<AppState>,
+    idempotent_session_id: Option<Extension<IdempotentSessionId>>,
     Json(r): Json<CreateRequest>,
 ) -> Result<(StatusCode, Json<Session>), ServiceError> {
     let p = Project::new(&r.project).map_err(|e| ServiceError::Invalid(e.to_string()))?;
@@ -2694,7 +2920,11 @@ async fn create(
             "author_name and author_email must be provided together".into(),
         ));
     }
-    let id = SessionId::new(&p).to_string();
+    let id = r
+        .session_id_override
+        .clone()
+        .or_else(|| idempotent_session_id.map(|Extension(value)| value.0))
+        .unwrap_or_else(|| SessionId::new(&p).to_string());
     let mut sandbox_env = vec![
         ("ANVIL_SESSION_ID".into(), id.clone()),
         (
@@ -5838,6 +6068,7 @@ mod tests {
         let mut config = config("http://127.0.0.1:4097".into());
         config.github_api_url = upstream.base_url();
         config.store_path = directory.path().join("controller.sqlite3");
+        let reopen_config = config.clone();
         let app = router(AppState::new(config, FakeSandbox));
         let plan = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":2,"tasks":[{"task_id":"build","prompt":"compile it","dependencies":[],"policy":{}}]});
         let submit = |plan: Value, key: &'static str| {
@@ -5849,18 +6080,37 @@ mod tests {
                 .body(Body::from(plan.to_string()))
                 .unwrap()
         };
-        let first = app
-            .clone()
-            .oneshot(submit(plan.clone(), "stable-key"))
-            .await
-            .unwrap();
-        assert_eq!(first.status(), StatusCode::CREATED);
+        let submit_raw = |body: String, key: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/batches")
+                .header("idempotency-key", key)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let (first, concurrent) = tokio::join!(
+            app.clone().oneshot(submit(plan.clone(), "stable-key")),
+            app.clone().oneshot(submit(plan.clone(), "stable-key")),
+        );
+        let first = first.unwrap();
+        let concurrent = concurrent.unwrap();
+        assert!([StatusCode::CREATED, StatusCode::OK].contains(&first.status()));
+        assert!([StatusCode::CREATED, StatusCode::OK].contains(&concurrent.status()));
+        assert_ne!(first.status(), concurrent.status());
         let first_body: Value = serde_json::from_slice(
             &axum::body::to_bytes(first.into_body(), usize::MAX)
                 .await
                 .unwrap(),
         )
         .unwrap();
+        let concurrent_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(concurrent.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first_body, concurrent_body);
         assert_eq!(first_body["requested_revision"], "main");
         assert_eq!(
             first_body["resolved_base_id"],
@@ -5889,7 +6139,10 @@ mod tests {
         });
         let replay = app
             .clone()
-            .oneshot(submit(plan.clone(), "stable-key"))
+            .oneshot(submit_raw(
+                serde_json::to_string_pretty(&plan).unwrap(),
+                "stable-key",
+            ))
             .await
             .unwrap();
         assert_eq!(replay.status(), StatusCode::OK);
@@ -5977,6 +6230,23 @@ mod tests {
                 assert_eq!(replay["ordinal"], 1);
             }
         }
+        let attempt_lookup = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/idempotency/attempt-key-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let attempt_lookup: Value = serde_json::from_slice(
+            &axum::body::to_bytes(attempt_lookup.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(attempt_lookup["operation_kind"], "create_attempt");
+        assert_eq!(attempt_lookup["result"]["ordinal"], 1);
         let listed = app
             .clone()
             .oneshot(
@@ -5994,6 +6264,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(attempts["attempts"].as_array().unwrap().len(), 2);
+        let conflict_attempt = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1/tasks/{}/attempts",
+                        independent_body["accepted_task_ids"][0].as_str().unwrap()
+                    ))
+                    .header("idempotency-key", "attempt-key-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict_attempt.status(), StatusCode::CONFLICT);
         let attempt_id = attempts["attempts"][0]["attempt_id"].as_str().unwrap();
         let get_attempt = app
             .clone()
@@ -6034,6 +6320,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        let reopened = router(AppState::new(reopen_config, FakeSandbox));
+        let restart_replay = reopened
+            .clone()
+            .oneshot(submit_raw(plan.to_string(), "stable-key"))
+            .await
+            .unwrap();
+        assert_eq!(restart_replay.status(), StatusCode::OK);
+        let restart_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(restart_replay.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restart_body, first_body);
+        let reopened_attempt = reopened
+            .clone()
+            .oneshot(
+                Request::get("/v1/idempotency/attempt-key-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let reopened_attempt: Value = serde_json::from_slice(
+            &axum::body::to_bytes(reopened_attempt.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reopened_attempt["result"]["ordinal"], 1);
+        let unkeyed_attempt = reopened
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/tasks/{task_id}/attempts"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unkeyed_attempt.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]
@@ -6495,6 +6824,196 @@ mod tests {
             history_path: PathBuf::from("/tmp/anvil-history.jsonl"),
             store_path: PathBuf::from(format!("/tmp/anvil-test-{}.sqlite3", uuid::Uuid::new_v4())),
         }
+    }
+
+    #[tokio::test]
+    async fn public_idempotency_middleware_replays_conflicts_converges_and_survives_reopen() {
+        use axum::{body::Body, http::Request, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let build = |counter: Arc<AtomicUsize>| {
+            let mut config = config("http://127.0.0.1:4097".into());
+            config.store_path = directory.path().join("controller.sqlite3");
+            let state = AppState::new(config, FakeSandbox);
+            let handler = move || {
+                let count = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                async move { (StatusCode::CREATED, Json(json!({"count":count}))) }
+            };
+            Router::new()
+                .route("/v1/test", post(handler))
+                .route("/v1/idempotency/:key", get(idempotency_record))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    idempotency_middleware,
+                ))
+                .with_state(state)
+        };
+        let app = build(counter.clone());
+        let request = |key: &str, body: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/test")
+                .header("Idempotency-Key", key)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap()
+        };
+        let first = app
+            .clone()
+            .oneshot(request("retry", r#"{"value":1}"#))
+            .await
+            .unwrap();
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let replay = app
+            .clone()
+            .oneshot(request("retry", r#"{ "value":1 }"#))
+            .await
+            .unwrap();
+        let replay_body = axum::body::to_bytes(replay.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(first_body, replay_body);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        let conflict = app
+            .clone()
+            .oneshot(request("retry", r#"{"value":2}"#))
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+        let (one, two) = tokio::join!(
+            app.clone().oneshot(request("concurrent", r#"{"value":3}"#)),
+            app.clone().oneshot(request("concurrent", r#"{"value":3}"#)),
+        );
+        let one = one.unwrap();
+        let two = two.unwrap();
+        assert_eq!(one.status(), two.status());
+        let one_body = axum::body::to_bytes(one.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let two_body = axum::body::to_bytes(two.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(one_body, two_body);
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        drop(app);
+
+        let reopened = build(counter.clone());
+        let response = reopened
+            .clone()
+            .oneshot(request("retry", r#"{"value":1}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let lookup = reopened
+            .clone()
+            .oneshot(
+                Request::get("/v1/idempotency/retry")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(lookup.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["state"], "completed");
+        assert_eq!(result["result"]["body"]["count"], 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        let no_key = reopened
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/test")
+                    .body(Body::from(r#"{"value":4}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_key.status(), StatusCode::CREATED);
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn interrupted_session_acceptance_resumes_with_the_reserved_session_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_path = directory.path().join("controller.sqlite3");
+        let session_id = SessionId::new(&Project::new("demo").unwrap()).to_string();
+        let request = json!({"project":"demo"});
+        let request_value = json!({
+            "method":"POST",
+            "path":"/v1/sessions",
+            "body":request,
+        });
+        let initial = json!({
+            "http_status":202,
+            "body":{
+                "accepted":true,
+                "operation":"http:post",
+                "resource":session_id,
+                "id":session_id,
+                "session_id":session_id,
+            }
+        });
+        store::ControllerStore::open(&store_path)
+            .unwrap()
+            .accept(
+                "create-key",
+                "http:post",
+                "/v1/sessions",
+                &request_value,
+                &session_id,
+                &initial,
+            )
+            .unwrap();
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = store_path;
+        let state = AppState::new(config, FakeSandbox);
+        let app = Router::new()
+            .route(
+                "/v1/sessions",
+                post(move |Extension(reserved): Extension<IdempotentSessionId>| {
+                    let calls = handler_calls.clone();
+                    async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (StatusCode::CREATED, Json(json!({"session_id":reserved.0})))
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                idempotency_middleware,
+            ))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header("Idempotency-Key", "create-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["session_id"], session_id);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

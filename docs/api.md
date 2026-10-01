@@ -8,6 +8,7 @@ normalized and never includes credential contents:
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/v1/providers` | List providers, authentication status, available auth methods, and API-key capability |
+| `GET` | `/v1/idempotency/{key}` | Read the durable authoritative result and accepted/completed state for an operation key |
 | `POST` | `/v1/providers/{provider}/login` | Begin an OpenCode OAuth or API-key attempt |
 | `POST` | `/v1/providers/{provider}/login/{login_id}/complete` | Complete the in-memory login attempt |
 | `GET` | `/v1/opencode/config` | Read the shared profile OpenCode configuration |
@@ -18,6 +19,13 @@ Session controller routes are:
 | --- | --- | --- |
 | `POST` | `/v1/sessions` | Create a session and dispatch its initial prompt |
 | `GET` | `/v1/sessions` | List sessions |
+| `POST` | `/v1/batches` | Durably accept a batch plan and logical tasks |
+| `GET` | `/v1/batches/{id}` | Read an accepted batch |
+| `GET` | `/v1/tasks/{id}` | Read an accepted logical task |
+| `POST` | `/v1/tasks/{id}/attempts` | Create an execution attempt for a task |
+| `GET` | `/v1/tasks/{id}/attempts` | List attempts for a task |
+| `GET` | `/v1/attempts/{id}` | Read an execution attempt |
+| `POST` | `/v1/attempts/{id}` | Bind an attempt to a session |
 | `GET` | `/v1/sessions/{id}` | Read durable session metadata and binding state |
 | `POST` | `/v1/sessions/{id}/messages` | Send steering to the current OpenCode session |
 | `GET` | `/v1/sessions/{id}/messages` | Read OpenCode messages |
@@ -31,6 +39,24 @@ Session controller routes are:
 | `POST` | `/v1/sessions/{id}/rebind` | Explicitly create a replacement OpenCode binding |
 | `POST` | `/v1/sessions/{id}/complete` | Controller acceptance into `completed` |
 | `DELETE` | `/v1/sessions/{id}` | Delete the session and workspace |
+
+Mutation callers may supply `Idempotency-Key` on session lifecycle/message,
+provider login, batch submission, and attempt creation/binding routes. Anvil
+binds the key, operation, scope, and canonical JSON request durably before
+dispatch. Matching retries replay the authoritative result without repeating
+provisioning or resource creation; reuse for a different operation or request
+returns HTTP 409 with an `error.message`. The header is optional for compatibility.
+Session mutations can return a durable `202` acceptance and resource reference
+while first execution is still in progress. Batch submit atomically records its
+accepted plan and tasks with the key; attempt creation commits its attempt and
+key binding in one transaction. Omitted keys are given an internal one-shot
+identity on these new resource endpoints. `GET /v1/idempotency/{key}` exposes the
+stored operation, scope, reference, result, accepted/completed state, and
+timestamps for reconciliation. The
+GitHub credential endpoint is excluded because its short-lived credential
+response must never be persisted; repeated credential reads do not transition
+controller state. The MCP facade has no separate operator-query tool shape, so
+reconciliation remains available through the HTTP lookup endpoint.
 
 Provider login is a relay to the singleton profile OpenCode server. OpenCode
 1.18.30 supplies `GET /provider`, `GET /provider/auth`,
