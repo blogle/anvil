@@ -10,15 +10,17 @@
     nix2container.url = "github:Dauliac/nix2container/8fd02c842686a528fd37508283853de0ed1462b1";
     nix2containerNixpkgs.follows = "nix2container/nixpkgs";
     opencode.url = "github:anomalyco/opencode/v1.18.30";
+    mergify-nix.url = "github:blogle/mergify-nix";
+    mergify-nix.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode }:
+  outputs = { self, nixpkgs, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode, mergify-nix }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
         craneLib = crane.mkLib pkgs;
         rust = import ./nix/rust.nix {
-          inherit pkgs craneLib opencode;
+          inherit pkgs craneLib opencode mergify-nix;
           nix2containerPkgs = nix2container.packages.${system};
           repoRoot = ./.;
         };

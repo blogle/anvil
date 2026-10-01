@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "skills": {
+    "mergify-ci": {
+      "source": "Mergifyio/mergify-cli",
+      "ref": "b24e8f2aa67dfceff9401b39450fb7bb91f5573e",
+      "sourceType": "github",
+      "skillPath": "skills/mergify-ci/SKILL.md",
+      "computedHash": "8e24eedba5cf86f637f18bbb73d0e9974e4b935c3933c91664db4d23fba56f0d"
+    },
+    "mergify-config": {
+      "source": "Mergifyio/mergify-cli",
+      "ref": "b24e8f2aa67dfceff9401b39450fb7bb91f5573e",
+      "sourceType": "github",
+      "skillPath": "skills/mergify-config/SKILL.md",
+      "computedHash": "ac0934358eaf5abf8f3c3a4a3aee7565788570f869c58849b3e37954033a7641"
+    },
+    "mergify-events": {
+      "source": "Mergifyio/mergify-cli",
+      "ref": "b24e8f2aa67dfceff9401b39450fb7bb91f5573e",
+      "sourceType": "github",
+      "skillPath": "skills/mergify-events/SKILL.md",
+      "computedHash": "e105d46b8ff3bce2bf60590ad0526eb5aac370a8efc1ce903121e18582cbe749"
+    },
+    "mergify-merge-protections": {
+      "source": "Mergifyio/mergify-cli",
+      "ref": "b24e8f2aa67dfceff9401b39450fb7bb91f5573e",
+      "sourceType": "github",
+      "skillPath": "skills/mergify-merge-protections/SKILL.md",
+      "computedHash": "bebab5df51f62d567cfd80de2338fcc0510e687c6d076212cf03e74d2582f8fa"
+    },
+    "mergify-merge-queue": {
+      "source": "Mergifyio/mergify-cli",
+      "ref": "b24e8f2aa67dfceff9401b39450fb7bb91f5573e",
+      "sourceType": "github",
+      "skillPath": "skills/mergify-merge-queue/SKILL.md",
+      "computedHash": "f728a41e4cc96ede4e4131a737feea82271aaed491f2b84e9c398e26b03cddb9"
+    },
+    "mergify-stack": {
+      "source": "Mergifyio/mergify-cli",
+      "ref": "b24e8f2aa67dfceff9401b39450fb7bb91f5573e",
+      "sourceType": "github",
+      "skillPath": "skills/mergify-stack/SKILL.md",
+      "computedHash": "5c42340b17342cffce6d0e9a8c23a7e868f679c3526f51f4c01a75b4a9956961"
+    },
+    "releasing": {
+      "source": "Mergifyio/mergify-cli",
+      "ref": "b24e8f2aa67dfceff9401b39450fb7bb91f5573e",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/releasing/SKILL.md",
+      "computedHash": "83b2898f0e7cef45f0a2aeb240cbac8118e58913ce8b486948a23b3b4404a5ed"
+    }
+  }
+}

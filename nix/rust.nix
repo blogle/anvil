@@ -1,4 +1,4 @@
-{ pkgs, craneLib, opencode, nix2containerPkgs, repoRoot }:
+{ pkgs, craneLib, opencode, mergify-nix, nix2containerPkgs, repoRoot }:
 
 let
   # Keep the Cargo source filter here so the root flake only wires modules
@@ -122,8 +122,10 @@ let
       pkgs.gh pkgs.curl pkgs.jq pkgs.kubectl pkgs.kustomize pkgs.nix pkgs.nodejs
       pkgs.process-compose pkgs.watchexec nix2containerPkgs.skopeo-nix2container pkgs.umoci pkgs.crun pkgs.kind pkgs.util-linux
       opencode.packages.${pkgs.system}.default
+      mergify-nix.packages.${pkgs.system}.mergify-cli
     ];
     shellHook = ''
+      ${mergify-nix.lib.installSkills pkgs.system}
       export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$PWD/target}"
       if [ -z "''${CARGO_HOME:-}" ]; then
         export CARGO_HOME="$CARGO_TARGET_DIR/.cargo-home"
