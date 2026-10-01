@@ -1,4 +1,4 @@
-import { applyServerRefresh, detailRenderSignature, formatElapsedValue, operatorState, parseRoute, sessionUiState } from "./ui-state.js"
+import { applyServerRefresh, detailRenderSignature, formatElapsedValue, operatorState, parseRoute, patchSessionRows, reconcileSessionRows, sessionRowMarkup, sessionUiState, updateSessionRowElapsed } from "./ui-state.js"
 
 const app = document.querySelector("#app")
 const state = {
@@ -120,17 +120,46 @@ function updateSidebar() {
   const sidebar = document.querySelector("#sidebar")
   const focused = sidebar.querySelector(":focus")?.dataset.focusKey || null
   const items = visibleSessions()
-  sidebar.innerHTML = `<div class="sidebar-head"><h1>Sessions</h1><span class="count">${state.sessions.length} total</span></div>
-    <div class="filters" aria-label="Session filters">${[["all", "All"], ["working", "Working"], ["needs-input", "Needs input"], ["ready-for-review", "Ready for review"], ["done", "Done"], ["problem", "Problem"]].map(([filter, label]) => `<button class="filter ${state.filter === filter ? "selected" : ""}" data-focus-key="filter-${filter}" data-filter="${filter}" aria-pressed="${state.filter === filter}">${label}</button>`).join("")}</div>
-    <div class="session-list">${state.loading ? `<div class="loading">Loading sessions...</div>` : state.error && !state.sessions.length ? `<div class="error-card"><strong>Sessions unavailable</strong>${escapeHtml(state.error)}</div>` : items.length ? items.map(renderSessionRow).join("") : `<div class="empty"><strong>${state.filter === "all" ? "No sessions yet" : `No ${state.filter} sessions`}</strong><span>${state.filter === "all" ? "Anvil sessions will appear here when work is dispatched." : "No sessions match this filter."}</span></div>`}</div>`
+  if (!sidebar.querySelector(".session-list")) {
+    sidebar.innerHTML = `<div class="sidebar-head"><h1>Sessions</h1><span class="count"></span></div>
+      <div class="filters" aria-label="Session filters">${[["all", "All"], ["working", "Working"], ["needs-input", "Needs input"], ["ready-for-review", "Ready for review"], ["done", "Done"], ["problem", "Problem"]].map(([filter, label]) => `<button class="filter" data-focus-key="filter-${filter}" data-filter="${filter}">${label}</button>`).join("")}</div>
+      <div class="session-list"></div>`
+  }
+  sidebar.querySelector(".count").textContent = `${state.sessions.length} total`
+  sidebar.querySelectorAll("[data-filter]").forEach((button) => {
+    const selected = state.filter === button.dataset.filter
+    button.classList.toggle("selected", selected)
+    button.setAttribute("aria-pressed", String(selected))
+  })
+  const list = sidebar.querySelector(".session-list")
+  if (state.loading || (state.error && !state.sessions.length) || !items.length) {
+    list.replaceChildren()
+    list.innerHTML = state.loading ? `<div class="loading">Loading sessions...</div>` : state.error && !state.sessions.length ? `<div class="error-card"><strong>Sessions unavailable</strong>${escapeHtml(state.error)}</div>` : `<div class="empty"><strong>${state.filter === "all" ? "No sessions yet" : `No ${state.filter} sessions`}</strong><span>${state.filter === "all" ? "Anvil sessions will appear here when work is dispatched." : "No sessions match this filter."}</span></div>`
+  } else {
+    const rows = reconcileSessionRows([...list.querySelectorAll("[data-session]")], items, (session) => {
+      const status = operatorState(sessionActivity(session.id))
+      return JSON.stringify([session.project, session.work_branch, status, state.selected === session.id])
+    }, (session) => {
+      const replacement = document.createElement("div")
+      replacement.innerHTML = renderSessionRow(session)
+      return replacement.firstElementChild
+    })
+    rows.forEach((row) => {
+      const session = items.find((item) => item.id === row.dataset.session)
+      updateSessionRowElapsed(row, sessionActivity(session.id)?.work_state_changed_at, formatStateElapsed(sessionActivity(session.id)))
+    })
+    patchSessionRows(list, rows)
+  }
   if (focused) sidebar.querySelector(`[data-focus-key="${CSS.escape(focused)}"]`)?.focus({ preventScroll: true })
 }
 
 function renderSessionRow(session) {
   const activity = sessionActivity(session.id)
   const status = operatorState(activity)
-  const meta = `${stateLabel(status)} · ${formatStateElapsed(activity)}`
-  return `<button class="session-row ${state.selected === session.id ? "selected" : ""}" data-focus-key="session-${escapeHtml(session.id)}" data-session="${escapeHtml(session.id)}" aria-current="${state.selected === session.id ? "true" : "false"}"><div class="session-title">${escapeHtml(titleFor(session))}</div><div class="session-meta"><span>${escapeHtml(session.project)}</span><span>·</span><span><code>${escapeHtml(session.work_branch)}</code></span></div><div class="session-state state-${escapeHtml(status)}"><span class="status-dot"></span><span>${stateLabel(status)}</span><span class="row-detail" data-live-state-elapsed="${escapeHtml(activity?.work_state_changed_at)}">${escapeHtml(meta)}</span></div></button>`
+  return sessionRowMarkup({
+    session, status, statusText: stateLabel(status), elapsedSince: activity?.work_state_changed_at,
+    elapsedText: formatStateElapsed(activity), selected: state.selected === session.id, title: titleFor(session),
+  })
 }
 
 function captureDetailInteraction() {
@@ -353,7 +382,7 @@ function updateClocks() {
     element.textContent = formatElapsedValue(element.dataset.liveElapsed, end || Date.now())
   })
   document.querySelectorAll("[data-live-state-elapsed]").forEach((element) => {
-    element.textContent = formatElapsedValue(element.dataset.liveStateElapsed)
+    updateSessionRowElapsed(element, element.dataset.liveStateElapsed, formatElapsedValue(element.dataset.liveStateElapsed), true)
   })
   document.querySelectorAll("[data-live-relative]").forEach((element) => {
     element.textContent = `Last activity ${relativeTime(element.dataset.liveRelative)}`

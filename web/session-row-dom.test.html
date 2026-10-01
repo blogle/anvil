@@ -1,0 +1,73 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Session row DOM regression</title>
+<div id="session-list"></div>
+<output id="result">RUNNING</output>
+<script type="module">
+  import { formatElapsedValue, operatorState, patchSessionRows, reconcileSessionRows, sessionRowMarkup, updateSessionRowElapsed } from "./ui-state.js"
+
+  const sessions = [
+    { id: "review", project: "Demo", work_branch: "main" },
+    { id: "working", project: "Demo", work_branch: "feature" },
+  ]
+  const activities = new Map([
+    ["review", { environment_state: "ready", execution_state: "idle", work_state: "ready_for_review", work_state_changed_at: "2026-09-19T11:58:00Z" }],
+    ["working", { environment_state: "ready", execution_state: "running", work_state: "in_progress", work_state_changed_at: "2026-09-19T11:58:00Z" }],
+  ])
+  const labels = { "ready-for-review": "Ready for review", working: "Working" }
+  const list = document.querySelector("#session-list")
+  const render = (session) => {
+    const activity = activities.get(session.id)
+    const status = operatorState(activity)
+    const container = document.createElement("div")
+    container.innerHTML = sessionRowMarkup({
+      session, status, statusText: labels[status], elapsedSince: activity.work_state_changed_at,
+      elapsedText: "2m 10s", selected: true, title: `${session.project} session`,
+    })
+    const row = container.firstElementChild
+    row.dataset.rowSignature = signatureFor(session)
+    return row
+  }
+  const signatureFor = (session) => JSON.stringify([session.project, session.work_branch, operatorState(activities.get(session.id))])
+  const makeRows = () => reconcileSessionRows([...list.querySelectorAll("[data-session]")], sessions, signatureFor, render)
+  const rows = makeRows()
+  patchSessionRows(list, rows)
+  rows[0].focus()
+  const elapsedLeaves = rows.map((row) => row.querySelector("[data-live-state-elapsed]"))
+  const statusNodes = rows.map((row) => row.querySelectorAll(".session-status-label"))
+  const originalFocusedNode = document.activeElement
+  let replaceChildrenCalls = 0
+  const replaceChildren = list.replaceChildren.bind(list)
+  list.replaceChildren = (...nodes) => { replaceChildrenCalls++; replaceChildren(...nodes) }
+  const mutations = []
+  const observer = new MutationObserver((records) => mutations.push(...records))
+  observer.observe(list, { subtree: true, childList: true, characterData: true })
+
+  // Deterministic fake-clock tick: only the elapsed leaves may be mutated.
+  const now = Date.parse("2026-09-19T12:00:11Z")
+  rows.forEach((row) => {
+    const elapsed = row.querySelector("[data-live-state-elapsed]")
+    updateSessionRowElapsed(elapsed, elapsed.dataset.liveStateElapsed, formatElapsedValue(elapsed.dataset.liveStateElapsed, now), true)
+  })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  if (!mutations.length || mutations.some((mutation) => mutation.target !== elapsedLeaves[0] && mutation.target !== elapsedLeaves[1])) {
+    throw new Error("timer tick changed a node other than an elapsed leaf")
+  }
+  if (elapsedLeaves.some((elapsed) => elapsed.textContent !== "2m 11s")) throw new Error("elapsed leaf did not update in place")
+
+  // Controlled no-op poll: preserve both real row nodes and skip list replacement.
+  const unchangedRows = makeRows()
+  patchSessionRows(list, unchangedRows)
+  if (unchangedRows[0] !== rows[0] || unchangedRows[1] !== rows[1]) throw new Error("no-op poll replaced a row node")
+  if (replaceChildrenCalls !== 0) throw new Error("no-op poll detached and reinserted rows")
+  if (document.activeElement !== originalFocusedNode) throw new Error("timer/poll disturbed focus")
+  if (rows.some((row, index) => row.classList.contains("selected") !== true || statusNodes[index].length !== 1)) {
+    throw new Error("selection changed or status was duplicated")
+  }
+  if (statusNodes[0][0].textContent !== "Ready for review" || statusNodes[1][0].textContent !== "Working") {
+    throw new Error("stable status text changed")
+  }
+  observer.disconnect()
+  document.querySelector("#result").textContent = "PASS"
+  document.title = "PASS"
+</script>
