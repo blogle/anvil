@@ -33,6 +33,44 @@
         "type": "github"
       }
     },
+    "mergify-cli": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1790892210,
+        "narHash": "sha256-fABNLDon0DMgXXxgEiLivKCbBb1QStRbgfKw5F/E4pE=",
+        "owner": "Mergifyio",
+        "repo": "mergify-cli",
+        "rev": "b24e8f2aa67dfceff9401b39450fb7bb91f5573e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Mergifyio",
+        "repo": "mergify-cli",
+        "type": "github"
+      }
+    },
+    "mergify-nix": {
+      "inputs": {
+        "mergify-cli": "mergify-cli",
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "rust-overlay": "rust-overlay"
+      },
+      "locked": {
+        "lastModified": 1790892723,
+        "narHash": "sha256-CWkesgHBDNTS8z2sgapF/yJPAefDUNrCP0ba+f6moNY=",
+        "owner": "blogle",
+        "repo": "mergify-nix",
+        "rev": "89a679f80be2a1faddd6778b6a5098280e7a5ac8",
+        "type": "github"
+      },
+      "original": {
+        "owner": "blogle",
+        "repo": "mergify-nix",
+        "type": "github"
+      }
+    },
     "nix2container": {
       "inputs": {
         "nixpkgs": "nixpkgs"
@@ -122,6 +160,7 @@
       "inputs": {
         "crane": "crane",
         "flake-utils": "flake-utils",
+        "mergify-nix": "mergify-nix",
         "nix2container": "nix2container",
         "nix2containerNixpkgs": [
           "nix2container",
@@ -129,6 +168,27 @@
         ],
         "nixpkgs": "nixpkgs_2",
         "opencode": "opencode"
+      }
+    },
+    "rust-overlay": {
+      "inputs": {
+        "nixpkgs": [
+          "mergify-nix",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1790882220,
+        "narHash": "sha256-n+rcrZkqos6/HY2iSJsVsJw3Q4mB9XEquYpus97iOi4=",
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "rev": "dcee1adabb61484343af863501d2e3d91ef51f72",
+        "type": "github"
+      },
+      "original": {
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "type": "github"
       }
     },
     "systems": {
