@@ -81,6 +81,14 @@ struct TaskResourceId {
     task_id: String,
     idempotency_key: String,
 }
+#[derive(Debug, Deserialize, JsonSchema)]
+struct BatchDigestRequest {
+    batch_id: String,
+    after: Option<String>,
+    #[serde(default)]
+    attention_only: bool,
+    view: Option<String>,
+}
 
 #[derive(Clone)]
 struct AnvilMcp {
@@ -192,6 +200,7 @@ const CONTROLLER_OPERATIONS: &[&str] = &[
     "anvil_get_task",
     "anvil_get_attempt",
     "anvil_create_attempt",
+    "anvil_get_batch_digest",
     "anvil_list_sessions",
     "anvil_get_session",
     "anvil_get_activity",
@@ -211,6 +220,54 @@ const CONTROLLER_OPERATIONS: &[&str] = &[
 
 #[rmcp::tool_router]
 impl AnvilMcp {
+    #[rmcp::tool(
+        description = "Read a compact digest of a durable batch. Defaults to the compact agent view; after accepts the opaque GET /v1/changes cursor, and attention_only filters rows without changing cursor progression."
+    )]
+    async fn anvil_get_batch_digest(
+        &self,
+        Parameters(p): Parameters<BatchDigestRequest>,
+    ) -> Result<Json<Value>, ErrorData> {
+        let mut url = self
+            .base
+            .join(&format!("v1/batches/{}/digest", p.batch_id))
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(after) = p.after.as_deref() {
+                query.append_pair("after", after);
+            }
+            if p.attention_only {
+                query.append_pair("attention_only", "true");
+            }
+            if let Some(view) = p.view.as_deref() {
+                query.append_pair("view", view);
+            }
+        }
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        if !status.is_success() {
+            let detail = serde_json::from_slice::<Value>(&bytes).unwrap_or_else(
+                |_| json!({"message":String::from_utf8_lossy(&bytes).into_owned()}),
+            );
+            return Err(ErrorData::internal_error(
+                format!("Anvil API returned {status}"),
+                Some(json!({"http_status":status.as_u16(),"error":detail})),
+            ));
+        }
+        let digest = serde_json::from_slice(&bytes)
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        Ok(Json(digest))
+    }
+
     #[rmcp::tool(
         description = "Create an isolated OpenCode development session from a public Git repository."
     )]
@@ -561,8 +618,8 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnvilMcp, BatchSubmission, BatchTask, Recovery, ResourceId, TaskResourceId,
-        CONTROLLER_OPERATIONS,
+        AnvilMcp, BatchDigestRequest, BatchSubmission, BatchTask, Recovery, ResourceId,
+        TaskResourceId, CONTROLLER_OPERATIONS,
     };
     use httpmock::{Method::GET, MockServer};
     use rmcp::handler::server::wrapper::Parameters;
@@ -696,10 +753,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn batch_digest_tool_forwards_opaque_cursor_and_view_to_live_route() {
+        let server = MockServer::start_async().await;
+        let response = json!({
+            "schema_version":1,
+            "batch_id":"batch-1",
+            "cursor":"anv1.42",
+            "counts":{"total":1,"queued":0,"active":1,"review":0,"failed":0,"done":0},
+            "tasks":[{"id":"task-1","state":"running","attempt_id":"attempt-1"}]
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/batches/batch-1/digest")
+                .query_param("after", "opaque.cursor+/=")
+                .query_param("attention_only", "true")
+                .query_param("view", "human");
+            then.status(200).json_body(response.clone());
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/batches/batch-1/digest");
+            then.status(200).json_body(response.clone());
+        });
+        let mcp = AnvilMcp::new(reqwest::Url::parse(&format!("{}/", server.base_url())).unwrap())
+            .unwrap();
+        let digest = mcp
+            .anvil_get_batch_digest(Parameters(BatchDigestRequest {
+                batch_id: "batch-1".into(),
+                after: Some("opaque.cursor+/=".into()),
+                attention_only: true,
+                view: Some("human".into()),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(digest["batch_id"], "batch-1");
+        assert_eq!(digest["tasks"][0]["attempt_id"], "attempt-1");
+        let agent_default = mcp
+            .anvil_get_batch_digest(Parameters(BatchDigestRequest {
+                batch_id: "batch-1".into(),
+                after: None,
+                attention_only: false,
+                view: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(agent_default["tasks"][0]["id"], "task-1");
+        assert!(agent_default.get("text").is_none());
+    }
+
     #[test]
     fn controller_surface_includes_required_operations() {
         for operation in [
             "anvil_submit_batch",
+            "anvil_get_batch_digest",
             "anvil_list_sessions",
             "anvil_get_session",
             "anvil_get_activity",
