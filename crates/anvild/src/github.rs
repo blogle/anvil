@@ -65,7 +65,19 @@ impl CapabilitySigner {
         ))
     }
 
+    #[cfg(test)]
     pub fn verify(&self, token: &str) -> Result<CapabilityClaims, String> {
+        let claims = self.verify_for_refresh(token)?;
+        if claims.expires_at <= Utc::now().timestamp() {
+            return Err("expired session capability".into());
+        }
+        Ok(claims)
+    }
+
+    /// Verify the signed session/repository binding while allowing an expired
+    /// capability to reach the session-aware renewal path. This token still
+    /// cannot access GitHub directly; the caller must verify the live session.
+    pub fn verify_for_refresh(&self, token: &str) -> Result<CapabilityClaims, String> {
         let (payload, signature) = token
             .split_once('.')
             .ok_or_else(|| "malformed session capability".to_owned())?;
@@ -82,8 +94,8 @@ impl CapabilitySigner {
                 .map_err(|_| "malformed session capability payload".to_owned())?,
         )
         .map_err(|_| "malformed session capability payload".to_owned())?;
-        if claims.capability != CAPABILITY_CLASS || claims.expires_at <= Utc::now().timestamp() {
-            return Err("expired or unsupported session capability".into());
+        if claims.capability != CAPABILITY_CLASS {
+            return Err("unsupported session capability".into());
         }
         Ok(claims)
     }
@@ -104,6 +116,8 @@ pub struct GithubCredential {
     pub expires_at: String,
     pub repository: String,
     pub permissions: HashMap<&'static str, &'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_credential: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash, Default)]
@@ -378,6 +392,7 @@ impl GithubBroker {
             expires_at: expires_at.to_rfc3339(),
             repository: format!("{owner}/{name}"),
             permissions: purpose.permissions(),
+            session_credential: None,
         };
         self.cache.lock().map_err(|_| GithubError::Cache)?.insert(
             key,

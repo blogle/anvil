@@ -27,6 +27,7 @@
           nix2containerPkgs = nix2container.packages.${system};
           nix2containerBuildPkgs = nix2containerNixpkgs.legacyPackages.${system};
           credentialHelperSource = ./runtime/anvil-credential;
+          sessionCapabilityHelperSource = ./runtime/anvil-session-capability;
           sandboxEntrypointSource = ./runtime/sandbox-entrypoint;
           importSandboxImageK3sSource = ./scripts/import-sandbox-image-k3s.sh;
         };

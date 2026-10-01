@@ -1290,6 +1290,10 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
         .and_then(Value::as_str)
         .is_some_and(|mode| mode.eq_ignore_ascii_case("suspended"));
     let (mut environment_state, phase) = sandbox_environment(o, suspended);
+    let deleting = o.metadata.deletion_timestamp.is_some();
+    if deleting {
+        environment_state = "deleting";
+    }
     let environment_error = if environment_state == "provisioning" {
         provisioning_timeout_reason(o, config, config.request_timeout)
     } else {
@@ -3383,7 +3387,7 @@ async fn github_credentials(
         ServiceError::Config("GitHub session capabilities are not configured".into())
     })?;
     let claims = signer
-        .verify(token)
+        .verify_for_refresh(token)
         .map_err(|_| ServiceError::Unauthorized)?;
     if claims.session_id != id || claims.capability != "github-repository" {
         return Err(ServiceError::Forbidden(
@@ -3392,6 +3396,13 @@ async fn github_credentials(
     }
     let record = s.kube.get(&id).await?;
     let session = record.session;
+    if record.work_state.api_state() == WorkState::Completed
+        || matches!(session.environment_state.as_str(), "deleting" | "deleted")
+    {
+        return Err(ServiceError::Forbidden(
+            "completed sessions cannot renew GitHub credentials".into(),
+        ));
+    }
     if session.repository != claims.repository {
         return Err(ServiceError::Forbidden(
             "capability repository does not match session".into(),
@@ -3401,7 +3412,7 @@ async fn github_credentials(
         .github
         .as_ref()
         .ok_or_else(|| ServiceError::Config("GitHub App credentials are not configured".into()))?;
-    broker
+    let mut credential = broker
         .credential(
             &session.repository,
             request
@@ -3409,8 +3420,13 @@ async fn github_credentials(
                 .unwrap_or_default(),
         )
         .await
-        .map(Json)
-        .map_err(ServiceError::Github)
+        .map_err(ServiceError::Github)?;
+    credential.session_credential = Some(
+        signer
+            .mint(&session.id, &session.repository)
+            .map_err(ServiceError::Config)?,
+    );
+    Ok(Json(credential))
 }
 async fn wait_ready(s: &AppState, id: &str) -> Result<SandboxRecord, ServiceError> {
     let end = tokio::time::Instant::now() + s.config.request_timeout;
@@ -8964,6 +8980,186 @@ mod tests {
             body["error"]["documentation_url"],
             "https://docs.github.com/safe"
         );
+    }
+
+    #[tokio::test]
+    async fn expired_session_capability_renews_for_suspended_and_resumed_sessions() {
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/app/installations/42/access_tokens")
+                .json_body(json!({
+                    "repositories": ["demo"],
+                    "permissions": github::GithubCredentialPurpose::Git.permissions()
+                }));
+            then.status(201).json_body(json!({
+                "token": "ghs_renewable",
+                "expires_at": "2099-01-01T00:00:00Z"
+            }));
+        });
+        let secret = "x".repeat(32);
+        let ttl = Duration::from_secs(2);
+        let mut test_config = config(server.base_url());
+        test_config.session_signing_secret = Some(secret.clone());
+        test_config.session_capability_ttl = ttl;
+        let sandbox = LifecycleSandbox {
+            record: Arc::new(Mutex::new(active_work_record(activity_session()))),
+        };
+        let mut state = AppState::new(test_config, sandbox);
+        state.github = Some(
+            github::GithubBroker::new(github::GithubConfig {
+                app_id: "1".into(),
+                installation_id: 42,
+                private_key: "not-used-in-test".into(),
+                api_url: Url::parse(&server.base_url()).unwrap(),
+            })
+            .with_jwt("test-jwt"),
+        );
+        let sandbox_api = state.kube.clone();
+        let app = router(state);
+        let signer = github::CapabilitySigner::new(&secret, ttl).unwrap();
+        let initial_capability = signer
+            .mint("demo-12345678", "https://github.com/example/demo.git")
+            .unwrap();
+        let request = |capability: &str| {
+            Request::post("/v1/sessions/demo-12345678/credentials/github")
+                .header("authorization", format!("Bearer {capability}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"purpose":"git"}"#))
+                .unwrap()
+        };
+
+        sandbox_api.suspend("demo-12345678").await.unwrap();
+        tokio::time::sleep(ttl + Duration::from_millis(100)).await;
+        assert!(signer.verify(&initial_capability).is_err());
+        let response = app
+            .clone()
+            .oneshot(request(&initial_capability))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let renewed: Value = json_response(response).await;
+        assert_eq!(renewed["token"], "ghs_renewable");
+        let suspended_capability = renewed["session_credential"].as_str().unwrap();
+        assert_ne!(suspended_capability, initial_capability);
+        assert!(signer.verify(suspended_capability).is_ok());
+
+        sandbox_api.resume("demo-12345678").await.unwrap();
+        tokio::time::sleep(ttl + Duration::from_millis(100)).await;
+        assert!(signer.verify(suspended_capability).is_err());
+        let response = app.oneshot(request(suspended_capability)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let resumed: Value = json_response(response).await;
+        let resumed_capability = resumed["session_credential"].as_str().unwrap();
+        assert_ne!(resumed_capability, suspended_capability);
+        assert!(signer.verify(resumed_capability).is_ok());
+        token.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn completed_or_deleted_sessions_cannot_renew_github_capabilities() {
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/app/installations/42/access_tokens");
+            then.status(201).json_body(json!({
+                "token": "unexpected",
+                "expires_at": "2099-01-01T00:00:00Z"
+            }));
+        });
+        let secret = "x".repeat(32);
+        let mut test_config = config(server.base_url());
+        test_config.session_signing_secret = Some(secret.clone());
+        let signer = github::CapabilitySigner::new(&secret, Duration::from_millis(1)).unwrap();
+        let capability = signer
+            .mint("demo-12345678", "https://github.com/example/demo.git")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut completed = active_work_record(activity_session());
+        let finished_run = CompletedRun {
+            run_id: RunId("run_test".into()),
+            assistant_message_id: OpenCodeMessageId("assistant_test".into()),
+            started_at: "2026-01-01T10:00:00Z".into(),
+            finished_at: "2026-01-01T10:01:00Z".into(),
+        };
+        completed.work_state = WorkStateRecord {
+            changed_at: finished_run.finished_at.clone(),
+            state: WorkLifecycleState::Completed {
+                run: finished_run,
+                previous_run: None,
+            },
+        };
+        completed.session.work_state = WorkState::Completed.as_str().into();
+        let sandbox = LifecycleSandbox {
+            record: Arc::new(Mutex::new(completed)),
+        };
+        let mut state = AppState::new(test_config.clone(), sandbox);
+        state.github = Some(
+            github::GithubBroker::new(github::GithubConfig {
+                app_id: "1".into(),
+                installation_id: 42,
+                private_key: "not-used-in-test".into(),
+                api_url: Url::parse(&server.base_url()).unwrap(),
+            })
+            .with_jwt("test-jwt"),
+        );
+        let app = router(state);
+        let request = || {
+            Request::post("/v1/sessions/demo-12345678/credentials/github")
+                .header("authorization", format!("Bearer {capability}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = app.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let deleting_object: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {
+                "name": "anvil-demo-12345678",
+                "deletionTimestamp": "2026-01-01T10:00:00Z",
+                "annotations": {
+                    "anvil.example/project": "demo",
+                    "anvil.example/repository": "https://github.com/example/demo.git",
+                    "anvil.example/base-ref": "main",
+                    "anvil.example/work-branch": "anvil/demo-12345678"
+                }
+            },
+            "status": {"phase": "Ready"}
+        }))
+        .unwrap();
+        let deleting_sandbox = ActivitySandbox {
+            object: deleting_object,
+            config: test_config.clone(),
+        };
+        let mut deleting_state = AppState::new(test_config.clone(), deleting_sandbox);
+        deleting_state.github = Some(
+            github::GithubBroker::new(github::GithubConfig {
+                app_id: "1".into(),
+                installation_id: 42,
+                private_key: "not-used-in-test".into(),
+                api_url: Url::parse(&server.base_url()).unwrap(),
+            })
+            .with_jwt("test-jwt"),
+        );
+        let response = router(deleting_state).oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let mut deleted_state = AppState::new(test_config, FakeSandbox);
+        deleted_state.github = Some(
+            github::GithubBroker::new(github::GithubConfig {
+                app_id: "1".into(),
+                installation_id: 42,
+                private_key: "not-used-in-test".into(),
+                api_url: Url::parse(&server.base_url()).unwrap(),
+            })
+            .with_jwt("test-jwt"),
+        );
+        let response = router(deleted_state).oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        token.assert_hits(0);
     }
 
     #[test]
