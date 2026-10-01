@@ -3,7 +3,7 @@
 //! A store handle serializes its own operations with a mutex; separate handles/processes
 //! use SQLite WAL for reader/writer concurrency and SQLite's writer lock for arbitration.
 //! FULL synchronous commits make accepted results durable before provisioning begins.
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -12,6 +12,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 use thiserror::Error;
+
+pub mod scheduler;
 
 const CANONICALIZATION_VERSION: i64 = 1;
 
@@ -25,6 +27,8 @@ pub enum StoreError {
     NotFound,
     #[error("invalid idempotency state {0}")]
     InvalidState(String),
+    #[error("scheduler configuration or transition is invalid: {0}")]
+    Scheduler(String),
     #[error("store error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("store I/O error: {0}")]
@@ -656,58 +660,26 @@ impl ControllerStore {
             .lock()
             .expect("controller store lock poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let replay: Option<(String, String)> = tx
-            .query_row(
-                "SELECT task_id,attempt_id FROM attempt_submissions WHERE idempotency_key=?1",
-                [idempotency_key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        if let Some((bound_task, bound_attempt)) = replay {
-            if bound_task != task_id {
-                return Err(StoreError::Conflict);
-            }
-            let json: String = tx.query_row(
-                "SELECT payload_json FROM attempts WHERE attempt_id=?1",
-                [bound_attempt],
-                |row| row.get(0),
-            )?;
-            tx.commit()?;
-            return Ok(AttemptAcceptance {
-                attempt: serde_json::from_str(&json)?,
-                created: false,
-            });
-        }
-        let task: Option<String> = tx
-            .query_row(
-                "SELECT payload_json FROM tasks WHERE task_id=?1",
-                [task_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(task) = task else {
-            return Err(StoreError::NotFound);
-        };
-        let ordinal: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(ordinal),0)+1 FROM attempts WHERE task_id=?1",
-            [task_id],
-            |row| row.get(0),
-        )?;
-        let now = chrono::Utc::now().to_rfc3339();
-        let attempt = serde_json::json!({"attempt_id":attempt_id,"task_id":task_id,"ordinal":ordinal,"session_id":null,"state":"queued","created_at":now});
-        tx.execute("INSERT INTO attempts(attempt_id,task_id,ordinal,session_id,payload_json,created_at) VALUES(?1,?2,?3,NULL,?4,?5)", params![attempt_id,task_id,ordinal,serde_json::to_string(&attempt)?,now])?;
-        tx.execute(
-            "INSERT INTO attempt_submissions(idempotency_key,task_id,attempt_id) VALUES(?1,?2,?3)",
-            params![idempotency_key, task_id, attempt_id],
-        )?;
-        tx.execute("INSERT INTO orchestration_resources(resource_type,resource_id,batch_id,task_id,attempt_id,payload_json,created_at,updated_at) SELECT 'attempt',?1,batch_id,?2,?1,?3,?4,?4 FROM orchestration_resources WHERE resource_type='task' AND resource_id=?2", params![attempt_id,task_id,serde_json::to_string(&attempt)?,now])?;
-        append_resource_change(&tx, "attempt", attempt_id, &attempt)?;
-        let _: Value = serde_json::from_str(&task)?;
+        let acceptance = create_attempt_tx(&tx, task_id, attempt_id, idempotency_key)?;
         tx.commit()?;
-        Ok(AttemptAcceptance {
-            attempt,
-            created: true,
-        })
+        Ok(acceptance)
+    }
+
+    pub fn get_attempt_submission(&self, key: &str) -> Result<Option<Value>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let payload = connection
+            .query_row(
+                "SELECT attempts.payload_json FROM attempt_submissions JOIN attempts ON attempts.attempt_id=attempt_submissions.attempt_id WHERE attempt_submissions.idempotency_key=?1",
+                [key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        payload
+            .map(|payload| serde_json::from_str(&payload).map_err(StoreError::from))
+            .transpose()
     }
 
     pub fn attempts_for_task(&self, task_id: &str) -> Result<Vec<Value>, StoreError> {
@@ -820,6 +792,87 @@ impl ControllerStore {
         tx.commit()?;
         Ok(record)
     }
+
+    /// Persist the authoritative HTTP result after an accepted operation finishes.
+    pub fn set_result(
+        &self,
+        key: &str,
+        result_reference: &str,
+        result: &Value,
+    ) -> Result<(), StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let changed = connection.execute(
+            "UPDATE idempotency_records SET result_reference=?2, result_json=?3, updated_at=?4 WHERE idempotency_key=?1 AND state='accepted'",
+            params![key, result_reference, serde_json::to_string(result)?, chrono::Utc::now().to_rfc3339()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+}
+
+/// Shared canonical Attempt acceptance used by both the public idempotent API
+/// and atomic scheduler claims. Caller owns and commits the surrounding txn.
+pub(super) fn create_attempt_tx(
+    tx: &Transaction<'_>,
+    task_id: &str,
+    attempt_id: &str,
+    idempotency_key: &str,
+) -> Result<AttemptAcceptance, StoreError> {
+    let replay: Option<(String, String)> = tx
+        .query_row(
+            "SELECT task_id,attempt_id FROM attempt_submissions WHERE idempotency_key=?1",
+            [idempotency_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((bound_task, bound_attempt)) = replay {
+        if bound_task != task_id {
+            return Err(StoreError::Conflict);
+        }
+        let json: String = tx.query_row(
+            "SELECT payload_json FROM attempts WHERE attempt_id=?1",
+            [bound_attempt],
+            |row| row.get(0),
+        )?;
+        return Ok(AttemptAcceptance {
+            attempt: serde_json::from_str(&json)?,
+            created: false,
+        });
+    }
+    let task: Option<String> = tx
+        .query_row(
+            "SELECT payload_json FROM tasks WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(task) = task else {
+        return Err(StoreError::NotFound);
+    };
+    let ordinal: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(ordinal),0)+1 FROM attempts WHERE task_id=?1",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let attempt = serde_json::json!({"attempt_id":attempt_id,"task_id":task_id,"ordinal":ordinal,"session_id":null,"state":"queued","created_at":now});
+    tx.execute("INSERT INTO attempts(attempt_id,task_id,ordinal,session_id,payload_json,created_at) VALUES(?1,?2,?3,NULL,?4,?5)", params![attempt_id,task_id,ordinal,serde_json::to_string(&attempt)?,now])?;
+    tx.execute(
+        "INSERT INTO attempt_submissions(idempotency_key,task_id,attempt_id) VALUES(?1,?2,?3)",
+        params![idempotency_key, task_id, attempt_id],
+    )?;
+    tx.execute("INSERT INTO orchestration_resources(resource_type,resource_id,batch_id,task_id,attempt_id,payload_json,created_at,updated_at) SELECT 'attempt',?1,batch_id,?2,?1,?3,?4,?4 FROM orchestration_resources WHERE resource_type='task' AND resource_id=?2", params![attempt_id,task_id,serde_json::to_string(&attempt)?,now])?;
+    append_resource_change(tx, "attempt", attempt_id, &attempt)?;
+    let _: Value = serde_json::from_str(&task)?;
+    Ok(AttemptAcceptance {
+        attempt,
+        created: true,
+    })
 }
 
 /// Default active-work uniqueness is scoped to project, repository, frozen base,
@@ -962,6 +1015,18 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
         tx.execute_batch("CREATE TABLE orchestration_materializations (resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, payload_json TEXT, last_sequence INTEGER NOT NULL, PRIMARY KEY(resource_type,resource_id));")?;
         tx.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?1)",
+            [chrono::Utc::now().to_rfc3339()],
+        )?;
+    }
+    if version < 8 {
+        // Scheduler queries are served from canonical task/attempt payload state.
+        // Expression indexes preserve that single source of truth while keeping
+        // capacity snapshots and atomic claims efficient as history grows.
+        tx.execute_batch(
+            "CREATE INDEX attempts_by_state ON attempts(json_extract(payload_json,'$.state'));",
+        )?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (8, ?1)",
             [chrono::Utc::now().to_rfc3339()],
         )?;
     }
@@ -1246,7 +1311,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
     #[test]
     fn migration_is_repeatable_and_indexed() {
@@ -1266,7 +1331,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(latest, 7);
+        assert_eq!(latest, 8);
         let index: i64=connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='orchestration_by_attempt'",[],|row|row.get(0)).unwrap();
         assert_eq!(index, 1);
     }

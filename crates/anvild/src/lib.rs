@@ -13,9 +13,11 @@ use anvil_core::{
 };
 use async_trait::async_trait;
 use axum::{
-    extract::{Path, Query, State},
-    http::HeaderMap,
+    body::Body,
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
+    http::{HeaderMap, Request},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -30,6 +32,7 @@ use kube::{
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     env,
@@ -131,6 +134,9 @@ pub struct Config {
     pub github_api_url: String,
     pub history_path: PathBuf,
     pub store_path: PathBuf,
+    pub concurrency_limit: u32,
+    pub provisioning_max_attempts: u32,
+    pub provisioning_retry_base: Duration,
 }
 impl Config {
     pub fn from_env() -> Result<Self, ServiceError> {
@@ -202,6 +208,28 @@ impl Config {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
         );
+        let concurrency_limit: u32 = get("ANVIL_CONCURRENCY", "4").parse().map_err(|_| {
+            ServiceError::Config("ANVIL_CONCURRENCY must be a positive integer".into())
+        })?;
+        let provisioning_max_attempts: u32 = get("ANVIL_PROVISIONING_MAX_ATTEMPTS", "3")
+            .parse()
+            .map_err(|_| {
+                ServiceError::Config(
+                    "ANVIL_PROVISIONING_MAX_ATTEMPTS must be a positive integer".into(),
+                )
+            })?;
+        let provisioning_retry_base_ms: u64 = get("ANVIL_PROVISIONING_RETRY_BASE_MS", "1000")
+            .parse()
+            .map_err(|_| {
+                ServiceError::Config(
+                    "ANVIL_PROVISIONING_RETRY_BASE_MS must be an unsigned integer".into(),
+                )
+            })?;
+        if concurrency_limit == 0 || provisioning_max_attempts == 0 {
+            return Err(ServiceError::Config(
+                "ANVIL_CONCURRENCY and ANVIL_PROVISIONING_MAX_ATTEMPTS must be positive".into(),
+            ));
+        }
         Ok(Self {
             sandbox_backend,
             bind_port: get("ANVIL_BIND_PORT", "8080")
@@ -253,6 +281,9 @@ impl Config {
             github_api_url: get("ANVIL_GITHUB_API_URL", "https://api.github.com"),
             history_path,
             store_path,
+            concurrency_limit,
+            provisioning_max_attempts,
+            provisioning_retry_base: Duration::from_millis(provisioning_retry_base_ms),
         })
     }
 }
@@ -285,6 +316,8 @@ pub enum ServiceError {
     Kubernetes(String),
     #[error("OpenCode error: {0}")]
     OpenCode(String),
+    #[error("provisioning infrastructure error: {0}")]
+    Provisioning(String),
     #[error("profile OpenCode error: {0}")]
     Profile(String),
     #[error("session not found")]
@@ -324,6 +357,7 @@ impl IntoResponse for ServiceError {
             ServiceError::Recovery(_) => StatusCode::CONFLICT,
             ServiceError::Invalid(_) => StatusCode::BAD_REQUEST,
             ServiceError::OpenCode(_) => StatusCode::BAD_GATEWAY,
+            ServiceError::Provisioning(_) => StatusCode::SERVICE_UNAVAILABLE,
             ServiceError::Profile(_) => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -347,7 +381,12 @@ pub struct CreateRequest {
     pub author_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author_email: Option<String>,
+    #[serde(skip)]
+    session_id_override: Option<String>,
 }
+
+#[derive(Debug, Clone)]
+struct IdempotentSessionId(String);
 #[derive(Debug, Deserialize)]
 pub struct PromptRequest {
     pub prompt: String,
@@ -1699,9 +1738,11 @@ pub struct AppState {
     pending_logins: Arc<Mutex<HashMap<String, PendingLogin>>>,
     binding_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     transition_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    idempotency_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     lifecycle_watchers: LifecycleWatchers,
     materializations_reconciled: Arc<AtomicBool>,
     materialization_reconcile_lock: Arc<AsyncMutex<()>>,
+    admission_lock: Arc<AsyncMutex<()>>,
     capability_signer: Option<github::CapabilitySigner>,
     github: Option<github::GithubBroker>,
 }
@@ -1748,9 +1789,11 @@ impl AppState {
             pending_logins: Arc::new(Mutex::new(HashMap::new())),
             binding_locks: Arc::new(Mutex::new(HashMap::new())),
             transition_locks: Arc::new(Mutex::new(HashMap::new())),
+            idempotency_locks: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_watchers: Arc::new(Mutex::new(HashMap::new())),
             materializations_reconciled: Arc::new(AtomicBool::new(false)),
             materialization_reconcile_lock: Arc::new(AsyncMutex::new(())),
+            admission_lock: Arc::new(AsyncMutex::new(())),
             capability_signer,
             github,
         }
@@ -1774,6 +1817,15 @@ impl AppState {
             .clone()
     }
 
+    fn idempotency_lock(&self, key: &str) -> Arc<AsyncMutex<()>> {
+        self.idempotency_locks
+            .lock()
+            .expect("idempotency lock map poisoned")
+            .entry(key.to_owned())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
     pub async fn initialize(&self) -> Result<(), ServiceError> {
         self.store()
             .map_err(|error| ServiceError::Store(error.to_string()))?;
@@ -1790,6 +1842,7 @@ impl AppState {
                 }
             }
         }
+        self.start_batch_scheduler();
         Ok(())
     }
 
@@ -1802,6 +1855,19 @@ impl AppState {
         self.materializations_reconciled
             .store(true, Ordering::Release);
         Ok(records)
+    }
+
+    fn start_batch_scheduler(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                if let Err(error) = run_batch_scheduler_tick(&state).await {
+                    warn!(%error, "batch scheduler tick failed");
+                }
+            }
+        });
     }
 
     pub fn store(&self) -> Result<&store::ControllerStore, &str> {
@@ -1867,6 +1933,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/batches", post(submit_batch))
         .route("/v1/batches/:id", get(get_batch))
         .route("/v1/batches/:id/digest", get(get_batch_digest))
+        .route("/v1/capacity", get(get_capacity))
         .route("/v1/tasks/:id", get(get_task))
         .route(
             "/v1/tasks/:id/attempts",
@@ -1876,6 +1943,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/attempts/:id",
             get(get_attempt).post(bind_attempt_session),
         )
+        .route("/v1/idempotency/:key", get(idempotency_record))
         .route("/v1/sessions/:id", get(session).delete(remove))
         .route("/v1/sessions/:id/messages", post(prompt).get(messages))
         .route("/v1/sessions/:id/complete", post(complete))
@@ -1903,6 +1971,10 @@ pub fn router(state: AppState) -> Router {
             post(complete_provider_login),
         )
         .route("/v1/opencode/config", get(opencode_config))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            idempotency_middleware,
+        ))
         .with_state(state)
 }
 
@@ -1978,14 +2050,15 @@ async fn submit_batch(
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ServiceError::Invalid("Idempotency-Key header is required".into()))?;
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let semantic_request =
         serde_json::to_value(&request).map_err(|error| ServiceError::Invalid(error.to_string()))?;
     let store = state
         .store()
         .map_err(|error| ServiceError::Store(error.into()))?;
     if let Some(replayed) = store
-        .replay_batch(key, &project.name, &semantic_request)
+        .replay_batch(&key, &project.name, &semantic_request)
         .map_err(|error| match error {
             store::StoreError::Conflict => ServiceError::Conflict(
                 "idempotency key was already used for a different batch plan".into(),
@@ -2028,7 +2101,7 @@ async fn submit_batch(
     let batch = json!({"batch_id":batch_id,"project":project.name,"repository":request.repository,"requested_revision":request.revision,"resolved_base_id":resolved_base,"base_commit":resolved_base,"default_policies":request.policies,"accepted_task_ids":accepted_ids,"requested_task_ids":request.tasks.iter().map(|task| task.task_id.clone()).collect::<Vec<_>>(),"rejected_task_ids":[],"preflight_results":[],"queued_count":request.tasks.len(),"runnable_count":request.tasks.iter().filter(|task|task.dependencies.is_empty()).count(),"requested_concurrency":request.concurrency,"duplicate_suppression":[]});
     let acceptance = store
         .accept_batch(store::BatchAcceptance {
-            key,
+            key: &key,
             scope: &project.name,
             request: &semantic_request,
             batch_id: &batch_id,
@@ -2527,6 +2600,231 @@ fn render_batch_digest(digest: &Value) -> String {
     text
 }
 
+async fn get_capacity(State(state): State<AppState>) -> Result<Json<Value>, ServiceError> {
+    let _admission = state.admission_lock.clone().lock_owned().await;
+    let capacity = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?;
+    let capacity =
+        service_capacity_snapshot(&state, capacity, chrono::Utc::now().timestamp_millis()).await?;
+    serde_json::to_value(capacity)
+        .map(Json)
+        .map_err(|error| ServiceError::Store(error.to_string()))
+}
+
+async fn service_capacity_snapshot(
+    state: &AppState,
+    store: &store::ControllerStore,
+    now_ms: i64,
+) -> Result<store::scheduler::Capacity, ServiceError> {
+    let attempt_sessions = store
+        .attempt_session_ids()
+        .map_err(|error| ServiceError::Store(error.to_string()))?;
+    let records = state.kube.list().await?;
+    let (mut non_batch_running, mut non_batch_provisioning) = (0u32, 0u32);
+    for record in records {
+        if attempt_sessions.contains(&record.session.id) {
+            continue;
+        }
+        match record.session.environment_state.as_str() {
+            "ready" => non_batch_running = non_batch_running.saturating_add(1),
+            "provisioning" => non_batch_provisioning = non_batch_provisioning.saturating_add(1),
+            // Suspended/failed resources are not active service occupancy.
+            _ => {}
+        }
+    }
+    store
+        .capacity(
+            state.config.concurrency_limit,
+            now_ms,
+            state.config.provisioning_max_attempts,
+            non_batch_running,
+            non_batch_provisioning,
+        )
+        .map_err(|error| ServiceError::Store(error.to_string()))
+}
+
+async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> {
+    let _admission = state.admission_lock.clone().lock_owned().await;
+    let store = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?;
+    // Observe authoritative backend lifecycle state before claiming dependent work.
+    for active in store
+        .active_attempts()
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+    {
+        let Some(session_id) = active.session_id else {
+            continue;
+        };
+        let record = match state.kube.get(&session_id).await {
+            Ok(record) => record,
+            Err(ServiceError::NotFound) => {
+                store
+                    .record_attempt_failure(
+                        &active.attempt_id,
+                        store::scheduler::FailureClass::Infrastructure,
+                        &format!("bound sandbox {session_id} disappeared from the backend"),
+                        chrono::Utc::now().timestamp_millis(),
+                        state.config.provisioning_max_attempts,
+                        state.config.provisioning_retry_base.as_millis() as u64,
+                    )
+                    .map_err(|error| ServiceError::Store(error.to_string()))?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let disposition = if record.session.environment_state == "suspended" {
+            Some(("suspended", "suspended"))
+        } else if record.session.environment_state == "failed" {
+            store
+                .record_attempt_failure(
+                    &active.attempt_id,
+                    store::scheduler::FailureClass::Infrastructure,
+                    record
+                        .session
+                        .environment_error
+                        .as_deref()
+                        .unwrap_or("sandbox provisioning failed"),
+                    chrono::Utc::now().timestamp_millis(),
+                    state.config.provisioning_max_attempts,
+                    state.config.provisioning_retry_base.as_millis() as u64,
+                )
+                .map_err(|error| ServiceError::Store(error.to_string()))?;
+            None
+        } else if record.session.environment_state != "ready" {
+            Some(("provisioning", "provisioning"))
+        } else {
+            match &record.work_state.state {
+                WorkLifecycleState::Completed { .. } => Some(("completed", "completed")),
+                WorkLifecycleState::Failed { .. } => {
+                    store
+                        .record_attempt_failure(
+                            &active.attempt_id,
+                            store::scheduler::FailureClass::Execution,
+                            record
+                                .work_state
+                                .summary()
+                                .as_deref()
+                                .unwrap_or("execution failed"),
+                            chrono::Utc::now().timestamp_millis(),
+                            state.config.provisioning_max_attempts,
+                            state.config.provisioning_retry_base.as_millis() as u64,
+                        )
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                    None
+                }
+                WorkLifecycleState::Active { .. } => Some(("running", "running")),
+                WorkLifecycleState::ReadyForReview { .. } => {
+                    Some(("completed", "ready_for_review"))
+                }
+            }
+        };
+        if let Some((attempt_state, task_state)) = disposition {
+            if active.state != attempt_state {
+                store
+                    .set_attempt_and_task_state(&active.attempt_id, attempt_state, task_state)
+                    .map_err(|error| ServiceError::Store(error.to_string()))?;
+            }
+        }
+    }
+
+    let capacity =
+        service_capacity_snapshot(state, store, chrono::Utc::now().timestamp_millis()).await?;
+    let non_batch_active = capacity
+        .non_batch_running
+        .saturating_add(capacity.non_batch_provisioning);
+    let claims = store
+        .claim_runnable(
+            state.config.concurrency_limit,
+            chrono::Utc::now().timestamp_millis(),
+            state.config.provisioning_max_attempts,
+            non_batch_active,
+        )
+        .map_err(|error| ServiceError::Store(error.to_string()))?;
+    for claim in claims {
+        let project = claim.task["project"].as_str().unwrap_or("batch");
+        let attempt_id = claim.attempt["attempt_id"].as_str().unwrap_or_default();
+        let session_id = deterministic_attempt_session_id(project, attempt_id);
+        match state.kube.get(&session_id).await {
+            Ok(_) => {
+                store
+                    .bind_attempt_session(
+                        claim.attempt["attempt_id"].as_str().unwrap_or_default(),
+                        &session_id,
+                    )
+                    .and_then(|_| {
+                        store.set_attempt_state(
+                            claim.attempt["attempt_id"].as_str().unwrap_or_default(),
+                            "running",
+                        )
+                    })
+                    .map_err(|error| ServiceError::Store(error.to_string()))?;
+                continue;
+            }
+            Err(ServiceError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let request = CreateRequest {
+            project: project.to_owned(),
+            repository: claim.task["repository"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            base_ref: claim.task["base_commit"]
+                .as_str()
+                .or_else(|| claim.task["requested_revision"].as_str())
+                .unwrap_or("main")
+                .to_owned(),
+            prompt: claim.task["prompt"].as_str().unwrap_or_default().to_owned(),
+            model: claim.task["model"]
+                .as_str()
+                .or_else(|| claim.task["policy"]["model"].as_str())
+                .map(str::to_owned),
+            author_name: None,
+            author_email: None,
+            session_id_override: Some(session_id.clone()),
+        };
+        match create(State(state.clone()), None, Json(request)).await {
+            Ok((_, Json(session))) => {
+                store
+                    .bind_attempt_session(attempt_id, &session.id)
+                    .and_then(|_| store.set_attempt_state(attempt_id, "running"))
+                    .map_err(|error| ServiceError::Store(error.to_string()))?;
+            }
+            Err(error) => {
+                let class = if matches!(
+                    &error,
+                    ServiceError::Kubernetes(_) | ServiceError::Provisioning(_)
+                ) {
+                    store::scheduler::FailureClass::Infrastructure
+                } else {
+                    store::scheduler::FailureClass::NonRetryable
+                };
+                store
+                    .record_attempt_failure(
+                        attempt_id,
+                        class,
+                        &error.to_string(),
+                        chrono::Utc::now().timestamp_millis(),
+                        state.config.provisioning_max_attempts,
+                        state.config.provisioning_retry_base.as_millis() as u64,
+                    )
+                    .map_err(|store_error| ServiceError::Store(store_error.to_string()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn deterministic_attempt_session_id(project: &str, attempt_id: &str) -> String {
+    let digest = Sha256::digest(attempt_id.as_bytes());
+    format!(
+        "{project}-{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    )
+}
+
 async fn get_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2561,14 +2859,13 @@ async fn create_attempt(
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            ServiceError::Invalid("Idempotency-Key header is required for attempt creation".into())
-        })?;
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let attempt_id = uuid::Uuid::new_v4().to_string();
     let acceptance = state
         .store()
         .map_err(|error| ServiceError::Store(error.into()))?
-        .create_attempt(&id, &attempt_id, key)
+        .create_attempt(&id, &attempt_id, &key)
         .map_err(|error| match error {
             store::StoreError::NotFound => ServiceError::NotFound,
             store::StoreError::Conflict => ServiceError::Conflict(
@@ -2620,6 +2917,163 @@ async fn get_attempt(
         .map(Json)
         .ok_or(ServiceError::NotFound)
 }
+
+async fn idempotency_middleware(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let key = request
+        .headers()
+        .get("Idempotency-Key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    // Credential issuance is deliberately excluded: its response is a short-lived secret and
+    // the controller contract must never persist credential material in SQLite.
+    let is_mutation = method == axum::http::Method::POST
+        || method == axum::http::Method::PUT
+        || method == axum::http::Method::PATCH
+        || method == axum::http::Method::DELETE;
+    if key.is_none()
+        || path == "/v1/batches"
+        || (path.starts_with("/v1/tasks/") && path.ends_with("/attempts"))
+        || path.ends_with("/credentials/github")
+        || !is_mutation
+        || !path.starts_with("/v1/")
+    {
+        return next.run(request).await;
+    }
+    let key = key.unwrap();
+    let lock = state.idempotency_lock(&key);
+    let _guard = lock.lock().await;
+    let (mut parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return ServiceError::Invalid(format!("unable to read request body: {error}"))
+                .into_response()
+        }
+    };
+    let semantic = serde_json::from_slice::<Value>(&bytes)
+        .unwrap_or_else(|_| json!({"body":String::from_utf8_lossy(&bytes)}));
+    let mut resource_reference = if path == "/v1/sessions" && method == axum::http::Method::POST {
+        semantic
+            .get("project")
+            .and_then(Value::as_str)
+            .and_then(|project| Project::new(project).ok())
+            .map(|project| SessionId::new(&project).to_string())
+            .unwrap_or_else(|| path.clone())
+    } else {
+        path.clone()
+    };
+    let request_value = json!({"method":method.as_str(),"path":path,"body":semantic});
+    let operation = format!("http:{}", method.as_str().to_ascii_lowercase());
+    let accepted_body = if path == "/v1/sessions" {
+        json!({
+            "accepted":true,
+            "operation":operation,
+            "resource":resource_reference,
+            "id":resource_reference,
+            "session_id":resource_reference
+        })
+    } else {
+        json!({"accepted":true,"operation":operation,"resource":resource_reference})
+    };
+    let initial = json!({"http_status":202,"body":accepted_body});
+    let accepted = match state
+        .store()
+        .map_err(|error| error.to_owned())
+        .and_then(|store| {
+            store
+                .accept(
+                    &key,
+                    &operation,
+                    &path,
+                    &request_value,
+                    &resource_reference,
+                    &initial,
+                )
+                .map_err(|error| error.to_string())
+        }) {
+        Ok(accepted) => accepted,
+        Err(error) if error.contains("different request") => {
+            return ServiceError::Conflict(
+                "Idempotency-Key was already used for a different operation or request".into(),
+            )
+            .into_response()
+        }
+        Err(error) => return ServiceError::Store(error).into_response(),
+    };
+    if let store::Acceptance::Replayed(record) = accepted {
+        if record.state == store::IdempotencyState::Completed
+            || path != "/v1/sessions"
+            || method != axum::http::Method::POST
+        {
+            return stored_http_response(record.result);
+        }
+        resource_reference = record.result_reference;
+        // A crash can leave the durable reservation accepted before session
+        // creation begins. Resume only when its deterministic session id is not
+        // present; otherwise return the accepted reservation without a duplicate.
+        match state.kube.list().await {
+            Ok(sessions)
+                if sessions
+                    .iter()
+                    .any(|session| session.session.id == resource_reference) =>
+            {
+                return stored_http_response(record.result);
+            }
+            Ok(_) => {}
+            Err(error) => return error.into_response(),
+        }
+    }
+    if path == "/v1/sessions" && method == axum::http::Method::POST {
+        parts
+            .extensions
+            .insert(IdempotentSessionId(resource_reference.clone()));
+    }
+    let response = next
+        .run(Request::from_parts(parts, Body::from(bytes)))
+        .await;
+    let status = response.status();
+    let (parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return ServiceError::Store(format!("unable to persist HTTP result: {error}"))
+                .into_response()
+        }
+    };
+    let body_value = serde_json::from_slice::<Value>(&bytes)
+        .unwrap_or_else(|_| json!({"body":String::from_utf8_lossy(&bytes)}));
+    let result = json!({"http_status":status.as_u16(),"body":body_value});
+    if let Ok(store) = state.store() {
+        if store.set_result(&key, &resource_reference, &result).is_ok() {
+            let _ = store.mark_completed(&key);
+        }
+    }
+    Response::from_parts(parts, Body::from(bytes))
+}
+
+fn stored_http_response(result: Value) -> Response {
+    let status = result
+        .get("http_status")
+        .and_then(Value::as_u64)
+        .and_then(|code| StatusCode::from_u16(code as u16).ok())
+        .unwrap_or(StatusCode::ACCEPTED);
+    let body = result
+        .get("body")
+        .cloned()
+        .unwrap_or_else(|| json!({"accepted":true}));
+    if status == StatusCode::NO_CONTENT {
+        return status.into_response();
+    }
+    (status, Json(body)).into_response()
+}
 async fn health() -> Json<Value> {
     Json(json!({"status":"ok"}))
 }
@@ -2664,8 +3118,54 @@ async fn asset_css() -> Response {
 async fn ready() -> StatusCode {
     StatusCode::OK
 }
+
+async fn idempotency_record(
+    Path(key): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ServiceError> {
+    let store = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.to_owned()))?;
+    if let Some(record) = store
+        .get(&key)
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+    {
+        return Ok(Json(json!({
+            "idempotency_key": record.idempotency_key,
+            "operation_kind": record.operation_kind,
+            "scope": record.scope,
+            "result_reference": record.result_reference,
+            "result": record.result,
+            "state": match record.state {
+                store::IdempotencyState::Accepted => "accepted",
+                store::IdempotencyState::Completed => "completed",
+            },
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
+        })));
+    }
+    let attempt = store
+        .get_attempt_submission(&key)
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+        .ok_or(ServiceError::NotFound)?;
+    let timestamp = attempt
+        .get("created_at")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Ok(Json(json!({
+        "idempotency_key": key,
+        "operation_kind": "create_attempt",
+        "scope": attempt["task_id"],
+        "result_reference": attempt["attempt_id"],
+        "result": attempt,
+        "state": "completed",
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    })))
+}
 async fn create(
     State(s): State<AppState>,
+    idempotent_session_id: Option<Extension<IdempotentSessionId>>,
     Json(r): Json<CreateRequest>,
 ) -> Result<(StatusCode, Json<Session>), ServiceError> {
     let p = Project::new(&r.project).map_err(|e| ServiceError::Invalid(e.to_string()))?;
@@ -2694,7 +3194,27 @@ async fn create(
             "author_name and author_email must be provided together".into(),
         ));
     }
-    let id = SessionId::new(&p).to_string();
+    let id = r
+        .session_id_override
+        .clone()
+        .or_else(|| idempotent_session_id.map(|Extension(value)| value.0))
+        .unwrap_or_else(|| SessionId::new(&p).to_string());
+    let _admission_guard = if r.session_id_override.is_none() {
+        let guard = s.admission_lock.clone().lock_owned().await;
+        let store = s
+            .store()
+            .map_err(|error| ServiceError::Store(error.to_owned()))?;
+        let capacity =
+            service_capacity_snapshot(&s, store, chrono::Utc::now().timestamp_millis()).await?;
+        if capacity.running.saturating_add(capacity.provisioning) >= s.config.concurrency_limit {
+            return Err(ServiceError::Conflict(
+                "global Anvil concurrency capacity is exhausted".into(),
+            ));
+        }
+        Some(guard)
+    } else {
+        None
+    };
     let mut sandbox_env = vec![
         ("ANVIL_SESSION_ID".into(), id.clone()),
         (
@@ -2759,7 +3279,11 @@ async fn create(
     let mut sess = obj.session.clone();
     sess.ready_at = Some(ready_at);
     let oc = OpenCode::new(service_url(&sess, &s.config), s.config.request_timeout);
-    wait_opencode(&oc, s.config.request_timeout).await?;
+    wait_opencode(&oc, s.config.request_timeout)
+        .await
+        .map_err(|error| {
+            ServiceError::Provisioning(format!("sandbox OpenCode readiness failed: {error}"))
+        })?;
     let model = match r.model.as_deref() {
         Some(requested) => {
             let model = oc.resolve_model(requested).await?;
@@ -2768,7 +3292,9 @@ async fn create(
         }
         None => None,
     };
-    let oc_id = oc.create_session().await?;
+    let oc_id = oc.create_session().await.map_err(|error| {
+        ServiceError::Provisioning(format!("OpenCode session provisioning failed: {error}"))
+    })?;
     s.kube.set_opencode_session(&id, &oc_id).await?;
     let recovered = reconcile_binding(&s, &id).await?;
     if !binding_is_usable(&recovered) {
@@ -5827,7 +6353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_rest_accepts_replays_queries_attempts_and_rejects_conflicts() {
+    async fn public_wide_batch_api_is_idempotent_durable_and_base_stable() {
         let upstream = MockServer::start_async().await;
         let resolution = upstream.mock(|when, then| {
             when.method(GET);
@@ -5838,8 +6364,11 @@ mod tests {
         let mut config = config("http://127.0.0.1:4097".into());
         config.github_api_url = upstream.base_url();
         config.store_path = directory.path().join("controller.sqlite3");
-        let app = router(AppState::new(config, FakeSandbox));
-        let plan = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":2,"tasks":[{"task_id":"build","prompt":"compile it","dependencies":[],"policy":{}}]});
+        let reopen_config = config.clone();
+        let app = router(AppState::new(config.clone(), FakeSandbox));
+        let plan = wide_batch_fixture_plan(100);
+        let request_bytes = serde_json::to_vec(&plan).unwrap().len();
+        assert!(request_bytes < 64 * 1024);
         let submit = |plan: Value, key: &'static str| {
             Request::builder()
                 .method("POST")
@@ -5849,23 +6378,102 @@ mod tests {
                 .body(Body::from(plan.to_string()))
                 .unwrap()
         };
-        let first = app
-            .clone()
-            .oneshot(submit(plan.clone(), "stable-key"))
+        let submit_raw = |body: String, key: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/batches")
+                .header("idempotency-key", key)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let (first, concurrent) = tokio::join!(
+            app.clone().oneshot(submit(plan.clone(), "stable-key")),
+            app.clone().oneshot(submit(plan.clone(), "stable-key")),
+        );
+        let first = first.unwrap();
+        let concurrent = concurrent.unwrap();
+        assert!([StatusCode::CREATED, StatusCode::OK].contains(&first.status()));
+        assert!([StatusCode::CREATED, StatusCode::OK].contains(&concurrent.status()));
+        assert_ne!(first.status(), concurrent.status());
+        let first_bytes = axum::body::to_bytes(first.into_body(), 64 * 1024)
             .await
-            .unwrap();
-        assert_eq!(first.status(), StatusCode::CREATED);
-        let first_body: Value = serde_json::from_slice(
-            &axum::body::to_bytes(first.into_body(), usize::MAX)
+            .expect("100-task batch acceptance response must fit its 64 KiB budget");
+        assert!(first_bytes.len() < 64 * 1024);
+        let first_body: Value = serde_json::from_slice(&first_bytes).unwrap();
+        let concurrent_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(concurrent.into_body(), 64 * 1024)
                 .await
                 .unwrap(),
         )
         .unwrap();
+        assert_eq!(first_body, concurrent_body);
         assert_eq!(first_body["requested_revision"], "main");
         assert_eq!(
             first_body["resolved_base_id"],
             "0123456789abcdef0123456789abcdef01234567"
         );
+        let capacity = app
+            .clone()
+            .oneshot(Request::get("/v1/capacity").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(capacity.status(), StatusCode::OK);
+        let capacity: Value = serde_json::from_slice(
+            &axum::body::to_bytes(capacity.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(capacity["global_limit"], 4);
+        assert_eq!(capacity["running"], 0);
+        assert_eq!(capacity["provisioning"], 0);
+        assert_eq!(capacity["queued_runnable"], 1);
+        assert_eq!(capacity["available_slots"], 4);
+        assert_eq!(capacity["batches"][0]["active"], 0);
+        assert_eq!(capacity["batches"][0]["queued"], 1);
+        assert_eq!(
+            first_body["accepted_task_ids"].as_array().unwrap().len(),
+            100
+        );
+        let accepted_ids = first_body["accepted_task_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(accepted_ids.len(), 100);
+        assert_eq!(first_body["queued_count"], 100);
+        assert_eq!(first_body["runnable_count"], 1);
+        for detail_field in [
+            "prompt",
+            "prompts",
+            "messages",
+            "transcript",
+            "transcripts",
+            "events",
+            "raw_events",
+            "logs",
+            "diff",
+            "diffs",
+        ] {
+            assert!(
+                first_body.get(detail_field).is_none(),
+                "compact batch acceptance must not include {detail_field}"
+            );
+        }
+
+        for (count, key) in [(20, "budget-20"), (50, "budget-50")] {
+            let budget_plan = wide_batch_fixture_plan(count);
+            let request_bytes = serde_json::to_vec(&budget_plan).unwrap().len();
+            let response = app.clone().oneshot(submit(budget_plan, key)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("batch acceptance response must fit its 64 KiB budget");
+            assert!(request_bytes < 64 * 1024);
+            assert!(bytes.len() < 64 * 1024);
+        }
         let independent = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":1,"tasks":[{"task_id":"build","prompt":"different logical work"}]});
         let independent_response = app
             .clone()
@@ -5889,7 +6497,10 @@ mod tests {
         });
         let replay = app
             .clone()
-            .oneshot(submit(plan.clone(), "stable-key"))
+            .oneshot(submit_raw(
+                serde_json::to_string_pretty(&plan).unwrap(),
+                "stable-key",
+            ))
             .await
             .unwrap();
         assert_eq!(replay.status(), StatusCode::OK);
@@ -5900,7 +6511,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first_body, replay_body);
-        let conflict_plan = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":2,"tasks":[{"task_id":"build","prompt":"different work","dependencies":[],"policy":{}}]});
+        let mut conflict_plan = plan.clone();
+        conflict_plan["tasks"][0]["prompt"] = json!("conflicting work under the same key");
         let conflict = app
             .clone()
             .oneshot(submit(conflict_plan, "stable-key"))
@@ -5909,27 +6521,46 @@ mod tests {
         assert_eq!(conflict.status(), StatusCode::CONFLICT);
         let batch_id = first_body["batch_id"].as_str().unwrap();
         let task_id = first_body["accepted_task_ids"][0].as_str().unwrap();
-        for (path, expected) in [
-            (format!("/v1/batches/{batch_id}"), first_body.clone()),
-            (format!("/v1/tasks/{task_id}"), json!({"task_id":task_id})),
-        ] {
+        let batch_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/batches/{batch_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch_response.status(), StatusCode::OK);
+        let persisted_batch: Value = serde_json::from_slice(
+            &axum::body::to_bytes(batch_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted_batch, first_body);
+        for accepted_task_id in first_body["accepted_task_ids"].as_array().unwrap() {
+            let accepted_task_id = accepted_task_id.as_str().unwrap();
             let response = app
                 .clone()
-                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/tasks/{accepted_task_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
-            let body: Value = serde_json::from_slice(
-                &axum::body::to_bytes(response.into_body(), usize::MAX)
+            let task: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 16 * 1024)
                     .await
                     .unwrap(),
             )
             .unwrap();
-            if expected.get("batch_id").is_some() {
-                assert_eq!(body, expected);
-            } else {
-                assert_eq!(body["task_id"], task_id);
-            }
+            assert_eq!(task["base_commit"], first_body["resolved_base_id"]);
+            assert_eq!(task["state"], "queued");
+            assert!(task.get("task_id").is_some());
         }
         for ordinal in 1..=2 {
             let key = format!("attempt-key-{ordinal}");
@@ -5977,6 +6608,23 @@ mod tests {
                 assert_eq!(replay["ordinal"], 1);
             }
         }
+        let attempt_lookup = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/idempotency/attempt-key-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let attempt_lookup: Value = serde_json::from_slice(
+            &axum::body::to_bytes(attempt_lookup.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(attempt_lookup["operation_kind"], "create_attempt");
+        assert_eq!(attempt_lookup["result"]["ordinal"], 1);
         let listed = app
             .clone()
             .oneshot(
@@ -5994,7 +6642,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(attempts["attempts"].as_array().unwrap().len(), 2);
+        let conflict_attempt = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1/tasks/{}/attempts",
+                        independent_body["accepted_task_ids"][0].as_str().unwrap()
+                    ))
+                    .header("idempotency-key", "attempt-key-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict_attempt.status(), StatusCode::CONFLICT);
         let attempt_id = attempts["attempts"][0]["attempt_id"].as_str().unwrap();
+        assert_eq!(attempts["attempts"][0]["state"], "queued");
         let get_attempt = app
             .clone()
             .oneshot(
@@ -6006,6 +6671,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_attempt.status(), StatusCode::OK);
+        let attempt: Value = serde_json::from_slice(
+            &axum::body::to_bytes(get_attempt.into_body(), 4 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(attempt["attempt_id"], attempt_id);
+        assert_eq!(attempt["state"], "queued");
+        assert!(attempt.get("messages").is_none());
+        assert!(attempt.get("diff").is_none());
+        assert!(attempt.get("logs").is_none());
         let bind_session = app
             .clone()
             .oneshot(
@@ -6030,10 +6706,135 @@ mod tests {
         assert_eq!(bound["session_id"], "session-runtime-id");
         let duplicate = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":2,"tasks":[{"task_id":"x","prompt":"a"},{"task_id":"x","prompt":"b"}]});
         let rejected = app
+            .clone()
             .oneshot(submit(duplicate, "duplicate-key"))
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        drop(app);
+        let reopened = router(AppState::new(reopen_config, FakeSandbox));
+        let persisted = reopened
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/batches/{batch_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(persisted.status(), StatusCode::OK);
+        let persisted: Value = serde_json::from_slice(
+            &axum::body::to_bytes(persisted.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted, first_body);
+        for accepted_task_id in first_body["accepted_task_ids"].as_array().unwrap() {
+            let accepted_task_id = accepted_task_id.as_str().unwrap();
+            let task_after_restart = reopened
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/tasks/{accepted_task_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(task_after_restart.status(), StatusCode::OK);
+            let task_after_restart: Value = serde_json::from_slice(
+                &axum::body::to_bytes(task_after_restart.into_body(), 16 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                task_after_restart["base_commit"],
+                first_body["resolved_base_id"]
+            );
+        }
+        let persisted_task_id = first_body["accepted_task_ids"][0].as_str().unwrap();
+        let attempts_after_restart = reopened
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/tasks/{persisted_task_id}/attempts"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let attempts_after_restart: Value = serde_json::from_slice(
+            &axum::body::to_bytes(attempts_after_restart.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            attempts_after_restart["attempts"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            attempts_after_restart["attempts"][0]["attempt_id"],
+            attempt_id
+        );
+        let restart_replay = reopened
+            .clone()
+            .oneshot(submit_raw(plan.to_string(), "stable-key"))
+            .await
+            .unwrap();
+        assert_eq!(restart_replay.status(), StatusCode::OK);
+        let restart_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(restart_replay.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restart_body, first_body);
+        let reopened_attempt = reopened
+            .clone()
+            .oneshot(
+                Request::get("/v1/idempotency/attempt-key-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let reopened_attempt: Value = serde_json::from_slice(
+            &axum::body::to_bytes(reopened_attempt.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reopened_attempt["result"]["ordinal"], 1);
+        let unkeyed_attempt = reopened
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/tasks/{task_id}/attempts"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unkeyed_attempt.status(), StatusCode::CREATED);
+        let retry_after_restart = reopened
+            .clone()
+            .oneshot(submit(plan, "stable-key"))
+            .await
+            .unwrap();
+        assert_eq!(retry_after_restart.status(), StatusCode::OK);
+        let retry_after_restart: Value = serde_json::from_slice(
+            &axum::body::to_bytes(retry_after_restart.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(retry_after_restart, first_body);
     }
 
     #[tokio::test]
@@ -6182,6 +6983,10 @@ mod tests {
 
     struct FakeSandbox;
 
+    struct OccupancySandbox {
+        records: Vec<SandboxRecord>,
+    }
+
     struct BindingSandbox {
         object: Arc<Mutex<DynamicObject>>,
         opencode_port: u16,
@@ -6194,6 +6999,31 @@ mod tests {
 
     struct LifecycleSandbox {
         record: Arc<Mutex<SandboxRecord>>,
+    }
+
+    fn wide_batch_fixture_plan(count: usize) -> Value {
+        assert!((20..=100).contains(&count));
+        let tasks = (0..count)
+            .map(|index| {
+                json!({
+                    "task_id": format!("task-{index:03}"),
+                    "prompt": format!("Deterministic acceptance work item {index:03}"),
+                    "dependencies": if index == 0 {
+                        vec![]
+                    } else {
+                        vec![format!("task-{:03}", index - 1)]
+                    },
+                    "policy": {}
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "project": format!("wide-acceptance-{count}"),
+            "repository": "https://github.com/example/demo.git",
+            "ref": "main",
+            "concurrency": 8,
+            "tasks": tasks
+        })
     }
 
     async fn fixture_session_exists() -> Json<Value> {
@@ -6252,6 +7082,222 @@ mod tests {
         async fn delete(&self, _id: &str) -> Result<(), ServiceError> {
             Ok(())
         }
+    }
+
+    #[async_trait]
+    impl SandboxApi for OccupancySandbox {
+        async fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError> {
+            Ok(self.records.clone())
+        }
+
+        async fn create(
+            &self,
+            _id: &str,
+            _request: &CreateRequest,
+            _sandbox_env: &[(String, String)],
+            _initial_work_state: &WorkStateRecord,
+        ) -> Result<Session, ServiceError> {
+            Err(ServiceError::Provisioning(
+                "injected provisioning outage".into(),
+            ))
+        }
+
+        async fn suspend(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn resume(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    fn accept_scheduler_batch(
+        store: &store::ControllerStore,
+        batch_id: &str,
+        concurrency: u32,
+        task_specs: &[(&str, Vec<&str>)],
+    ) {
+        let task_ids: Vec<_> = task_specs.iter().map(|(id, _)| (*id).to_owned()).collect();
+        let batch = json!({
+            "batch_id":batch_id,
+            "project":"demo",
+            "repository":"https://github.com/example/repo.git",
+            "requested_revision":"main",
+            "base_commit":"0123456789abcdef0123456789abcdef01234567",
+            "requested_concurrency":concurrency,
+            "accepted_task_ids":task_ids,
+        });
+        let tasks: Vec<_> = task_specs
+            .iter()
+            .map(|(task_id, dependencies)| {
+                (
+                    (*task_id).to_owned(),
+                    json!({
+                        "task_id":task_id,
+                        "batch_id":batch_id,
+                        "project":"demo",
+                        "repository":"https://github.com/example/repo.git",
+                        "requested_revision":"main",
+                        "base_commit":"0123456789abcdef0123456789abcdef01234567",
+                        "prompt":format!("work for {task_id}"),
+                        "dependencies":dependencies,
+                        "state":"queued",
+                    }),
+                )
+            })
+            .collect();
+        store
+            .accept_batch(store::BatchAcceptance {
+                key: &format!("key-{batch_id}"),
+                scope: "demo",
+                request: &json!({"batch":batch_id}),
+                batch_id,
+                batch: &batch,
+                tasks: &tasks,
+                allow_competing: true,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduler_retries_when_bound_sandbox_disappears_and_releases_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        config.concurrency_limit = 1;
+        config.provisioning_max_attempts = 2;
+        config.provisioning_retry_base = Duration::ZERO;
+        let state = AppState::new(config, FakeSandbox);
+        let store = state.store().unwrap();
+        accept_scheduler_batch(store, "lost", 1, &[("logical-task", vec![])]);
+        store
+            .create_attempt("logical-task", "attempt-1", "external-attempt-key")
+            .unwrap();
+        store
+            .bind_attempt_session("attempt-1", "gone-session")
+            .unwrap();
+        store.set_attempt_state("attempt-1", "running").unwrap();
+
+        run_batch_scheduler_tick(&state).await.unwrap();
+
+        let attempts = store.attempts_for_task("logical-task").unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0]["failure_class"], "infrastructure");
+        assert!(attempts[0]["failure_reason"]
+            .as_str()
+            .unwrap()
+            .contains("gone-session"));
+        assert_eq!(attempts[1]["ordinal"], 2);
+        assert_eq!(attempts[1]["task_id"], attempts[0]["task_id"]);
+        assert_eq!(
+            store.get_resource("task", "logical-task").unwrap().unwrap()["task_id"],
+            "logical-task"
+        );
+        let capacity =
+            service_capacity_snapshot(&state, store, chrono::Utc::now().timestamp_millis())
+                .await
+                .unwrap();
+        assert_eq!(capacity.running + capacity.provisioning, 0);
+        assert_eq!(capacity.available_slots, 1);
+    }
+
+    #[tokio::test]
+    async fn scheduler_exhausts_when_bound_sandbox_disappears_and_releases_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        config.concurrency_limit = 1;
+        config.provisioning_max_attempts = 1;
+        let state = AppState::new(config, FakeSandbox);
+        let store = state.store().unwrap();
+        accept_scheduler_batch(store, "lost-exhausted", 1, &[("logical-task", vec![])]);
+        store
+            .create_attempt("logical-task", "attempt-1", "external-attempt-key")
+            .unwrap();
+        store
+            .bind_attempt_session("attempt-1", "gone-session")
+            .unwrap();
+        store.set_attempt_state("attempt-1", "running").unwrap();
+
+        run_batch_scheduler_tick(&state).await.unwrap();
+
+        let attempts = store.attempts_for_task("logical-task").unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0]["state"], "exhausted");
+        assert_eq!(attempts[0]["failure_class"], "infrastructure");
+        let capacity =
+            service_capacity_snapshot(&state, store, chrono::Utc::now().timestamp_millis())
+                .await
+                .unwrap();
+        assert_eq!(capacity.running + capacity.provisioning, 0);
+        assert_eq!(capacity.available_slots, 1);
+    }
+
+    #[tokio::test]
+    async fn batch_scheduler_counts_non_batch_live_and_provisioning_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        config.concurrency_limit = 4;
+        config.provisioning_max_attempts = 3;
+        config.provisioning_retry_base = Duration::from_secs(30);
+        let records = (0..3)
+            .map(|index| {
+                let mut session = activity_session();
+                session.id = format!("external-{index:08x}");
+                let mut record = active_work_record(session);
+                if index == 2 {
+                    record.session.environment_state = "provisioning".into();
+                }
+                record
+            })
+            .collect();
+        let state = AppState::new(config, OccupancySandbox { records });
+        let store = state.store().unwrap();
+        accept_scheduler_batch(
+            store,
+            "non-batch-capacity",
+            4,
+            &[("task-1", vec![]), ("task-2", vec![])],
+        );
+
+        let response = router(state.clone())
+            .oneshot(Request::get("/v1/capacity").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let capacity: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(capacity["running"], 2);
+        assert_eq!(capacity["provisioning"], 1);
+        assert_eq!(capacity["non_batch_running"], 2);
+        assert_eq!(capacity["non_batch_provisioning"], 1);
+        assert_eq!(capacity["available_slots"], 1);
+        assert_eq!(capacity["queued_runnable"], 2);
+        assert_eq!(capacity["batches"][0]["active"], 0);
+        assert_eq!(capacity["batches"][0]["queued"], 2);
+
+        run_batch_scheduler_tick(&state).await.unwrap();
+
+        assert_eq!(store.attempts_for_task("task-1").unwrap().len(), 1);
+        assert!(store.attempts_for_task("task-2").unwrap().is_empty());
+        let capacity =
+            service_capacity_snapshot(&state, store, chrono::Utc::now().timestamp_millis())
+                .await
+                .unwrap();
+        assert_eq!(capacity.non_batch_running, 2);
+        assert_eq!(capacity.non_batch_provisioning, 1);
+        assert_eq!(capacity.running + capacity.provisioning, 3);
+        assert_eq!(capacity.queued_runnable, 1);
+        assert_eq!(capacity.available_slots, 1);
     }
 
     #[async_trait]
@@ -6494,7 +7540,200 @@ mod tests {
             github_api_url: "https://api.github.com".into(),
             history_path: PathBuf::from("/tmp/anvil-history.jsonl"),
             store_path: PathBuf::from(format!("/tmp/anvil-test-{}.sqlite3", uuid::Uuid::new_v4())),
+            concurrency_limit: 4,
+            provisioning_max_attempts: 3,
+            provisioning_retry_base: Duration::from_millis(10),
         }
+    }
+
+    #[tokio::test]
+    async fn public_idempotency_middleware_replays_conflicts_converges_and_survives_reopen() {
+        use axum::{body::Body, http::Request, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let build = |counter: Arc<AtomicUsize>| {
+            let mut config = config("http://127.0.0.1:4097".into());
+            config.store_path = directory.path().join("controller.sqlite3");
+            let state = AppState::new(config, FakeSandbox);
+            let handler = move || {
+                let count = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                async move { (StatusCode::CREATED, Json(json!({"count":count}))) }
+            };
+            Router::new()
+                .route("/v1/test", post(handler))
+                .route("/v1/idempotency/:key", get(idempotency_record))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    idempotency_middleware,
+                ))
+                .with_state(state)
+        };
+        let app = build(counter.clone());
+        let request = |key: &str, body: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/test")
+                .header("Idempotency-Key", key)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap()
+        };
+        let first = app
+            .clone()
+            .oneshot(request("retry", r#"{"value":1}"#))
+            .await
+            .unwrap();
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let replay = app
+            .clone()
+            .oneshot(request("retry", r#"{ "value":1 }"#))
+            .await
+            .unwrap();
+        let replay_body = axum::body::to_bytes(replay.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(first_body, replay_body);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        let conflict = app
+            .clone()
+            .oneshot(request("retry", r#"{"value":2}"#))
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+        let (one, two) = tokio::join!(
+            app.clone().oneshot(request("concurrent", r#"{"value":3}"#)),
+            app.clone().oneshot(request("concurrent", r#"{"value":3}"#)),
+        );
+        let one = one.unwrap();
+        let two = two.unwrap();
+        assert_eq!(one.status(), two.status());
+        let one_body = axum::body::to_bytes(one.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let two_body = axum::body::to_bytes(two.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(one_body, two_body);
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        drop(app);
+
+        let reopened = build(counter.clone());
+        let response = reopened
+            .clone()
+            .oneshot(request("retry", r#"{"value":1}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let lookup = reopened
+            .clone()
+            .oneshot(
+                Request::get("/v1/idempotency/retry")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(lookup.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["state"], "completed");
+        assert_eq!(result["result"]["body"]["count"], 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        let no_key = reopened
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/test")
+                    .body(Body::from(r#"{"value":4}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_key.status(), StatusCode::CREATED);
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn interrupted_session_acceptance_resumes_with_the_reserved_session_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_path = directory.path().join("controller.sqlite3");
+        let session_id = SessionId::new(&Project::new("demo").unwrap()).to_string();
+        let request = json!({"project":"demo"});
+        let request_value = json!({
+            "method":"POST",
+            "path":"/v1/sessions",
+            "body":request,
+        });
+        let initial = json!({
+            "http_status":202,
+            "body":{
+                "accepted":true,
+                "operation":"http:post",
+                "resource":session_id,
+                "id":session_id,
+                "session_id":session_id,
+            }
+        });
+        store::ControllerStore::open(&store_path)
+            .unwrap()
+            .accept(
+                "create-key",
+                "http:post",
+                "/v1/sessions",
+                &request_value,
+                &session_id,
+                &initial,
+            )
+            .unwrap();
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = store_path;
+        let state = AppState::new(config, FakeSandbox);
+        let app = Router::new()
+            .route(
+                "/v1/sessions",
+                post(move |Extension(reserved): Extension<IdempotentSessionId>| {
+                    let calls = handler_calls.clone();
+                    async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (StatusCode::CREATED, Json(json!({"session_id":reserved.0})))
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                idempotency_middleware,
+            ))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header("Idempotency-Key", "create-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["session_id"], session_id);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -6550,10 +7789,13 @@ mod tests {
             .unwrap();
         drop(old_store);
 
-        let backend = LifecycleSandbox {
-            record: Arc::new(Mutex::new(live)),
-        };
-        let state = AppState::new(test_config, backend);
+        let backend_record = Arc::new(Mutex::new(live.clone()));
+        let state = AppState::new(
+            test_config.clone(),
+            LifecycleSandbox {
+                record: backend_record.clone(),
+            },
+        );
         state.initialize().await.unwrap();
         let app = router(state.clone());
         let response = app
@@ -6564,6 +7806,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let initial = json_response(response).await;
         let cursor = initial["cursor"].as_str().unwrap().to_owned();
+        assert_eq!(initial["snapshot"].as_array().unwrap().len(), 1);
         assert_eq!(
             initial["snapshot"][0]["record"]["session"]["environment_state"],
             "ready"
@@ -6579,6 +7822,7 @@ mod tests {
             .await
             .unwrap();
         let response = app
+            .clone()
             .oneshot(
                 Request::get(format!("/v1/changes?after={cursor}"))
                     .body(Body::empty())
@@ -6593,6 +7837,47 @@ mod tests {
             delta["changes"][0]["change"]["record"]["session"]["session_binding_state"],
             "recovered"
         );
+        assert!(serde_json::to_vec(&delta).unwrap().len() < 4 * 1024);
+
+        let next_cursor = delta["cursor"].as_str().unwrap().to_owned();
+        let no_change = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/v1/changes?after={next_cursor}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let no_change_bytes = axum::body::to_bytes(no_change.into_body(), 1024)
+            .await
+            .unwrap();
+        let no_change: Value = serde_json::from_slice(&no_change_bytes).unwrap();
+        assert!(no_change["changes"].as_array().unwrap().is_empty());
+        assert_eq!(no_change["cursor"], next_cursor);
+        assert!(no_change_bytes.len() < 256);
+
+        drop(app);
+        drop(state);
+        let reopened = router(AppState::new(
+            test_config,
+            LifecycleSandbox {
+                record: backend_record,
+            },
+        ));
+        let after_restart = reopened
+            .oneshot(
+                Request::get(format!("/v1/changes?after={next_cursor}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_restart.status(), StatusCode::OK);
+        let after_restart: Value = json_response(after_restart).await;
+        assert!(!after_restart["reset_required"].as_bool().unwrap());
+        assert_eq!(after_restart["cursor"], next_cursor);
+        assert!(after_restart["changes"].as_array().unwrap().is_empty());
     }
 
     #[test]
