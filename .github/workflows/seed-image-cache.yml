@@ -1,0 +1,83 @@
+name: Seed shared Nix image cache
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 5 * * 1'
+  push:
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - flake.lock
+      - flake.nix
+      - crates/**/Cargo.toml
+      - nix/**
+      - runtime/**
+      - scripts/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: main-nix-image-cache
+  cancel-in-progress: false
+
+jobs:
+  seed:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v19
+      - name: Restore main-scope image cache
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/anvil-image-cache
+          key: ${{ runner.os }}-anvil-image-ci-${{ hashFiles('flake.lock', 'Cargo.lock') }}-${{ hashFiles('flake.nix', 'Cargo.toml', 'crates/**', 'web/**', 'runtime/**', 'scripts/**', 'nix/**') }}
+          restore-keys: |
+            ${{ runner.os }}-anvil-image-ci-${{ hashFiles('flake.lock', 'Cargo.lock') }}-
+      - name: Restore cached Nix store paths
+        run: |
+          set -euo pipefail
+          cache_dir="$RUNNER_TEMP/anvil-image-cache"
+          mkdir -p "$cache_dir"
+          if [ -s "$cache_dir/paths" ]; then
+            mapfile -t cache_paths < "$cache_dir/paths"
+            nix --option build-users-group "" copy --no-check-sigs --from "file://$cache_dir" "${cache_paths[@]}"
+            echo 'main-cache-restore=hit'
+          else
+            echo 'main-cache-restore=miss'
+          fi
+      - name: Build roots used by PR image validation
+        run: |
+          set -euo pipefail
+          roots=(
+            .#anvil-image-ci
+            .#anvil-ci-release-cargo-artifacts
+            .#anvil-sandbox-image
+            .#anvil-nix-daemon-image
+            .#anvil-nix-daemon-upgrade-test-image
+          )
+          nix --option build-users-group "" build --no-link "${roots[@]}"
+          nix --option build-users-group "" path-info --recursive "${roots[@]}" \
+            > "$RUNNER_TEMP/anvil-image-cache/paths.new"
+          cache_nar_bytes="$(nix --option build-users-group "" path-info --json --recursive "${roots[@]}" \
+            | jq '[.[] | .narSize] | add // 0')"
+          printf 'main-cache-nar-bytes=%s\n' "$cache_nar_bytes"
+          if [ "$cache_nar_bytes" -gt 2147483648 ]; then
+            echo 'Nix cache closure exceeds the 2 GiB repository cache bound' >&2
+            exit 1
+          fi
+          mapfile -t built_paths < "$RUNNER_TEMP/anvil-image-cache/paths.new"
+          nix --option build-users-group "" copy --no-check-sigs \
+            --to "file://$RUNNER_TEMP/anvil-image-cache" \
+            "${built_paths[@]}"
+          mv "$RUNNER_TEMP/anvil-image-cache/paths.new" "$RUNNER_TEMP/anvil-image-cache/paths"
+      - name: Save main-scope image cache
+        if: steps.restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/anvil-image-cache
+          key: ${{ runner.os }}-anvil-image-ci-${{ hashFiles('flake.lock', 'Cargo.lock') }}-${{ hashFiles('flake.nix', 'Cargo.toml', 'crates/**', 'web/**', 'runtime/**', 'scripts/**', 'nix/**') }}
