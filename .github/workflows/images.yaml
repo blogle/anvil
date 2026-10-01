@@ -50,12 +50,13 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/anvil-image-cache
-          key: ${{ runner.os }}-anvil-image-ci-${{ hashFiles('flake.lock', 'Cargo.lock') }}-${{ hashFiles('flake.nix', 'Cargo.toml', 'crates/**', 'web/**', 'nix/rust.nix', 'nix/images.nix') }}
+          key: ${{ runner.os }}-anvil-image-ci-${{ hashFiles('flake.lock', 'Cargo.lock') }}-${{ hashFiles('flake.nix', 'Cargo.toml', 'crates/**', 'web/**', 'runtime/**', 'scripts/**', 'nix/**') }}
           restore-keys: |
             ${{ runner.os }}-anvil-image-ci-${{ hashFiles('flake.lock', 'Cargo.lock') }}-
       - name: Report targeted image cache restore
         run: |
-          printf 'anvil-image-cache-hit=%s\n' '${{ steps.restore.outputs.cache-hit }}'
+          printf 'anvil-image-cache-exact-hit=%s\n' '${{ steps.restore.outputs.cache-hit }}'
+          printf 'anvil-image-cache-matched-key=%s\n' '${{ steps.restore.outputs.cache-matched-key }}'
       - name: Validate flake outputs
         run: time nix --option build-users-group "" flake check --no-build
       - name: Build OCI archives
@@ -66,8 +67,9 @@ jobs:
           cache_dir="$RUNNER_TEMP/anvil-image-cache"
           mkdir -p "$cache_dir"
           if [ -s "$cache_dir/paths" ]; then
+            mapfile -t cache_paths < "$cache_dir/paths"
             cache_start=$SECONDS
-            nix --option build-users-group "" copy --no-check-sigs --from "file://$cache_dir" $(<"$cache_dir/paths")
+            nix --option build-users-group "" copy --no-check-sigs --from "file://$cache_dir" "${cache_paths[@]}"
             printf 'anvil-cache-import-seconds=%s\n' "$((SECONDS - cache_start))" | tee -a image-build-timings.txt
           else
             printf '%s\n' 'anvil-cache-import-seconds=0 (miss)' | tee -a image-build-timings.txt
@@ -146,28 +148,7 @@ jobs:
               printf "%s %s\n" "$image" "$actual"
             done
           ' | tee image-report.txt
-          cache_export_start=$SECONDS
-          nix --option build-users-group "" path-info --recursive \
-            .#anvil-image-ci .#anvil-ci-release-cargo-artifacts > "$cache_dir/paths.new"
-          cache_nar_bytes="$(nix --option build-users-group "" path-info --json --recursive \
-            .#anvil-image-ci .#anvil-ci-release-cargo-artifacts \
-            | jq '[.[] | .narSize] | add // 0')"
-          printf 'anvil-cache-nar-bytes=%s\n' "$cache_nar_bytes" | tee -a image-build-timings.txt
-          if [ "$cache_nar_bytes" -le 2147483648 ]; then
-            nix --option build-users-group "" copy --no-check-sigs --to "file://$cache_dir" $(<"$cache_dir/paths.new")
-            mv "$cache_dir/paths.new" "$cache_dir/paths"
-          else
-            rm -rf "$cache_dir"
-            printf '%s\n' 'anvil-cache-export=skipped (over 2 GiB bound)' | tee -a image-build-timings.txt
-          fi
-          printf 'anvil-cache-export-seconds=%s\n' "$((SECONDS - cache_export_start))" | tee -a image-build-timings.txt
           (cd image-artifacts && sha256sum *.tar > SHA256SUMS)
-      - name: Save targeted Anvil image cache
-        if: success()
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ runner.temp }}/anvil-image-cache
-          key: ${{ runner.os }}-anvil-image-ci-${{ hashFiles('flake.lock', 'Cargo.lock') }}-${{ hashFiles('flake.nix', 'Cargo.toml', 'crates/**', 'web/**', 'nix/rust.nix', 'nix/images.nix') }}
       - uses: actions/upload-artifact@v4
         with:
           name: anvil-pr-image-archives
