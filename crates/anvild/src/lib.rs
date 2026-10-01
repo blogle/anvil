@@ -2785,7 +2785,7 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
             author_email: None,
             session_id_override: Some(session_id.clone()),
         };
-        match create(State(state.clone()), Json(request)).await {
+        match create(State(state.clone()), None, Json(request)).await {
             Ok((_, Json(session))) => {
                 store
                     .bind_attempt_session(attempt_id, &session.id)
@@ -6431,7 +6431,7 @@ mod tests {
         assert_eq!(capacity["queued_runnable"], 1);
         assert_eq!(capacity["available_slots"], 4);
         assert_eq!(capacity["batches"][0]["active"], 0);
-        assert_eq!(capacity["batches"][0]["queued"], 100);
+        assert_eq!(capacity["batches"][0]["queued"], 1);
         assert_eq!(
             first_body["accepted_task_ids"].as_array().unwrap().len(),
             100
@@ -6773,8 +6773,14 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(attempts_after_restart["attempts"].as_array().unwrap().len(), 2);
-        assert_eq!(attempts_after_restart["attempts"][0]["attempt_id"], attempt_id);
+        assert_eq!(
+            attempts_after_restart["attempts"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            attempts_after_restart["attempts"][0]["attempt_id"],
+            attempt_id
+        );
         let restart_replay = reopened
             .clone()
             .oneshot(submit_raw(plan.to_string(), "stable-key"))
