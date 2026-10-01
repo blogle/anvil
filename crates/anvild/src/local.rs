@@ -809,6 +809,9 @@ mod tests {
             history_path: std::env::temp_dir().join("anvil-local-test-history.jsonl"),
             store_path: std::env::temp_dir()
                 .join(format!("anvil-local-test-{}.sqlite3", uuid::Uuid::new_v4())),
+            concurrency_limit: 4,
+            provisioning_max_attempts: 3,
+            provisioning_retry_base: Duration::from_millis(10),
         }
     }
 
@@ -910,6 +913,7 @@ mod tests {
                 model: None,
                 author_name: None,
                 author_email: None,
+                session_id_override: None,
             }
         }
 
