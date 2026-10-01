@@ -32,6 +32,7 @@ use kube::{
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     env,
@@ -133,6 +134,9 @@ pub struct Config {
     pub github_api_url: String,
     pub history_path: PathBuf,
     pub store_path: PathBuf,
+    pub concurrency_limit: u32,
+    pub provisioning_max_attempts: u32,
+    pub provisioning_retry_base: Duration,
 }
 impl Config {
     pub fn from_env() -> Result<Self, ServiceError> {
@@ -204,6 +208,28 @@ impl Config {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
         );
+        let concurrency_limit: u32 = get("ANVIL_CONCURRENCY", "4").parse().map_err(|_| {
+            ServiceError::Config("ANVIL_CONCURRENCY must be a positive integer".into())
+        })?;
+        let provisioning_max_attempts: u32 = get("ANVIL_PROVISIONING_MAX_ATTEMPTS", "3")
+            .parse()
+            .map_err(|_| {
+                ServiceError::Config(
+                    "ANVIL_PROVISIONING_MAX_ATTEMPTS must be a positive integer".into(),
+                )
+            })?;
+        let provisioning_retry_base_ms: u64 = get("ANVIL_PROVISIONING_RETRY_BASE_MS", "1000")
+            .parse()
+            .map_err(|_| {
+                ServiceError::Config(
+                    "ANVIL_PROVISIONING_RETRY_BASE_MS must be an unsigned integer".into(),
+                )
+            })?;
+        if concurrency_limit == 0 || provisioning_max_attempts == 0 {
+            return Err(ServiceError::Config(
+                "ANVIL_CONCURRENCY and ANVIL_PROVISIONING_MAX_ATTEMPTS must be positive".into(),
+            ));
+        }
         Ok(Self {
             sandbox_backend,
             bind_port: get("ANVIL_BIND_PORT", "8080")
@@ -255,6 +281,9 @@ impl Config {
             github_api_url: get("ANVIL_GITHUB_API_URL", "https://api.github.com"),
             history_path,
             store_path,
+            concurrency_limit,
+            provisioning_max_attempts,
+            provisioning_retry_base: Duration::from_millis(provisioning_retry_base_ms),
         })
     }
 }
@@ -287,6 +316,8 @@ pub enum ServiceError {
     Kubernetes(String),
     #[error("OpenCode error: {0}")]
     OpenCode(String),
+    #[error("provisioning infrastructure error: {0}")]
+    Provisioning(String),
     #[error("profile OpenCode error: {0}")]
     Profile(String),
     #[error("session not found")]
@@ -326,6 +357,7 @@ impl IntoResponse for ServiceError {
             ServiceError::Recovery(_) => StatusCode::CONFLICT,
             ServiceError::Invalid(_) => StatusCode::BAD_REQUEST,
             ServiceError::OpenCode(_) => StatusCode::BAD_GATEWAY,
+            ServiceError::Provisioning(_) => StatusCode::SERVICE_UNAVAILABLE,
             ServiceError::Profile(_) => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -1710,6 +1742,7 @@ pub struct AppState {
     lifecycle_watchers: LifecycleWatchers,
     materializations_reconciled: Arc<AtomicBool>,
     materialization_reconcile_lock: Arc<AsyncMutex<()>>,
+    admission_lock: Arc<AsyncMutex<()>>,
     capability_signer: Option<github::CapabilitySigner>,
     github: Option<github::GithubBroker>,
 }
@@ -1760,6 +1793,7 @@ impl AppState {
             lifecycle_watchers: Arc::new(Mutex::new(HashMap::new())),
             materializations_reconciled: Arc::new(AtomicBool::new(false)),
             materialization_reconcile_lock: Arc::new(AsyncMutex::new(())),
+            admission_lock: Arc::new(AsyncMutex::new(())),
             capability_signer,
             github,
         }
@@ -1808,6 +1842,7 @@ impl AppState {
                 }
             }
         }
+        self.start_batch_scheduler();
         Ok(())
     }
 
@@ -1820,6 +1855,19 @@ impl AppState {
         self.materializations_reconciled
             .store(true, Ordering::Release);
         Ok(records)
+    }
+
+    fn start_batch_scheduler(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                if let Err(error) = run_batch_scheduler_tick(&state).await {
+                    warn!(%error, "batch scheduler tick failed");
+                }
+            }
+        });
     }
 
     pub fn store(&self) -> Result<&store::ControllerStore, &str> {
@@ -1885,6 +1933,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/batches", post(submit_batch))
         .route("/v1/batches/:id", get(get_batch))
         .route("/v1/batches/:id/digest", get(get_batch_digest))
+        .route("/v1/capacity", get(get_capacity))
         .route("/v1/tasks/:id", get(get_task))
         .route(
             "/v1/tasks/:id/attempts",
@@ -2551,6 +2600,231 @@ fn render_batch_digest(digest: &Value) -> String {
     text
 }
 
+async fn get_capacity(State(state): State<AppState>) -> Result<Json<Value>, ServiceError> {
+    let _admission = state.admission_lock.clone().lock_owned().await;
+    let capacity = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?;
+    let capacity =
+        service_capacity_snapshot(&state, capacity, chrono::Utc::now().timestamp_millis()).await?;
+    serde_json::to_value(capacity)
+        .map(Json)
+        .map_err(|error| ServiceError::Store(error.to_string()))
+}
+
+async fn service_capacity_snapshot(
+    state: &AppState,
+    store: &store::ControllerStore,
+    now_ms: i64,
+) -> Result<store::scheduler::Capacity, ServiceError> {
+    let attempt_sessions = store
+        .attempt_session_ids()
+        .map_err(|error| ServiceError::Store(error.to_string()))?;
+    let records = state.kube.list().await?;
+    let (mut non_batch_running, mut non_batch_provisioning) = (0u32, 0u32);
+    for record in records {
+        if attempt_sessions.contains(&record.session.id) {
+            continue;
+        }
+        match record.session.environment_state.as_str() {
+            "ready" => non_batch_running = non_batch_running.saturating_add(1),
+            "provisioning" => non_batch_provisioning = non_batch_provisioning.saturating_add(1),
+            // Suspended/failed resources are not active service occupancy.
+            _ => {}
+        }
+    }
+    store
+        .capacity(
+            state.config.concurrency_limit,
+            now_ms,
+            state.config.provisioning_max_attempts,
+            non_batch_running,
+            non_batch_provisioning,
+        )
+        .map_err(|error| ServiceError::Store(error.to_string()))
+}
+
+async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> {
+    let _admission = state.admission_lock.clone().lock_owned().await;
+    let store = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?;
+    // Observe authoritative backend lifecycle state before claiming dependent work.
+    for active in store
+        .active_attempts()
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+    {
+        let Some(session_id) = active.session_id else {
+            continue;
+        };
+        let record = match state.kube.get(&session_id).await {
+            Ok(record) => record,
+            Err(ServiceError::NotFound) => {
+                store
+                    .record_attempt_failure(
+                        &active.attempt_id,
+                        store::scheduler::FailureClass::Infrastructure,
+                        &format!("bound sandbox {session_id} disappeared from the backend"),
+                        chrono::Utc::now().timestamp_millis(),
+                        state.config.provisioning_max_attempts,
+                        state.config.provisioning_retry_base.as_millis() as u64,
+                    )
+                    .map_err(|error| ServiceError::Store(error.to_string()))?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let disposition = if record.session.environment_state == "suspended" {
+            Some(("suspended", "suspended"))
+        } else if record.session.environment_state == "failed" {
+            store
+                .record_attempt_failure(
+                    &active.attempt_id,
+                    store::scheduler::FailureClass::Infrastructure,
+                    record
+                        .session
+                        .environment_error
+                        .as_deref()
+                        .unwrap_or("sandbox provisioning failed"),
+                    chrono::Utc::now().timestamp_millis(),
+                    state.config.provisioning_max_attempts,
+                    state.config.provisioning_retry_base.as_millis() as u64,
+                )
+                .map_err(|error| ServiceError::Store(error.to_string()))?;
+            None
+        } else if record.session.environment_state != "ready" {
+            Some(("provisioning", "provisioning"))
+        } else {
+            match &record.work_state.state {
+                WorkLifecycleState::Completed { .. } => Some(("completed", "completed")),
+                WorkLifecycleState::Failed { .. } => {
+                    store
+                        .record_attempt_failure(
+                            &active.attempt_id,
+                            store::scheduler::FailureClass::Execution,
+                            record
+                                .work_state
+                                .summary()
+                                .as_deref()
+                                .unwrap_or("execution failed"),
+                            chrono::Utc::now().timestamp_millis(),
+                            state.config.provisioning_max_attempts,
+                            state.config.provisioning_retry_base.as_millis() as u64,
+                        )
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                    None
+                }
+                WorkLifecycleState::Active { .. } => Some(("running", "running")),
+                WorkLifecycleState::ReadyForReview { .. } => {
+                    Some(("completed", "ready_for_review"))
+                }
+            }
+        };
+        if let Some((attempt_state, task_state)) = disposition {
+            if active.state != attempt_state {
+                store
+                    .set_attempt_and_task_state(&active.attempt_id, attempt_state, task_state)
+                    .map_err(|error| ServiceError::Store(error.to_string()))?;
+            }
+        }
+    }
+
+    let capacity =
+        service_capacity_snapshot(state, store, chrono::Utc::now().timestamp_millis()).await?;
+    let non_batch_active = capacity
+        .non_batch_running
+        .saturating_add(capacity.non_batch_provisioning);
+    let claims = store
+        .claim_runnable(
+            state.config.concurrency_limit,
+            chrono::Utc::now().timestamp_millis(),
+            state.config.provisioning_max_attempts,
+            non_batch_active,
+        )
+        .map_err(|error| ServiceError::Store(error.to_string()))?;
+    for claim in claims {
+        let project = claim.task["project"].as_str().unwrap_or("batch");
+        let attempt_id = claim.attempt["attempt_id"].as_str().unwrap_or_default();
+        let session_id = deterministic_attempt_session_id(project, attempt_id);
+        match state.kube.get(&session_id).await {
+            Ok(_) => {
+                store
+                    .bind_attempt_session(
+                        claim.attempt["attempt_id"].as_str().unwrap_or_default(),
+                        &session_id,
+                    )
+                    .and_then(|_| {
+                        store.set_attempt_state(
+                            claim.attempt["attempt_id"].as_str().unwrap_or_default(),
+                            "running",
+                        )
+                    })
+                    .map_err(|error| ServiceError::Store(error.to_string()))?;
+                continue;
+            }
+            Err(ServiceError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let request = CreateRequest {
+            project: project.to_owned(),
+            repository: claim.task["repository"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            base_ref: claim.task["base_commit"]
+                .as_str()
+                .or_else(|| claim.task["requested_revision"].as_str())
+                .unwrap_or("main")
+                .to_owned(),
+            prompt: claim.task["prompt"].as_str().unwrap_or_default().to_owned(),
+            model: claim.task["model"]
+                .as_str()
+                .or_else(|| claim.task["policy"]["model"].as_str())
+                .map(str::to_owned),
+            author_name: None,
+            author_email: None,
+            session_id_override: Some(session_id.clone()),
+        };
+        match create(State(state.clone()), Json(request)).await {
+            Ok((_, Json(session))) => {
+                store
+                    .bind_attempt_session(attempt_id, &session.id)
+                    .and_then(|_| store.set_attempt_state(attempt_id, "running"))
+                    .map_err(|error| ServiceError::Store(error.to_string()))?;
+            }
+            Err(error) => {
+                let class = if matches!(
+                    &error,
+                    ServiceError::Kubernetes(_) | ServiceError::Provisioning(_)
+                ) {
+                    store::scheduler::FailureClass::Infrastructure
+                } else {
+                    store::scheduler::FailureClass::NonRetryable
+                };
+                store
+                    .record_attempt_failure(
+                        attempt_id,
+                        class,
+                        &error.to_string(),
+                        chrono::Utc::now().timestamp_millis(),
+                        state.config.provisioning_max_attempts,
+                        state.config.provisioning_retry_base.as_millis() as u64,
+                    )
+                    .map_err(|store_error| ServiceError::Store(store_error.to_string()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn deterministic_attempt_session_id(project: &str, attempt_id: &str) -> String {
+    let digest = Sha256::digest(attempt_id.as_bytes());
+    format!(
+        "{project}-{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    )
+}
+
 async fn get_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2925,6 +3199,22 @@ async fn create(
         .clone()
         .or_else(|| idempotent_session_id.map(|Extension(value)| value.0))
         .unwrap_or_else(|| SessionId::new(&p).to_string());
+    let _admission_guard = if r.session_id_override.is_none() {
+        let guard = s.admission_lock.clone().lock_owned().await;
+        let store = s
+            .store()
+            .map_err(|error| ServiceError::Store(error.to_owned()))?;
+        let capacity =
+            service_capacity_snapshot(&s, store, chrono::Utc::now().timestamp_millis()).await?;
+        if capacity.running.saturating_add(capacity.provisioning) >= s.config.concurrency_limit {
+            return Err(ServiceError::Conflict(
+                "global Anvil concurrency capacity is exhausted".into(),
+            ));
+        }
+        Some(guard)
+    } else {
+        None
+    };
     let mut sandbox_env = vec![
         ("ANVIL_SESSION_ID".into(), id.clone()),
         (
@@ -2989,7 +3279,11 @@ async fn create(
     let mut sess = obj.session.clone();
     sess.ready_at = Some(ready_at);
     let oc = OpenCode::new(service_url(&sess, &s.config), s.config.request_timeout);
-    wait_opencode(&oc, s.config.request_timeout).await?;
+    wait_opencode(&oc, s.config.request_timeout)
+        .await
+        .map_err(|error| {
+            ServiceError::Provisioning(format!("sandbox OpenCode readiness failed: {error}"))
+        })?;
     let model = match r.model.as_deref() {
         Some(requested) => {
             let model = oc.resolve_model(requested).await?;
@@ -2998,7 +3292,9 @@ async fn create(
         }
         None => None,
     };
-    let oc_id = oc.create_session().await?;
+    let oc_id = oc.create_session().await.map_err(|error| {
+        ServiceError::Provisioning(format!("OpenCode session provisioning failed: {error}"))
+    })?;
     s.kube.set_opencode_session(&id, &oc_id).await?;
     let recovered = reconcile_binding(&s, &id).await?;
     if !binding_is_usable(&recovered) {
@@ -6116,6 +6412,25 @@ mod tests {
             first_body["resolved_base_id"],
             "0123456789abcdef0123456789abcdef01234567"
         );
+        let capacity = app
+            .clone()
+            .oneshot(Request::get("/v1/capacity").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(capacity.status(), StatusCode::OK);
+        let capacity: Value = serde_json::from_slice(
+            &axum::body::to_bytes(capacity.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(capacity["global_limit"], 4);
+        assert_eq!(capacity["running"], 0);
+        assert_eq!(capacity["provisioning"], 0);
+        assert_eq!(capacity["queued_runnable"], 1);
+        assert_eq!(capacity["available_slots"], 4);
+        assert_eq!(capacity["batches"][0]["active"], 0);
+        assert_eq!(capacity["batches"][0]["queued"], 1);
         let independent = json!({"project":"demo","repository":"https://github.com/example/demo.git","ref":"main","concurrency":1,"tasks":[{"task_id":"build","prompt":"different logical work"}]});
         let independent_response = app
             .clone()
@@ -6511,6 +6826,10 @@ mod tests {
 
     struct FakeSandbox;
 
+    struct OccupancySandbox {
+        records: Vec<SandboxRecord>,
+    }
+
     struct BindingSandbox {
         object: Arc<Mutex<DynamicObject>>,
         opencode_port: u16,
@@ -6581,6 +6900,222 @@ mod tests {
         async fn delete(&self, _id: &str) -> Result<(), ServiceError> {
             Ok(())
         }
+    }
+
+    #[async_trait]
+    impl SandboxApi for OccupancySandbox {
+        async fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError> {
+            Ok(self.records.clone())
+        }
+
+        async fn create(
+            &self,
+            _id: &str,
+            _request: &CreateRequest,
+            _sandbox_env: &[(String, String)],
+            _initial_work_state: &WorkStateRecord,
+        ) -> Result<Session, ServiceError> {
+            Err(ServiceError::Provisioning(
+                "injected provisioning outage".into(),
+            ))
+        }
+
+        async fn suspend(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn resume(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    fn accept_scheduler_batch(
+        store: &store::ControllerStore,
+        batch_id: &str,
+        concurrency: u32,
+        task_specs: &[(&str, Vec<&str>)],
+    ) {
+        let task_ids: Vec<_> = task_specs.iter().map(|(id, _)| (*id).to_owned()).collect();
+        let batch = json!({
+            "batch_id":batch_id,
+            "project":"demo",
+            "repository":"https://github.com/example/repo.git",
+            "requested_revision":"main",
+            "base_commit":"0123456789abcdef0123456789abcdef01234567",
+            "requested_concurrency":concurrency,
+            "accepted_task_ids":task_ids,
+        });
+        let tasks: Vec<_> = task_specs
+            .iter()
+            .map(|(task_id, dependencies)| {
+                (
+                    (*task_id).to_owned(),
+                    json!({
+                        "task_id":task_id,
+                        "batch_id":batch_id,
+                        "project":"demo",
+                        "repository":"https://github.com/example/repo.git",
+                        "requested_revision":"main",
+                        "base_commit":"0123456789abcdef0123456789abcdef01234567",
+                        "prompt":format!("work for {task_id}"),
+                        "dependencies":dependencies,
+                        "state":"queued",
+                    }),
+                )
+            })
+            .collect();
+        store
+            .accept_batch(store::BatchAcceptance {
+                key: &format!("key-{batch_id}"),
+                scope: "demo",
+                request: &json!({"batch":batch_id}),
+                batch_id,
+                batch: &batch,
+                tasks: &tasks,
+                allow_competing: true,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduler_retries_when_bound_sandbox_disappears_and_releases_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        config.concurrency_limit = 1;
+        config.provisioning_max_attempts = 2;
+        config.provisioning_retry_base = Duration::ZERO;
+        let state = AppState::new(config, FakeSandbox);
+        let store = state.store().unwrap();
+        accept_scheduler_batch(store, "lost", 1, &[("logical-task", vec![])]);
+        store
+            .create_attempt("logical-task", "attempt-1", "external-attempt-key")
+            .unwrap();
+        store
+            .bind_attempt_session("attempt-1", "gone-session")
+            .unwrap();
+        store.set_attempt_state("attempt-1", "running").unwrap();
+
+        run_batch_scheduler_tick(&state).await.unwrap();
+
+        let attempts = store.attempts_for_task("logical-task").unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0]["failure_class"], "infrastructure");
+        assert!(attempts[0]["failure_reason"]
+            .as_str()
+            .unwrap()
+            .contains("gone-session"));
+        assert_eq!(attempts[1]["ordinal"], 2);
+        assert_eq!(attempts[1]["task_id"], attempts[0]["task_id"]);
+        assert_eq!(
+            store.get_resource("task", "logical-task").unwrap().unwrap()["task_id"],
+            "logical-task"
+        );
+        let capacity =
+            service_capacity_snapshot(&state, store, chrono::Utc::now().timestamp_millis())
+                .await
+                .unwrap();
+        assert_eq!(capacity.running + capacity.provisioning, 0);
+        assert_eq!(capacity.available_slots, 1);
+    }
+
+    #[tokio::test]
+    async fn scheduler_exhausts_when_bound_sandbox_disappears_and_releases_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        config.concurrency_limit = 1;
+        config.provisioning_max_attempts = 1;
+        let state = AppState::new(config, FakeSandbox);
+        let store = state.store().unwrap();
+        accept_scheduler_batch(store, "lost-exhausted", 1, &[("logical-task", vec![])]);
+        store
+            .create_attempt("logical-task", "attempt-1", "external-attempt-key")
+            .unwrap();
+        store
+            .bind_attempt_session("attempt-1", "gone-session")
+            .unwrap();
+        store.set_attempt_state("attempt-1", "running").unwrap();
+
+        run_batch_scheduler_tick(&state).await.unwrap();
+
+        let attempts = store.attempts_for_task("logical-task").unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0]["state"], "exhausted");
+        assert_eq!(attempts[0]["failure_class"], "infrastructure");
+        let capacity =
+            service_capacity_snapshot(&state, store, chrono::Utc::now().timestamp_millis())
+                .await
+                .unwrap();
+        assert_eq!(capacity.running + capacity.provisioning, 0);
+        assert_eq!(capacity.available_slots, 1);
+    }
+
+    #[tokio::test]
+    async fn batch_scheduler_counts_non_batch_live_and_provisioning_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        config.concurrency_limit = 4;
+        config.provisioning_max_attempts = 3;
+        config.provisioning_retry_base = Duration::from_secs(30);
+        let records = (0..3)
+            .map(|index| {
+                let mut session = activity_session();
+                session.id = format!("external-{index:08x}");
+                let mut record = active_work_record(session);
+                if index == 2 {
+                    record.session.environment_state = "provisioning".into();
+                }
+                record
+            })
+            .collect();
+        let state = AppState::new(config, OccupancySandbox { records });
+        let store = state.store().unwrap();
+        accept_scheduler_batch(
+            store,
+            "non-batch-capacity",
+            4,
+            &[("task-1", vec![]), ("task-2", vec![])],
+        );
+
+        let response = router(state.clone())
+            .oneshot(Request::get("/v1/capacity").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let capacity: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(capacity["running"], 2);
+        assert_eq!(capacity["provisioning"], 1);
+        assert_eq!(capacity["non_batch_running"], 2);
+        assert_eq!(capacity["non_batch_provisioning"], 1);
+        assert_eq!(capacity["available_slots"], 1);
+        assert_eq!(capacity["queued_runnable"], 2);
+        assert_eq!(capacity["batches"][0]["active"], 0);
+        assert_eq!(capacity["batches"][0]["queued"], 2);
+
+        run_batch_scheduler_tick(&state).await.unwrap();
+
+        assert_eq!(store.attempts_for_task("task-1").unwrap().len(), 1);
+        assert!(store.attempts_for_task("task-2").unwrap().is_empty());
+        let capacity =
+            service_capacity_snapshot(&state, store, chrono::Utc::now().timestamp_millis())
+                .await
+                .unwrap();
+        assert_eq!(capacity.non_batch_running, 2);
+        assert_eq!(capacity.non_batch_provisioning, 1);
+        assert_eq!(capacity.running + capacity.provisioning, 3);
+        assert_eq!(capacity.queued_runnable, 1);
+        assert_eq!(capacity.available_slots, 1);
     }
 
     #[async_trait]
@@ -6823,6 +7358,9 @@ mod tests {
             github_api_url: "https://api.github.com".into(),
             history_path: PathBuf::from("/tmp/anvil-history.jsonl"),
             store_path: PathBuf::from(format!("/tmp/anvil-test-{}.sqlite3", uuid::Uuid::new_v4())),
+            concurrency_limit: 4,
+            provisioning_max_attempts: 3,
+            provisioning_retry_base: Duration::from_millis(10),
         }
     }
 
