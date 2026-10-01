@@ -710,6 +710,23 @@ impl ControllerStore {
         })
     }
 
+    pub fn get_attempt_submission(&self, key: &str) -> Result<Option<Value>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let payload = connection
+            .query_row(
+                "SELECT attempts.payload_json FROM attempt_submissions JOIN attempts ON attempts.attempt_id=attempt_submissions.attempt_id WHERE attempt_submissions.idempotency_key=?1",
+                [key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        payload
+            .map(|payload| serde_json::from_str(&payload).map_err(StoreError::from))
+            .transpose()
+    }
+
     pub fn attempts_for_task(&self, task_id: &str) -> Result<Vec<Value>, StoreError> {
         let connection = self
             .connection
@@ -819,6 +836,27 @@ impl ControllerStore {
         let record = read_result(&tx, key)?.ok_or(StoreError::NotFound)?;
         tx.commit()?;
         Ok(record)
+    }
+
+    /// Persist the authoritative HTTP result after an accepted operation finishes.
+    pub fn set_result(
+        &self,
+        key: &str,
+        result_reference: &str,
+        result: &Value,
+    ) -> Result<(), StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let changed = connection.execute(
+            "UPDATE idempotency_records SET result_reference=?2, result_json=?3, updated_at=?4 WHERE idempotency_key=?1 AND state='accepted'",
+            params![key, result_reference, serde_json::to_string(result)?, chrono::Utc::now().to_rfc3339()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
     }
 }
 

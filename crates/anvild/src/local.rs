@@ -910,6 +910,7 @@ mod tests {
                 model: None,
                 author_name: None,
                 author_email: None,
+                session_id_override: None,
             }
         }
 
