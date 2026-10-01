@@ -171,4 +171,11 @@ pushes and Pull requests: write before `gh` can use that profile; otherwise
 GitHub rejects the corresponding token request with HTTP 422.
 An omitted body deliberately selects the legacy pre-purpose profile for
 persistent old sandbox helpers during rollout. The route continues to require
-the session capability bound to the requested session and repository.
+the session capability bound to the requested session and repository. Each
+successful response also returns a renewed `session_credential`; the sandbox
+helpers persist it under `/home/anvil/.local/state` and use it for later broker
+requests, including after pod recreation. An expired signed capability may be
+used only to renew credentials after Anvil confirms that its session still
+exists, is not completed or being deleted, and remains bound to the same
+repository. The short-lived GitHub installation token and its permission
+profile are unchanged.
