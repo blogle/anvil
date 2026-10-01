@@ -3,8 +3,11 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 helper="$repo_root/runtime/anvil-credential"
+capability_helper="$repo_root/runtime/anvil-session-capability"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
+export ANVIL_SESSION_CAPABILITY_HELPER="$capability_helper"
+export XDG_STATE_HOME="$tmp_dir/state"
 
 mock_curl="$tmp_dir/curl"
 curl_log="$tmp_dir/curl.log"
@@ -31,7 +34,7 @@ fi
 if [ "${CREDENTIAL_CURL_RESPONSE+x}" = x ]; then
   response="$CREDENTIAL_CURL_RESPONSE"
 else
-  response='{"token":"ghs_test-token"}'
+  response='{"token":"ghs_test-token","session_credential":"renewed-session-secret"}'
 fi
 printf '%s\n%s' "$response" "${CREDENTIAL_CURL_STATUS:-200}"
 EOF
@@ -53,6 +56,16 @@ test -s "$curl_log"
 grep -Fq 'Authorization: Bearer session-secret' "$curl_log"
 grep -Fq 'request-body={"purpose":"git"}' "$curl_log"
 ! grep -Fq 'session-secret' <<<"$output"
+capability_file="$XDG_STATE_HOME/anvil/github-session-capability"
+test "$(<"$capability_file")" = 'renewed-session-secret'
+test "$(stat -c '%a' "$capability_file")" = 600
+
+# A separate helper process (including a recreated sandbox using its persistent
+# HOME/PVC) must pick up the refreshed capability rather than the stale Pod env.
+output="$(run_helper $'protocol=https\nhost=github.com\n')"
+grep -Fq 'Authorization: Bearer renewed-session-secret' "$curl_log"
+! grep -Fq 'Authorization: Bearer session-secret' "$curl_log"
+! grep -Fq 'renewed-session-secret' <<<"$output"
 
 if printf '%s' $'protocol=http\nhost=github.com\n' | env \
   ANVIL_SESSION_ID=session-123 \
