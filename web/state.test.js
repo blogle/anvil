@@ -11,7 +11,9 @@ window.__ANVIL_TEST__ = true
 
 const { h, render } = await import('preact')
 const { act } = await import('preact/test-utils')
-const app = await import('./src/app.jsx')
+const sessionsModule = await import('./src/sessions.jsx')
+const detailModule = await import('./src/detail.jsx')
+const { AppShell } = await import('./src/app.jsx')
 const state = await import('./src/state.js')
 
 const session = { id: 'demo', project: 'Demo', work_branch: 'main', environment_state: 'ready', work_state: 'in_progress', created_at: '2026-09-19T11:00:00Z', sandbox: 'sandbox', repository: 'https://example.test/repo', base_ref: 'main' }
@@ -31,7 +33,7 @@ test('elapsed display and status mappings retain current-main semantics', () => 
   state.filter.value = 'all'
 })
 
-function TestApp() { return h('div', { class: 'app-shell' }, h('aside', { class: 'sidebar' }, h('div', { class: 'session-list' }, state.sessions.value.map((item) => h(app.SessionRow, { key: item.id, session: item })))), h(app.SessionDetail)) }
+function TestApp() { return h('div', { class: 'app-shell' }, h('aside', { class: 'sidebar' }, h('div', { class: 'session-list' }, state.sessions.value.map((item) => h(sessionsModule.SessionRow, { key: item.id, session: item })))), h(detailModule.SessionDetail)) }
 
 test('keyed rows and selected detail remain mounted across polls and status transitions', async () => {
   state.sessions.value = [session]
@@ -90,7 +92,7 @@ test('direct links and browser history route deterministically; list adapts at m
   state.activities.value = new Map([[session.id, activity()]])
   state.selected.value = 'demo'
   const root = document.getElementById('app')
-  await act(async () => render(h(app.AppShell), root))
+  await act(async () => render(h(AppShell), root))
   assert.equal(root.querySelector('.app-shell').classList.contains('mobile-detail'), true)
   await act(async () => { state.navigate(null); window.dispatchEvent(new window.PopStateEvent('popstate')) })
   assert.equal(state.routeFromHash(), null)
