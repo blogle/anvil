@@ -202,6 +202,8 @@ kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-dae
   test -s /nix/var/nix/db/db.sqlite
   test -f /nix/var/nix/.anvil-bootstrap-complete
   test -d /nix/var/nix/gcroots/anvil-baseline
+  grep -Fx "build-users-group = nixbld" /etc/nix/nix.conf
+  ! grep -Eq "^filter-syscalls[[:space:]]*=[[:space:]]*false" /etc/nix/nix.conf
   nix store info >/dev/null
   for path in /nix/var /nix/var/nix /nix/var/nix/builds; do
     test "$(stat -c "%u:%g:%a" "$path")" = 0:0:755
