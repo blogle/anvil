@@ -5383,8 +5383,8 @@ fn bounded_message_items(value: Value, limit: usize) -> (Vec<Value>, Option<Acti
     (messages, Some(window))
 }
 
-fn activity_redaction_patterns() -> &'static [Regex; 4] {
-    static PATTERNS: OnceLock<[Regex; 4]> = OnceLock::new();
+fn activity_redaction_patterns() -> &'static [Regex; 5] {
+    static PATTERNS: OnceLock<[Regex; 5]> = OnceLock::new();
     PATTERNS.get_or_init(|| {
         [
             Regex::new(
@@ -5392,9 +5392,9 @@ fn activity_redaction_patterns() -> &'static [Regex; 4] {
             )
             .expect("valid authorization redaction regex"),
             Regex::new(
-                r#"(?i)((?:[a-z0-9-]+[_-])?(?:authorization|proxy-authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|private[_-]?key|client[_-]?secret)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"#,
+                r#"(?i)((?:[a-z0-9]+[_-])*(?:secret[_-]access[_-]key|authorization|proxy-authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|private[_-]?key|client[_-]?secret)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"#,
             )
-            .expect("valid credential-field redaction regex"),
+            .expect("valid multi-component credential-field redaction regex"),
             Regex::new(
                 r#"(?i)(--?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|client[_-]?secret)\s+)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"#,
             )
@@ -5403,6 +5403,8 @@ fn activity_redaction_patterns() -> &'static [Regex; 4] {
                 r#"(?i)((?:set-cookie|cookie)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,\"']+)"#,
             )
                 .expect("valid cookie-header redaction regex"),
+            Regex::new(r#"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@(?=[^/\s]+)"#)
+                .expect("valid URL userinfo redaction regex"),
         ]
     })
 }
@@ -5429,7 +5431,10 @@ fn redact_activity_text(value: &str) -> String {
     let value = patterns[0].replace_all(value, "$1$2[REDACTED]");
     let value = patterns[1].replace_all(&value, "$1[REDACTED]");
     let value = patterns[2].replace_all(&value, "$1[REDACTED]");
-    patterns[3].replace_all(&value, "$1[REDACTED]").into_owned()
+    let value = patterns[3].replace_all(&value, "$1[REDACTED]");
+    patterns[4]
+        .replace_all(&value, "$1[REDACTED]@")
+        .into_owned()
 }
 
 fn redact_activity_value(value: &Value) -> Value {
@@ -9536,7 +9541,7 @@ mod tests {
             {
                 "info":{"id":"msg-1","parentID":"user-1","role":"assistant","time":{"created":1780000000000i64,"completed":1780000002000i64}},
                 "parts":[
-                    {"id":"part-tool","type":"tool","tool":"bash","state":{"status":"completed","title":"Ran tests","input":{"command":"curl -H 'Authorization: Bearer input-auth-secret'","api_key":"input-api-secret"},"output":{"message":"ok","access_token":"output-token-secret"},"time":{"start":1780000001000i64,"end":1780000001500i64}}},
+                    {"id":"part-tool","type":"tool","tool":"bash","state":{"status":"completed","title":"Ran tests","input":{"command":"terraform plan; AWS_SECRET_ACCESS_KEY=input-aws-secret; BUILD_DATABASE_PASSWORD='input-db-password'; curl https://deploy-user:input-url-password@deploy.example.test","api_key":"input-api-secret"},"output":{"message":"ok: Connected postgres://service-user:output-db-password@db.example.test/app; CI_SECRET_ACCESS_KEY=output-aws-secret; 61 tests passed","access_token":"output-token-secret"},"time":{"start":1780000001000i64,"end":1780000001500i64}}},
                     {"id":"part-text","type":"text","text":"The retry path behaves as expected.","time":{"start":1780000001600i64,"end":1780000001700i64}},
                     {"id":"part-reasoning","type":"reasoning","text":"private"}
                 ]
@@ -9610,9 +9615,20 @@ mod tests {
             "input-auth-secret",
             "input-api-secret",
             "output-token-secret",
+            "input-aws-secret",
+            "input-db-password",
+            "input-url-password",
+            "deploy-user:input-url-password",
+            "output-db-password",
+            "service-user:output-db-password",
+            "output-aws-secret",
         ] {
             assert!(!serialized_events.contains(secret));
         }
+        assert!(serialized_events.contains("terraform plan"));
+        assert!(serialized_events.contains("61 tests passed"));
+        assert!(serialized_events.contains("deploy.example.test"));
+        assert!(serialized_events.contains("db.example.test/app"));
     }
 
     #[test]
@@ -9668,6 +9684,51 @@ mod tests {
         }
         assert!(safe.contains("curl"));
         assert!(safe.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn activity_redacts_multicomponent_env_and_url_credentials_in_raw_strings() {
+        let command = redact_activity_text(
+            "terraform plan; AWS_SECRET_ACCESS_KEY=aws-secret-value; BUILD_DATABASE_PASSWORD='db-password-value'; curl https://deploy-user:url-password-value@deploy.example.test; echo deployment started",
+        );
+        for secret in [
+            "aws-secret-value",
+            "db-password-value",
+            "url-password-value",
+            "deploy-user:url-password-value",
+        ] {
+            assert!(!command.contains(secret), "credential leaked in {command}");
+        }
+        assert!(command.contains("terraform plan"));
+        assert!(command.contains("curl https://[REDACTED]@deploy.example.test"));
+        assert!(command.contains("echo deployment started"));
+
+        let output = redact_activity_text(
+            "Connected to postgres://service-user:database-password-value@db.example.test/app; CI_SECRET_ACCESS_KEY=output-aws-secret-value; 61 tests passed",
+        );
+        for secret in [
+            "database-password-value",
+            "service-user:database-password-value",
+            "output-aws-secret-value",
+        ] {
+            assert!(!output.contains(secret), "credential leaked in {output}");
+        }
+        assert!(output.contains("postgres://[REDACTED]@db.example.test/app"));
+        assert!(output.contains("61 tests passed"));
+
+        let serialized_event = serde_json::to_string(&ActivityEvent {
+            id: "tool:raw-output".into(),
+            at: "2026-01-01T00:00:00Z".into(),
+            kind: "tool".into(),
+            title: "Database check".into(),
+            tool: Some("bash".into()),
+            detail: Some(output),
+            status: Some("completed".into()),
+        })
+        .unwrap();
+        assert!(!serialized_event.contains("database-password-value"));
+        assert!(!serialized_event.contains("output-aws-secret-value"));
+        assert!(serialized_event.contains("61 tests passed"));
     }
 
     #[test]
