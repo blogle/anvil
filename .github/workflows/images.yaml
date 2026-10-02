@@ -41,44 +41,30 @@ jobs:
     if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'mergify/merge-queue/')
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v19
-      - name: Restore targeted Anvil image cache
-        id: restore
-        uses: actions/cache/restore@v4
+      - uses: Mic92/hestia@v3.1.0
         with:
-          path: ${{ runner.temp }}/anvil-image-cache
-          key: ${{ runner.os }}-anvil-image-ci-${{ hashFiles('flake.lock', 'Cargo.lock') }}-${{ hashFiles('flake.nix', 'Cargo.toml', 'crates/**', 'web/**', 'nix/rust.nix', 'nix/images.nix') }}
-          restore-keys: |
-            ${{ runner.os }}-anvil-image-ci-${{ hashFiles('flake.lock', 'Cargo.lock') }}-
-      - name: Report targeted image cache restore
-        run: |
-          printf 'anvil-image-cache-hit=%s\n' '${{ steps.restore.outputs.cache-hit }}'
+          version: v3.1.0
+          no-closure: true
+          upstream-cache-filter: true
       - name: Validate flake outputs
-        run: time nix --option build-users-group "" flake check --no-build
+        run: time nix flake check --no-build
       - name: Build OCI archives
         run: |
           set -euo pipefail
           mkdir -p image-artifacts paths
           : > image-build-timings.txt
-          cache_dir="$RUNNER_TEMP/anvil-image-cache"
-          mkdir -p "$cache_dir"
-          if [ -s "$cache_dir/paths" ]; then
-            cache_start=$SECONDS
-            nix --option build-users-group "" copy --no-check-sigs --from "file://$cache_dir" $(<"$cache_dir/paths")
-            printf 'anvil-cache-import-seconds=%s\n' "$((SECONDS - cache_start))" | tee -a image-build-timings.txt
-          else
-            printf '%s\n' 'anvil-cache-import-seconds=0 (miss)' | tee -a image-build-timings.txt
-          fi
           build_root() {
             name="$1"
             output="$2"
             start=$SECONDS
             started_at="$(date -u +%FT%TZ)"
             printf '%s-start=%s\n' "$name" "$started_at"
-            nix --option build-users-group "" build --no-link --print-out-paths "$output" > "paths/$name"
+            nix build --no-link --print-out-paths "$output" > "paths/$name"
             ended_at="$(date -u +%FT%TZ)"
             printf '%s-end=%s\n' "$name" "$ended_at"
             printf '%s-seconds=%s\n' "$name" "$((SECONDS - start))"
@@ -122,14 +108,29 @@ jobs:
               printf '%s-convert-start=%s\n' "$name" "$started_at"
               printf '%s-convert-end=%s\n' "$name" "$ended_at"
               printf '%s-convert-seconds=%s\n' "$name" "$((SECONDS - start))"
-            } >> image-build-timings.txt
+            } > "image-build-timings-$name.txt"
           }
-          convert_image anvil "docker-archive:$(<paths/anvil)" docker-archive:image-artifacts/anvil-image.tar:ghcr.io/blogle/anvil:kind-e2e
-          convert_image sandbox "nix:$(<paths/sandbox)" docker-archive:image-artifacts/anvil-sandbox-image.tar:ghcr.io/blogle/anvil-sandbox:kind-e2e
-          convert_image daemon "nix:$(<paths/daemon)" docker-archive:image-artifacts/anvil-nix-daemon-image.tar:ghcr.io/blogle/anvil-nix-daemon:kind-e2e
-          convert_image upgrade "nix:$(<paths/upgrade)" docker-archive:image-artifacts/anvil-nix-daemon-upgrade-test-image.tar:ghcr.io/blogle/anvil-nix-daemon:kind-upgrade
+          convert_image anvil "docker-archive:$(<paths/anvil)" docker-archive:image-artifacts/anvil-image.tar:ghcr.io/blogle/anvil:kind-e2e & anvil_convert_pid=$!
+          convert_image sandbox "nix:$(<paths/sandbox)" docker-archive:image-artifacts/anvil-sandbox-image.tar:ghcr.io/blogle/anvil-sandbox:kind-e2e & sandbox_convert_pid=$!
+          convert_image daemon "nix:$(<paths/daemon)" docker-archive:image-artifacts/anvil-nix-daemon-image.tar:ghcr.io/blogle/anvil-nix-daemon:kind-e2e & daemon_convert_pid=$!
+          convert_image upgrade "nix:$(<paths/upgrade)" docker-archive:image-artifacts/anvil-nix-daemon-upgrade-test-image.tar:ghcr.io/blogle/anvil-nix-daemon:kind-upgrade & upgrade_convert_pid=$!
+          convert_failed=0
+          for pid in "$anvil_convert_pid" "$sandbox_convert_pid" "$daemon_convert_pid" "$upgrade_convert_pid"; do
+            wait "$pid" || convert_failed=1
+          done
+          if [ "$convert_failed" -ne 0 ]; then
+            echo 'one or more OCI image conversions failed' >&2
+            exit 1
+          fi
+          for name in anvil sandbox daemon upgrade; do
+            while IFS= read -r timing; do
+              printf '%s\n' "$timing" >> image-build-timings.txt
+            done < "image-build-timings-$name.txt"
+            rm "image-build-timings-$name.txt"
+          done
 
-          (cd image-artifacts && sha256sum *.tar > SHA256SUMS)
+          (cd image-artifacts && sha256sum -- *.tar > SHA256SUMS)
+          # shellcheck disable=SC2016
           nix develop .#kind-ci --command bash -c '
             set -euo pipefail
             cd image-artifacts
@@ -146,28 +147,6 @@ jobs:
               printf "%s %s\n" "$image" "$actual"
             done
           ' | tee image-report.txt
-          cache_export_start=$SECONDS
-          nix --option build-users-group "" path-info --recursive \
-            .#anvil-image-ci .#anvil-ci-release-cargo-artifacts > "$cache_dir/paths.new"
-          cache_nar_bytes="$(nix --option build-users-group "" path-info --json --recursive \
-            .#anvil-image-ci .#anvil-ci-release-cargo-artifacts \
-            | jq '[.[] | .narSize] | add // 0')"
-          printf 'anvil-cache-nar-bytes=%s\n' "$cache_nar_bytes" | tee -a image-build-timings.txt
-          if [ "$cache_nar_bytes" -le 2147483648 ]; then
-            nix --option build-users-group "" copy --no-check-sigs --to "file://$cache_dir" $(<"$cache_dir/paths.new")
-            mv "$cache_dir/paths.new" "$cache_dir/paths"
-          else
-            rm -rf "$cache_dir"
-            printf '%s\n' 'anvil-cache-export=skipped (over 2 GiB bound)' | tee -a image-build-timings.txt
-          fi
-          printf 'anvil-cache-export-seconds=%s\n' "$((SECONDS - cache_export_start))" | tee -a image-build-timings.txt
-          (cd image-artifacts && sha256sum *.tar > SHA256SUMS)
-      - name: Save targeted Anvil image cache
-        if: success()
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ runner.temp }}/anvil-image-cache
-          key: ${{ runner.os }}-anvil-image-ci-${{ hashFiles('flake.lock', 'Cargo.lock') }}-${{ hashFiles('flake.nix', 'Cargo.toml', 'crates/**', 'web/**', 'nix/rust.nix', 'nix/images.nix') }}
       - uses: actions/upload-artifact@v4
         with:
           name: anvil-pr-image-archives
@@ -211,15 +190,21 @@ jobs:
     if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'mergify/merge-queue/')
     needs: pr-artifacts
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: anvil-pr-image-archives
           path: image-artifacts
-      - uses: cachix/install-nix-action@v31
+      - uses: DeterminateSystems/nix-installer-action@v19
+      - uses: Mic92/hestia@v3.1.0
         with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          version: v3.1.0
+          no-closure: true
+          upstream-cache-filter: true
       - name: Isolated Agent Sandbox Kubernetes lane
         run: |
           time ANVIL_KIND_ARTIFACT_DIR="$GITHUB_WORKSPACE/image-artifacts" \
@@ -257,19 +242,25 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v19
+      - uses: Mic92/hestia@v3.1.0
+        with:
+          version: v3.1.0
+          no-closure: true
+          upstream-cache-filter: true
       - name: Run Nix checks
-        run: time nix --option build-users-group "" flake check
+        run: time nix flake check
       - name: Build production images
         run: |
-          nix --option build-users-group "" build .#anvil-image -o result-anvil
+          nix build .#anvil-image -o result-anvil
           docker load < result-anvil
-          nix --option build-users-group "" run .#anvil-sandbox-image.copyToDockerDaemon
-          nix --option build-users-group "" run .#anvil-nix-daemon-image.copyToDockerDaemon
+          nix run .#anvil-sandbox-image.copyToDockerDaemon
+          nix run .#anvil-nix-daemon-image.copyToDockerDaemon
           docker image inspect anvil:dev >/dev/null
           docker image inspect ghcr.io/blogle/anvil-sandbox:main >/dev/null
           docker image inspect ghcr.io/blogle/anvil-nix-daemon:main >/dev/null
