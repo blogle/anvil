@@ -5920,7 +5920,8 @@ fn build_activity(
         }
     }
     events.sort_by(|left, right| left.at.cmp(&right.at).then_with(|| left.id.cmp(&right.id)));
-    let event_capacity = ACTIVITY_EVENT_LIMIT.saturating_sub(lifecycle.len());
+    // Primary transcript retention is independent from Trail's diagnostic lifecycle rows.
+    let event_capacity = ACTIVITY_EVENT_LIMIT;
     if events.len() > event_capacity {
         events.drain(..events.len() - event_capacity);
         if let Some(window) = event_window.as_mut() {
@@ -6115,58 +6116,23 @@ fn bound_activity_timeline(
     lifecycle: &mut Vec<LifecycleEvent>,
     window: &mut Option<ActivityEventWindow>,
 ) {
-    let total = events.len() + lifecycle.len();
-    if total <= ACTIVITY_EVENT_LIMIT {
-        return;
+    events.sort_by(|left, right| left.at.cmp(&right.at).then_with(|| left.id.cmp(&right.id)));
+    if events.len() > ACTIVITY_EVENT_LIMIT {
+        events.drain(..events.len() - ACTIVITY_EVENT_LIMIT);
+        window
+            .get_or_insert(ActivityEventWindow {
+                message_limit: ACTIVITY_MESSAGE_LIMIT as u32,
+                returned_messages: 0,
+                loaded_messages: 0,
+                next_cursor: None,
+                truncated: false,
+            })
+            .truncated = true;
     }
-    let mut order = events
-        .iter()
-        .enumerate()
-        .map(|(index, event)| (event.at.clone(), event.id.clone(), false, index))
-        .chain(lifecycle.iter().enumerate().map(|(index, event)| {
-            (
-                event.at.clone(),
-                format!(
-                    "{}:{}:{index}",
-                    event.kind,
-                    event.detail.as_deref().unwrap_or_default()
-                ),
-                true,
-                index,
-            )
-        }))
-        .collect::<Vec<_>>();
-    order.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    let mut keep_events = std::collections::HashSet::new();
-    let mut keep_lifecycle = std::collections::HashSet::new();
-    for (_, _, is_lifecycle, index) in order.into_iter().skip(total - ACTIVITY_EVENT_LIMIT) {
-        if is_lifecycle {
-            keep_lifecycle.insert(index);
-        } else {
-            keep_events.insert(index);
-        }
+    // Trail diagnostics have a separate retention budget from conversation and tool events.
+    if lifecycle.len() > ACTIVITY_EVENT_LIMIT {
+        lifecycle.drain(..lifecycle.len() - ACTIVITY_EVENT_LIMIT);
     }
-    let mut index = 0;
-    events.retain(|_| {
-        let keep = keep_events.contains(&index);
-        index += 1;
-        keep
-    });
-    let mut index = 0;
-    lifecycle.retain(|_| {
-        let keep = keep_lifecycle.contains(&index);
-        index += 1;
-        keep
-    });
-    window
-        .get_or_insert(ActivityEventWindow {
-            message_limit: ACTIVITY_MESSAGE_LIMIT as u32,
-            returned_messages: 0,
-            loaded_messages: 0,
-            next_cursor: None,
-            truncated: false,
-        })
-        .truncated = true;
 }
 
 #[derive(Clone)]
@@ -9759,19 +9725,38 @@ mod tests {
             .collect::<Vec<_>>();
         let mut window = None;
         bound_activity_timeline(&mut events, &mut lifecycle, &mut window);
-        assert_eq!(events.len() + lifecycle.len(), ACTIVITY_EVENT_LIMIT);
-        assert!(window.unwrap().truncated);
-        assert!(
-            lifecycle
-                .first()
-                .unwrap()
-                .detail
-                .as_deref()
-                .unwrap()
-                .parse::<usize>()
-                .unwrap()
-                >= 100
+        assert_eq!(
+            events.len(),
+            10,
+            "lifecycle diagnostics must not consume transcript capacity"
         );
+        assert_eq!(lifecycle.len(), ACTIVITY_EVENT_LIMIT);
+        assert!(
+            window.is_none(),
+            "lifecycle truncation is not transcript truncation"
+        );
+        assert_eq!(lifecycle.first().unwrap().detail.as_deref(), Some("100"));
+
+        let mut oversized_events = (0..ACTIVITY_EVENT_LIMIT + 1)
+            .map(|index| ActivityEvent {
+                id: format!("tool:{index}"),
+                at: format!("2026-01-01T00:00:{index:04}Z"),
+                kind: "tool".into(),
+                title: "Tool".into(),
+                tool: Some("read".into()),
+                detail: None,
+                status: Some("completed".into()),
+            })
+            .collect::<Vec<_>>();
+        let mut no_lifecycle = Vec::new();
+        let mut transcript_window = None;
+        bound_activity_timeline(
+            &mut oversized_events,
+            &mut no_lifecycle,
+            &mut transcript_window,
+        );
+        assert_eq!(oversized_events.len(), ACTIVITY_EVENT_LIMIT);
+        assert!(transcript_window.unwrap().truncated);
     }
 
     #[test]
