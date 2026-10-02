@@ -122,7 +122,7 @@ let
       pkgs.gh pkgs.curl pkgs.jq pkgs.kubectl pkgs.kustomize pkgs.nix pkgs.nodejs
       pkgs.process-compose pkgs.watchexec nix2containerPkgs.skopeo-nix2container pkgs.umoci pkgs.crun pkgs.kind pkgs.util-linux
       opencode.packages.${pkgs.system}.default
-    ];
+    ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.chromium ];
     shellHook = ''
       export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$PWD/target}"
       if [ -z "''${CARGO_HOME:-}" ]; then

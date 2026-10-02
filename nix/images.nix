@@ -1,10 +1,11 @@
-{ pkgs, rust }:
+{ pkgs, rust, frontend }:
 
 let
   mkAnvilImage = {
     name,
     tag,
     binaries,
+    webAssets,
   }:
     pkgs.dockerTools.buildLayeredImage {
       inherit name tag;
@@ -13,10 +14,14 @@ let
         binaries.anvilMcp
         binaries.anvilRouter
         pkgs.cacert
+        webAssets
       ];
       config = {
         Cmd = [ "/bin/anvild" ];
-        Env = [ "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt" ];
+        Env = [
+          "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+          "ANVIL_WEB_DIR=${webAssets}"
+        ];
       };
     };
 in
@@ -25,6 +30,7 @@ in
     name = "anvil";
     tag = "dev";
     binaries = rust.releaseBinaries;
+    webAssets = frontend;
   };
 
   # This image intentionally has the same runtime filesystem and config as
@@ -33,5 +39,6 @@ in
     name = "anvil-ci";
     tag = "dev";
     binaries = rust.ciReleaseBinaries;
+    webAssets = frontend;
   };
 }
