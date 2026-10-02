@@ -48,6 +48,14 @@
         packages.anvil-nix-daemon-image = sandbox.daemonImage;
         packages.anvil-nix-daemon-upgrade-test-image = sandbox.daemonUpgradeImage;
         packages.anvil-nix-daemon-upgrade-test-canary = sandbox.daemonUpgradeCanary;
+        packages.shared-nix-directory-source-smoke = pkgs.stdenv.mkDerivation {
+          pname = "anvil-shared-nix-directory-source-smoke";
+          version = "1";
+          src = ./tests/nix-directory-source;
+          installPhase = ''
+            install -Dm644 fixture.txt "$out/fixture.txt"
+          '';
+        };
         packages.anvil-nix-daemon-image-push = sandbox.daemonImagePush;
         packages.anvil-sandbox-image-push = sandbox.sandboxImagePush;
         packages.import-sandbox-image-k3s = sandbox.importSandboxImageK3s;
