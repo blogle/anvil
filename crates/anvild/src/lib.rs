@@ -1,5 +1,6 @@
 //! HTTP control plane for Anvil Kubernetes sandboxes.
 
+mod git_diff;
 mod github;
 mod local;
 pub mod store;
@@ -105,7 +106,7 @@ fn sandbox_manifest(
     workspace_init: Value,
     env: Vec<Value>,
 ) -> Value {
-    let container = json!({"name":"sandbox","image":config.image,"ports":[{"name":"opencode","containerPort":config.opencode_port}],"env":env,"volumeMounts":[{"name":"workspace","mountPath":"/home/anvil"},{"name":"shared-profile","mountPath":"/anvil/profile"},shared_nix_store_mount(),shared_nix_socket_mount()]});
+    let container = json!({"name":"sandbox","image":config.image,"ports":[{"name":"opencode","containerPort":config.opencode_port},{"name":"files-diff","containerPort":4097}],"env":env,"volumeMounts":[{"name":"workspace","mountPath":"/home/anvil"},{"name":"shared-profile","mountPath":"/anvil/profile"},shared_nix_store_mount(),shared_nix_socket_mount()]});
     json!({"apiVersion":"agents.x-k8s.io/v1beta1","kind":"Sandbox","metadata":{"name":name,"namespace":config.namespace,"labels":labels,"annotations":annotations},"spec":{"service":true,"podTemplate":{"spec":{"securityContext":{"fsGroup":1000},"initContainers":[workspace_init],"containers":[container],"volumes":[{"name":"shared-profile","persistentVolumeClaim":{"claimName":config.profile_pvc}},shared_nix_volume(&config.nix_pvc)]}},"volumeClaimTemplates":[{"metadata":{"name":"workspace"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":config.workspace_size}}}}]}})
 }
 
@@ -398,12 +399,6 @@ pub struct RecoveryRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct DiffQuery {
-    #[serde(rename = "messageID")]
-    pub message_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct ProviderLoginRequest {
     pub method: Option<String>,
     #[serde(default)]
@@ -579,6 +574,11 @@ pub trait SandboxApi: Send + Sync + 'static {
             .into_iter()
             .find(|record| record.session.id == id)
             .ok_or(ServiceError::NotFound)
+    }
+    async fn working_tree_diff(&self, _id: &str) -> Result<Value, ServiceError> {
+        Ok(
+            json!({"status":"unavailable","message":"This backend cannot access the worker workspace."}),
+        )
     }
     async fn set_opencode_session(&self, _id: &str, _oc: &str) -> Result<(), ServiceError> {
         Ok(())
@@ -1327,6 +1327,7 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
             .get(&annotation_key(config, "base-ref"))
             .cloned()
             .unwrap_or_default(),
+        base_revision: a.get(&annotation_key(config, "base-revision")).cloned(),
         work_branch: a
             .get(&annotation_key(config, "work-branch"))
             .cloned()
@@ -1409,6 +1410,33 @@ impl SandboxApi for KubeSandboxApi {
                 .collect()
         })
         .map_err(|e| ServiceError::Kubernetes(e.to_string()))
+    }
+    async fn working_tree_diff(&self, id: &str) -> Result<Value, ServiceError> {
+        let record = self.get(id).await?;
+        let host = if record.session.service.is_empty() {
+            format!("anvil-{}", id)
+        } else {
+            record.session.service
+        };
+        let response = match reqwest::Client::new()
+            .get(format!("http://{host}:4097/v1/diff"))
+            .timeout(self.config.request_timeout)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(
+                    json!({"status":"unavailable","message":format!("Worker diff data is unavailable: {error}")}),
+                )
+            }
+        };
+        match response.json().await {
+            Ok(value) => Ok(value),
+            Err(error) => Ok(
+                json!({"status":"unavailable","message":format!("Worker returned invalid diff data: {error}")}),
+            ),
+        }
     }
     async fn create(
         &self,
@@ -1529,6 +1557,7 @@ impl SandboxApi for KubeSandboxApi {
             project: r.project.clone(),
             repository: r.repository.clone(),
             base_ref: r.base_ref.clone(),
+            base_revision: None,
             work_branch: branch_name(&SessionId::parse(id).unwrap()),
             model: r.model.clone(),
             opencode_session_id: None,
@@ -1604,6 +1633,26 @@ impl SandboxApi for KubeSandboxApi {
             annotation_key(&self.config, "ready-at"),
             Value::String(at.to_owned()),
         );
+        let record = self.get(id).await?;
+        if record.session.base_revision.is_none() {
+            let host = if record.session.service.is_empty() {
+                format!("anvil-{id}")
+            } else {
+                record.session.service
+            };
+            let revision = capture_worker_base_revision(
+                &reqwest::Client::new(),
+                &format!("http://{host}:4097/v1/base"),
+                20,
+                Duration::from_millis(250),
+            )
+            .await
+            .map_err(ServiceError::OpenCode)?;
+            annotations.insert(
+                annotation_key(&self.config, "base-revision"),
+                Value::String(revision),
+            );
+        }
         self.patch(id, json!({"metadata":{"annotations":annotations}}))
             .await
     }
@@ -1666,6 +1715,38 @@ impl SandboxApi for KubeSandboxApi {
         self.patch(id, json!({"metadata":{"annotations":annotations}}))
             .await
     }
+}
+
+async fn capture_worker_base_revision(
+    client: &reqwest::Client,
+    url: &str,
+    attempts: usize,
+    retry_delay: Duration,
+) -> Result<String, String> {
+    for attempt in 0..attempts {
+        if let Ok(response) = client.get(url).timeout(Duration::from_secs(2)).send().await {
+            if response.status().is_success() {
+                if let Ok(body) = response.json::<Value>().await {
+                    if body["status"] == "ready" {
+                        if let Some(revision) = body["base_revision"].as_str() {
+                            if matches!(revision.len(), 40 | 64)
+                                && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            {
+                                return Ok(revision.to_ascii_lowercase());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(retry_delay).await;
+        }
+    }
+    Err(
+        "worker became ready without publishing its recorded base revision after retries; refusing to mark the session as a legacy unknown-base session"
+            .into(),
+    )
 }
 impl KubeSandboxApi {
     async fn patch(&self, id: &str, v: Value) -> Result<(), ServiceError> {
@@ -1953,7 +2034,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sessions/:id/complete", post(complete))
         .route("/v1/sessions/:id/rebind", post(rebind))
         .route("/v1/sessions/:id/status", get(status))
-        .route("/v1/sessions/:id/diff", get(diff))
+        .route("/v1/sessions/:id/diff", get(working_tree_diff))
         .route("/v1/sessions/:id/abort", post(abort))
         .route("/v1/sessions/:id/suspend", post(suspend))
         .route("/v1/sessions/:id/resume", post(resume))
@@ -1966,6 +2047,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/assets/app.js", get(asset_js))
         .route("/assets/ui-state.js", get(asset_ui_state_js))
+        .route("/assets/files-state.js", get(asset_files_state_js))
+        .route("/assets/files-view.js", get(asset_files_view_js))
         .route("/assets/styles.css", get(asset_css))
         .route("/", get(index))
         .route("/v1/providers", get(providers))
@@ -3108,6 +3191,28 @@ async fn asset_ui_state_js() -> Response {
             "text/javascript; charset=utf-8",
         )],
         include_str!("../../../web/ui-state.js"),
+    )
+        .into_response()
+}
+
+async fn asset_files_state_js() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/javascript; charset=utf-8",
+        )],
+        include_str!("../../../web/files-state.js"),
+    )
+        .into_response()
+}
+
+async fn asset_files_view_js() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/javascript; charset=utf-8",
+        )],
+        include_str!("../../../web/files-view.js"),
     )
         .into_response()
 }
@@ -5093,60 +5198,11 @@ async fn status(
         "opencode": selected,
     })))
 }
-async fn diff(
+async fn working_tree_diff(
     Path(id): Path<String>,
-    Query(q): Query<DiffQuery>,
     State(s): State<AppState>,
 ) -> Result<Json<Value>, ServiceError> {
-    let session = reconcile_binding(&s, &id).await?;
-    if !binding_is_usable(&session) {
-        return Err(ServiceError::Recovery(
-            session
-                .session_binding_error
-                .unwrap_or_else(|| "exact OpenCode session recovery is unavailable".into()),
-        ));
-    }
-    let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
-    let opencode_session_id = session
-        .opencode_session_id
-        .as_deref()
-        .ok_or(ServiceError::NotFound)?;
-    let mut result = op
-        .request(
-            &format!(
-                "session/{opencode_session_id}/diff{}",
-                q.message_id
-                    .as_deref()
-                    .map(|id| format!("?messageID={id}"))
-                    .unwrap_or_default()
-            ),
-            reqwest::Method::GET,
-            None,
-        )
-        .await?;
-    if result.as_array().is_some_and(Vec::is_empty) {
-        let messages = op
-            .request(
-                &format!("session/{opencode_session_id}/message"),
-                reqwest::Method::GET,
-                None,
-            )
-            .await?;
-        let diffs = message_items(messages)
-            .into_iter()
-            .filter_map(|message| {
-                let info = message.get("info").unwrap_or(&message);
-                info.pointer("/summary/diffs")
-                    .and_then(Value::as_array)
-                    .cloned()
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-        if !diffs.is_empty() {
-            result = Value::Array(diffs);
-        }
-    }
-    Ok(Json(result))
+    Ok(Json(s.kube.working_tree_diff(&id).await?))
 }
 async fn abort(p: Path<String>, s: State<AppState>) -> Result<Json<Value>, ServiceError> {
     proxy(p, s, "abort", reqwest::Method::POST, None).await
@@ -8066,6 +8122,7 @@ mod tests {
             project: "demo".into(),
             repository: "https://github.com/example/demo.git".into(),
             base_ref: "main".into(),
+            base_revision: None,
             work_branch: "anvil/demo-12345678".into(),
             model: None,
             opencode_session_id: Some("ses_demo".into()),
@@ -8731,6 +8788,7 @@ mod tests {
         );
 
         let response = app
+            .clone()
             .oneshot(
                 Request::get("/assets/ui-state.js")
                     .body(Body::empty())
@@ -8743,6 +8801,24 @@ mod tests {
             response.headers()["content-type"],
             "text/javascript; charset=utf-8"
         );
+
+        let response = app
+            .oneshot(
+                Request::get("/assets/files-state.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("createFilesDiffState"));
     }
 
     #[test]
@@ -9645,5 +9721,42 @@ mod tests {
         assert_eq!(body["theme"], "dark");
         assert_eq!(body["provider"]["openai"]["api_key"], "[redacted]");
         assert_eq!(body["nested"][0]["access_token"], "[redacted]");
+    }
+
+    async fn base_available_after_startup(
+        State(attempts): State<Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> Json<Value> {
+        let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if attempt < 2 {
+            Json(json!({"status":"unavailable","message":"worker startup"}))
+        } else {
+            Json(
+                json!({"status":"ready","base_revision":"0123456789012345678901234567890123456789"}),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_base_capture_retries_until_worker_endpoint_is_listening() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/base", get(base_available_after_startup))
+            .with_state(attempts.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let revision = capture_worker_base_revision(
+            &reqwest::Client::new(),
+            &format!("http://{address}/v1/base"),
+            5,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(revision, "0123456789012345678901234567890123456789");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        server.abort();
     }
 }

@@ -1,4 +1,6 @@
 import { applyServerRefresh, detailRenderSignature, formatElapsedValue, operatorState, parseRoute, patchSessionRows, reconcileSessionRows, sessionRowMarkup, sessionUiState, updateSessionRowElapsed } from "./ui-state.js"
+import { renderFilesResult, updateFilesPanel } from "./files-view.js"
+import { createFilesDiffState, FILE_DIFF_REFRESH_MS, isFilesTabActive } from "./files-state.js"
 
 const app = document.querySelector("#app")
 const state = {
@@ -11,6 +13,7 @@ const state = {
   loading: true,
   refreshInFlight: false,
   refreshGeneration: 0,
+  fileDiffs: null,
 }
 
 function routeFor(sessionId) {
@@ -30,7 +33,9 @@ function navigate(sessionId, push = true) {
 }
 
 function applyRoute() {
+  const previous = state.selected
   state.selected = parseRoute(location.hash)
+  if (previous && previous !== state.selected) state.fileDiffs.invalidate(previous)
   document.querySelector(".app-shell")?.classList.toggle("mobile-detail", Boolean(state.selected))
   updateSidebar()
   updateDetail()
@@ -41,6 +46,7 @@ const api = async (path, options) => {
   if (!response.ok) throw new Error((await response.json().catch(() => null))?.error?.message || `Request failed (${response.status})`)
   return response.status === 204 ? null : response.json()
 }
+state.fileDiffs = createFilesDiffState((id) => api(`/v1/sessions/${encodeURIComponent(id)}/diff`))
 
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character])
 const timestamp = (value) => {
@@ -226,8 +232,8 @@ function renderDetail(activity, session) {
      <div class="detail-header"><div><div class="eyebrow">Session overview</div><h2>${escapeHtml(titleFor(session))}</h2><div class="detail-subtitle"><span>${escapeHtml(session.project)}</span><span>·</span><code>${escapeHtml(session.work_branch)}</code></div><div class="detail-status state-${escapeHtml(status)}"><span class="status-dot"></span><strong>${stateLabel(status)}</strong><span>${activity?.work_state_changed_at ? `· <span data-live-state-elapsed="${escapeHtml(activity.work_state_changed_at)}">${formatStateElapsed(activity)}</span>` : ""}</span></div></div></div>
      ${activity?.work_state_summary ? `<div class="work-summary"><div class="eyebrow">Work summary</div>${escapeHtml(activity.work_state_summary)}</div>` : ""}
      ${renderActions(activity, session, attachCommand)}
-     <div class="tabs" role="tablist" aria-label="Session detail"><button id="logs-tab" class="tab" data-tab="logs" data-focus-key="tab-logs" role="tab" aria-controls="logs-panel">Logs</button><button id="runtime-tab" class="tab" data-tab="runtime" data-focus-key="tab-runtime" role="tab" aria-controls="runtime-panel">Runtime</button></div>
-     <div id="logs-panel" role="tabpanel" tabindex="0" aria-labelledby="logs-tab">${renderLogs(activity)}</div><div id="runtime-panel" role="tabpanel" tabindex="0" aria-labelledby="runtime-tab">${renderRuntime(activity, session)}</div>
+      <div class="tabs" role="tablist" aria-label="Session detail"><button id="logs-tab" class="tab" data-tab="logs" data-focus-key="tab-logs" role="tab" aria-controls="logs-panel">Logs</button><button id="files-tab" class="tab" data-tab="files" data-focus-key="tab-files" role="tab" aria-controls="files-panel">Files</button><button id="runtime-tab" class="tab" data-tab="runtime" data-focus-key="tab-runtime" role="tab" aria-controls="runtime-panel">Runtime</button></div>
+      <div id="logs-panel" role="tabpanel" tabindex="0" aria-labelledby="logs-tab">${renderLogs(activity)}</div><div id="files-panel" role="tabpanel" tabindex="0" aria-labelledby="files-tab">${renderFiles(session)}</div><div id="runtime-panel" role="tabpanel" tabindex="0" aria-labelledby="runtime-tab">${renderRuntime(activity, session)}</div>
   </div>`
 }
 
@@ -243,7 +249,7 @@ function updateDetailTab() {
   const detail = document.querySelector("#detail")
   const ui = selectedUi()
   if (!detail || !ui) return
-  const active = ui.tab === "runtime" ? "runtime" : "logs"
+  const active = ["runtime", "files"].includes(ui.tab) ? ui.tab : "logs"
   for (const tab of detail.querySelectorAll("[role=tab]")) {
     const selected = tab.dataset.tab === active
     tab.classList.toggle("active", selected)
@@ -252,6 +258,23 @@ function updateDetailTab() {
   }
   detail.querySelector("#logs-panel")?.toggleAttribute("hidden", active !== "logs")
   detail.querySelector("#runtime-panel")?.toggleAttribute("hidden", active !== "runtime")
+  detail.querySelector("#files-panel")?.toggleAttribute("hidden", active !== "files")
+}
+
+function renderFiles(session) {
+  return renderFilesResult(state.fileDiffs.get(session.id))
+}
+
+function refreshSelectedFiles(force = false) {
+  const sessionId = state.selected
+  const ui = selectedUi()
+  const session = state.sessions.find((item) => item.id === sessionId)
+  if (document.visibilityState === "hidden" || !isFilesTabActive(session, ui?.tab)) return
+  state.fileDiffs.refresh(sessionId, { force }).then(({ changed, result }) => {
+    if (!changed || state.selected !== sessionId || selectedUi()?.tab !== "files") return
+    const panel = document.querySelector("#files-panel")
+    if (panel) updateFilesPanel(panel, result)
+  })
 }
 
 function relativeTime(value) {
@@ -303,8 +326,11 @@ async function handleClick(event) {
   if (tab) {
     const ui = selectedUi()
     if (ui) {
+      const previousTab = ui.tab
       ui.tab = tab.dataset.tab
+      if (previousTab === "files" && ui.tab !== "files") state.fileDiffs.invalidate(state.selected)
       updateDetailTab()
+      if (ui.tab === "files") refreshSelectedFiles(true)
     }
     return
   }
@@ -391,10 +417,11 @@ function updateClocks() {
 
 window.addEventListener("hashchange", applyRoute)
 window.addEventListener("popstate", applyRoute)
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") refresh() })
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { refresh(); refreshSelectedFiles(true) } })
 ensureShell()
 updateSidebar()
 updateDetail()
 refresh()
 setInterval(refresh, 4000)
+setInterval(() => refreshSelectedFiles(), FILE_DIFF_REFRESH_MS)
 setInterval(updateClocks, 1000)

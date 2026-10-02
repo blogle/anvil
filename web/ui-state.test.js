@@ -1,6 +1,9 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { applyServerRefresh, detailRenderSignature, formatElapsedValue, operatorState, parseRoute, reconcileSessionRows, sessionUiState } from "./ui-state.js"
+import { readFile } from "node:fs/promises"
+import { renderFilesResult, updateFilesPanel } from "./files-view.js"
+import { createFilesDiffState, FILE_DIFF_REFRESH_MS, isFilesTabActive } from "./files-state.js"
 
 test("poll payload preserves local interaction state and selected session", () => {
   const activities = new Map([["demo-12345678", {
@@ -113,4 +116,86 @@ test("detail interaction state is scoped to each session", () => {
   assert.deepEqual(second.expandedPrompts, new Set())
   assert.equal(second.tab, "logs")
   assert.equal(second.focusKey, null)
+})
+
+test("Files tab renderer covers empty, unavailable, statuses, binary and large files safely", async () => {
+  const app = await readFile(new URL("./app.js", import.meta.url), "utf8")
+  assert.match(app, /id="files-tab"/)
+  assert.match(renderFilesResult({ status: "loading" }), /Loading file changes/)
+  assert.match(renderFilesResult({ status: "unavailable", message: "No recorded worker base" }), /Files unavailable[\s\S]*No recorded worker base/)
+  assert.match(renderFilesResult({ status: "ready", diff: { base_revision: "abc", files: [] } }), /No file changes/)
+  const html = renderFilesResult({ status: "ready", diff: { files: [
+    { path: "added<.txt", status: "added", additions: 1, deletions: 0, diff: "+<script>" },
+    { path: "renamed.txt", old_path: "old.txt", status: "renamed", additions: 0, deletions: 0, diff: "rename" },
+    { path: "image.png", status: "modified", binary: true },
+    { path: "huge.txt", status: "modified", too_large: true },
+  ] } })
+  assert.match(html, /added&lt;\.txt/)
+  assert.match(html, /&lt;script&gt;/)
+  assert.match(html, /old\.txt → renamed\.txt/)
+  assert.match(html, /Binary file/)
+  assert.match(html, /Diff too large/)
+})
+
+test("Files diff refresh exposes new worktree data without a page reload", async () => {
+  let now = 1000
+  let request = 0
+  const files = createFilesDiffState(async () => ({
+    status: "ready",
+    diff: { files: [{ path: `change-${++request}.txt`, status: "added", diff: `+version ${request}` }] },
+  }), () => now)
+  const first = await files.refresh("session", { force: true })
+  assert.equal(first.changed, true)
+  const firstMarkup = renderFilesResult(first.result)
+  assert.match(firstMarkup, /change-1\.txt/)
+
+  now += FILE_DIFF_REFRESH_MS
+  assert.equal(files.shouldRefresh("session"), true)
+  const second = await files.refresh("session")
+  assert.equal(second.changed, true)
+  assert.match(renderFilesResult(files.get("session")), /change-2\.txt/)
+})
+
+test("stale and out-of-order Files diff responses cannot replace the latest result", async () => {
+  const pending = []
+  const files = createFilesDiffState(() => new Promise((resolve) => pending.push(resolve)))
+  const olderRequest = files.refresh("session", { force: true })
+  files.invalidate("session")
+  const newerRequest = files.refresh("session", { force: true })
+  pending[1]({ status: "ready", diff: { files: [{ path: "new.txt", status: "added", diff: "+new" }] } })
+  await newerRequest
+  pending[0]({ status: "ready", diff: { files: [{ path: "old.txt", status: "added", diff: "+old" }] } })
+  assert.equal((await olderRequest).stale, true)
+  assert.equal(files.get("session").diff.files[0].path, "new.txt")
+})
+
+test("identical diff updates preserve panel identity and nested scroll position", () => {
+  class Panel {
+    dataset = {}
+    nodes = []
+    writes = 0
+    set innerHTML(value) {
+      this.writes++
+      this.markup = value
+      this.content = { scrollTop: 0 }
+      this.nodes = [{ dataset: { fileKey: '[null,"same.txt"]' }, querySelector: () => this.content }]
+    }
+    querySelectorAll() { return this.nodes }
+  }
+  const panel = new Panel()
+  const result = { status: "ready", diff: { files: [{ path: "same.txt", status: "modified", diff: "patch" }] } }
+  assert.equal(updateFilesPanel(panel, result), true)
+  const node = panel.nodes[0]
+  const content = panel.content
+  content.scrollTop = 91
+  assert.equal(updateFilesPanel(panel, structuredClone(result)), false)
+  assert.equal(panel.writes, 1)
+  assert.equal(panel.nodes[0], node)
+  assert.equal(panel.content, content)
+  assert.equal(panel.content.scrollTop, 91)
+})
+
+test("completed sessions continue to qualify for final Files data while selected", () => {
+  assert.equal(isFilesTabActive({ id: "done-session", work_state: "completed", artifacts_exist: true }, "files"), true)
+  assert.equal(isFilesTabActive({ id: "done-session", work_state: "completed", artifacts_exist: true }, "logs"), false)
 })
