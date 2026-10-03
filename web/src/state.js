@@ -3,11 +3,25 @@ import { computed, signal } from '@preact/signals'
 export const sessions = signal([])
 export const activities = signal(new Map())
 export const selected = signal(routeFromHash())
-export const filter = signal('all')
+export const search = signal('')
+export const environmentFilter = signal('')
+export const executionFilter = signal('')
 export const loading = signal(true)
 export const error = signal(null)
 export const polling = signal(false)
-export const visibleSessions = computed(() => sessions.value.filter((session) => filter.value === 'all' || statusFor(activities.value.get(session.id)) === filter.value))
+export const visibleSessions = computed(() => sessions.value.filter((session) => matchesSessionFilters(session, activities.value.get(session.id), {
+  search: search.value,
+  environment: environmentFilter.value,
+  execution: executionFilter.value,
+})))
+export const environmentOptions = computed(() => filterValues(
+  sessions.value.flatMap((session) => [session.environment_state, activities.value.get(session.id)?.environment_state]),
+  environmentFilter.value,
+))
+export const executionOptions = computed(() => filterValues(
+  sessions.value.flatMap((session) => [session.execution_state, activities.value.get(session.id)?.execution_state]),
+  executionFilter.value,
+))
 export const uiBySession = new Map()
 
 export function sessionUI(id) {
@@ -33,20 +47,28 @@ export function navigate(id, push = true) {
   selected.value = routeFromHash()
 }
 
-export function statusFor(activity) {
-  if (!activity) return 'starting'
-  if (activity.environment_state === 'failed') return 'problem'
-  if (activity.environment_state === 'suspended') return 'stopped'
-  if (activity.environment_state === 'provisioning') return 'starting'
-  if (['failed', 'unavailable'].includes(activity.execution_state)) return 'problem'
-  if (activity.work_state === 'completed') return 'done'
-  if (activity.work_state === 'failed') return 'problem'
-  if (activity.execution_state === 'running') return 'working'
-  if (activity.execution_state === 'idle' || activity.work_state === 'ready_for_review') return 'ready-for-review'
-  return 'starting'
+export function environmentFor(session, activity) {
+  return activity?.environment_state || session.environment_state || 'unknown'
 }
 
-export const stateLabel = (state) => ({ working: 'Working', 'needs-input': 'Needs input', 'ready-for-review': 'Ready for review', done: 'Done', problem: 'Problem', stopped: 'Stopped', starting: 'Starting' }[state] || 'Starting')
+export function executionFor(session, activity) {
+  return activity?.execution_state || session.execution_state || 'unknown'
+}
+
+export function matchesSessionFilters(session, activity, filters) {
+  const query = String(filters.search || '').trim().toLocaleLowerCase()
+  const metadata = [session.project, session.name, session.id, session.repository, session.ref, session.base_ref, session.work_branch]
+    .filter(Boolean).join(' ').toLocaleLowerCase()
+  return (!query || metadata.includes(query))
+    && (!filters.environment || environmentFor(session, activity) === filters.environment)
+    && (!filters.execution || executionFor(session, activity) === filters.execution)
+}
+
+export function filterValues(values, selectedValue) {
+  const result = [...new Set(values.filter(Boolean))].sort()
+  if (selectedValue && !result.includes(selectedValue)) result.push(selectedValue)
+  return result
+}
 export const timestamp = (value) => {
   if (!value) return null
   const raw = String(value)
@@ -95,7 +117,7 @@ export async function refresh() {
     sessions.value = next
     activities.value = new Map(activityPairs.filter(([, activity]) => activity))
     const active = next.find((item) => item.id === selected.value)
-    if (selected.value && (!active || (filter.value !== 'all' && statusFor(activities.value.get(active.id)) !== filter.value))) navigate(null, false)
+    if (selected.value && (!active || !visibleSessions.value.some((item) => item.id === selected.value))) navigate(null, false)
     error.value = null
   } catch (cause) { error.value = cause.message }
   finally { loading.value = false; polling.value = false }
