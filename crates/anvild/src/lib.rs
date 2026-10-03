@@ -8819,7 +8819,7 @@ mod tests {
                 .split("/assets/")
                 .skip(1)
                 .filter_map(|part| {
-                    part.split(|character| character == '\"' || character == '\'')
+                    part.split(['\"', '\''])
                         .next()
                 })
                 .filter(|path| !path.is_empty())
