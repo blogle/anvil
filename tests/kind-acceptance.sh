@@ -198,7 +198,17 @@ kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anv
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-profile --timeout=180s
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-router --timeout=180s
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-nix-daemon --timeout=600s
-kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c 'test -s /nix/var/nix/db/db.sqlite && test -f /nix/var/nix/.anvil-bootstrap-complete && test -d /nix/var/nix/gcroots/anvil-baseline && nix store info >/dev/null'
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c '
+  test -s /nix/var/nix/db/db.sqlite
+  test -f /nix/var/nix/.anvil-bootstrap-complete
+  test -d /nix/var/nix/gcroots/anvil-baseline
+  grep -Fx "build-users-group = nixbld" /etc/nix/nix.conf
+  ! grep -Eq "^filter-syscalls[[:space:]]*=[[:space:]]*false" /etc/nix/nix.conf
+  nix store info >/dev/null
+  for path in /nix/var /nix/var/nix /nix/var/nix/builds; do
+    test "$(stat -c "%u:%g:%a" "$path")" = 0:0:755
+  done
+'
 
 # Verify the Anvil service account can manage only its namespaced Sandbox API.
 test "$(kubectl --kubeconfig "$kubeconfig" auth can-i --as=system:serviceaccount:anvil:anvild create sandboxes.agents.x-k8s.io -n anvil)" = yes
@@ -361,6 +371,11 @@ shared_path="$(agent_exec "$api_a_pod" nix build --no-link --print-out-paths --i
 [[ "$shared_path" = /nix/store/* ]]
 agent_exec "$api_a_pod" /bin/bash -c 'test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null' -- "$shared_path"
 agent_exec "$api_b_pod" /bin/bash -c 'test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null' -- "$shared_path"
+directory_source_path="$(agent_exec "$api_b_pod" /bin/bash -lc '
+  cd /home/anvil/workspace/anvil
+  nix build --no-link --print-out-paths .#shared-nix-directory-source-smoke
+')"
+agent_exec "$api_b_pod" /bin/bash -c 'test "$(cat "$1/fixture.txt")" = "directory source passed through the shared Nix daemon"' -- "$directory_source_path"
 if agent_exec "$api_b_pod" nix path-info "$upgrade_canary" >/dev/null 2>&1; then
   printf 'upgrade canary was unexpectedly present in the original baseline\n' >&2
   exit 1
@@ -417,8 +432,19 @@ while (( SECONDS < deadline )); do
 done
 test -n "$pod_name"
 
+# Recreate the old persistent-PVC state before restarting the daemon. The init
+# container must remove setgid rather than relying on a fresh volume.
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c '
+  chmod 2775 /nix/var /nix/var/nix /nix/var/nix/builds
+  test "$(stat -c "%u:%g:%a" /nix/var/nix/builds)" = 0:0:2775
+'
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout restart deployment/anvil-nix-daemon
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-nix-daemon --timeout=300s
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c '
+  for path in /nix/var /nix/var/nix /nix/var/nix/builds; do
+    test "$(stat -c "%u:%g:%a" "$path")" = 0:0:755
+  done
+'
 agent_exec "$api_b_pod" /bin/bash -c 'nix store info >/dev/null && test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null' -- "$shared_path"
 
 # Upgrade the baseline on the populated PVC; registration must merge into the
