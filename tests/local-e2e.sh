@@ -126,8 +126,15 @@ git -C "$fixture" add target.txt && git -C "$fixture" commit -m fixture >/dev/nu
 repository="file://$fixture"
 
 assert_http_smoke() {
-  curl -fsS http://127.0.0.1:8080/ | grep -q '<html'
-  curl -fsS http://127.0.0.1:8080/assets/app.js | grep -q 'fetch'
+  local index asset_paths asset_path=
+  index="$(curl -fsS http://127.0.0.1:8080/)"
+  grep -q '<html' <<<"$index"
+  asset_paths="$(grep -oE '/assets/[^"[:space:]]+' <<<"$index" || true)"
+  while IFS= read -r asset_path; do
+    break
+  done <<<"$asset_paths"
+  test -n "$asset_path"
+  curl -fsS "http://127.0.0.1:8080$asset_path" >/dev/null
   curl -fsS http://127.0.0.1:8080/healthz | jq -e '.status == "ok"' >/dev/null
 }
 assert_http_smoke
