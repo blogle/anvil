@@ -9,7 +9,7 @@ import { chromium } from '@playwright/test'
 test('production browser retains sessions, detail interactions, routes, and mobile layout', async () => {
   const session = { id: 'demo', project: 'Demo', work_branch: 'main', environment_state: 'ready', work_state: 'in_progress', created_at: '2026-09-19T11:00:00Z', sandbox: 'sandbox', repository: 'https://example.test/repo', base_ref: 'main' }
   const state = { summary: `Initial metadata ${'long summary '.repeat(500)}`, execution: 'running', changedAt: new Date(Date.now() - 1000).toISOString() }
-  const activity = () => ({ session, environment_state: 'ready', execution_state: state.execution, work_state: state.execution === 'idle' ? 'ready_for_review' : 'in_progress', work_state_changed_at: state.changedAt, work_state_summary: state.summary, attach_command: 'anvilctl sessions attach demo', lifecycle: [{ kind: 'created', at: '2026-09-19T11:00:00Z' }], requests: [{ id: 'request-1', number: 1, origin: 'operator', state: 'running', started_at: '2026-09-19T11:58:00Z', last_activity_at: '2026-09-19T11:59:00Z', prompt: `selection anchor ${'long prompt '.repeat(500)}` }] })
+  const activity = () => ({ session, environment_state: 'ready', execution_state: state.execution, work_state: state.execution === 'idle' ? 'ready_for_review' : 'in_progress', work_state_changed_at: state.changedAt, work_state_summary: state.summary, attach_command: 'anvilctl sessions attach demo', lifecycle: [{ id: 'created', kind: 'created', at: '2026-09-19T11:00:00Z' }, { id: 'run-started', kind: 'run_started', at: '2026-09-19T11:58:30Z' }, { id: 'turn-finished', kind: 'opencode_idle', at: '2026-09-19T12:01:00Z' }], requests: [{ id: 'request-1', number: 1, origin: 'operator', state: 'completed', started_at: '2026-09-19T11:58:00Z', completed_at: '2026-09-19T11:58:20Z', last_activity_at: '2026-09-19T11:58:20Z', prompt: `selection anchor ${'long prompt '.repeat(500)}` }, { id: 'request-2', number: 2, origin: 'operator', state: 'running', started_at: '2026-09-19T11:59:00Z', last_activity_at: '2026-09-19T12:00:00Z', prompt: 'second request prompt' }] })
   const server = createServer(async (request, response) => {
     const url = new URL(request.url, 'http://localhost')
     if (url.pathname === '/v1/sessions') {
@@ -35,6 +35,13 @@ test('production browser retains sessions, detail interactions, routes, and mobi
     await row.waitFor()
     await page.locator('.work-summary').waitFor()
     assert.equal(await page.locator('.session-status-label').count(), 1)
+    const timeline = page.locator('.timeline > .timeline-event')
+    assert.deepEqual(await timeline.evaluateAll((entries) => entries.map((entry) => entry.dataset.timelineItem === 'request' ? `request:${entry.dataset.requestNumber}` : `event:${entry.dataset.eventKind}`)), [
+      'event:created', 'request:1', 'event:run_started', 'request:2', 'event:opencode_idle',
+    ])
+    assert.deepEqual(await timeline.evaluateAll((entries) => entries.map((entry) => entry.querySelectorAll('.event-marker').length)), [1, 1, 1, 1, 1])
+    assert.equal(await timeline.locator('.request-card').count(), 2)
+    assert.equal(await timeline.locator('.request-card').first().evaluate((card) => getComputedStyle(card, '::before').content), 'none')
     const initialElapsed = await row.locator('.row-detail').textContent()
     await page.evaluate(() => {
       window.initialRow = document.querySelector('[data-session="demo"]')
@@ -62,7 +69,7 @@ test('production browser retains sessions, detail interactions, routes, and mobi
     const promptToggle = page.locator('.prompt-toggle')
     await promptToggle.scrollIntoViewIfNeeded()
     await promptToggle.click()
-    const prompt = page.locator('.prompt')
+    const prompt = page.locator('.prompt').first()
     await detail.evaluate((element) => { element.scrollTop = 80 })
     assert.ok(await detail.evaluate((element) => element.scrollHeight - element.clientHeight >= 80))
     assert.equal(await detail.evaluate((element) => element.scrollTop), 80)

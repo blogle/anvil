@@ -112,10 +112,13 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .event-request_failed .event-marker { background: var(--danger); box-shadow: 0 0 0 1px var(--danger); }
 .event-title { font-size: 13px; font-weight: 650; }
 .event-detail { margin-top: 6px; color: var(--text-secondary); font-size: 12px; line-height: 1.45; }
-.request-card { position: relative; margin: -2px 0 26px 96px; padding: 17px 18px 18px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
-.request-card::before { position: absolute; left: -29px; top: 5px; width: 13px; height: 13px; border: 3px solid var(--background); border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 1px var(--accent); content: ""; }
-.request-card.completed::before { background: var(--success); box-shadow: 0 0 0 1px var(--success); }
-.request-card.failed::before { background: var(--danger); box-shadow: 0 0 0 1px var(--danger); }
+.timeline-request .request-card { margin: 0; }
+.request-card { position: relative; padding: 17px 18px 18px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
+.request-card.running { border-color: rgba(108, 168, 255, 0.48); }
+.request-card.completed { border-color: rgba(116, 201, 157, 0.42); }
+.request-card.failed { border-color: rgba(228, 135, 135, 0.48); }
+.event-marker.request-marker-completed { background: var(--success); box-shadow: 0 0 0 1px var(--success); }
+.event-marker.request-marker-failed { background: var(--danger); box-shadow: 0 0 0 1px var(--danger); }
 .request-top { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; color: var(--text-secondary); font-size: 12px; }
 .request-top strong { color: var(--text-primary); }
 .request-duration { font-family: "SFMono-Regular", Consolas, monospace; color: var(--text-secondary); }
@@ -150,8 +153,6 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
   .back-link { display: inline-flex; }
   .detail-header { display: block; }
   .button.danger { margin-left: 0; }
-  .request-card { margin-left: 0; }
-  .request-card::before { display: none; }
   .timeline-event { grid-template-columns: 57px 1fr; gap: 14px; }
   .event-body { padding-left: 17px; }
   .event-time { font-size: 10px; }
