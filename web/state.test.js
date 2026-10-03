@@ -14,6 +14,7 @@ const { act } = await import('preact/test-utils')
 const sessionsModule = await import('./src/sessions.jsx')
 const detailModule = await import('./src/detail.jsx')
 const { AppShell } = await import('./src/app.jsx')
+const { openCodeConversationUrl, openCodeLinkState } = await import('./src/opencode-link.js')
 const state = await import('./src/state.js')
 
 const session = { id: 'demo', project: 'Demo', work_branch: 'main', environment_state: 'ready', work_state: 'in_progress', created_at: '2026-09-19T11:00:00Z', sandbox: 'sandbox', repository: 'https://example.test/repo', base_ref: 'main' }
@@ -31,6 +32,21 @@ test('elapsed display and status mappings retain current-main semantics', () => 
   state.filter.value = 'working'
   assert.deepEqual(state.visibleSessions.value, [])
   state.filter.value = 'all'
+})
+
+test('OpenCode URLs follow v1.18 server-key base64url and encoded session paths', () => {
+  assert.equal(openCodeConversationUrl('https://demo-p4096.preview.example.test', 'ses_abc'), 'https://demo-p4096.preview.example.test/server/aHR0cHM6Ly9kZW1vLXA0MDk2LnByZXZpZXcuZXhhbXBsZS50ZXN0/session/ses_abc')
+  assert.equal(openCodeConversationUrl('https://preview.example.test/path?x=a&y=b', 'ses /?#'), 'https://preview.example.test/server/aHR0cHM6Ly9wcmV2aWV3LmV4YW1wbGUudGVzdC9wYXRoP3g9YSZ5PWI/session/ses%20%2F%3F%23')
+  assert.equal(openCodeConversationUrl('javascript:alert(1)', 'ses_abc'), null)
+})
+
+test('OpenCode link state requires authoritative binding and follows recovered IDs', () => {
+  const activity = { opencode_url: 'https://demo-p4096.preview.example.test', session: { opencode_session_id: null } }
+  assert.equal(openCodeLinkState({ opencode_session_id: null }, activity).disabled, true)
+  assert.equal(openCodeLinkState({ id: 'display-name' }, activity).disabled, true)
+  assert.match(openCodeLinkState({ opencode_session_id: 'ses_recovered' }, activity).url, /session\/ses_recovered$/)
+  assert.match(openCodeLinkState({ opencode_session_id: 'ses_rebound' }, activity).url, /session\/ses_rebound$/)
+  assert.equal(openCodeLinkState({ opencode_session_id: 'ses_recovered' }, null).disabled, true)
 })
 
 function TestApp() { return h('div', { class: 'app-shell' }, h('aside', { class: 'sidebar' }, h('div', { class: 'session-list' }, state.sessions.value.map((item) => h(sessionsModule.SessionRow, { key: item.id, session: item })))), h(detailModule.SessionDetail)) }
