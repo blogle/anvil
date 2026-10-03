@@ -9,7 +9,7 @@ const React = { createElement: h }
 
 export function AppShell() {
   useEffect(() => {
-    const route = () => syncRouteFromHash()
+    const route = () => { syncRouteFromHash(); refresh() }
     window.addEventListener('hashchange', route); window.addEventListener('popstate', route)
     const visibility = () => { if (document.visibilityState === 'visible') refresh() }
     document.addEventListener('visibilitychange', visibility)
