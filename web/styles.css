@@ -76,6 +76,17 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .detail h2 { margin: 8px 0 8px; font-size: clamp(24px, 3vw, 34px); line-height: 1.1; letter-spacing: -0.04em; }
 .detail-subtitle { display: flex; flex-wrap: wrap; gap: 8px 14px; color: var(--text-secondary); font-size: 13px; }
 .detail-subtitle code, code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+.git-metadata { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 18px 0 22px; }
+.git-card { min-width: 0; padding: 15px 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.git-card-label { margin-bottom: 8px; color: var(--text-muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.git-card-value { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.pull-request-content { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.git-card-value code, .git-card-link { overflow-wrap: anywhere; }
+.git-card-link { display: inline-flex; align-items: center; gap: 8px; color: var(--text-primary); text-decoration: none; }
+.git-card-link:hover { color: var(--rust-brand); }
+.git-card-title { color: var(--text-secondary); }
+.git-card-empty { color: var(--text-muted); }
+.pr-state { flex: none; padding: 3px 7px; border-radius: 999px; background: var(--surface-raised); color: var(--text-secondary); font-size: 11px; }
 .detail-status { display: inline-flex; align-items: center; gap: 8px; margin-top: 22px; color: var(--text-secondary); font-size: 13px; }
 .detail-status strong { color: var(--text-primary); }
 .work-summary { max-width: 720px; margin-top: 24px; padding: 14px 16px; border-left: 2px solid var(--rust-brand); background: var(--surface); color: var(--text-secondary); line-height: 1.5; white-space: pre-wrap; }
