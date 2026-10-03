@@ -1,4 +1,5 @@
 import { h } from 'preact'
+import { Activity } from './activity.jsx'
 import { activities, api, clearSessionFilters, environmentFor, executionFor, navigate, refresh, selected, sessions, sessionUI, visibleSessions } from './state.js'
 import { Logs } from './logs.jsx'
 import { Runtime } from './runtime.jsx'
@@ -19,7 +20,8 @@ export function SessionDetail() {
 function DetailContent({ session, activity, outsideFilters }) {
   const ui = sessionUI(session.id)
   const tabs = [
-    { id: 'logs', label: 'Logs', content: <Logs activity={activity} ui={ui}/> },
+    { id: 'activity', label: 'Activity', content: <Activity activity={activity} sessionId={session.id}/> },
+    { id: 'logs', label: 'Trail', content: <Logs activity={activity} ui={ui}/> },
     { id: 'runtime', label: 'Runtime', content: <Runtime activity={activity} session={session}/> },
   ]
   return <div class="detail-inner"><a class="back-link" href="#sessions" onClick={(event) => { event.preventDefault(); navigate(null) }}>← All sessions</a>

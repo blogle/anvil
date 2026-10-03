@@ -23,6 +23,8 @@ const activity = (execution_state = 'running') => ({
   execution_state,
   attach_command: 'anvilctl attach demo',
   lifecycle: [{ kind: 'created', at: '2026-09-19T11:00:00Z' }],
+  events: [{ id: 'prompt-1', at: '2026-09-19T11:58:00Z', kind: 'prompt', title: 'You', detail: 'Inspect the login flow.' }, { id: 'tool-1', at: '2026-09-19T11:58:30Z', kind: 'tool', title: 'src/auth.js', tool: 'read', detail: '24 lines read', status: 'completed' }, { id: 'agent-1', at: '2026-09-19T11:59:00Z', kind: 'message', title: 'Agent', detail: 'The login flow uses the shared session helper.' }],
+  event_window: { message_limit: 100, returned_messages: 3, loaded_messages: 3, next_cursor: null, truncated: false },
   requests: [{ id: 'request-1', number: 1, origin: 'operator', state: 'running', started_at: '2026-09-19T11:58:00Z', last_activity_at: '2026-09-19T11:59:00Z', prompt: 'x'.repeat(550) }],
 })
 
@@ -135,6 +137,7 @@ test('per-session attach, prompt expansion, tab, focus, and scroll state survive
   const attach = root.querySelector('details')
   attach.open = true
   await act(async () => { attach.dispatchEvent(new window.Event('toggle')) })
+  await act(async () => root.querySelector('#logs-tab').click())
   await act(async () => root.querySelector('.prompt-toggle').click())
   await act(async () => root.querySelector('#runtime-tab').click())
   root.querySelector('#runtime-tab').focus()
@@ -174,7 +177,84 @@ test('filtering leaves the selected factual detail open and offers to clear filt
   render(null, root)
 })
 
-test('direct links and browser history return to a useful Sessions landing', async () => {
+test('Activity is the ordered conversation transcript and Trail keeps lifecycle diagnostics', async () => {
+  const manyLifecycle = Array.from({ length: 900 }, (_, index) => ({ kind: 'run_started', at: String(index).padStart(4, '0') }))
+  const transcript = {
+    ...activity(),
+    lifecycle: manyLifecycle,
+    events: [
+      { id: 'tool-1', at: '2026-01-01T00:00:02Z', kind: 'tool', title: 'src/auth.js', tool: 'read', detail: '24 lines read', status: 'completed' },
+      { id: 'agent-1', at: '2026-01-01T00:00:03Z', kind: 'message', title: 'Agent', detail: 'The flow is handled by the session helper.' },
+      { id: 'prompt-1', at: '2026-01-01T00:00:01Z', kind: 'prompt', title: 'You', detail: 'Inspect the login flow.' },
+    ],
+  }
+  state.sessions.value = [session]
+  state.activities.value = new Map([[session.id, transcript]])
+  state.selected.value = session.id
+  state.sessionUI(session.id).tab.value = 'activity'
+  const root = document.getElementById('app')
+  await act(async () => render(h(TestApp), root))
+  const rows = [...root.querySelectorAll('#activity-panel [data-event-id]')]
+  assert.deepEqual(rows.map((row) => row.dataset.eventId), ['prompt-1', 'tool-1', 'agent-1'])
+  assert.equal(root.querySelector('#activity-panel').textContent.includes('Session created'), false)
+  assert.equal(root.querySelector('#activity-panel').textContent.includes('run_started'), false)
+  assert.equal(root.querySelector('#activity-panel').textContent.includes('Inspect the login flow.'), true)
+  assert.equal(root.querySelector('#activity-panel').textContent.includes('24 lines read'), true)
+  await act(async () => root.querySelector('#logs-tab').click())
+  assert.equal(root.querySelector('#logs-panel').textContent.includes('Run started'), true)
+  render(null, root)
+})
+
+test('Activity page merge ignores lifecycle count and advances older cursors', () => {
+  const lifecycle = Array.from({ length: 900 }, (_, index) => ({ kind: 'ready', at: String(index).padStart(4, '0') }))
+  const latest = { lifecycle, events: [{ id: 'new', at: '0003', kind: 'message' }], event_window: { loaded_messages: 100, next_cursor: 'cursor-2' } }
+  const middle = { lifecycle, events: [{ id: 'middle', at: '0002', kind: 'tool' }], event_window: { loaded_messages: 100, next_cursor: 'cursor-3' } }
+  const firstMerge = state.mergeActivityPages(latest, middle, true)
+  assert.deepEqual(firstMerge.events.map((event) => event.id), ['middle', 'new'])
+  assert.equal(firstMerge.event_window.next_cursor, 'cursor-3')
+  const oldest = { lifecycle, events: [{ id: 'old', at: '0001', kind: 'prompt' }], event_window: { loaded_messages: 100, next_cursor: 'cursor-4' } }
+  const secondMerge = state.mergeActivityPages(firstMerge, oldest, true)
+  assert.deepEqual(secondMerge.events.map((event) => event.id), ['old', 'middle', 'new'])
+  assert.equal(secondMerge.event_window.next_cursor, 'cursor-4')
+  assert.equal(secondMerge.event_window.loaded_messages, 300)
+  assert.equal(secondMerge.event_window.truncated, false)
+  const polled = state.mergeActivityPages({ ...latest, events: [...latest.events, { id: 'live', at: '0004', kind: 'tool' }] }, secondMerge)
+  assert.equal(polled.event_window.next_cursor, 'cursor-4')
+  assert.deepEqual(polled.events.map((event) => event.id), ['old', 'middle', 'new', 'live'])
+})
+
+test('Load older Activity sends each returned cursor and retains loaded pages', async () => {
+  const requests = []
+  const pages = [
+    { events: [{ id: 'middle', at: '0002', kind: 'tool' }], event_window: { message_limit: 100, loaded_messages: 100, next_cursor: 'cursor-3' } },
+    { events: [{ id: 'old', at: '0001', kind: 'prompt' }], event_window: { message_limit: 100, loaded_messages: 100, next_cursor: 'cursor-4' } },
+  ]
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (requestUrl) => {
+    requests.push(new URL(requestUrl, 'http://localhost'))
+    return new Response(JSON.stringify(pages.shift()), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  try {
+    state.activities.value = new Map([[session.id, {
+      events: [{ id: 'new', at: '0003', kind: 'message' }],
+      event_window: { message_limit: 100, loaded_messages: 100, next_cursor: 'cursor-2' },
+    }]])
+    await act(async () => state.loadOlderActivity(session.id))
+    assert.equal(requests[0].searchParams.get('include_events'), 'true')
+    assert.equal(requests[0].searchParams.get('before'), 'cursor-2')
+    assert.equal(state.activities.value.get(session.id).event_window.next_cursor, 'cursor-3')
+    await act(async () => state.loadOlderActivity(session.id))
+    assert.equal(requests[1].searchParams.get('before'), 'cursor-3')
+    assert.deepEqual(state.activities.value.get(session.id).events.map((event) => event.id), ['old', 'middle', 'new'])
+    assert.equal(state.activities.value.get(session.id).event_window.next_cursor, 'cursor-4')
+    assert.equal(state.activities.value.get(session.id).event_window.loaded_messages, 300)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('direct links and browser history route deterministically; list adapts at mobile breakpoint', async () => {
+  assert.equal(state.routeFromHash('#session/demo'), 'demo')
   state.loading.value = false
   state.error.value = null
   state.sessions.value = [session]
@@ -186,6 +266,6 @@ test('direct links and browser history return to a useful Sessions landing', asy
   await act(async () => { state.navigate(null); window.dispatchEvent(new window.PopStateEvent('popstate')) })
   assert.equal(state.routeFromHash(), null)
   assert.equal(root.querySelector('.detail h2'), null)
-  assert.equal(root.querySelector('.session-workspace h1').textContent, 'Sessions')
+  assert.equal(root.querySelector('.sidebar-head h1').textContent, 'Sessions')
   render(null, root)
 })
