@@ -209,14 +209,14 @@ test "$(kubectl --kubeconfig "$kubeconfig" auth can-i --as=system:serviceaccount
 run_id="run_kind_acceptance"
 started_at="2026-01-01T00:00:00Z"
 finished_at="2026-01-01T00:01:00Z"
-work_state_record="$(jq -cn --arg run_id "$run_id" --arg started_at "$started_at" --arg finished_at "$finished_at" '{changed_at:$finished_at,state:{state:"ready_for_review",details:{run:{run_id:$run_id,assistant_message_id:"assistant_kind_acceptance",started_at:$started_at,finished_at:$finished_at},previous_run:null}}}')"
+run_record="$(jq -cn --arg run_id "$run_id" --arg started_at "$started_at" --arg finished_at "$finished_at" '{changed_at:$finished_at,current:null,last:{outcome:"completed",run:{run_id:$run_id,assistant_message_id:"assistant_kind_acceptance",started_at:$started_at,finished_at:$finished_at}}}')"
 last_run="$(jq -cn --arg run_id "$run_id" --arg started_at "$started_at" --arg finished_at "$finished_at" '{id:$run_id,state:"completed",started_at:$started_at,finished_at:$finished_at}')"
 jq -n \
   --arg repository "$source_repo" \
   --arg source_ref "$source_ref" \
   --arg run_id "$run_id" \
   --arg finished_at "$finished_at" \
-  --arg work_state_record "$work_state_record" \
+  --arg run_record "$run_record" \
   --arg last_run "$last_run" \
   --arg image "ghcr.io/blogle/anvil-sandbox:kind-e2e" \
   '{
@@ -233,10 +233,7 @@ jq -n \
         "anvil.example/work-branch":"anvil/fixture-12345678",
         "anvil.example/runtime-layout":"v2",
         "anvil.example/created-at":"2026-01-01T00:00:00Z",
-        "anvil.example/work-state":"ready_for_review",
-        "anvil.example/work-state-changed-at":$finished_at,
-        "anvil.example/work-state-run-id":$run_id,
-        "anvil.example/work-state-record":$work_state_record,
+        "anvil.example/run-record":$run_record,
         "anvil.example/run-last":$last_run,
         "anvil.example/binding-state":"pending",
         "anvil.example/binding-continuity":"exact",
@@ -408,7 +405,7 @@ curl -fsS -X POST http://127.0.0.1:18080/v1/sessions/fixture-12345678/resume >/d
 session_after_resume="$(curl -fsS http://127.0.0.1:18080/v1/sessions/fixture-12345678)"
 test "$(jq -r .opencode_session_id <<<"$session_after_resume")" = "$opencode_session"
 status="$(curl -fsS http://127.0.0.1:18080/v1/sessions/fixture-12345678/status)"
-jq -e '.environment_state == "ready" and .execution_state == "idle" and .work_state == "ready_for_review" and .current_run == null' <<<"$status" >/dev/null
+jq -e '.environment_state == "ready" and .execution_state == "idle" and .last_run.state == "completed" and .current_run == null and (.work_state == null)' <<<"$status" >/dev/null
 deadline=$((SECONDS + 120))
 while (( SECONDS < deadline )); do
   pod_name="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$sandbox_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"

@@ -9,7 +9,7 @@ use anvil_core::{
     branch_name, preview_hostname, GitRef, LifecycleEvent, LoginFlow, OpenCodeMessageId,
     OperationTelemetry, Port, Project, Prompt, ProviderAuthMethod, ProviderListResponse,
     ProviderStatus, ProviderSummary, Repository, Run, RunId, RunState, Session, SessionActivity,
-    SessionId, SessionRequest, SessionTelemetry, WorkState,
+    SessionId, SessionRequest, SessionTelemetry,
 };
 use async_trait::async_trait;
 use axum::{
@@ -568,7 +568,7 @@ pub trait SandboxApi: Send + Sync + 'static {
         id: &str,
         request: &CreateRequest,
         sandbox_env: &[(String, String)],
-        initial_work_state: &WorkStateRecord,
+        initial_run: &RunRecord,
     ) -> Result<Session, ServiceError>;
     async fn suspend(&self, id: &str) -> Result<(), ServiceError>;
     async fn resume(&self, id: &str) -> Result<(), ServiceError>;
@@ -589,11 +589,7 @@ pub trait SandboxApi: Send + Sync + 'static {
     async fn set_ready_at(&self, _id: &str, _at: &str) -> Result<(), ServiceError> {
         Ok(())
     }
-    async fn set_work_state(
-        &self,
-        _id: &str,
-        _state: &WorkStateRecord,
-    ) -> Result<(), ServiceError> {
+    async fn set_run_record(&self, _id: &str, _state: &RunRecord) -> Result<(), ServiceError> {
         Ok(())
     }
     async fn set_binding_state(
@@ -681,7 +677,7 @@ impl SandboxApi for MaterializingSandboxApi {
         id: &str,
         request: &CreateRequest,
         env: &[(String, String)],
-        state: &WorkStateRecord,
+        state: &RunRecord,
     ) -> Result<Session, ServiceError> {
         let lock = self.lock(id);
         let _guard = lock.lock().await;
@@ -731,10 +727,10 @@ impl SandboxApi for MaterializingSandboxApi {
         self.inner.set_ready_at(id, value).await?;
         self.persist(id).await
     }
-    async fn set_work_state(&self, id: &str, value: &WorkStateRecord) -> Result<(), ServiceError> {
+    async fn set_run_record(&self, id: &str, value: &RunRecord) -> Result<(), ServiceError> {
         let lock = self.lock(id);
         let _guard = lock.lock().await;
-        self.inner.set_work_state(id, value).await?;
+        self.inner.set_run_record(id, value).await?;
         self.persist(id).await
     }
     async fn set_binding_state(
@@ -763,7 +759,8 @@ impl SandboxApi for MaterializingSandboxApi {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxRecord {
     pub session: Session,
-    pub work_state: WorkStateRecord,
+    #[serde(default)]
+    pub run_record: RunRecord,
     pub binding_state: BindingStateRecord,
     pub operating_mode: String,
     pub created_at: String,
@@ -771,10 +768,14 @@ pub struct SandboxRecord {
     pub telemetry: SessionTelemetry,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkStateRecord {
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRecord {
+    #[serde(default)]
     pub changed_at: String,
-    pub state: WorkLifecycleState,
+    #[serde(default)]
+    pub current: Option<ActiveRunState>,
+    #[serde(default)]
+    pub last: Option<FinishedRun>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -796,7 +797,10 @@ pub enum ActiveRunState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletedRun {
     pub run_id: RunId,
-    pub assistant_message_id: OpenCodeMessageId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_message_id: Option<OpenCodeMessageId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_message_id: Option<OpenCodeMessageId>,
     pub started_at: String,
     pub finished_at: String,
 }
@@ -804,6 +808,8 @@ pub struct CompletedRun {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailedRun {
     pub run_id: RunId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_message_id: Option<OpenCodeMessageId>,
     pub assistant_message_id: Option<OpenCodeMessageId>,
     pub started_at: String,
     pub finished_at: String,
@@ -817,144 +823,100 @@ pub enum FinishedRun {
     Failed(FailedRun),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", content = "details", rename_all = "snake_case")]
-pub enum WorkLifecycleState {
-    Active {
-        run: ActiveRunState,
-        last_run: Option<FinishedRun>,
-    },
-    ReadyForReview {
-        run: CompletedRun,
-        previous_run: Option<FinishedRun>,
-    },
-    Failed {
-        run: FailedRun,
-        previous_run: Option<FinishedRun>,
-    },
-    Completed {
-        run: CompletedRun,
-        previous_run: Option<FinishedRun>,
-    },
-}
-
-impl WorkStateRecord {
+impl RunRecord {
     fn submitted(run_id: RunId, user_message_id: OpenCodeMessageId, started_at: String) -> Self {
         Self {
             changed_at: started_at.clone(),
-            state: WorkLifecycleState::Active {
-                run: ActiveRunState::Submitted {
-                    run_id,
-                    user_message_id,
-                    started_at,
-                },
-                last_run: None,
-            },
-        }
-    }
-
-    fn api_state(&self) -> WorkState {
-        match self.state {
-            WorkLifecycleState::Active { .. } => WorkState::InProgress,
-            WorkLifecycleState::ReadyForReview { .. } => WorkState::ReadyForReview,
-            WorkLifecycleState::Failed { .. } => WorkState::Failed,
-            WorkLifecycleState::Completed { .. } => WorkState::Completed,
-        }
-    }
-
-    fn summary(&self) -> Option<String> {
-        match &self.state {
-            WorkLifecycleState::Failed { run, .. } => Some(run.error.clone()),
-            _ => None,
+            current: Some(ActiveRunState::Submitted {
+                run_id,
+                user_message_id,
+                started_at,
+            }),
+            last: None,
         }
     }
 
     fn run_id(&self) -> Option<String> {
-        let id = match &self.state {
-            WorkLifecycleState::Active { run, .. } => match run {
-                ActiveRunState::Submitted { run_id, .. }
-                | ActiveRunState::Running { run_id, .. } => run_id,
-            },
-            WorkLifecycleState::ReadyForReview { run, .. }
-            | WorkLifecycleState::Completed { run, .. } => &run.run_id,
-            WorkLifecycleState::Failed { run, .. } => &run.run_id,
-        };
-        Some(id.to_string())
+        self.current.as_ref().map(active_run_id).or_else(|| {
+            self.last.as_ref().map(|run| match run {
+                FinishedRun::Completed(run) => run.run_id.to_string(),
+                FinishedRun::Failed(run) => run.run_id.to_string(),
+            })
+        })
     }
 
     fn user_message_id(&self) -> Option<&OpenCodeMessageId> {
-        match &self.state {
-            WorkLifecycleState::Active { run, .. } => Some(match run {
-                ActiveRunState::Submitted {
-                    user_message_id, ..
-                }
-                | ActiveRunState::Running {
-                    user_message_id, ..
-                } => user_message_id,
-            }),
-            _ => None,
+        match self.current.as_ref()? {
+            ActiveRunState::Submitted {
+                user_message_id, ..
+            }
+            | ActiveRunState::Running {
+                user_message_id, ..
+            } => Some(user_message_id),
         }
     }
 
     fn current_run(&self) -> Option<Run> {
-        match &self.state {
-            WorkLifecycleState::Active { run, .. } => Some(match run {
-                ActiveRunState::Submitted {
-                    run_id, started_at, ..
-                } => Run {
-                    id: run_id.clone(),
-                    state: RunState::Submitted,
-                    started_at: started_at.clone(),
-                    finished_at: None,
-                },
-                ActiveRunState::Running {
-                    run_id, started_at, ..
-                } => Run {
-                    id: run_id.clone(),
-                    state: RunState::Running,
-                    started_at: started_at.clone(),
-                    finished_at: None,
-                },
-            }),
-            _ => None,
-        }
+        self.current.as_ref().map(|run| match run {
+            ActiveRunState::Submitted {
+                run_id,
+                user_message_id,
+                started_at,
+            } => Run {
+                id: run_id.clone(),
+                state: RunState::Submitted,
+                user_message_id: Some(user_message_id.clone()),
+                assistant_message_id: None,
+                started_at: started_at.clone(),
+                finished_at: None,
+                error: None,
+            },
+            ActiveRunState::Running {
+                run_id,
+                user_message_id,
+                assistant_message_id,
+                started_at,
+            } => Run {
+                id: run_id.clone(),
+                state: RunState::Running,
+                user_message_id: Some(user_message_id.clone()),
+                assistant_message_id: Some(assistant_message_id.clone()),
+                started_at: started_at.clone(),
+                finished_at: None,
+                error: None,
+            },
+        })
     }
 
     fn last_run(&self) -> Option<Run> {
-        let finished = match &self.state {
-            WorkLifecycleState::Active { last_run, .. } => last_run.as_ref(),
-            WorkLifecycleState::ReadyForReview { run, .. }
-            | WorkLifecycleState::Completed { run, .. } => {
-                return Some(Run {
-                    id: run.run_id.clone(),
-                    state: RunState::Completed,
-                    started_at: run.started_at.clone(),
-                    finished_at: Some(run.finished_at.clone()),
-                });
-            }
-            WorkLifecycleState::Failed { run, .. } => {
-                return Some(Run {
-                    id: run.run_id.clone(),
-                    state: RunState::Failed,
-                    started_at: run.started_at.clone(),
-                    finished_at: Some(run.finished_at.clone()),
-                });
-            }
-        }?;
-        Some(match finished {
+        self.last.as_ref().map(|run| match run {
             FinishedRun::Completed(run) => Run {
                 id: run.run_id.clone(),
                 state: RunState::Completed,
+                user_message_id: run.user_message_id.clone(),
+                assistant_message_id: run.assistant_message_id.clone(),
                 started_at: run.started_at.clone(),
                 finished_at: Some(run.finished_at.clone()),
+                error: None,
             },
             FinishedRun::Failed(run) => Run {
                 id: run.run_id.clone(),
                 state: RunState::Failed,
+                user_message_id: run.user_message_id.clone(),
+                assistant_message_id: run.assistant_message_id.clone(),
                 started_at: run.started_at.clone(),
                 finished_at: Some(run.finished_at.clone()),
+                error: Some(run.error.clone()),
             },
         })
+    }
+}
+
+fn active_run_id(run: &ActiveRunState) -> String {
+    match run {
+        ActiveRunState::Submitted { run_id, .. } | ActiveRunState::Running { run_id, .. } => {
+            run_id.to_string()
+        }
     }
 }
 
@@ -1001,12 +963,6 @@ fn sandbox_resource() -> ApiResource {
 
 fn annotation_key(config: &Config, name: &str) -> String {
     format!("{}/{}", config.annotation_prefix, name)
-}
-
-fn parse_work_state(value: Option<&String>) -> WorkState {
-    value
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(WorkState::InProgress)
 }
 
 fn environment_state(phase: Option<&str>, suspended: bool) -> &'static str {
@@ -1102,96 +1058,89 @@ fn run_annotation(value: Option<&String>) -> Option<Run> {
     value.and_then(|value| serde_json::from_str(value).ok())
 }
 
-fn legacy_finished_run(run: Run) -> FinishedRun {
+fn legacy_finished_run(run: Run) -> Option<FinishedRun> {
     let finished_at = run.finished_at.unwrap_or_else(|| run.started_at.clone());
-    FinishedRun::Failed(FailedRun {
-        run_id: run.id,
-        assistant_message_id: None,
-        started_at: run.started_at,
-        finished_at,
-        error: "Legacy run outcome cannot be verified against an OpenCode message".into(),
+    match run.state {
+        RunState::Completed => Some(FinishedRun::Completed(CompletedRun {
+            run_id: run.id,
+            user_message_id: run.user_message_id,
+            assistant_message_id: run.assistant_message_id,
+            started_at: run.started_at,
+            finished_at,
+        })),
+        RunState::Failed => Some(FinishedRun::Failed(FailedRun {
+            run_id: run.id,
+            user_message_id: run.user_message_id,
+            assistant_message_id: run.assistant_message_id,
+            started_at: run.started_at,
+            finished_at,
+            error: run
+                .error
+                .unwrap_or_else(|| "Legacy run failure details are unavailable".into()),
+        })),
+        RunState::Submitted | RunState::Running => None,
+    }
+}
+
+// Read existing Sandbox annotations once into factual run records. The old
+// session disposition is ignored; only message-correlated run data is retained.
+fn legacy_run_record(value: &str) -> Option<RunRecord> {
+    let value: Value = serde_json::from_str(value).ok()?;
+    let changed_at = value.get("changed_at")?.as_str()?.to_owned();
+    let details = value.get("state")?.get("details")?;
+    let state = value.get("state")?.get("state")?.as_str()?;
+    let (current, last) = match state {
+        "active" => (
+            serde_json::from_value(details.get("run")?.clone()).ok(),
+            details
+                .get("last_run")
+                .and_then(|run| serde_json::from_value(run.clone()).ok()),
+        ),
+        "ready_for_review" | "completed" => (
+            None,
+            details
+                .get("run")
+                .and_then(|run| serde_json::from_value::<CompletedRun>(run.clone()).ok())
+                .map(FinishedRun::Completed),
+        ),
+        "failed" => (
+            None,
+            details
+                .get("run")
+                .and_then(|run| serde_json::from_value::<FailedRun>(run.clone()).ok())
+                .map(FinishedRun::Failed),
+        ),
+        _ => (None, None),
+    };
+    Some(RunRecord {
+        changed_at,
+        current,
+        last,
     })
 }
 
-fn work_state_record(o: &DynamicObject, config: &Config) -> WorkStateRecord {
+fn run_record(o: &DynamicObject, config: &Config) -> RunRecord {
     let annotations = o.annotations();
-    if let Some(state) = annotations
-        .get(&annotation_key(config, "work-state-record"))
+    if let Some(record) = annotations
+        .get(&annotation_key(config, "run-record"))
         .and_then(|value| serde_json::from_str(value).ok())
     {
-        return state;
+        return record;
     }
-    let changed_at = annotations
-        .get(&annotation_key(config, "work-state-changed-at"))
-        .cloned()
-        .or_else(|| {
-            annotations
-                .get(&annotation_key(config, "created-at"))
-                .cloned()
-        })
-        .unwrap_or_else(chrono_like_now);
-    let prior = run_annotation(annotations.get(&annotation_key(config, "run-last")))
-        .map(legacy_finished_run);
-    let run_id = annotations
-        .get(&annotation_key(config, "work-state-run-id"))
-        .cloned()
-        .map(RunId)
-        .unwrap_or_else(|| RunId(new_run_id()));
-    let state = parse_work_state(annotations.get(&annotation_key(config, "work-state")));
-    let lifecycle = match state {
-        WorkState::InProgress => {
-            let old_run = run_annotation(annotations.get(&annotation_key(config, "run-current")));
-            let run_id = old_run.as_ref().map_or(run_id, |run| run.id.clone());
-            let started_at = old_run.map_or_else(|| changed_at.clone(), |run| run.started_at);
-            WorkLifecycleState::Failed {
-                run: FailedRun {
-                    run_id,
-                    assistant_message_id: None,
-                    started_at,
-                    finished_at: changed_at.clone(),
-                    error: "Active run predates message-correlated lifecycle tracking; submit a follow-up prompt".into(),
-                },
-                previous_run: prior,
-            }
-        }
-        WorkState::ReadyForReview | WorkState::Completed => {
-            let run = run_annotation(annotations.get(&annotation_key(config, "run-last"))).or_else(
-                || run_annotation(annotations.get(&annotation_key(config, "run-current"))),
-            );
-            let failed = FailedRun {
-                run_id: run.as_ref().map_or(run_id, |run| run.id.clone()),
-                assistant_message_id: None,
-                started_at: run
-                    .as_ref()
-                    .map_or_else(|| changed_at.clone(), |run| run.started_at.clone()),
-                finished_at: run
-                    .and_then(|run| run.finished_at)
-                    .unwrap_or_else(|| changed_at.clone()),
-                error: "Legacy terminal state cannot be verified against an OpenCode message"
-                    .into(),
-            };
-            WorkLifecycleState::Failed {
-                run: failed,
-                previous_run: None,
-            }
-        }
-        WorkState::Failed => WorkLifecycleState::Failed {
-            run: FailedRun {
-                run_id,
-                assistant_message_id: None,
-                started_at: changed_at.clone(),
-                finished_at: changed_at.clone(),
-                error: annotations
-                    .get(&annotation_key(config, "work-state-summary"))
-                    .cloned()
-                    .unwrap_or_else(|| "OpenCode run failed".into()),
-            },
-            previous_run: prior,
-        },
-    };
-    WorkStateRecord {
-        state: lifecycle,
-        changed_at,
+    if let Some(legacy) = annotations
+        .get(&annotation_key(config, "work-state-record"))
+        .and_then(|value| legacy_run_record(value))
+    {
+        return legacy;
+    }
+    RunRecord {
+        changed_at: annotations
+            .get(&annotation_key(config, "created-at"))
+            .cloned()
+            .unwrap_or_else(chrono_like_now),
+        current: None,
+        last: run_annotation(annotations.get(&annotation_key(config, "run-last")))
+            .and_then(legacy_finished_run),
     }
 }
 
@@ -1203,39 +1152,30 @@ fn run_value(run: Option<&Run>) -> Value {
     })
 }
 
-fn work_state_annotations(
-    config: &Config,
-    state: &WorkStateRecord,
-) -> serde_json::Map<String, Value> {
+fn run_record_annotations(config: &Config, record: &RunRecord) -> serde_json::Map<String, Value> {
     let mut annotations = serde_json::Map::new();
     annotations.insert(
-        annotation_key(config, "work-state-record"),
-        Value::String(serde_json::to_string(state).expect("work-state record is serializable")),
-    );
-    annotations.insert(
-        annotation_key(config, "work-state"),
-        Value::String(state.api_state().as_str().into()),
-    );
-    annotations.insert(
-        annotation_key(config, "work-state-changed-at"),
-        Value::String(state.changed_at.clone()),
-    );
-    annotations.insert(
-        annotation_key(config, "work-state-summary"),
-        state.summary().map_or(Value::Null, Value::String),
-    );
-    annotations.insert(
-        annotation_key(config, "work-state-run-id"),
-        state.run_id().map_or(Value::Null, Value::String),
+        annotation_key(config, "run-record"),
+        Value::String(serde_json::to_string(record).expect("run record is serializable")),
     );
     annotations.insert(
         annotation_key(config, "run-current"),
-        run_value(state.current_run().as_ref()),
+        run_value(record.current_run().as_ref()),
     );
     annotations.insert(
         annotation_key(config, "run-last"),
-        run_value(state.last_run().as_ref()),
+        run_value(record.last_run().as_ref()),
     );
+    // Clear annotations from the retired session disposition model on write.
+    for name in [
+        "work-state-record",
+        "work-state",
+        "work-state-changed-at",
+        "work-state-summary",
+        "work-state-run-id",
+    ] {
+        annotations.insert(annotation_key(config, name), Value::Null);
+    }
     annotations
 }
 
@@ -1281,7 +1221,7 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
         .strip_prefix("anvil-")
         .map(str::to_owned)
         .ok_or(ServiceError::NotFound)?;
-    let work = work_state_record(o, config);
+    let run_record = run_record(o, config);
     let binding = binding_state_record(o, config);
     let suspended = o
         .data
@@ -1347,13 +1287,26 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
             }),
         ready_at: a.get(&annotation_key(config, "ready-at")).cloned(),
         environment_state: environment_state.into(),
+        execution_state: match binding.state.as_str() {
+            "missing" => "unavailable".into(),
+            "recovering" => "recovering".into(),
+            _ => o
+                .annotations()
+                .get(&annotation_key(config, "telemetry-v1"))
+                .and_then(|serialized| serde_json::from_str::<SessionTelemetry>(serialized).ok())
+                .map(|telemetry| {
+                    match telemetry.execution.as_str() {
+                        "busy" => "running",
+                        "error" => "failed",
+                        value => value,
+                    }
+                    .to_owned()
+                })
+                .unwrap_or_else(|| "unknown".into()),
+        },
         environment_error,
-        work_state: work.api_state().as_str().into(),
-        work_state_changed_at: Some(work.changed_at.clone()),
-        work_state_summary: work.summary(),
-        work_state_run_id: work.run_id(),
-        current_run: work.current_run(),
-        last_run: work.last_run(),
+        current_run: run_record.current_run(),
+        last_run: run_record.last_run(),
         session_binding_state: binding.state,
         session_binding_continuity: binding.continuity,
         session_binding_error: binding.error,
@@ -1365,7 +1318,7 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
 
 fn sandbox_record_from(o: &DynamicObject, config: &Config) -> Result<SandboxRecord, ServiceError> {
     let session = session_from(o, config)?;
-    let work_state = work_state_record(o, config);
+    let run_record = run_record(o, config);
     let binding_state = binding_state_record(o, config);
     let operating_mode = o
         .data
@@ -1381,7 +1334,7 @@ fn sandbox_record_from(o: &DynamicObject, config: &Config) -> Result<SandboxReco
         .unwrap_or_default();
     Ok(SandboxRecord {
         session,
-        work_state,
+        run_record,
         binding_state,
         operating_mode,
         created_at,
@@ -1415,14 +1368,14 @@ impl SandboxApi for KubeSandboxApi {
         id: &str,
         r: &CreateRequest,
         sandbox_env: &[(String, String)],
-        initial_work_state: &WorkStateRecord,
+        initial_run: &RunRecord,
     ) -> Result<Session, ServiceError> {
         let ns = &self.config.namespace;
         let name = format!("anvil-{id}");
         let now = chrono_like_now();
-        let run_id = initial_work_state
+        let run_id = initial_run
             .run_id()
-            .expect("initial work state must contain its submitted run");
+            .expect("initial run record must contain its submitted run");
         let l = labels();
         let work_branch = branch_name(&SessionId::parse(id).unwrap());
         let mut annotations = serde_json::Map::new();
@@ -1450,7 +1403,7 @@ impl SandboxApi for KubeSandboxApi {
             annotation_key(&self.config, "runtime-layout"),
             Value::String(RUNTIME_LAYOUT.into()),
         );
-        annotations.extend(work_state_annotations(&self.config, initial_work_state));
+        annotations.extend(run_record_annotations(&self.config, initial_run));
         // Kubernetes metadata annotations are strings; nulls are useful in
         // patch payloads for clearing values but invalid during creation.
         annotations.retain(|_, value| !value.is_null());
@@ -1535,13 +1488,10 @@ impl SandboxApi for KubeSandboxApi {
             created_at: Some(now.clone()),
             ready_at: None,
             environment_state: "provisioning".into(),
+            execution_state: "unknown".into(),
             environment_error: None,
-            work_state: initial_work_state.api_state().as_str().into(),
-            work_state_changed_at: Some(initial_work_state.changed_at.clone()),
-            work_state_summary: initial_work_state.summary(),
-            work_state_run_id: initial_work_state.run_id(),
-            current_run: initial_work_state.current_run(),
-            last_run: initial_work_state.last_run(),
+            current_run: initial_run.current_run(),
+            last_run: initial_run.last_run(),
             session_binding_state: "pending".into(),
             session_binding_continuity: "exact".into(),
             session_binding_error: None,
@@ -1607,8 +1557,8 @@ impl SandboxApi for KubeSandboxApi {
         self.patch(id, json!({"metadata":{"annotations":annotations}}))
             .await
     }
-    async fn set_work_state(&self, id: &str, state: &WorkStateRecord) -> Result<(), ServiceError> {
-        let annotations = work_state_annotations(&self.config, state);
+    async fn set_run_record(&self, id: &str, state: &RunRecord) -> Result<(), ServiceError> {
+        let annotations = run_record_annotations(&self.config, state);
         self.patch(id, json!({"metadata":{"annotations":annotations}}))
             .await
     }
@@ -1882,7 +1832,6 @@ impl AppState {
         let record = self.kube.get(id).await?;
         if record.session.environment_state != "ready"
             || record.session.opencode_session_id.is_none()
-            || record.work_state.api_state() == WorkState::Completed
         {
             return Ok(());
         }
@@ -1927,7 +1876,7 @@ impl AppState {
 }
 
 fn normalized_sandbox_value(record: &SandboxRecord) -> Value {
-    json!({"session":record.session,"work_state":record.work_state,"binding_state":record.binding_state,"operating_mode":record.operating_mode,"created_at":record.created_at,"telemetry":record.telemetry})
+    json!({"session":record.session,"run_record":record.run_record,"binding_state":record.binding_state,"operating_mode":record.operating_mode,"created_at":record.created_at,"telemetry":record.telemetry})
 }
 pub fn router(state: AppState) -> Router {
     let web_root = env::var_os("ANVIL_WEB_DIR")
@@ -1957,7 +1906,6 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
         .route("/v1/idempotency/:key", get(idempotency_record))
         .route("/v1/sessions/:id", get(session).delete(remove))
         .route("/v1/sessions/:id/messages", post(prompt).get(messages))
-        .route("/v1/sessions/:id/complete", post(complete))
         .route("/v1/sessions/:id/rebind", post(rebind))
         .route("/v1/sessions/:id/status", get(status))
         .route("/v1/sessions/:id/diff", get(diff))
@@ -2430,7 +2378,7 @@ fn digest_counts(resources: &[Value]) -> Value {
         let bucket = match state {
             "queued" | "pending" => "queued",
             "running" | "provisioning" | "active" => "active",
-            "review" | "ready_for_review" => "review",
+            "review" => "review",
             "failed" | "error" => "failed",
             "completed" | "done" | "cancelled" | "skipped" => "done",
             _ => continue,
@@ -2552,10 +2500,7 @@ fn project_digest_tasks(
         tasks.retain(|task| {
             task.get("reason").is_some()
                 || task.get("retry").is_some()
-                || matches!(
-                    task["state"].as_str(),
-                    Some("failed" | "error" | "review" | "ready_for_review")
-                )
+                || matches!(task["state"].as_str(), Some("failed" | "error" | "review"))
         });
     }
     tasks
@@ -2686,7 +2631,7 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
             Err(error) => return Err(error),
         };
         let disposition = if record.session.environment_state == "suspended" {
-            Some(("suspended", "suspended"))
+            Some("suspended")
         } else if record.session.environment_state == "failed" {
             store
                 .record_attempt_failure(
@@ -2704,20 +2649,17 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
                 .map_err(|error| ServiceError::Store(error.to_string()))?;
             None
         } else if record.session.environment_state != "ready" {
-            Some(("provisioning", "provisioning"))
+            Some("provisioning")
         } else {
-            match &record.work_state.state {
-                WorkLifecycleState::Completed { .. } => Some(("completed", "completed")),
-                WorkLifecycleState::Failed { .. } => {
+            match (&record.run_record.current, &record.run_record.last) {
+                (Some(_), _) => Some("running"),
+                (None, Some(FinishedRun::Completed(_))) => Some("completed"),
+                (None, Some(FinishedRun::Failed(run))) => {
                     store
                         .record_attempt_failure(
                             &active.attempt_id,
                             store::scheduler::FailureClass::Execution,
-                            record
-                                .work_state
-                                .summary()
-                                .as_deref()
-                                .unwrap_or("execution failed"),
+                            &run.error,
                             chrono::Utc::now().timestamp_millis(),
                             state.config.provisioning_max_attempts,
                             state.config.provisioning_retry_base.as_millis() as u64,
@@ -2725,16 +2667,13 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
                         .map_err(|error| ServiceError::Store(error.to_string()))?;
                     None
                 }
-                WorkLifecycleState::Active { .. } => Some(("running", "running")),
-                WorkLifecycleState::ReadyForReview { .. } => {
-                    Some(("completed", "ready_for_review"))
-                }
+                (None, None) => None,
             }
         };
-        if let Some((attempt_state, task_state)) = disposition {
+        if let Some(attempt_state) = disposition {
             if active.state != attempt_state {
                 store
-                    .set_attempt_and_task_state(&active.attempt_id, attempt_state, task_state)
+                    .set_attempt_state(&active.attempt_id, attempt_state)
                     .map_err(|error| ServiceError::Store(error.to_string()))?;
             }
         }
@@ -2765,8 +2704,9 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
                         &session_id,
                     )
                     .and_then(|_| {
-                        store.set_attempt_state(
+                        store.set_attempt_and_task_state(
                             claim.attempt["attempt_id"].as_str().unwrap_or_default(),
+                            "running",
                             "running",
                         )
                     })
@@ -3260,14 +3200,12 @@ async fn create(
         run_id: RunId(new_run_id()),
         user_message_id: new_opencode_message_id(),
     };
-    let initial_work_state = WorkStateRecord::submitted(
+    let initial_run = RunRecord::submitted(
         initial_submission.run_id.clone(),
         initial_submission.user_message_id.clone(),
         started_at,
     );
-    s.kube
-        .create(&id, &r, &sandbox_env, &initial_work_state)
-        .await?;
+    s.kube.create(&id, &r, &sandbox_env, &initial_run).await?;
     record_history(
         &s,
         &id,
@@ -3328,7 +3266,7 @@ async fn create(
     materialize_request(
         &s,
         &id,
-        initial_work_state
+        initial_run
             .user_message_id()
             .expect("submitted run has a message id"),
         prompt.as_str(),
@@ -3344,7 +3282,7 @@ async fn create(
         Some(request_id.clone()),
         Some(prompt.as_str().into()),
         Some("Anvil controller"),
-        initial_work_state.run_id(),
+        initial_run.run_id(),
         None,
         model.as_ref().map(|model| model.qualified_id()),
     )
@@ -3352,7 +3290,7 @@ async fn create(
     if let Err(error) = oc
         .prompt_async(
             &oc_id,
-            initial_work_state
+            initial_run
                 .user_message_id()
                 .expect("submitted run has a message id"),
             prompt.as_str(),
@@ -3413,11 +3351,9 @@ async fn github_credentials(
     }
     let record = s.kube.get(&id).await?;
     let session = record.session;
-    if record.work_state.api_state() == WorkState::Completed
-        || matches!(session.environment_state.as_str(), "deleting" | "deleted")
-    {
+    if matches!(session.environment_state.as_str(), "deleting" | "deleted") {
         return Err(ServiceError::Forbidden(
-            "completed sessions cannot renew GitHub credentials".into(),
+            "sessions being deleted cannot renew GitHub credentials".into(),
         ));
     }
     if session.repository != claims.repository {
@@ -3740,7 +3676,7 @@ async fn activity(
     State(s): State<AppState>,
 ) -> Result<Json<SessionActivity>, ServiceError> {
     let object = s.kube.get(&id).await?;
-    let session = reconcile_binding(&s, &id).await?;
+    let mut session = reconcile_binding(&s, &id).await?;
     let operating_mode = Some(object.operating_mode.as_str());
     let status = if binding_is_usable(&session) {
         let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
@@ -3749,6 +3685,13 @@ async fn activity(
         Value::Null
     };
     let has_authoritative_session_status = binding_is_usable(&session) && status.is_object();
+    session.execution_state = if binding_is_usable(&session) {
+        execution_state(&status, session.opencode_session_id.as_deref()).into()
+    } else if session.session_binding_state == "missing" {
+        "unavailable".into()
+    } else {
+        "recovering".into()
+    };
     let mut messages = build_activity(
         &session,
         &session.environment_state,
@@ -3801,11 +3744,16 @@ async fn activity(
         }
         .into();
     }
+    messages.session.execution_state = messages.execution_state.clone();
+    if messages.telemetry.execution != object.telemetry.execution
+        || messages.telemetry.execution_error != object.telemetry.execution_error
+    {
+        s.kube.set_telemetry(&id, &messages.telemetry).await?;
+    }
     let history = s.history.for_session(&id).await;
     let mut activity = merge_history(messages, &history);
     if !binding_is_usable(&session) && session.opencode_session_id.is_some() {
         activity.execution_state = "unavailable".into();
-        activity.state = "failed".into();
     }
     Ok(Json(activity))
 }
@@ -4061,51 +4009,6 @@ async fn update_telemetry(
     state.kube.set_telemetry(session_id, &telemetry).await
 }
 
-async fn complete(
-    Path(id): Path<String>,
-    State(s): State<AppState>,
-) -> Result<Json<Value>, ServiceError> {
-    let lock = s.transition_lock(&id);
-    let _guard = lock.lock().await;
-    let object = s.kube.get(&id).await?;
-    let (run, previous_run) = match object.work_state.state {
-        WorkLifecycleState::ReadyForReview { run, previous_run } => (run, previous_run),
-        _ => {
-            return Err(ServiceError::Conflict(
-                "only ready_for_review sessions can be completed".into(),
-            ));
-        }
-    };
-    let changed_at = chrono_like_now();
-    let run_id = run.run_id.to_string();
-    let next = WorkStateRecord {
-        changed_at: changed_at.clone(),
-        state: WorkLifecycleState::Completed { run, previous_run },
-    };
-    s.kube.set_work_state(&id, &next).await?;
-    s.stop_lifecycle_watcher(&id).await;
-    record_history(
-        &s,
-        &id,
-        "session_completed",
-        changed_at.clone(),
-        None,
-        None,
-        Some("Anvil controller"),
-        Some(run_id.clone()),
-        None,
-        None,
-    )
-    .await;
-    Ok(Json(json!({
-        "accepted": true,
-        "session_id": id,
-        "run_id": run_id,
-        "work_state": WorkState::Completed.as_str(),
-        "work_state_changed_at": changed_at,
-    })))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunSubmission {
     run_id: RunId,
@@ -4121,36 +4024,27 @@ async fn begin_run(
     let _guard = lock.lock().await;
     let object = s.kube.get(id).await?;
     let mut telemetry = object.telemetry;
-    let work = object.work_state;
-    let last_run = match work.state {
-        WorkLifecycleState::Active { .. } => {
-            return Err(ServiceError::Conflict(
-                "an OpenCode turn is already active for this session".into(),
-            ));
-        }
-        WorkLifecycleState::ReadyForReview { run, .. } => Some(FinishedRun::Completed(run)),
-        WorkLifecycleState::Failed { run, .. } => Some(FinishedRun::Failed(run)),
-        WorkLifecycleState::Completed { .. } => {
-            return Err(ServiceError::Conflict("session is completed".into()));
-        }
-    };
+    let run_record = object.run_record;
+    if run_record.current.is_some() {
+        return Err(ServiceError::Conflict(
+            "an OpenCode turn is already active for this session".into(),
+        ));
+    }
     let changed_at = chrono_like_now();
     let submission = RunSubmission {
         run_id: RunId(new_run_id()),
         user_message_id: new_opencode_message_id(),
     };
-    let next = WorkStateRecord {
+    let next = RunRecord {
         changed_at: changed_at.clone(),
-        state: WorkLifecycleState::Active {
-            run: ActiveRunState::Submitted {
-                run_id: submission.run_id.clone(),
-                user_message_id: submission.user_message_id.clone(),
-                started_at: changed_at.clone(),
-            },
-            last_run,
-        },
+        current: Some(ActiveRunState::Submitted {
+            run_id: submission.run_id.clone(),
+            user_message_id: submission.user_message_id.clone(),
+            started_at: changed_at.clone(),
+        }),
+        last: run_record.last,
     };
-    s.kube.set_work_state(id, &next).await?;
+    s.kube.set_run_record(id, &next).await?;
     if let Some((prompt, model)) = request {
         append_materialized_request(&mut telemetry, &submission.user_message_id, prompt, model);
         s.kube.set_telemetry(id, &telemetry).await?;
@@ -4211,12 +4105,12 @@ enum TelemetryFact {
     Wait(Value),
 }
 
-fn transition_work_state(
-    current: &WorkStateRecord,
+fn transition_run_record(
+    current: &RunRecord,
     observation: LifecycleObservation,
     at: &str,
-) -> WorkStateRecord {
-    let WorkLifecycleState::Active { run, last_run } = &current.state else {
+) -> RunRecord {
+    let Some(run) = &current.current else {
         return current.clone();
     };
     let (run_id, user_message_id, started_at, existing_assistant_id) = match run {
@@ -4263,42 +4157,46 @@ fn transition_work_state(
         .or_else(|| existing_assistant_id.cloned());
     let failure =
         submission_error.or_else(|| assistant.as_ref().and_then(|message| message.error.clone()));
-    let next_state = if let Some(error) = failure {
-        WorkLifecycleState::Failed {
-            run: FailedRun {
+    let (next_current, next_last) = if let Some(error) = failure {
+        (
+            None,
+            Some(FinishedRun::Failed(FailedRun {
                 run_id: run_id.clone(),
+                user_message_id: Some(user_message_id.clone()),
                 assistant_message_id: assistant_id,
                 started_at: started_at.clone(),
                 finished_at: at.into(),
                 error,
-            },
-            previous_run: last_run.clone(),
-        }
+            })),
+        )
     } else if assistant.as_ref().is_some_and(|message| message.completed) {
-        WorkLifecycleState::ReadyForReview {
-            run: CompletedRun {
+        (
+            None,
+            Some(FinishedRun::Completed(CompletedRun {
                 run_id: run_id.clone(),
-                assistant_message_id: assistant_id
-                    .expect("completed assistant observation has an id"),
+                user_message_id: Some(user_message_id.clone()),
+                assistant_message_id: Some(
+                    assistant_id.expect("completed assistant observation has an id"),
+                ),
                 started_at: started_at.clone(),
                 finished_at: at.into(),
-            },
-            previous_run: last_run.clone(),
-        }
+            })),
+        )
     } else {
-        WorkLifecycleState::Active {
-            run: ActiveRunState::Running {
+        (
+            Some(ActiveRunState::Running {
                 run_id: run_id.clone(),
                 user_message_id: user_message_id.clone(),
                 assistant_message_id: assistant_id.expect("assistant observation has an id"),
                 started_at: started_at.clone(),
-            },
-            last_run: last_run.clone(),
-        }
+            }),
+            current.last.clone(),
+        )
     };
-    WorkStateRecord {
+    RunRecord {
         changed_at: at.into(),
-        state: next_state,
+        current: next_current,
+        last: next_last,
     }
 }
 
@@ -4531,27 +4429,6 @@ async fn apply_lifecycle_observation(
                     if changed {
                         telemetry.execution = state.clone();
                         telemetry.execution_error = error.clone();
-                        if let Some(request) = telemetry.requests.last_mut() {
-                            match state.as_str() {
-                                "busy" => request.state = "running".into(),
-                                "idle"
-                                    if matches!(
-                                        request.state.as_str(),
-                                        "running" | "submitted"
-                                    ) =>
-                                {
-                                    request.state = "completed".into();
-                                    request.completed_at = Some(at.clone());
-                                }
-                                "error" => {
-                                    request.state = "failed".into();
-                                    request.completed_at = Some(at.clone());
-                                    request.error = error.clone();
-                                }
-                                _ => {}
-                            }
-                            request.last_activity_at = Some(at.clone());
-                        }
                         telemetry.last_activity_at = Some(at.clone());
                     }
                 }
@@ -4592,7 +4469,7 @@ async fn apply_lifecycle_observation(
                 .await?;
         }
     } else if let LifecycleObservation::AssistantMessage(message) = &observation {
-        if record.work_state.user_message_id() == Some(&message.parent_id) {
+        if record.run_record.user_message_id() == Some(&message.parent_id) {
             let mut telemetry = record.telemetry.clone();
             if let Some(request) = telemetry
                 .requests
@@ -4625,18 +4502,19 @@ async fn apply_lifecycle_observation(
             }
         }
     }
-    let next = transition_work_state(&record.work_state, observation, &at);
-    if next == record.work_state {
+    let next = transition_run_record(&record.run_record, observation, &at);
+    if next == record.run_record {
         return Ok(());
     }
-    state.kube.set_work_state(anvil_session_id, &next).await?;
-    let (kind, detail) = match &next.state {
-        WorkLifecycleState::Active {
-            run: ActiveRunState::Running { .. },
-            ..
-        } => ("run_started", None),
-        WorkLifecycleState::ReadyForReview { .. } => ("opencode_turn_completed", None),
-        WorkLifecycleState::Failed { run, .. } => ("opencode_turn_failed", Some(run.error.clone())),
+    state.kube.set_run_record(anvil_session_id, &next).await?;
+    let (kind, detail) = match (&record.run_record.current, &next.current, &next.last) {
+        (Some(ActiveRunState::Submitted { .. }), Some(ActiveRunState::Running { .. }), _) => {
+            ("run_started", None)
+        }
+        (Some(_), None, Some(FinishedRun::Completed(_))) => ("opencode_turn_completed", None),
+        (Some(_), None, Some(FinishedRun::Failed(run))) => {
+            ("opencode_turn_failed", Some(run.error.clone()))
+        }
         _ => return Ok(()),
     };
     record_history(
@@ -4662,7 +4540,7 @@ async fn reconcile_lifecycle_messages(
     messages: &Value,
 ) -> Result<(), ServiceError> {
     let record = state.kube.get(anvil_session_id).await?;
-    let Some(user_message_id) = record.work_state.user_message_id().cloned() else {
+    let Some(user_message_id) = record.run_record.user_message_id().cloned() else {
         return Ok(());
     };
     let entries = messages
@@ -4784,7 +4662,7 @@ async fn reconcile_lifecycle_from_opencode(
         .kube
         .get(anvil_session_id)
         .await?
-        .work_state
+        .run_record
         .user_message_id()
         .is_some()
     {
@@ -4818,9 +4696,7 @@ async fn lifecycle_watch_loop(
             Ok(record) => record,
             Err(_) => return,
         };
-        if record.session.environment_state != "ready"
-            || record.work_state.api_state() == WorkState::Completed
-        {
+        if record.session.environment_state != "ready" {
             return;
         }
         let Some(opencode_session_id) = record.session.opencode_session_id.clone() else {
@@ -5011,20 +4887,16 @@ async fn status(
     Path(id): Path<String>,
     State(s): State<AppState>,
 ) -> Result<Json<Value>, ServiceError> {
-    let x = reconcile_binding(&s, &id).await?;
+    let mut x = reconcile_binding(&s, &id).await?;
     let record = s.kube.get(&id).await?;
     if !binding_is_usable(&x) {
         return Ok(Json(json!({
             "environment_state": x.environment_state,
             "environment_error": x.environment_error,
             "execution_state": if x.session_binding_state == "missing" { "unavailable" } else { "recovering" },
-            "work_state": x.work_state,
-            "work_state_changed_at": x.work_state_changed_at,
-            "work_state_summary": x.work_state_summary,
-            "work_state_run_id": x.work_state_run_id,
             "current_run": x.current_run,
             "last_run": x.last_run,
-            "last_activity_at": x.work_state_changed_at,
+            "last_activity_at": record.telemetry.last_activity_at,
             "telemetry": record.telemetry,
             "session_binding_state": x.session_binding_state,
             "session_binding_continuity": x.session_binding_continuity,
@@ -5077,7 +4949,9 @@ async fn status(
         }),
     )
     .await?;
-    let mut telemetry = s.kube.get(&id).await?.telemetry;
+    let updated = s.kube.get(&id).await?;
+    x = updated.session;
+    let mut telemetry = updated.telemetry;
     telemetry.execution = match execution_state {
         "running" => "busy",
         "idle" => "idle",
@@ -5093,13 +4967,9 @@ async fn status(
         "environment_state": x.environment_state,
         "environment_error": x.environment_error,
         "execution_state": execution_state,
-        "work_state": x.work_state,
-        "work_state_changed_at": x.work_state_changed_at,
-        "work_state_summary": x.work_state_summary,
-        "work_state_run_id": x.work_state_run_id,
         "current_run": x.current_run,
         "last_run": x.last_run,
-        "last_activity_at": x.work_state_changed_at,
+        "last_activity_at": telemetry.last_activity_at,
         "telemetry": telemetry,
         "session_binding_state": x.session_binding_state,
         "session_binding_continuity": x.session_binding_continuity,
@@ -5356,7 +5226,6 @@ fn build_activity(
         .opencode_session_id
         .as_deref()
         .is_some_and(|id| status_is_busy(&status, id));
-    let status_available = status.is_object();
     let mut requests = Vec::with_capacity(user_messages.len());
     let mut lifecycle = Vec::new();
 
@@ -5390,15 +5259,9 @@ fn build_activity(
                 .unwrap_or_else(|| session.created_at.clone().unwrap_or_default());
         let assistant = assistant_for(&messages, &id);
         let assistant_info = assistant.map(|value| value.get("info").unwrap_or(value));
-        let completed_at = assistant_info
-            .and_then(|value| {
-                timestamp_from_value(value.get("time").and_then(|time| time.get("completed")))
-            })
-            .or_else(|| {
-                (status_available && !busy)
-                    .then(|| session.work_state_changed_at.clone())
-                    .flatten()
-            });
+        let completed_at = assistant_info.and_then(|value| {
+            timestamp_from_value(value.get("time").and_then(|time| time.get("completed")))
+        });
         let started_ms = timestamp_millis(info.get("time").and_then(|time| time.get("created")));
         let completed_ms = assistant_info.and_then(|value| {
             timestamp_millis(value.get("time").and_then(|time| time.get("completed")))
@@ -5464,48 +5327,15 @@ fn build_activity(
     let current = busy
         .then(|| requests.last().filter(|request| request.state == "running"))
         .flatten();
-    let request_state = if session.work_state == WorkState::Failed.as_str()
-        || requests
-            .last()
-            .is_some_and(|request| request.state == "failed")
-    {
-        "failed"
-    } else if busy {
-        "running"
-    } else if status_available {
-        "idle"
-    } else {
-        "unavailable"
-    }
-    .to_owned();
-    let state = if operating_mode == Some("Suspended") {
-        "stopped"
-    } else if session.environment_state == "failed" {
-        "failed"
-    } else if session.environment_state != "ready" || session.opencode_session_id.is_none() {
-        "starting"
-    } else if session.work_state == WorkState::Completed.as_str() {
-        "done"
-    } else if session.work_state == WorkState::Failed.as_str()
-        || requests
-            .last()
-            .is_some_and(|request| request.state == "failed")
-    {
-        "failed"
-    } else if busy {
-        "active"
-    } else if !status_available {
-        "starting"
-    } else {
-        "idle"
-    };
     let current_operation = current.and_then(|request| request.current_operation.clone());
     let last_activity_at = requests
         .last()
         .and_then(|request| request.last_activity_at.clone())
         .or_else(|| session.ready_at.clone())
         .or_else(|| session.created_at.clone());
-    let opencode_url = (state != "starting").then(|| {
+    let opencode_url = (session.environment_state == "ready"
+        && session.opencode_session_id.is_some())
+    .then(|| {
         preview_hostname(
             &SessionId::parse(&session.id).expect("session IDs are validated by session_from"),
             Port::new(session.opencode_port).expect("configured OpenCode port is non-zero"),
@@ -5524,8 +5354,6 @@ fn build_activity(
     let execution_state = execution_state(&status, session.opencode_session_id.as_deref());
     SessionActivity {
         session: session.clone(),
-        state: state.into(),
-        request_state,
         current_operation,
         last_activity_at,
         requests,
@@ -5537,9 +5365,6 @@ fn build_activity(
         environment_error: session.environment_error.clone(),
         execution_state: execution_state.into(),
         telemetry: SessionTelemetry::default(),
-        work_state: session.work_state.clone(),
-        work_state_changed_at: session.work_state_changed_at.clone(),
-        work_state_summary: session.work_state_summary.clone(),
         current_run: session.current_run.clone(),
         last_run: session.last_run.clone(),
         session_binding_state: session.session_binding_state.clone(),
@@ -7102,7 +6927,7 @@ mod tests {
             _id: &str,
             _request: &CreateRequest,
             _sandbox_env: &[(String, String)],
-            _initial_work_state: &WorkStateRecord,
+            _initial_run: &RunRecord,
         ) -> Result<Session, ServiceError> {
             Err(ServiceError::Invalid("not used in provider tests".into()))
         }
@@ -7128,7 +6953,7 @@ mod tests {
             _id: &str,
             _request: &CreateRequest,
             _sandbox_env: &[(String, String)],
-            _initial_work_state: &WorkStateRecord,
+            _initial_run: &RunRecord,
         ) -> Result<Session, ServiceError> {
             Err(ServiceError::Provisioning(
                 "injected provisioning outage".into(),
@@ -7282,7 +7107,7 @@ mod tests {
             .map(|index| {
                 let mut session = activity_session();
                 session.id = format!("external-{index:08x}");
-                let mut record = active_work_record(session);
+                let mut record = active_run_record(session);
                 if index == 2 {
                     record.session.environment_state = "provisioning".into();
                 }
@@ -7353,7 +7178,7 @@ mod tests {
             _id: &str,
             _request: &CreateRequest,
             _sandbox_env: &[(String, String)],
-            _initial_work_state: &WorkStateRecord,
+            _initial_run: &RunRecord,
         ) -> Result<Session, ServiceError> {
             Err(ServiceError::Invalid("not used in binding tests".into()))
         }
@@ -7437,7 +7262,7 @@ mod tests {
             _id: &str,
             _request: &CreateRequest,
             _sandbox_env: &[(String, String)],
-            _initial_work_state: &WorkStateRecord,
+            _initial_run: &RunRecord,
         ) -> Result<Session, ServiceError> {
             Err(ServiceError::Invalid("not used in activity tests".into()))
         }
@@ -7470,7 +7295,7 @@ mod tests {
             _id: &str,
             _request: &CreateRequest,
             _sandbox_env: &[(String, String)],
-            _initial_work_state: &WorkStateRecord,
+            _initial_run: &RunRecord,
         ) -> Result<Session, ServiceError> {
             Err(ServiceError::Invalid("not used in lifecycle tests".into()))
         }
@@ -7497,20 +7322,12 @@ mod tests {
             Ok(())
         }
 
-        async fn set_work_state(
-            &self,
-            _id: &str,
-            value: &WorkStateRecord,
-        ) -> Result<(), ServiceError> {
+        async fn set_run_record(&self, _id: &str, value: &RunRecord) -> Result<(), ServiceError> {
             let mut record = self
                 .record
                 .lock()
                 .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?;
-            record.work_state = value.clone();
-            record.session.work_state = value.api_state().as_str().into();
-            record.session.work_state_changed_at = Some(value.changed_at.clone());
-            record.session.work_state_summary = value.summary();
-            record.session.work_state_run_id = value.run_id();
+            record.run_record = value.clone();
             record.session.current_run = value.current_run();
             record.session.last_run = value.last_run();
             Ok(())
@@ -7540,10 +7357,18 @@ mod tests {
             _id: &str,
             value: &SessionTelemetry,
         ) -> Result<(), ServiceError> {
-            self.record
+            let mut record = self
+                .record
                 .lock()
-                .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?
-                .telemetry = value.clone();
+                .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?;
+            record.telemetry = value.clone();
+            record.session.execution_state = match value.execution.as_str() {
+                "busy" => "running",
+                "idle" => "idle",
+                "error" => "failed",
+                value => value,
+            }
+            .into();
             Ok(())
         }
     }
@@ -7807,7 +7632,7 @@ mod tests {
         let mut test_config = config("http://profile".into());
         test_config.store_path = db_path.clone();
 
-        let mut live = active_work_record(activity_session());
+        let mut live = active_run_record(activity_session());
         live.session.opencode_session_id = None;
         live.session.environment_state = "ready".into();
         let mut stale = live.clone();
@@ -7917,12 +7742,12 @@ mod tests {
     fn generated_sandbox_publishes_shared_nix_rw_with_read_only_mounts() {
         let mut config = config("http://profile".into());
         config.nix_pvc = "configured-nix-pvc".into();
-        let state = WorkStateRecord::submitted(
+        let state = RunRecord::submitted(
             RunId("run_example".into()),
             OpenCodeMessageId("msg_example".into()),
             "2026-01-01T00:00:00Z".into(),
         );
-        let mut annotations = work_state_annotations(&config, &state);
+        let mut annotations = run_record_annotations(&config, &state);
         annotations.retain(|_, value| !value.is_null());
         let manifest = sandbox_manifest(
             &config,
@@ -8089,16 +7914,16 @@ mod tests {
             created_at: Some("2026-01-01T10:00:00Z".into()),
             ready_at: Some("2026-01-01T10:00:41Z".into()),
             environment_state: "ready".into(),
+            execution_state: "running".into(),
             environment_error: None,
-            work_state: "in_progress".into(),
-            work_state_changed_at: Some("2026-01-01T10:00:00Z".into()),
-            work_state_summary: None,
-            work_state_run_id: Some("run_test".into()),
             current_run: Some(Run {
                 id: RunId("run_test".into()),
                 state: RunState::Running,
+                user_message_id: None,
+                assistant_message_id: None,
                 started_at: "2026-01-01T10:00:00Z".into(),
                 finished_at: None,
+                error: None,
             }),
             last_run: None,
             session_binding_state: "available".into(),
@@ -8110,7 +7935,7 @@ mod tests {
         }
     }
 
-    fn active_work_record(session: Session) -> SandboxRecord {
+    fn active_run_record(session: Session) -> SandboxRecord {
         let changed_at = "2026-01-01T10:00:00Z".to_owned();
         let run_id = RunId("run_test".into());
         let user_message_id = OpenCodeMessageId("msg_test_user".into());
@@ -8118,29 +7943,28 @@ mod tests {
         let run = Run {
             id: run_id.clone(),
             state: RunState::Running,
+            user_message_id: None,
+            assistant_message_id: None,
             started_at: changed_at.clone(),
             finished_at: None,
+            error: None,
         };
         let mut session = session;
         session.environment_state = "ready".into();
-        session.work_state = WorkState::InProgress.as_str().into();
-        session.work_state_changed_at = Some(changed_at.clone());
-        session.work_state_run_id = Some(run.id.to_string());
+        session.execution_state = "running".into();
         session.current_run = Some(run.clone());
         session.session_binding_state = "available".into();
         SandboxRecord {
             session,
-            work_state: WorkStateRecord {
+            run_record: RunRecord {
                 changed_at,
-                state: WorkLifecycleState::Active {
-                    run: ActiveRunState::Running {
-                        run_id,
-                        user_message_id,
-                        assistant_message_id,
-                        started_at: run.started_at,
-                    },
-                    last_run: None,
-                },
+                current: Some(ActiveRunState::Running {
+                    run_id,
+                    user_message_id,
+                    assistant_message_id,
+                    started_at: run.started_at,
+                }),
+                last: None,
             },
             binding_state: BindingStateRecord {
                 state: "available".into(),
@@ -8158,9 +7982,10 @@ mod tests {
 
     #[test]
     fn stream_materialization_contains_normalized_axes_without_upstream_events() {
-        let value = normalized_sandbox_value(&active_work_record(activity_session()));
+        let value = normalized_sandbox_value(&active_run_record(activity_session()));
         assert_eq!(value["session"]["environment_state"], "ready");
-        assert_eq!(value["work_state"]["state"]["state"], "active");
+        assert_eq!(value["session"]["execution_state"], "running");
+        assert!(value.get("work_state").is_none());
         assert_eq!(value["binding_state"]["state"], "available");
         assert!(value.get("telemetry").is_some());
         assert!(value.get("event").is_none());
@@ -8183,8 +8008,8 @@ mod tests {
         })
     }
 
-    fn submitted_record(run_id: &str, user_message_id: &str) -> WorkStateRecord {
-        WorkStateRecord::submitted(
+    fn submitted_record(run_id: &str, user_message_id: &str) -> RunRecord {
+        RunRecord::submitted(
             RunId(run_id.into()),
             OpenCodeMessageId(user_message_id.into()),
             "2026-01-01T10:00:00Z".into(),
@@ -8194,26 +8019,31 @@ mod tests {
     #[test]
     fn correlated_assistant_message_completes_the_submitted_run() {
         let submitted = submitted_record("run_A", "user_A");
-        let running = transition_work_state(
+        let running = transition_run_record(
             &submitted,
             assistant_observation("assistant_A", "user_A", false, None),
             "2026-01-01T10:01:00Z",
         );
         assert!(matches!(
-            running.state,
-            WorkLifecycleState::Active {
-                run: ActiveRunState::Running { .. },
-                ..
-            }
+            running.current,
+            Some(ActiveRunState::Running { .. })
         ));
-        let completed = transition_work_state(
+        let completed = transition_run_record(
             &running,
             assistant_observation("assistant_A", "user_A", true, None),
             "2026-01-01T10:02:00Z",
         );
-        assert_eq!(completed.api_state(), WorkState::ReadyForReview);
+        assert!(completed.current.is_none());
         assert_eq!(completed.run_id().as_deref(), Some("run_A"));
         assert_eq!(completed.last_run().unwrap().state, RunState::Completed);
+        assert_eq!(
+            completed.last_run().unwrap().user_message_id,
+            Some(OpenCodeMessageId("user_A".into()))
+        );
+        assert_eq!(
+            completed.last_run().unwrap().assistant_message_id,
+            Some(OpenCodeMessageId("assistant_A".into()))
+        );
         assert_eq!(
             completed.last_run().unwrap().finished_at.as_deref(),
             Some("2026-01-01T10:02:00Z")
@@ -8221,51 +8051,72 @@ mod tests {
     }
 
     #[test]
+    fn legacy_session_record_migrates_only_correlated_run_facts() {
+        let active = json!({
+            "changed_at":"2026-01-01T10:00:00Z",
+            "state":{"state":"active","details":{"run":{"state":"running","run":{"run_id":"run_A","user_message_id":"user_A","assistant_message_id":"assistant_A","started_at":"2026-01-01T10:00:00Z"}},"last_run":null}}
+        });
+        let active = legacy_run_record(&active.to_string()).unwrap();
+        assert!(matches!(
+            active.current,
+            Some(ActiveRunState::Running { .. })
+        ));
+        assert_eq!(active.current_run().unwrap().state, RunState::Running);
+
+        let completed = json!({
+            "changed_at":"2026-01-01T10:02:00Z",
+            "state":{"state":"ready_for_review","details":{"run":{"run_id":"run_A","assistant_message_id":"assistant_A","started_at":"2026-01-01T10:00:00Z","finished_at":"2026-01-01T10:02:00Z"},"previous_run":null}}
+        });
+        let completed = legacy_run_record(&completed.to_string()).unwrap();
+        assert!(completed.current.is_none());
+        assert_eq!(completed.last_run().unwrap().state, RunState::Completed);
+        assert!(serde_json::to_value(completed)
+            .unwrap()
+            .get("state")
+            .is_none());
+    }
+
+    #[test]
     fn late_idle_from_run_a_cannot_complete_running_run_b() {
         let submitted_a = submitted_record("run_A", "user_A");
-        let running_a = transition_work_state(
+        let running_a = transition_run_record(
             &submitted_a,
             assistant_observation("assistant_A", "user_A", false, None),
             "2026-01-01T10:01:00Z",
         );
-        let completed_a = transition_work_state(
+        let completed_a = transition_run_record(
             &running_a,
             assistant_observation("assistant_A", "user_A", true, None),
             "2026-01-01T10:02:00Z",
         );
-        let previous_run = match completed_a.state {
-            WorkLifecycleState::ReadyForReview { run, .. } => Some(FinishedRun::Completed(run)),
-            state => panic!("expected completed A, got {state:?}"),
-        };
-        let submitted_b = WorkStateRecord {
+        let previous_run = completed_a.last;
+        let submitted_b = RunRecord {
             changed_at: "2026-01-01T10:03:00Z".into(),
-            state: WorkLifecycleState::Active {
-                run: ActiveRunState::Submitted {
-                    run_id: RunId("run_B".into()),
-                    user_message_id: OpenCodeMessageId("user_B".into()),
-                    started_at: "2026-01-01T10:03:00Z".into(),
-                },
-                last_run: previous_run,
-            },
+            current: Some(ActiveRunState::Submitted {
+                run_id: RunId("run_B".into()),
+                user_message_id: OpenCodeMessageId("user_B".into()),
+                started_at: "2026-01-01T10:03:00Z".into(),
+            }),
+            last: previous_run,
         };
-        let running_b = transition_work_state(
+        let running_b = transition_run_record(
             &submitted_b,
             assistant_observation("assistant_B", "user_B", false, None),
             "2026-01-01T10:04:00Z",
         );
-        let late_idle = transition_work_state(
+        let late_idle = transition_run_record(
             &running_b,
             LifecycleObservation::UncorrelatedSessionEvent,
             "2026-01-01T10:04:01Z",
         );
         assert_eq!(late_idle, running_b, "stale idle must not alter run B");
 
-        let completed_b = transition_work_state(
+        let completed_b = transition_run_record(
             &late_idle,
             assistant_observation("assistant_B", "user_B", true, None),
             "2026-01-01T10:05:00Z",
         );
-        assert_eq!(completed_b.api_state(), WorkState::ReadyForReview);
+        assert!(completed_b.current.is_none());
         assert_eq!(completed_b.run_id().as_deref(), Some("run_B"));
         assert_eq!(completed_b.last_run().unwrap().id.to_string(), "run_B");
     }
@@ -8273,23 +8124,23 @@ mod tests {
     #[test]
     fn uncorrelated_assistant_and_session_errors_cannot_fail_the_current_run() {
         let submitted = submitted_record("run_B", "user_B");
-        let running = transition_work_state(
+        let running = transition_run_record(
             &submitted,
             assistant_observation("assistant_B", "user_B", false, None),
             "2026-01-01T10:01:00Z",
         );
-        let stale_error = transition_work_state(
+        let stale_error = transition_run_record(
             &running,
             assistant_observation("assistant_A", "user_A", true, Some("old error")),
             "2026-01-01T10:02:00Z",
         );
-        let session_error = transition_work_state(
+        let session_error = transition_run_record(
             &stale_error,
             LifecycleObservation::UncorrelatedSessionEvent,
             "2026-01-01T10:03:00Z",
         );
         assert_eq!(session_error, running);
-        let stale_submission_error = transition_work_state(
+        let stale_submission_error = transition_run_record(
             &running,
             LifecycleObservation::SubmissionFailed {
                 run_id: RunId("run_A".into()),
@@ -8299,14 +8150,17 @@ mod tests {
             "2026-01-01T10:04:00Z",
         );
         assert_eq!(stale_submission_error, running);
-        let correlated_error = transition_work_state(
+        let correlated_error = transition_run_record(
             &running,
             assistant_observation("assistant_B", "user_B", false, Some("worker error")),
             "2026-01-01T10:05:00Z",
         );
-        assert_eq!(correlated_error.api_state(), WorkState::Failed);
-        assert_eq!(correlated_error.summary().as_deref(), Some("worker error"));
+        assert!(correlated_error.current.is_none());
         assert_eq!(correlated_error.last_run().unwrap().state, RunState::Failed);
+        assert_eq!(
+            correlated_error.last_run().unwrap().error.as_deref(),
+            Some("worker error")
+        );
     }
 
     #[test]
@@ -8395,14 +8249,15 @@ mod tests {
         session.current_run = Some(Run {
             id: RunId("run_B".into()),
             state: RunState::Submitted,
+            user_message_id: None,
+            assistant_message_id: None,
             started_at: "2026-01-01T10:00:00Z".into(),
             finished_at: None,
+            error: None,
         });
-        session.work_state_run_id = Some("run_B".into());
-        let mut initial = active_work_record(session);
-        initial.work_state = submitted_record("run_B", "user_B");
-        initial.session.current_run = initial.work_state.current_run();
-        initial.session.work_state_run_id = initial.work_state.run_id();
+        let mut initial = active_run_record(session);
+        initial.run_record = submitted_record("run_B", "user_B");
+        initial.session.current_run = initial.run_record.current_run();
         let record = Arc::new(Mutex::new(initial));
         let state = AppState::new(
             test_config,
@@ -8422,11 +8277,8 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            record.lock().unwrap().work_state.state,
-            WorkLifecycleState::Active {
-                run: ActiveRunState::Running { .. },
-                ..
-            }
+            record.lock().unwrap().run_record.current,
+            Some(ActiveRunState::Running { .. })
         ));
         let completed_messages = json!([
             {"info":{"id":"assistant_A","parentID":"user_A","role":"assistant","time":{"created":1,"completed":2}}},
@@ -8435,15 +8287,27 @@ mod tests {
         reconcile_lifecycle_messages(&state, "demo-12345678", "ses_demo", &completed_messages)
             .await
             .unwrap();
-        let record = record.lock().unwrap();
-        assert_eq!(record.work_state.api_state(), WorkState::ReadyForReview);
-        assert_eq!(record.work_state.run_id().as_deref(), Some("run_B"));
+        {
+            let completed_record = record.lock().unwrap();
+            assert!(completed_record.run_record.current.is_none());
+            assert_eq!(
+                completed_record.run_record.last_run().unwrap().state,
+                RunState::Completed
+            );
+        }
+        let follow_up = begin_run(&state, "demo-12345678", Some(("follow up", None)))
+            .await
+            .expect("an idle session accepts another prompt without a semantic reset");
+        assert_eq!(
+            record.lock().unwrap().run_record.current_run().unwrap().id,
+            follow_up.run_id
+        );
     }
 
     #[tokio::test]
     async fn opencode_error_updates_execution_fact_without_failing_transport_or_admin_state() {
         let session = activity_session();
-        let record = Arc::new(Mutex::new(active_work_record(session)));
+        let record = Arc::new(Mutex::new(active_run_record(session)));
         let state = AppState::new(
             config("http://profile.test".into()),
             LifecycleSandbox {
@@ -8471,7 +8335,7 @@ mod tests {
             Some("OpenCode turn failed")
         );
         assert_eq!(record.telemetry.observer, "recovering");
-        assert_eq!(record.work_state.api_state(), WorkState::InProgress);
+        assert!(record.run_record.current.is_some());
     }
 
     #[tokio::test]
@@ -8481,7 +8345,7 @@ mod tests {
         let mut session = activity_session();
         session.service = "127.0.0.1".into();
         session.opencode_port = 1;
-        let record = Arc::new(Mutex::new(active_work_record(session)));
+        let record = Arc::new(Mutex::new(active_run_record(session)));
         let sandbox = LifecycleSandbox {
             record: record.clone(),
         };
@@ -8534,7 +8398,7 @@ mod tests {
         let mut session = activity_session();
         session.service = "127.0.0.1".into();
         session.opencode_port = mock.port();
-        let record = Arc::new(Mutex::new(active_work_record(session)));
+        let record = Arc::new(Mutex::new(active_run_record(session)));
         let app = router(AppState::new(
             test_config,
             LifecycleSandbox {
@@ -8551,9 +8415,10 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_response(response).await;
+        assert_eq!(body["environment_state"], "ready");
         assert_eq!(body["execution_state"], "idle");
-        assert_eq!(body["work_state"], "in_progress");
         assert_eq!(body["current_run"]["state"], "running");
+        assert!(body.get("work_state").is_none());
         assert_eq!(
             transcript.hits(),
             0,
@@ -8575,7 +8440,7 @@ mod tests {
         let mut session = activity_session();
         session.service = "127.0.0.1".into();
         session.opencode_port = mock.port();
-        let record = Arc::new(Mutex::new(active_work_record(session)));
+        let record = Arc::new(Mutex::new(active_run_record(session)));
         {
             let mut record = record.lock().unwrap();
             record.telemetry.execution = "error".into();
@@ -8626,7 +8491,7 @@ mod tests {
         let mut session = activity_session();
         session.service = "127.0.0.1".into();
         session.opencode_port = port;
-        let record = Arc::new(Mutex::new(active_work_record(session)));
+        let record = Arc::new(Mutex::new(active_run_record(session)));
         let state = AppState::new(
             test_config,
             LifecycleSandbox {
@@ -8640,7 +8505,13 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
-            if record.lock().unwrap().work_state.api_state() == WorkState::ReadyForReview {
+            if record
+                .lock()
+                .unwrap()
+                .run_record
+                .last_run()
+                .is_some_and(|run| run.state == RunState::Completed)
+            {
                 break;
             }
             assert!(
@@ -8650,7 +8521,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
-        assert!(record.lock().unwrap().work_state.current_run().is_none());
+        assert!(record.lock().unwrap().run_record.current_run().is_none());
         {
             let record_guard = record.lock().unwrap();
             let telemetry = &record_guard.telemetry;
@@ -8914,7 +8785,7 @@ mod tests {
             "work_branch": "anvil/demo-12345678",
             "model": "openai/gpt-5.6-luna",
             "environment_state": "ready",
-            "work_state": "in_progress"
+            "execution_state": "idle"
         }))
         .unwrap();
         let activity = build_activity(
@@ -9106,7 +8977,7 @@ mod tests {
         test_config.session_signing_secret = Some(secret.clone());
         test_config.session_capability_ttl = ttl;
         let sandbox = LifecycleSandbox {
-            record: Arc::new(Mutex::new(active_work_record(activity_session()))),
+            record: Arc::new(Mutex::new(active_run_record(activity_session()))),
         };
         let mut state = AppState::new(test_config, sandbox);
         state.github = Some(
@@ -9160,7 +9031,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_or_deleted_sessions_cannot_renew_github_capabilities() {
+    async fn healthy_idle_sessions_can_renew_and_deleting_sessions_cannot() {
         let server = MockServer::start();
         let token = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
@@ -9173,29 +9044,13 @@ mod tests {
         let secret = "x".repeat(32);
         let mut test_config = config(server.base_url());
         test_config.session_signing_secret = Some(secret.clone());
-        let signer = github::CapabilitySigner::new(&secret, Duration::from_millis(1)).unwrap();
+        let signer = github::CapabilitySigner::new(&secret, Duration::from_secs(60)).unwrap();
         let capability = signer
             .mint("demo-12345678", "https://github.com/example/demo.git")
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
 
-        let mut completed = active_work_record(activity_session());
-        let finished_run = CompletedRun {
-            run_id: RunId("run_test".into()),
-            assistant_message_id: OpenCodeMessageId("assistant_test".into()),
-            started_at: "2026-01-01T10:00:00Z".into(),
-            finished_at: "2026-01-01T10:01:00Z".into(),
-        };
-        completed.work_state = WorkStateRecord {
-            changed_at: finished_run.finished_at.clone(),
-            state: WorkLifecycleState::Completed {
-                run: finished_run,
-                previous_run: None,
-            },
-        };
-        completed.session.work_state = WorkState::Completed.as_str().into();
         let sandbox = LifecycleSandbox {
-            record: Arc::new(Mutex::new(completed)),
+            record: Arc::new(Mutex::new(active_run_record(activity_session()))),
         };
         let mut state = AppState::new(test_config.clone(), sandbox);
         state.github = Some(
@@ -9215,7 +9070,7 @@ mod tests {
                 .unwrap()
         };
         let response = app.oneshot(request()).await.unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
 
         let deleting_object: DynamicObject = serde_json::from_value(json!({
             "apiVersion": "agents.x-k8s.io/v1beta1",
@@ -9262,7 +9117,7 @@ mod tests {
         );
         let response = router(deleted_state).oneshot(request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        token.assert_hits(0);
+        token.assert_hits(1);
     }
 
     #[test]
@@ -9290,7 +9145,8 @@ mod tests {
             &config("http://profile.test".into()),
         );
 
-        assert_eq!(activity.state, "idle");
+        assert_eq!(activity.environment_state, "ready");
+        assert_eq!(activity.execution_state, "idle");
         assert_eq!(activity.requests.len(), 1);
         assert_eq!(
             activity.requests[0].prompt,
@@ -9320,8 +9176,7 @@ mod tests {
             &config("http://profile.test".into()),
         );
 
-        assert_eq!(activity.state, "active");
-        assert_eq!(activity.request_state, "running");
+        assert_eq!(activity.execution_state, "running");
         assert_eq!(activity.requests[0].duration_ms, None);
         assert_eq!(activity.requests[0].prompt, "Run the test suite.");
     }
@@ -9354,7 +9209,7 @@ mod tests {
         assert_eq!(record.session.id, session.id);
         assert_eq!(record.session.environment_state, session.environment_state);
         assert_eq!(record.session.service, session.service);
-        assert_eq!(record.session.work_state, session.work_state);
+        assert_eq!(record.session.execution_state, session.execution_state);
         assert_eq!(record.operating_mode, "Running");
     }
 
@@ -9376,40 +9231,44 @@ mod tests {
     }
 
     #[test]
-    fn run_annotations_are_json_encoded_strings() {
+    fn run_annotations_are_json_encoded_strings_and_semantic_fields_are_not_written() {
         let run = Run {
             id: RunId("run_test".into()),
             state: RunState::Submitted,
+            user_message_id: None,
+            assistant_message_id: None,
             started_at: "2026-01-01T10:00:00Z".into(),
             finished_at: None,
+            error: None,
         };
         let value = run_value(Some(&run));
         let encoded = value.as_str().expect("annotation value must be a string");
         assert_eq!(serde_json::from_str::<Run>(encoded).unwrap(), run);
         assert!(run_value(None).is_null());
 
-        let annotations = work_state_annotations(
-            &config("http://profile.test".into()),
-            &WorkStateRecord::submitted(
-                run.id.clone(),
-                OpenCodeMessageId("user_test".into()),
-                run.started_at.clone(),
-            ),
+        let record = RunRecord::submitted(
+            run.id.clone(),
+            OpenCodeMessageId("user_test".into()),
+            run.started_at.clone(),
         );
+        let annotations = run_record_annotations(&config("http://profile.test".into()), &record);
         assert!(annotations
             .values()
             .all(|value| value.is_string() || value.is_null()));
         assert!(annotations
-            .get("anvil.example/work-state-record")
+            .get("anvil.example/run-record")
             .and_then(Value::as_str)
-            .and_then(|value| serde_json::from_str::<WorkStateRecord>(value).ok())
+            .and_then(|value| serde_json::from_str::<RunRecord>(value).ok())
             .is_some());
+        assert!(annotations
+            .iter()
+            .all(|(key, value)| value.is_null() || !key.contains("work-state")));
         assert_eq!(
             annotations
                 .get("anvil.example/run-current")
                 .and_then(Value::as_str)
                 .and_then(|value| serde_json::from_str::<Run>(value).ok()),
-            Some(run)
+            record.current_run()
         );
     }
 

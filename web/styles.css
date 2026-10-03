@@ -78,8 +78,6 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .detail-subtitle code, code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
 .detail-status { display: inline-flex; align-items: center; gap: 8px; margin-top: 22px; color: var(--text-secondary); font-size: 13px; }
 .detail-status strong { color: var(--text-primary); }
-.work-summary { max-width: 720px; margin-top: 24px; padding: 14px 16px; border-left: 2px solid var(--rust-brand); background: var(--surface); color: var(--text-secondary); line-height: 1.5; white-space: pre-wrap; }
-.work-summary .eyebrow { margin-bottom: 6px; }
 .description { max-width: 720px; color: var(--text-secondary); margin: 25px 0 0; white-space: pre-wrap; line-height: 1.55; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 26px 0 31px; }
 .button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; cursor: pointer; border: 1px solid var(--border-strong); border-radius: 7px; min-height: 36px; padding: 0 13px; color: var(--text-primary); background: var(--surface); font-size: 12px; font-weight: 650; }
