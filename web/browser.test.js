@@ -5,24 +5,28 @@ import { readFile } from 'node:fs/promises'
 import { extname, join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { chromium } from '@playwright/test'
+import { openCodeConversationUrl } from './src/opencode-link.js'
 
 test('Preact Sessions workspace preserves routing, detail state, factual polling, and responsive layout', async () => {
   const baseSession = { id: 'demo', project: 'Demo', work_branch: 'main', environment_state: 'ready', execution_state: 'idle', created_at: '2026-09-19T11:00:00Z', sandbox: 'sandbox', repository: 'https://example.test/repo', base_ref: 'main' }
   const sessions = [baseSession, ...Array.from({ length: 35 }, (_, index) => ({ ...baseSession, id: `demo-${index}`, project: `Project ${index}`, work_branch: `branch-${index}`, environment_state: index === 2 ? 'suspended' : index === 3 ? 'failed' : 'ready', execution_state: index === 1 ? 'running' : index === 4 ? 'unavailable' : 'idle' }))]
   const selectedState = { environment: 'ready', execution: 'idle', changedAt: new Date(Date.now() - 1000).toISOString(), requestCount: 1 }
+  let openCodeSessionId = null
+  const openCodeBase = 'https://demo-p4096.preview.example.test'
+  const sessionFor = (session) => session.id === 'demo' ? { ...session, opencode_session_id: openCodeSessionId } : session
   const activityFor = (id) => {
     const session = sessions.find((item) => item.id === id) || baseSession
     const environment = id === 'demo' ? selectedState.environment : session.environment_state
     const execution = id === 'demo' ? selectedState.execution : session.execution_state
     const requestCount = id === 'demo' ? selectedState.requestCount : 1
     return {
-      session: { ...session, environment_state: environment, execution_state: execution },
+      session: { ...sessionFor(session), environment_state: environment, execution_state: execution },
       environment_state: environment,
       execution_state: execution,
       work_state_changed_at: id === 'demo' ? selectedState.changedAt : session.created_at,
       attach_command: `anvilctl sessions attach ${id}`,
       preview_url: 'https://preview.example.test',
-      opencode_url: 'https://opencode.example.test',
+      opencode_url: id === 'demo' ? openCodeBase : null,
       lifecycle: [{ kind: 'created', at: session.created_at }, { kind: 'ready', at: '2026-09-19T11:01:00Z', detail: 'Sandbox ready' }, ...(id === 'demo' && requestCount > 1 ? [{ kind: 'request_started', at: selectedState.changedAt, detail: 'A factual execution update arrived' }] : [])],
       requests: Array.from({ length: requestCount }, (_, index) => ({ id: `request-${index + 1}`, number: index + 1, origin: 'operator', state: execution === 'running' ? 'running' : 'completed', started_at: session.created_at, last_activity_at: selectedState.changedAt, prompt: `Representative prompt ${index + 1}: ${'inspect session '.repeat(45)}` })),
     }
@@ -33,10 +37,15 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
       selectedState.execution = 'running'
       selectedState.changedAt = new Date().toISOString()
       selectedState.requestCount = 2
+      openCodeSessionId = 'ses_recovered'
+      response.writeHead(204); response.end(); return
+    }
+    if (url.pathname === '/__test/rebind' && request.method === 'POST') {
+      openCodeSessionId = 'ses_rebound'
       response.writeHead(204); response.end(); return
     }
     if (url.pathname === '/v1/sessions') {
-      response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify(sessions)); return
+      response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify(sessions.map(sessionFor))); return
     }
     const activityMatch = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/activity$/)
     if (activityMatch) {
@@ -94,6 +103,14 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
     assert.match(await detail.locator('.factual-state').textContent(), /Environment: ready.*Execution: idle/)
     assert.match(await detail.locator('#logs-panel').textContent(), /Lifecycle & requests/)
     assert.match(await detail.locator('#runtime-panel').textContent(), /Runtime details/)
+    const actions = detail.locator('.actions')
+    const disabledOpenCode = actions.locator('[data-opencode-disabled]')
+    assert.equal(await disabledOpenCode.count(), 1)
+    assert.equal(await disabledOpenCode.isDisabled(), true)
+    assert.equal(await actions.locator('[data-opencode-link]').count(), 0)
+    assert.deepEqual(await actions.locator(':scope > *').evaluateAll((items) => items.map((item) => item.tagName)), ['A', 'BUTTON', 'DIV', 'BUTTON'])
+    assert.equal(await actions.locator('.attach summary').isEnabled(), true)
+    assert.equal(await actions.locator('button.danger').isEnabled(), true)
     await page.locator('.attach summary').click()
     const prompt = detail.locator('.prompt').first()
     const promptToggle = page.locator('.prompt-toggle')
@@ -122,6 +139,13 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
     await page.waitForFunction(() => document.querySelector('.detail .factual-state')?.textContent.includes('Execution: running'))
     assert.match(await detail.locator('.factual-state').textContent(), /Execution: running/)
+    const openLink = actions.locator('[data-opencode-link]')
+    await openLink.waitFor()
+    assert.equal(await openLink.getAttribute('href'), openCodeConversationUrl(openCodeBase, 'ses_recovered'))
+    await page.evaluate("fetch('/__test/rebind', {method:'POST'})")
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+    await page.waitForFunction((href) => document.querySelector('[data-opencode-link]')?.getAttribute('href') === href, openCodeConversationUrl(openCodeBase, 'ses_rebound'))
+    assert.equal(await openLink.getAttribute('href'), openCodeConversationUrl(openCodeBase, 'ses_rebound'))
     for (const [selector, key] of [['[data-session="demo"]', 'row'], ['.detail', 'detail'], ['.detail-inner', 'shell'], ['.detail-header', 'header'], ['.detail .factual-state', 'factual'], ['.actions', 'actions'], ['.tabs', 'tabs'], ['#logs-panel', 'logs'], ['#runtime-panel', 'runtime']]) {
       assert.equal(await page.locator(selector).evaluate((element, name) => element === window.initialNodes[name], key), true, `${selector} remains mounted across selected factual updates`)
     }

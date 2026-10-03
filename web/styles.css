@@ -85,6 +85,7 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .button.primary { background: #233b60; border-color: #45678f; }
 .button.danger { color: var(--danger); border-color: rgba(228, 135, 135, 0.35); background: transparent; margin-left: auto; }
 .button:disabled { opacity: 0.42; cursor: not-allowed; }
+.button.disabled:disabled { opacity: 0.55; }
 .attach { position: relative; }
 .attach details { position: relative; }
 .attach summary { list-style: none; }
