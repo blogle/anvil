@@ -9,7 +9,7 @@ import { chromium } from '@playwright/test'
 test('Preact Sessions workspace preserves routing, detail state, factual polling, and responsive layout', async () => {
   const baseSession = { id: 'demo', project: 'Demo', work_branch: 'main', environment_state: 'ready', execution_state: 'idle', created_at: '2026-09-19T11:00:00Z', sandbox: 'sandbox', repository: 'https://example.test/repo', base_ref: 'main' }
   const sessions = [baseSession, ...Array.from({ length: 35 }, (_, index) => ({ ...baseSession, id: `demo-${index}`, project: `Project ${index}`, work_branch: `branch-${index}`, environment_state: index === 2 ? 'suspended' : index === 3 ? 'failed' : 'ready', execution_state: index === 1 ? 'running' : index === 4 ? 'unavailable' : 'idle' }))]
-  const selectedState = { environment: 'ready', execution: 'idle', changedAt: new Date(Date.now() - 1000).toISOString(), requestCount: 1 }
+  const selectedState = { environment: 'ready', execution: 'idle', changedAt: new Date(Date.now() - 1000).toISOString(), requestCount: 2 }
   const activityFor = (id) => {
     const session = sessions.find((item) => item.id === id) || baseSession
     const environment = id === 'demo' ? selectedState.environment : session.environment_state
@@ -23,8 +23,10 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
       attach_command: `anvilctl sessions attach ${id}`,
       preview_url: 'https://preview.example.test',
       opencode_url: 'https://opencode.example.test',
-      lifecycle: [{ kind: 'created', at: session.created_at }, { kind: 'ready', at: '2026-09-19T11:01:00Z', detail: 'Sandbox ready' }, ...(id === 'demo' && requestCount > 1 ? [{ kind: 'request_started', at: selectedState.changedAt, detail: 'A factual execution update arrived' }] : [])],
-      requests: Array.from({ length: requestCount }, (_, index) => ({ id: `request-${index + 1}`, number: index + 1, origin: 'operator', state: execution === 'running' ? 'running' : 'completed', started_at: session.created_at, last_activity_at: selectedState.changedAt, prompt: `Representative prompt ${index + 1}: ${'inspect session '.repeat(45)}` })),
+      lifecycle: id === 'demo'
+        ? [{ id: 'created', kind: 'created', at: session.created_at }, { id: 'ready', kind: 'ready', at: '2026-09-19T11:01:00Z', detail: 'Sandbox ready' }, { id: 'run-started', kind: 'run_started', at: '2026-09-19T11:58:30Z' }, { id: 'turn-finished', kind: 'opencode_idle', at: '2026-09-19T12:01:00Z' }]
+        : [{ id: 'created', kind: 'created', at: session.created_at }, { id: 'ready', kind: 'ready', at: '2026-09-19T11:01:00Z', detail: 'Sandbox ready' }],
+      requests: Array.from({ length: requestCount }, (_, index) => ({ id: `request-${index + 1}`, number: index + 1, origin: 'operator', state: index === 0 ? 'completed' : 'running', started_at: id === 'demo' ? ['2026-09-19T11:58:00Z', '2026-09-19T11:59:00Z', '2026-09-19T12:02:00Z'][index] : session.created_at, completed_at: index === 0 ? '2026-09-19T11:58:20Z' : undefined, last_activity_at: selectedState.changedAt, prompt: index === 0 ? `Representative prompt ${index + 1}: ${'inspect session '.repeat(45)}` : `Follow-up request ${index + 1}` })),
     }
   }
   const server = createServer(async (request, response) => {
@@ -32,7 +34,7 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
     if (url.pathname === '/__test/change-selected' && request.method === 'POST') {
       selectedState.execution = 'running'
       selectedState.changedAt = new Date().toISOString()
-      selectedState.requestCount = 2
+      selectedState.requestCount = 3
       response.writeHead(204); response.end(); return
     }
     if (url.pathname === '/v1/sessions') {
@@ -94,6 +96,13 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
     assert.match(await detail.locator('.factual-state').textContent(), /Environment: ready.*Execution: idle/)
     assert.match(await detail.locator('#logs-panel').textContent(), /Lifecycle & requests/)
     assert.match(await detail.locator('#runtime-panel').textContent(), /Runtime details/)
+    const timeline = detail.locator('.timeline > .timeline-event')
+    assert.deepEqual(await timeline.evaluateAll((entries) => entries.map((entry) => entry.dataset.timelineItem === 'request' ? `request:${entry.dataset.requestNumber}` : `event:${entry.dataset.eventKind}`)), [
+      'event:created', 'event:ready', 'request:1', 'event:run_started', 'request:2', 'event:opencode_idle',
+    ])
+    assert.deepEqual(await timeline.evaluateAll((entries) => entries.map((entry) => entry.querySelectorAll('.event-marker').length)), [1, 1, 1, 1, 1, 1])
+    assert.equal(await timeline.locator('.request-card').count(), 2)
+    assert.equal(await timeline.locator('.request-card').first().evaluate((card) => getComputedStyle(card, '::before').content), 'none')
     await page.locator('.attach summary').click()
     const prompt = detail.locator('.prompt').first()
     const promptToggle = page.locator('.prompt-toggle')
