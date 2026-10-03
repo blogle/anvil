@@ -41,6 +41,7 @@ export function statusFor(activity) {
   if (['failed', 'unavailable'].includes(activity.execution_state)) return 'problem'
   if (activity.work_state === 'completed') return 'done'
   if (activity.work_state === 'failed') return 'problem'
+  if (activity.request_state === 'running' || activity.requests?.some((request) => request.state === 'running')) return 'working'
   if (activity.execution_state === 'running') return 'working'
   if (activity.execution_state === 'idle' || activity.work_state === 'ready_for_review') return 'ready-for-review'
   return 'starting'
