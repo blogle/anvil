@@ -1930,6 +1930,13 @@ fn normalized_sandbox_value(record: &SandboxRecord) -> Value {
     json!({"session":record.session,"work_state":record.work_state,"binding_state":record.binding_state,"operating_mode":record.operating_mode,"created_at":record.created_at,"telemetry":record.telemetry})
 }
 pub fn router(state: AppState) -> Router {
+    let web_root = env::var_os("ANVIL_WEB_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("web/dist"));
+    router_with_web_root(state, web_root)
+}
+
+fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
@@ -1964,9 +1971,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/sessions/:id/credentials/github",
             post(github_credentials),
         )
-        .route("/assets/app.js", get(asset_js))
-        .route("/assets/ui-state.js", get(asset_ui_state_js))
-        .route("/assets/styles.css", get(asset_css))
+        .route("/assets/*path", get(static_asset))
         .route("/", get(index))
         .route("/v1/providers", get(providers))
         .route("/v1/providers/:provider/login", post(begin_provider_login))
@@ -1979,6 +1984,8 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             idempotency_middleware,
         ))
+        .fallback(get(spa_fallback))
+        .layer(Extension(web_root))
         .with_state(state)
 }
 
@@ -3082,40 +3089,50 @@ async fn health() -> Json<Value> {
     Json(json!({"status":"ok"}))
 }
 
-async fn index() -> Response {
-    (
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        include_str!("../../../web/index.html"),
-    )
-        .into_response()
+async fn index(Extension(root): Extension<PathBuf>) -> Response {
+    static_file_at(&root, std::path::Path::new("index.html")).await
 }
 
-async fn asset_js() -> Response {
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/javascript; charset=utf-8",
-        )],
-        include_str!("../../../web/app.js"),
-    )
-        .into_response()
+async fn static_asset(Extension(root): Extension<PathBuf>, Path(path): Path<String>) -> Response {
+    let relative = std::path::Path::new("assets").join(path);
+    static_file_at(&root, &relative).await
 }
 
-async fn asset_ui_state_js() -> Response {
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/javascript; charset=utf-8",
-        )],
-        include_str!("../../../web/ui-state.js"),
-    )
-        .into_response()
+async fn spa_fallback(Extension(root): Extension<PathBuf>, uri: axum::http::Uri) -> Response {
+    spa_fallback_at(uri, &root).await
 }
 
-async fn asset_css() -> Response {
+async fn spa_fallback_at(uri: axum::http::Uri, root: &std::path::Path) -> Response {
+    if uri.path().starts_with("/v1/") || uri.path() == "/healthz" || uri.path() == "/readyz" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    static_file_at(root, std::path::Path::new("index.html")).await
+}
+
+async fn static_file_at(root: &std::path::Path, relative_path: &std::path::Path) -> Response {
+    if relative_path
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let path = root.join(relative_path);
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let content_type = match relative_path.extension().and_then(|value| value.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("json") => "application/json",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    };
     (
-        [(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../../../web/styles.css"),
+        [(axum::http::header::CONTENT_TYPE, content_type)],
+        axum::body::Body::from(bytes),
     )
         .into_response()
 }
@@ -8646,7 +8663,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activity_endpoint_returns_read_model_and_embedded_dashboard() {
+    async fn activity_endpoint_and_packaged_static_routes_return_expected_content() {
         let opencode = MockServer::start();
         opencode.mock(|when, then| {
             when.method(GET).path("/session/ses_demo");
@@ -8683,13 +8700,14 @@ mod tests {
         .unwrap();
         let mut test_config = config("http://profile.test".into());
         test_config.opencode_port = opencode.port();
-        let app = router(AppState::new(
+        let app_state = AppState::new(
             test_config.clone(),
             ActivitySandbox {
                 object,
                 config: test_config,
             },
-        ));
+        );
+        let app = router(app_state.clone());
         let response = app
             .clone()
             .oneshot(
@@ -8719,30 +8737,115 @@ mod tests {
             "activity must project the persisted telemetry snapshot"
         );
 
-        let response = app
+        let assets = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            assets.path().join("index.html"),
+            "<!doctype html><script type=\"module\" src=\"/assets/app-abc.js\"></script>",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir(assets.path().join("assets"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            assets.path().join("assets/app-abc.js"),
+            "export const app = true",
+        )
+        .await
+        .unwrap();
+        let static_app = router_with_web_root(app_state.clone(), assets.path().to_path_buf());
+        let index = static_app
             .clone()
             .oneshot(Request::get("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers()["content-type"],
-            "text/html; charset=utf-8"
-        );
+        assert_eq!(index.status(), StatusCode::OK);
+        assert_eq!(index.headers()["content-type"], "text/html; charset=utf-8");
+        let index_body = axum::body::to_bytes(index.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(std::str::from_utf8(&index_body)
+            .unwrap()
+            .contains("/assets/app-abc.js"));
 
-        let response = app
+        let javascript = static_app
+            .clone()
             .oneshot(
-                Request::get("/assets/ui-state.js")
+                Request::get("/assets/app-abc.js")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(javascript.status(), StatusCode::OK);
         assert_eq!(
-            response.headers()["content-type"],
+            javascript.headers()["content-type"],
             "text/javascript; charset=utf-8"
         );
+        let javascript_body = axum::body::to_bytes(javascript.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&javascript_body).unwrap(),
+            "export const app = true"
+        );
+
+        let session_route = static_app
+            .clone()
+            .oneshot(Request::get("/session/demo").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(session_route.status(), StatusCode::OK);
+        assert_eq!(
+            session_route.headers()["content-type"],
+            "text/html; charset=utf-8"
+        );
+        let session_body = axum::body::to_bytes(session_route.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(std::str::from_utf8(&session_body)
+            .unwrap()
+            .contains("/assets/app-abc.js"));
+        let missing_api = static_app
+            .oneshot(Request::get("/v1/missing").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(missing_api.status(), StatusCode::NOT_FOUND);
+
+        let built_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/dist");
+        if let Ok(built_index) = tokio::fs::read_to_string(built_root.join("index.html")).await {
+            let built_app = router_with_web_root(app_state, built_root);
+            let asset_urls = built_index
+                .split("/assets/")
+                .skip(1)
+                .filter_map(|part| {
+                    part.split(|character| character == '\"' || character == '\'')
+                        .next()
+                })
+                .filter(|path| !path.is_empty())
+                .collect::<Vec<_>>();
+            assert!(!asset_urls.is_empty(), "Vite index should reference assets");
+            for path in asset_urls {
+                let response = built_app
+                    .clone()
+                    .oneshot(
+                        Request::get(format!("/assets/{path}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "asset {path}");
+                assert!(response.headers()["content-type"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with(if path.ends_with(".css") {
+                        "text/css"
+                    } else {
+                        "text/javascript"
+                    }));
+            }
+        }
     }
 
     #[test]
