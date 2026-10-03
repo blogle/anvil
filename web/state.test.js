@@ -24,18 +24,28 @@ test('elapsed display and status mappings retain current-main semantics', () => 
   assert.equal(state.elapsed('1789819200Z', Date.parse('2026-09-19T12:00:10Z')), '10s')
   assert.equal(state.statusFor({ environment_state: 'ready', execution_state: 'idle', work_state: 'in_progress' }), 'ready-for-review')
   assert.equal(state.statusFor({ environment_state: 'suspended', execution_state: 'recovering' }), 'stopped')
+  assert.equal(state.routeFromHash('#sessions'), null)
+  assert.equal(state.routeFromHash('#providers'), null)
+  assert.equal(state.routeFromHash('#settings'), null)
+  assert.equal(state.routeFromHash('#session/demo%2Fdrawer'), 'demo/drawer')
+  assert.equal(state.routeFor(null), '#sessions')
+  assert.equal(state.routeFor('demo/drawer'), '#session/demo%2Fdrawer')
   state.sessions.value = [session]
   state.activities.value = new Map([[session.id, activity('idle')]])
   state.filter.value = 'ready-for-review'
   assert.deepEqual(state.visibleSessions.value.map((item) => item.id), ['demo'])
   state.filter.value = 'working'
   assert.deepEqual(state.visibleSessions.value, [])
+  state.selected.value = session.id
+  assert.equal(state.selected.value, session.id, 'filtering scopes only the list, not the open drawer')
   state.filter.value = 'all'
 })
 
-function TestApp() { return h('div', { class: 'app-shell' }, h('aside', { class: 'sidebar' }, h('div', { class: 'session-list' }, state.sessions.value.map((item) => h(sessionsModule.SessionRow, { key: item.id, session: item })))), h(detailModule.SessionDetail)) }
+function TestApp() { return h('div', { class: `app-shell ${state.selected.value ? 'mobile-detail' : ''}` }, h('main', { class: 'workspace' }, h('nav', { class: 'app-rail' }), h(sessionsModule.SessionsWorkspace), h(detailModule.SessionDetail))) }
 
 test('keyed rows and selected detail remain mounted across polls and status transitions', async () => {
+  state.loading.value = false
+  state.error.value = null
   state.sessions.value = [session]
   state.activities.value = new Map([[session.id, activity()]])
   state.selected.value = session.id
@@ -59,6 +69,8 @@ test('keyed rows and selected detail remain mounted across polls and status tran
 })
 
 test('per-session attach, prompt expansion, tab, focus, selection and scroll state survives updates', async () => {
+  state.loading.value = false
+  state.error.value = null
   state.sessions.value = [session]
   state.activities.value = new Map([[session.id, activity()]])
   state.selected.value = session.id
@@ -96,6 +108,7 @@ test('direct links and browser history route deterministically; list adapts at m
   assert.equal(root.querySelector('.app-shell').classList.contains('mobile-detail'), true)
   await act(async () => { state.navigate(null); window.dispatchEvent(new window.PopStateEvent('popstate')) })
   assert.equal(state.routeFromHash(), null)
-  assert.match(root.querySelector('.detail .empty').textContent, /Select a session/)
+  assert.equal(root.querySelector('.detail h2'), null, 'landing does not show a blank-detail placeholder')
+  assert.equal(root.querySelector('.session-workspace h1').textContent, 'Sessions', 'landing returns to the useful Sessions workspace')
   render(null, root)
 })
