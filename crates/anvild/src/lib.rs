@@ -41,7 +41,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{
@@ -586,6 +586,14 @@ pub trait SandboxApi: Send + Sync + 'static {
     async fn set_model(&self, _id: &str, _model: &str) -> Result<(), ServiceError> {
         Ok(())
     }
+    async fn set_git_metadata(
+        &self,
+        _id: &str,
+        _branch: Option<&str>,
+        _pr: Option<&anvil_core::PullRequest>,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
     async fn set_ready_at(&self, _id: &str, _at: &str) -> Result<(), ServiceError> {
         Ok(())
     }
@@ -723,6 +731,17 @@ impl SandboxApi for MaterializingSandboxApi {
         let lock = self.lock(id);
         let _guard = lock.lock().await;
         self.inner.set_model(id, value).await?;
+        self.persist(id).await
+    }
+    async fn set_git_metadata(
+        &self,
+        id: &str,
+        branch: Option<&str>,
+        pr: Option<&anvil_core::PullRequest>,
+    ) -> Result<(), ServiceError> {
+        let lock = self.lock(id);
+        let _guard = lock.lock().await;
+        self.inner.set_git_metadata(id, branch, pr).await?;
         self.persist(id).await
     }
     async fn set_ready_at(&self, id: &str, value: &str) -> Result<(), ServiceError> {
@@ -1331,6 +1350,10 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
             .get(&annotation_key(config, "work-branch"))
             .cloned()
             .unwrap_or_default(),
+        current_branch: a.get(&annotation_key(config, "git-branch")).cloned(),
+        pull_request: a
+            .get(&annotation_key(config, "git-pull-request"))
+            .and_then(|value| serde_json::from_str(value).ok()),
         model: a.get(&annotation_key(config, "model")).cloned(),
         opencode_session_id: a
             .get(&annotation_key(config, "opencode-session-id"))
@@ -1530,6 +1553,8 @@ impl SandboxApi for KubeSandboxApi {
             repository: r.repository.clone(),
             base_ref: r.base_ref.clone(),
             work_branch: branch_name(&SessionId::parse(id).unwrap()),
+            current_branch: None,
+            pull_request: None,
             model: r.model.clone(),
             opencode_session_id: None,
             created_at: Some(now.clone()),
@@ -1603,6 +1628,26 @@ impl SandboxApi for KubeSandboxApi {
         annotations.insert(
             annotation_key(&self.config, "ready-at"),
             Value::String(at.to_owned()),
+        );
+        self.patch(id, json!({"metadata":{"annotations":annotations}}))
+            .await
+    }
+    async fn set_git_metadata(
+        &self,
+        id: &str,
+        branch: Option<&str>,
+        pr: Option<&anvil_core::PullRequest>,
+    ) -> Result<(), ServiceError> {
+        let mut annotations = serde_json::Map::new();
+        annotations.insert(
+            annotation_key(&self.config, "git-branch"),
+            branch.map_or(Value::Null, |value| Value::String(value.to_owned())),
+        );
+        annotations.insert(
+            annotation_key(&self.config, "git-pull-request"),
+            pr.map_or(Value::Null, |value| {
+                Value::String(serde_json::to_string(value).expect("serialize pull request"))
+            }),
         );
         self.patch(id, json!({"metadata":{"annotations":annotations}}))
             .await
@@ -1749,6 +1794,7 @@ pub struct AppState {
     admission_lock: Arc<AsyncMutex<()>>,
     capability_signer: Option<github::CapabilitySigner>,
     github: Option<github::GithubBroker>,
+    git_pr_checks: Arc<Mutex<HashMap<String, (Option<String>, Instant)>>>,
 }
 
 type LifecycleWatchers = Arc<Mutex<HashMap<String, (uuid::Uuid, watch::Sender<bool>)>>>;
@@ -1800,6 +1846,7 @@ impl AppState {
             admission_lock: Arc::new(AsyncMutex::new(())),
             capability_signer,
             github,
+            git_pr_checks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1966,6 +2013,7 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
         .route("/v1/sessions/:id/resume", post(resume))
         .route("/v1/sessions/:id/previews/:port", get(preview))
         .route("/v1/sessions/:id/activity", get(activity))
+        .route("/v1/sessions/:id/git-metadata", post(report_git_metadata))
         .route("/v1/changes", get(changed_since))
         .route(
             "/v1/sessions/:id/credentials/github",
@@ -3386,6 +3434,168 @@ async fn create(
             session
         }),
     ))
+}
+
+#[derive(Deserialize)]
+struct GitMetadataReport {
+    branch: Option<String>,
+}
+
+fn pull_request_from_github(items: Vec<Value>) -> Option<anvil_core::PullRequest> {
+    items
+        .into_iter()
+        .filter(|item| item.get("state").and_then(Value::as_str) == Some("open"))
+        .max_by(|left, right| {
+            left.get("updated_at")
+                .or_else(|| left.get("updatedAt"))
+                .and_then(Value::as_str)
+                .cmp(
+                    &right
+                        .get("updated_at")
+                        .or_else(|| right.get("updatedAt"))
+                        .and_then(Value::as_str),
+                )
+                .then_with(|| {
+                    left.get("number")
+                        .and_then(Value::as_u64)
+                        .cmp(&right.get("number").and_then(Value::as_u64))
+                })
+        })
+        .and_then(|item| {
+            Some(anvil_core::PullRequest {
+                number: item.get("number")?.as_u64()?,
+                title: item.get("title")?.as_str()?.to_owned(),
+                url: item.get("html_url")?.as_str()?.to_owned(),
+                state: Some("open".into()),
+                draft: item.get("draft").and_then(Value::as_bool),
+            })
+        })
+}
+
+async fn report_git_metadata(
+    Path(id): Path<String>,
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<GitMetadataReport>,
+) -> Result<StatusCode, ServiceError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or(ServiceError::Unauthorized)?;
+    let signer = s
+        .capability_signer
+        .as_ref()
+        .ok_or(ServiceError::Unauthorized)?;
+    let claims = signer
+        .verify_for_refresh(token)
+        .map_err(|_| ServiceError::Unauthorized)?;
+    if claims.session_id != id || claims.capability != "github-repository" {
+        return Err(ServiceError::Forbidden(
+            "capability is not valid for this session".into(),
+        ));
+    }
+    let record = s.kube.get(&id).await?;
+    let session = record.session;
+    if claims.repository != session.repository {
+        return Err(ServiceError::Forbidden(
+            "capability repository does not match session".into(),
+        ));
+    }
+    let branch = report.branch.filter(|branch| !branch.trim().is_empty());
+    let branch_changed = session.current_branch != branch;
+    if branch_changed {
+        s.kube
+            .set_git_metadata(&id, branch.as_deref(), None)
+            .await?;
+    }
+    let should_lookup = if let Some(branch) = branch.as_deref() {
+        let mut checks = s
+            .git_pr_checks
+            .lock()
+            .map_err(|_| ServiceError::Config("Git metadata cache lock poisoned".into()))?;
+        let due = checks.get(&id).is_none_or(|(prior, checked)| {
+            prior != branch || checked.elapsed() >= Duration::from_secs(120)
+        });
+        if due {
+            checks.insert(id.clone(), (Some(branch.to_owned()), Instant::now()));
+        }
+        due
+    } else {
+        s.git_pr_checks
+            .lock()
+            .map_err(|_| ServiceError::Config("Git metadata cache lock poisoned".into()))?
+            .remove(&id);
+        false
+    };
+    if should_lookup {
+        let previous = if branch_changed {
+            None
+        } else {
+            session.pull_request.as_ref()
+        };
+        let lookup = async {
+            let broker = s.github.as_ref().ok_or_else(|| {
+                ServiceError::Config("GitHub App credentials are not configured".into())
+            })?;
+            let credential = broker
+                .credential(&session.repository, github::GithubCredentialPurpose::GhRead)
+                .await?;
+            let repo = Url::parse(&session.repository)
+                .map_err(|error| ServiceError::Config(error.to_string()))?;
+            let segments: Vec<_> = repo
+                .path_segments()
+                .into_iter()
+                .flatten()
+                .filter(|part| !part.is_empty())
+                .collect();
+            if segments.len() < 2 {
+                return Err(ServiceError::Config(
+                    "repository URL must include owner and repository".into(),
+                ));
+            }
+            let owner = segments[segments.len() - 2];
+            let repository = segments[segments.len() - 1].trim_end_matches(".git");
+            let url = format!(
+                "{}/repos/{owner}/{repository}/pulls",
+                s.config.github_api_url.trim_end_matches('/')
+            );
+            let head = format!("{owner}:{}", branch.as_deref().unwrap_or_default());
+            let response = reqwest::Client::new()
+                .get(url)
+                .bearer_auth(credential.token)
+                .query(&[
+                    ("state", "open"),
+                    ("head", head.as_str()),
+                    ("per_page", "100"),
+                ])
+                .send()
+                .await
+                .map_err(|error| ServiceError::Config(error.to_string()))?;
+            if !response.status().is_success() {
+                return Err(ServiceError::Config(format!(
+                    "GitHub PR lookup returned {}",
+                    response.status()
+                )));
+            }
+            let items: Vec<Value> = response
+                .json()
+                .await
+                .map_err(|error| ServiceError::Config(error.to_string()))?;
+            Ok::<_, ServiceError>(pull_request_from_github(items))
+        }
+        .await;
+        match lookup {
+            Ok(pr) => {
+                s.kube
+                    .set_git_metadata(&id, branch.as_deref(), pr.as_ref())
+                    .await?
+            }
+            Err(_) if previous.is_some() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn github_credentials(
@@ -6224,6 +6434,19 @@ mod tests {
     use std::collections::BTreeMap;
     use tower::ServiceExt;
 
+    #[test]
+    fn git_metadata_selects_latest_open_pull_request_deterministically() {
+        let pr = pull_request_from_github(vec![
+            json!({"number": 9, "title": "Old", "html_url": "https://github.com/acme/repo/pull/9", "state": "open", "updated_at": "2026-01-01T00:00:00Z"}),
+            json!({"number": 12, "title": "Closed", "html_url": "https://github.com/acme/repo/pull/12", "state": "closed", "updated_at": "2026-12-01T00:00:00Z"}),
+            json!({"number": 10, "title": "Latest", "html_url": "https://github.com/acme/repo/pull/10", "state": "open", "updated_at": "2026-02-01T00:00:00Z", "draft": true}),
+        ]).unwrap();
+        assert_eq!(pr.number, 10);
+        assert_eq!(pr.url, "https://github.com/acme/repo/pull/10");
+        assert_eq!(pr.draft, Some(true));
+        assert_eq!(pull_request_from_github(Vec::new()), None);
+    }
+
     fn seed_digest_batch(
         store: &store::ControllerStore,
         batch_id: &str,
@@ -8084,6 +8307,8 @@ mod tests {
             repository: "https://github.com/example/demo.git".into(),
             base_ref: "main".into(),
             work_branch: "anvil/demo-12345678".into(),
+            current_branch: None,
+            pull_request: None,
             model: None,
             opencode_session_id: Some("ses_demo".into()),
             created_at: Some("2026-01-01T10:00:00Z".into()),

@@ -44,17 +44,30 @@ test('keyed rows and selected detail remain mounted across polls and status tran
   const row = root.querySelector('[data-session="demo"]')
   const detail = root.querySelector('.detail')
   assert.equal(root.querySelectorAll('.session-status-label').length, 1)
+  const branchPrSession = {
+    ...session,
+    current_branch: 'feature/review',
+    pull_request: { number: 42, title: 'Review session metadata', url: 'https://github.com/acme/repo/pull/42', state: 'open', draft: false },
+  }
   await act(async () => {
-    state.sessions.value = [{ ...session }]
+    state.sessions.value = [branchPrSession]
     state.activities.value = new Map([[session.id, activity('running', 'Updated metadata')]])
   })
   assert.equal(root.querySelector('[data-session="demo"]'), row)
   assert.equal(root.querySelector('.detail'), detail)
   assert.equal(root.querySelector('.session-status-label').textContent, 'Working')
+  assert.equal(root.querySelector('[data-testid="git-branch"]').textContent, 'feature/review')
+  const pullRequestLink = root.querySelector('.git-card-link')
+  assert.ok(pullRequestLink, root.querySelector('.pull-request-card').innerHTML)
+  assert.equal(pullRequestLink.href, branchPrSession.pull_request.url)
+  assert.equal(pullRequestLink.textContent.includes('PR #42'), true)
   await act(async () => { state.activities.value = new Map([[session.id, activity('idle')]]) })
   assert.equal(root.querySelector('[data-session="demo"]'), row)
   assert.equal(root.querySelector('.session-status-label').textContent, 'Ready for review')
   assert.equal(root.querySelectorAll('.session-status-label').length, 1)
+  await act(async () => { state.sessions.value = [{ ...branchPrSession, current_branch: null, pull_request: null }] })
+  assert.equal(root.querySelector('[data-testid="git-branch"]').textContent, 'No current branch')
+  assert.equal(root.querySelector('.git-card-empty').textContent, 'No pull request')
   render(null, root)
 })
 

@@ -24,6 +24,23 @@ struct LocalState {
     directory: PathBuf,
     child: Option<Child>,
     record_environment: Vec<(String, String)>,
+    last_pr_check: Option<std::time::Instant>,
+    last_branch_check: Option<std::time::Instant>,
+}
+
+async fn read_current_branch(project: &std::path::Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project)
+        .args(["branch", "--show-current"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!branch.is_empty()).then_some(branch)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -133,6 +150,8 @@ impl LocalSandboxApi {
                     directory: path,
                     child: None,
                     record_environment,
+                    last_pr_check: None,
+                    last_branch_check: None,
                 },
             );
         }
@@ -440,22 +459,90 @@ async fn stop_recorded_worker(directory: &std::path::Path) -> Result<(), Service
 #[async_trait]
 impl SandboxApi for LocalSandboxApi {
     async fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError> {
-        Ok(self
-            .sessions
-            .lock()
-            .await
-            .values()
-            .map(|state| state.record.clone())
-            .collect())
+        let ids: Vec<_> = self.sessions.lock().await.keys().cloned().collect();
+        let mut records = Vec::with_capacity(ids.len());
+        for id in ids {
+            records.push(self.get(&id).await?);
+        }
+        Ok(records)
     }
 
     async fn get(&self, id: &str) -> Result<SandboxRecord, ServiceError> {
-        self.sessions
-            .lock()
-            .await
-            .get(id)
-            .map(|state| state.record.clone())
-            .ok_or(ServiceError::NotFound)
+        let (project, old_branch, old_pr, environment, should_lookup) = {
+            let mut sessions = self.sessions.lock().await;
+            let state = sessions.get_mut(id).ok_or(ServiceError::NotFound)?;
+            if state
+                .last_branch_check
+                .is_some_and(|checked| checked.elapsed() < Duration::from_secs(10))
+            {
+                return Ok(state.record.clone());
+            }
+            state.last_branch_check = Some(std::time::Instant::now());
+            let project = state
+                .directory
+                .join("home/workspace")
+                .join(&state.record.session.project);
+            let should_lookup = state
+                .last_pr_check
+                .is_none_or(|checked| checked.elapsed() >= Duration::from_secs(120));
+            if should_lookup {
+                state.last_pr_check = Some(std::time::Instant::now());
+            }
+            (
+                project,
+                state.record.session.current_branch.clone(),
+                state.record.session.pull_request.clone(),
+                state.record_environment.clone(),
+                should_lookup,
+            )
+        };
+        let branch = read_current_branch(&project).await;
+        let same_branch = old_branch == branch;
+        let mut pull_request = if same_branch { old_pr } else { None };
+        if (should_lookup || !same_branch)
+            && branch.is_some()
+            && environment
+                .iter()
+                .any(|(key, value)| key == "ANVIL_SESSION_CREDENTIAL" && !value.is_empty())
+        {
+            let branch_value = branch.as_deref().unwrap_or_default();
+            let result = Command::new("gh")
+                .args([
+                    "pr",
+                    "list",
+                    "--head",
+                    branch_value,
+                    "--state",
+                    "open",
+                    "--json",
+                    "number,title,url,state,isDraft,updatedAt",
+                    "--limit",
+                    "100",
+                ])
+                .current_dir(&project)
+                .envs(environment)
+                .output()
+                .await;
+            if let Ok(output) = result {
+                if output.status.success() {
+                    if let Ok(items) =
+                        serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+                    {
+                        pull_request = super::pull_request_from_github(items);
+                    }
+                }
+            }
+        }
+        let mut sessions = self.sessions.lock().await;
+        let state = sessions.get_mut(id).ok_or(ServiceError::NotFound)?;
+        if state.record.session.current_branch == old_branch {
+            state
+                .record
+                .session
+                .update_git_metadata(branch, pull_request);
+            persist(&state.directory, &state.record).await?;
+        }
+        Ok(state.record.clone())
     }
 
     async fn create(
@@ -541,6 +628,8 @@ impl SandboxApi for LocalSandboxApi {
                 repository: request.repository.clone(),
                 base_ref: request.base_ref.clone(),
                 work_branch,
+                current_branch: None,
+                pull_request: None,
                 model: request.model.clone(),
                 opencode_session_id: None,
                 created_at: Some(now.clone()),
@@ -580,6 +669,8 @@ impl SandboxApi for LocalSandboxApi {
                 directory: directory.clone(),
                 child: None,
                 record_environment: sandbox_env.to_vec(),
+                last_pr_check: None,
+                last_branch_check: None,
             };
             let environment_path = directory.join("sandbox-env.json");
             tokio::fs::write(
@@ -671,6 +762,20 @@ impl SandboxApi for LocalSandboxApi {
         let mut sessions = self.sessions.lock().await;
         let state = sessions.get_mut(id).ok_or(ServiceError::NotFound)?;
         state.record.session.model = Some(value.into());
+        persist(&state.directory, &state.record).await
+    }
+    async fn set_git_metadata(
+        &self,
+        id: &str,
+        branch: Option<&str>,
+        pr: Option<&anvil_core::PullRequest>,
+    ) -> Result<(), ServiceError> {
+        let mut sessions = self.sessions.lock().await;
+        let state = sessions.get_mut(id).ok_or(ServiceError::NotFound)?;
+        state
+            .record
+            .session
+            .update_git_metadata(branch.map(str::to_owned), pr.cloned());
         persist(&state.directory, &state.record).await
     }
     async fn set_ready_at(&self, id: &str, value: &str) -> Result<(), ServiceError> {

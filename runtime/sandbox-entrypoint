@@ -83,4 +83,23 @@ elif [ "$(git -C "$project_dir" symbolic-ref --quiet --short HEAD 2>/dev/null ||
 fi
 
 cd "$project_dir"
+if [ -n "${ANVIL_SESSION_CREDENTIAL:-}" ]; then (
+  while :; do
+    branch="$(git branch --show-current 2>/dev/null || true)"
+    if [ -n "$branch" ]; then
+      payload="$(jq -cn --arg branch "$branch" '{branch:$branch}')"
+    else
+      payload='{"branch":null}'
+    fi
+    umask 077
+    cfg="$(mktemp)"
+    printf 'header = "Authorization: Bearer %s"\n' "$ANVIL_SESSION_CREDENTIAL" > "$cfg"
+    curl --config "$cfg" --silent --max-time 10 --request POST \
+      --header 'content-type: application/json' --data "$payload" \
+      "${ANVIL_CREDENTIAL_URL%/}/v1/sessions/${ANVIL_SESSION_ID}/git-metadata" >/dev/null || true
+    rm -f "$cfg"
+    sleep 15
+  done
+) >/tmp/anvil-git-metadata.log 2>&1 &
+fi
 exec opencode serve --hostname 0.0.0.0 --port 4096

@@ -3,6 +3,7 @@ import { activities, api, navigate, refresh, selected, sessions, sessionUI, stat
 import { Clock } from './clock.jsx'
 import { Logs } from './logs.jsx'
 import { Runtime } from './runtime.jsx'
+import { GitMetadata } from './git-metadata.jsx'
 
 const React = { createElement: h }
 
@@ -19,7 +20,8 @@ function DetailContent({ session, activity }) {
   const ui = sessionUI(session.id)
   const status = statusFor(activity)
   return <div class="detail-inner"><a class="back-link" href={location.pathname} onClick={(event) => { event.preventDefault(); navigate(null) }}>All sessions</a>
-    <div class="detail-header"><div><div class="eyebrow">Session overview</div><h2>{session.project || 'Anvil'} session</h2><div class="detail-subtitle"><span>{session.project}</span><span>·</span><code>{session.work_branch}</code></div><div class={`detail-status state-${status}`}><span class="status-dot"/><strong>{stateLabel(status)}</strong>{activity?.work_state_changed_at && <span>· <Clock value={activity.work_state_changed_at}/></span>}</div></div></div>
+    <div class="detail-header"><div><div class="eyebrow">Session overview</div><h2>{session.project || 'Anvil'} session</h2><div class="detail-subtitle"><span>{session.project}</span></div><div class={`detail-status state-${status}`}><span class="status-dot"/><strong>{stateLabel(status)}</strong>{activity?.work_state_changed_at && <span>· <Clock value={activity.work_state_changed_at}/></span>}</div></div></div>
+    <GitMetadata session={session}/>
     {activity?.work_state_summary && <div class="work-summary"><div class="eyebrow">Work summary</div>{activity.work_state_summary}</div>}
     <SessionActions session={session} activity={activity} ui={ui}/>
     <div class="tabs" role="tablist" aria-label="Session detail"><button id="logs-tab" class={`tab ${ui.tab.value === 'logs' ? 'active' : ''}`} role="tab" aria-selected={ui.tab.value === 'logs'} tabIndex={ui.tab.value === 'logs' ? 0 : -1} aria-controls="logs-panel" onClick={() => ui.tab.value = 'logs'}>Logs</button><button id="runtime-tab" class={`tab ${ui.tab.value === 'runtime' ? 'active' : ''}`} role="tab" aria-selected={ui.tab.value === 'runtime'} tabIndex={ui.tab.value === 'runtime' ? 0 : -1} aria-controls="runtime-panel" onClick={() => ui.tab.value = 'runtime'}>Runtime</button></div>
