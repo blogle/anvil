@@ -23,44 +23,6 @@ pub enum AnvilError {
     Operation(String),
 }
 
-/// The durable semantic disposition of a session's current work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkState {
-    InProgress,
-    ReadyForReview,
-    Failed,
-    Completed,
-}
-
-impl WorkState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::InProgress => "in_progress",
-            Self::ReadyForReview => "ready_for_review",
-            Self::Failed => "failed",
-            Self::Completed => "completed",
-        }
-    }
-}
-
-impl std::str::FromStr for WorkState {
-    type Err = ValidationError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "in_progress" => Ok(Self::InProgress),
-            "ready_for_review" => Ok(Self::ReadyForReview),
-            "failed" => Ok(Self::Failed),
-            "completed" => Ok(Self::Completed),
-            _ => Err(ValidationError::Invalid {
-                field: "work_state",
-                reason: "unknown work state".into(),
-            }),
-        }
-    }
-}
-
 // ── Project ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,16 +229,10 @@ pub struct Session {
     pub ready_at: Option<String>,
     #[serde(default)]
     pub environment_state: String,
+    #[serde(default)]
+    pub execution_state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_error: Option<String>,
-    #[serde(default)]
-    pub work_state: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub work_state_changed_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub work_state_summary: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub work_state_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_run: Option<Run>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -328,9 +284,15 @@ pub enum RunState {
 pub struct Run {
     pub id: RunId,
     pub state: RunState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_message_id: Option<OpenCodeMessageId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_message_id: Option<OpenCodeMessageId>,
     pub started_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,8 +330,6 @@ pub struct LifecycleEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionActivity {
     pub session: Session,
-    pub state: String,
-    pub request_state: String,
     pub current_operation: Option<String>,
     pub last_activity_at: Option<String>,
     pub requests: Vec<SessionRequest>,
@@ -382,9 +342,6 @@ pub struct SessionActivity {
     pub execution_state: String,
     #[serde(default)]
     pub telemetry: SessionTelemetry,
-    pub work_state: String,
-    pub work_state_changed_at: Option<String>,
-    pub work_state_summary: Option<String>,
     pub current_run: Option<Run>,
     pub last_run: Option<Run>,
     pub session_binding_state: String,

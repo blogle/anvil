@@ -1,6 +1,5 @@
 use super::{
-    BindingStateRecord, Config, CreateRequest, SandboxApi, SandboxRecord, ServiceError,
-    WorkStateRecord,
+    BindingStateRecord, Config, CreateRequest, RunRecord, SandboxApi, SandboxRecord, ServiceError,
 };
 use anvil_core::{branch_name, Session, SessionId, SessionTelemetry};
 use async_trait::async_trait;
@@ -118,9 +117,30 @@ impl LocalSandboxApi {
             let Ok(bytes) = std::fs::read(path.join("session.json")) else {
                 continue;
             };
-            let Ok(record) = serde_json::from_slice::<SandboxRecord>(&bytes) else {
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
                 continue;
             };
+            let Ok(mut record) = serde_json::from_value::<SandboxRecord>(value.clone()) else {
+                continue;
+            };
+            if record.run_record.changed_at.is_empty() {
+                if let Some(legacy) = value.get("work_state") {
+                    if let Some(migrated) = super::legacy_run_record(&legacy.to_string()) {
+                        record.run_record = migrated;
+                        record.session.current_run = record.run_record.current_run();
+                        record.session.last_run = record.run_record.last_run();
+                    }
+                }
+            }
+            if record.session.execution_state.is_empty() {
+                record.session.execution_state = match record.telemetry.execution.as_str() {
+                    "busy" => "running",
+                    "error" => "failed",
+                    "idle" | "recovering" | "unavailable" => record.telemetry.execution.as_str(),
+                    _ => "unknown",
+                }
+                .into();
+            }
             reserved_ports.insert(record.session.opencode_port);
             let record_environment = std::fs::read(path.join("sandbox-env.json"))
                 .ok()
@@ -240,7 +260,7 @@ impl LocalSandboxApi {
             .env("ANVIL_WORK_BRANCH", &state.record.session.work_branch)
             .env(
                 "ANVIL_RUN_ID",
-                state.record.work_state.run_id().unwrap_or_default(),
+                state.record.run_record.run_id().unwrap_or_default(),
             )
             .env("ANVIL_SESSION_ID", id)
             .env("OPENCODE_CONFIG", profile.join("config/opencode.jsonc"))
@@ -463,7 +483,7 @@ impl SandboxApi for LocalSandboxApi {
         id: &str,
         request: &CreateRequest,
         sandbox_env: &[(String, String)],
-        initial_work_state: &WorkStateRecord,
+        initial_run: &RunRecord,
     ) -> Result<Session, ServiceError> {
         let directory = self.root.join(id);
         if directory.exists() {
@@ -547,12 +567,9 @@ impl SandboxApi for LocalSandboxApi {
                 ready_at: None,
                 environment_state: "provisioning".into(),
                 environment_error: None,
-                work_state: initial_work_state.api_state().as_str().into(),
-                work_state_changed_at: Some(initial_work_state.changed_at.clone()),
-                work_state_summary: initial_work_state.summary(),
-                work_state_run_id: initial_work_state.run_id(),
-                current_run: initial_work_state.current_run(),
-                last_run: initial_work_state.last_run(),
+                execution_state: "unknown".into(),
+                current_run: initial_run.current_run(),
+                last_run: initial_run.last_run(),
                 session_binding_state: "pending".into(),
                 session_binding_continuity: "exact".into(),
                 session_binding_error: None,
@@ -562,7 +579,7 @@ impl SandboxApi for LocalSandboxApi {
             };
             let state = SandboxRecord {
                 session: session.clone(),
-                work_state: initial_work_state.clone(),
+                run_record: initial_run.clone(),
                 binding_state: BindingStateRecord {
                     state: "pending".into(),
                     continuity: "exact".into(),
@@ -679,14 +696,10 @@ impl SandboxApi for LocalSandboxApi {
         state.record.session.ready_at = Some(value.into());
         persist(&state.directory, &state.record).await
     }
-    async fn set_work_state(&self, id: &str, value: &WorkStateRecord) -> Result<(), ServiceError> {
+    async fn set_run_record(&self, id: &str, value: &RunRecord) -> Result<(), ServiceError> {
         let mut sessions = self.sessions.lock().await;
         let state = sessions.get_mut(id).ok_or(ServiceError::NotFound)?;
-        state.record.work_state = value.clone();
-        state.record.session.work_state = value.api_state().as_str().into();
-        state.record.session.work_state_changed_at = Some(value.changed_at.clone());
-        state.record.session.work_state_summary = value.summary();
-        state.record.session.work_state_run_id = value.run_id();
+        state.record.run_record = value.clone();
         state.record.session.current_run = value.current_run();
         state.record.session.last_run = value.last_run();
         persist(&state.directory, &state.record).await
@@ -711,6 +724,14 @@ impl SandboxApi for LocalSandboxApi {
         let mut sessions = self.sessions.lock().await;
         let state = sessions.get_mut(id).ok_or(ServiceError::NotFound)?;
         state.record.telemetry = value.clone();
+        state.record.session.execution_state = match value.execution.as_str() {
+            "busy" => "running",
+            "error" => "failed",
+            "recovering" | "unavailable" => value.execution.as_str(),
+            "idle" => "idle",
+            _ => "unknown",
+        }
+        .into();
         persist(&state.directory, &state.record).await
     }
 
@@ -926,12 +947,58 @@ mod tests {
         std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
 
-    fn initial_work_state() -> WorkStateRecord {
-        WorkStateRecord::submitted(
+    fn initial_run_record() -> RunRecord {
+        RunRecord::submitted(
             super::super::RunId(format!("run_{}", uuid::Uuid::new_v4().simple())),
             super::super::OpenCodeMessageId(format!("msg_{}", uuid::Uuid::new_v4().simple())),
             chrono::Utc::now().to_rfc3339(),
         )
+    }
+
+    #[test]
+    fn loads_legacy_local_records_as_factual_run_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime");
+        let session_dir = root.join("demo-12345678");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let legacy = serde_json::json!({
+            "session": {
+                "id":"demo-12345678", "sandbox":"anvil-demo-12345678", "service":"127.0.0.1",
+                "namespace":"local", "opencode_port":4096, "project":"demo",
+                "repository":"https://example.test/demo.git", "ref":"main", "work_branch":"anvil/demo",
+                "environment_state":"ready", "work_state":"ready_for_review"
+            },
+            "work_state": {
+                "changed_at":"2026-01-01T10:02:00Z",
+                "state":{"state":"ready_for_review","details":{"run":{
+                    "run_id":"run_legacy", "assistant_message_id":"assistant_legacy",
+                    "started_at":"2026-01-01T10:00:00Z", "finished_at":"2026-01-01T10:02:00Z"
+                },"previous_run":null}}
+            },
+            "binding_state":{"state":"available","continuity":"exact","checked_at":"2026-01-01T10:02:00Z","error":null,"previous_session_id":null,"recovery_event":null},
+            "operating_mode":"Running", "created_at":"2026-01-01T10:00:00Z"
+        });
+        std::fs::write(session_dir.join("session.json"), legacy.to_string()).unwrap();
+
+        let api = LocalSandboxApi::with_paths(
+            test_config(),
+            root,
+            temp.path().join("unused-opencode"),
+            temp.path().join("profile"),
+        )
+        .unwrap();
+        let sessions = api.sessions.try_lock().unwrap();
+        let record = &sessions.get("demo-12345678").unwrap().record;
+        assert_eq!(record.session.environment_state, "ready");
+        assert_eq!(record.session.execution_state, "unknown");
+        assert!(record.run_record.current.is_none());
+        assert_eq!(
+            record.run_record.last_run().unwrap().state,
+            anvil_core::RunState::Completed
+        );
+        let persisted = serde_json::to_value(record).unwrap();
+        assert!(persisted.get("work_state").is_none());
+        assert!(persisted["session"].get("work_state").is_none());
     }
 
     #[test]
@@ -965,7 +1032,7 @@ mod tests {
         configured.git_committer_name = "Anvil".into();
         configured.git_committer_email = "anvil@noreply.thejeffer.net".into();
         let api = fixture.api_with_config(configured.clone());
-        let initial_work_state = initial_work_state();
+        let initial_run = initial_run_record();
         let mut request = fixture.request("demo");
         request.author_name = Some("Invoking Developer".into());
         request.author_email = Some("developer@example.test".into());
@@ -980,7 +1047,7 @@ mod tests {
                 "demo-12345678",
                 &request,
                 &sandbox_environment,
-                &initial_work_state,
+                &initial_run,
             )
             .await
             .unwrap();
@@ -1089,20 +1156,20 @@ mod tests {
         let api = fixture.api();
         let mut invalid = fixture.request("failed");
         invalid.base_ref = "missing-ref".into();
-        let invalid_work_state = initial_work_state();
+        let invalid_run = initial_run_record();
         assert!(api
-            .create("failed-12345678", &invalid, &[], &invalid_work_state)
+            .create("failed-12345678", &invalid, &[], &invalid_run)
             .await
             .is_err());
         assert!(!fixture.runtime.join("failed-12345678").exists());
 
         let first_request = fixture.request("demo");
         let second_request = fixture.request("other");
-        let first_work_state = initial_work_state();
-        let second_work_state = initial_work_state();
+        let first_run = initial_run_record();
+        let second_run = initial_run_record();
         let (first, second) = tokio::join!(
-            api.create("demo-12345678", &first_request, &[], &first_work_state),
-            api.create("other-12345679", &second_request, &[], &second_work_state),
+            api.create("demo-12345678", &first_request, &[], &first_run),
+            api.create("other-12345679", &second_request, &[], &second_run),
         );
         let first = first.unwrap();
         let second = second.unwrap();

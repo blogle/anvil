@@ -29,7 +29,7 @@ Session controller routes are:
 | `GET` | `/v1/sessions/{id}` | Read durable session metadata and binding state |
 | `POST` | `/v1/sessions/{id}/messages` | Send steering to the current OpenCode session |
 | `GET` | `/v1/sessions/{id}/messages` | Read OpenCode messages |
-| `GET` | `/v1/sessions/{id}/status` | Read environment, execution, work, and binding state |
+| `GET` | `/v1/sessions/{id}/status` | Read environment, execution, run, and binding state |
 | `GET` | `/v1/sessions/{id}/activity` | Read the normalized dashboard/activity model |
 | `GET` | `/v1/sessions/{id}/diff` | Read the repository diff |
 | `GET` | `/v1/sessions/{id}/previews/{port}` | Resolve a preview URL |
@@ -37,7 +37,6 @@ Session controller routes are:
 | `POST` | `/v1/sessions/{id}/suspend` | Suspend the Sandbox |
 | `POST` | `/v1/sessions/{id}/resume` | Resume and reconcile the Sandbox |
 | `POST` | `/v1/sessions/{id}/rebind` | Explicitly create a replacement OpenCode binding |
-| `POST` | `/v1/sessions/{id}/complete` | Controller acceptance into `completed` |
 | `DELETE` | `/v1/sessions/{id}` | Delete the session and workspace |
 
 Mutation callers may supply `Idempotency-Key` on session lifecycle/message,
@@ -68,16 +67,23 @@ OpenCode without being logged or persisted by Anvil. Pending login IDs live only
 an `anvild` restart requires an in-progress login to be restarted; completed
 credentials remain on the profile PVC.
 
-## Session work state
+## Observed session and run state
 
-Session responses expose `environment_state`, `execution_state`, and `work_state`
-fields derived from environment and OpenCode lifecycle facts. OpenCode busy maps
-to execution `running`; OpenCode idle maps to execution `idle`, independently of
-the Anvil run identity/review state. A run becomes `ready_for_review` when the
-bound OpenCode conversation confirms completion for its correlated user turn.
-OpenCode errors map to execution `failed`, while observer transport degradation
-is reported separately in telemetry. Suspended and completed remain explicit
-Anvil administrative states.
+Session responses expose the independent factual axes `environment_state` and
+`execution_state`. OpenCode busy maps to execution `running`; OpenCode idle maps
+to execution `idle`. Correlated prompts have their own factual run lifecycle
+(`submitted`, `running`, `completed`, or `failed`) with message identity,
+timestamps, and errors. A completed turn does not imply any task or session
+completion. OpenCode errors are exposed in execution telemetry; observer
+transport degradation is reported separately. Environment suspension is an
+explicit Sandbox lifecycle state.
+
+The Sessions UI presents environment/runtime and OpenCode execution as separate
+factual axes. Run outcomes are not promoted to session or task conclusions.
+Session search is limited to locally available session metadata; it does not
+search prompts, transcripts, or other session content. Prompts can be sent to
+an idle healthy session without an acceptance or reset step. Sessions remain
+available until explicitly suspended or deleted.
 
 OpenCode v1.18.30 `session/status` lists only non-idle sessions, so an absent
 entry for the exact bound session is authoritative `idle`. Successful live
@@ -85,10 +91,9 @@ status reads supersede persisted telemetry and clear stale execution errors.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/v1/sessions/{id}/complete` | Controller acceptance into `completed` |
 | `POST` | `/v1/sessions/{id}/rebind` | Explicitly create a replacement OpenCode session |
 
-Run and work metadata plus the version-1 Anvil telemetry snapshot are stored
+Factual run records plus the version-1 Anvil telemetry snapshot are stored
 with Sandbox annotations, so they survive service restarts and Sandbox
 suspension. `/activity` projects the persisted request/operation snapshot rather
 than rebuilding it from the full conversation on every read. The snapshot uses
@@ -133,8 +138,9 @@ returned as structured MCP error data containing the HTTP status and Anvil's
 HTTP. `just` remains a development/build/deployment workflow and does not
 provide provider-login or session-administration commands.
 
-Controller acceptance uses `anvilctl session complete <session>`. Task lifecycle
-is derived from the bound OpenCode conversation and has no model-report command.
+Session lifecycle is limited to the observed Sandbox environment and OpenCode
+execution axes. Prompt run outcomes are exposed as run history; session
+completion is not an operator action.
 
 Anvil uses the Agent Sandbox `agents.x-k8s.io/v1beta1` `Sandbox` resource. The
 `anvild` process is configured with `ANVIL_NAMESPACE` and is the sole component
@@ -176,6 +182,6 @@ successful response also returns a renewed `session_credential`; the sandbox
 helpers persist it under `/home/anvil/.local/state` and use it for later broker
 requests, including after pod recreation. An expired signed capability may be
 used only to renew credentials after Anvil confirms that its session still
-exists, is not completed or being deleted, and remains bound to the same
+exists, is not being deleted, and remains bound to the same
 repository. The short-lived GitHub installation token and its permission
 profile are unchanged.

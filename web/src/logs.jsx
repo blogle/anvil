@@ -4,7 +4,7 @@ import { Clock } from './clock.jsx'
 
 const React = { createElement: h }
 
-const eventTitle = (kind) => ({ created: 'Session created by controller', session_created: 'Session created by controller', ready: 'Sandbox ready', environment_ready: 'Sandbox ready', request_started: 'Request started', request_completed: 'Request completed', request_failed: 'Request failed', run_started: 'Work run started', opencode_idle: 'OpenCode turn finished', opencode_error: 'OpenCode turn failed', conversation_rebound: 'Conversation rebound', session_suspended: 'Session suspended', session_resumed: 'Session resumed', session_completed: 'Session completed', session_deleted: 'Session deleted' }[kind] || 'Session activity')
+const eventTitle = (kind) => ({ created: 'Session created by controller', session_created: 'Session created by controller', ready: 'Sandbox ready', environment_ready: 'Sandbox ready', request_started: 'Request started', request_completed: 'Request completed', request_failed: 'Request failed', run_started: 'Run started', opencode_idle: 'OpenCode reported idle', opencode_error: 'OpenCode reported an error', conversation_rebound: 'Conversation rebound', session_suspended: 'Session suspended', session_resumed: 'Session resumed', session_deleted: 'Session deleted' }[kind] || 'Session activity')
 
 export function Logs({ activity, ui }) {
   if (!activity) return <div class="content-section"><div class="loading">Loading activity...</div></div>
