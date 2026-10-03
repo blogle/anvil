@@ -8,12 +8,13 @@ import { chromium } from '@playwright/test'
 
 test('production browser retains sessions, detail interactions, routes, and mobile layout', async () => {
   const session = { id: 'demo', project: 'Demo', work_branch: 'main', environment_state: 'ready', work_state: 'in_progress', created_at: '2026-09-19T11:00:00Z', sandbox: 'sandbox', repository: 'https://example.test/repo', base_ref: 'main' }
-  const state = { summary: `Initial metadata ${'long summary '.repeat(500)}`, execution: 'running', changedAt: new Date(Date.now() - 1000).toISOString() }
-  const activity = () => ({ session, environment_state: 'ready', execution_state: state.execution, work_state: state.execution === 'idle' ? 'ready_for_review' : 'in_progress', work_state_changed_at: state.changedAt, work_state_summary: state.summary, attach_command: 'anvilctl sessions attach demo', lifecycle: [{ kind: 'created', at: '2026-09-19T11:00:00Z' }], requests: [{ id: 'request-1', number: 1, origin: 'operator', state: 'running', started_at: '2026-09-19T11:58:00Z', last_activity_at: '2026-09-19T11:59:00Z', prompt: `selection anchor ${'long prompt '.repeat(500)}` }] })
+  const state = { summary: `Initial metadata ${'long summary '.repeat(500)}`, execution: 'running', request: 'running', project: session.project, branch: session.work_branch, changedAt: new Date(Date.now() - 1000).toISOString() }
+  const currentSession = () => ({ ...session, project: state.project, work_branch: state.branch })
+  const activity = () => ({ session: currentSession(), environment_state: 'ready', execution_state: state.execution, request_state: state.request, work_state: 'in_progress', work_state_changed_at: state.changedAt, work_state_summary: state.summary, attach_command: 'anvilctl sessions attach demo', lifecycle: [{ kind: 'created', at: '2026-09-19T11:00:00Z' }], requests: [{ id: 'request-1', number: 1, origin: 'operator', state: state.request, started_at: '2026-09-19T11:58:00Z', last_activity_at: '2026-09-19T11:59:00Z', prompt: `selection anchor ${'long prompt '.repeat(500)}` }] })
   const server = createServer(async (request, response) => {
     const url = new URL(request.url, 'http://localhost')
     if (url.pathname === '/v1/sessions') {
-      response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify([session])); return
+      response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify([currentSession()])); return
     }
     if (url.pathname === '/v1/sessions/demo/activity') {
       response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify(activity())); return
@@ -41,19 +42,37 @@ test('production browser retains sessions, detail interactions, routes, and mobi
       window.initialDetail = document.querySelector('.detail')
       window.initialActions = document.querySelector('.actions')
       window.initialTab = document.querySelector('#logs-tab')
+      const elapsed = window.initialRow.querySelector('.row-detail')
+      window.elapsedText = [...elapsed.childNodes].find((node) => node.nodeType === Node.TEXT_NODE && node.nodeValue.trim())
     })
 
+    const noOpMutations = await page.evaluate(async () => {
+      const row = document.querySelector('[data-session="demo"]')
+      const records = []
+      const observer = new MutationObserver((mutations) => records.push(...mutations))
+      observer.observe(row, { subtree: true, childList: true, characterData: true, attributes: true })
+      document.dispatchEvent(new Event('visibilitychange'))
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      observer.disconnect()
+      return records.map(({ type, target }) => `${type}:${target.nodeName}`)
+    })
+    assert.deepEqual(noOpMutations, [])
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
     await page.waitForTimeout(100)
     assert.equal(await row.evaluate((element) => element === window.initialRow), true)
 
     state.summary = `Updated metadata ${'long summary '.repeat(500)}`
+    state.project = 'Updated Demo'
+    state.branch = 'feature/live-refresh'
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
     await page.getByText('Updated metadata').waitFor()
     assert.equal(await row.evaluate((element) => element === window.initialRow), true)
+    assert.equal(await row.locator('.session-meta').locator('span').first().textContent(), 'Updated Demo')
+    assert.equal(await row.locator('.session-meta code').textContent(), 'feature/live-refresh')
     await page.waitForTimeout(1100)
     assert.equal(await row.evaluate((element) => element === window.initialRow), true)
     assert.notEqual(await row.locator('.row-detail').textContent(), initialElapsed)
+    assert.equal(await row.locator('.row-detail').evaluate((element) => [...element.childNodes].includes(window.elapsedText)), true)
 
     const detail = page.locator('.detail'), actions = page.locator('.actions'), runtimeTab = page.locator('#runtime-tab')
     await detail.evaluate((element) => { element.style.height = '300px'; element.style.overflow = 'auto' })
@@ -67,6 +86,10 @@ test('production browser retains sessions, detail interactions, routes, and mobi
     assert.ok(await detail.evaluate((element) => element.scrollHeight - element.clientHeight >= 80))
     assert.equal(await detail.evaluate((element) => element.scrollTop), 80)
     state.execution = 'idle'
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+    await page.getByText('Working', { exact: true }).first().waitFor()
+    assert.equal(await row.evaluate((element) => element === window.initialRow), true)
+    state.request = 'completed'
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
     await page.getByText('Ready for review', { exact: true }).first().waitFor()
     assert.equal(await row.evaluate((element) => element === window.initialRow), true)
