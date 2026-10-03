@@ -9,7 +9,7 @@ import { chromium } from '@playwright/test'
 test('production browser retains sessions, detail interactions, routes, and mobile layout', async () => {
   const session = { id: 'demo', project: 'Demo', work_branch: 'main', environment_state: 'ready', work_state: 'in_progress', created_at: '2026-09-19T11:00:00Z', sandbox: 'sandbox', repository: 'https://example.test/repo', base_ref: 'main' }
   const state = { summary: `Initial metadata ${'long summary '.repeat(500)}`, execution: 'running', changedAt: new Date(Date.now() - 1000).toISOString() }
-  const activity = () => ({ session, environment_state: 'ready', execution_state: state.execution, work_state: state.execution === 'idle' ? 'ready_for_review' : 'in_progress', work_state_changed_at: state.changedAt, work_state_summary: state.summary, attach_command: 'anvilctl sessions attach demo', lifecycle: [{ kind: 'created', at: '2026-09-19T11:00:00Z' }], requests: [{ id: 'request-1', number: 1, origin: 'operator', state: 'running', started_at: '2026-09-19T11:58:00Z', last_activity_at: '2026-09-19T11:59:00Z', prompt: `selection anchor ${'long prompt '.repeat(500)}` }] })
+  const activity = () => ({ session, environment_state: 'ready', execution_state: state.execution, work_state: state.execution === 'idle' ? 'ready_for_review' : 'in_progress', work_state_changed_at: state.changedAt, work_state_summary: state.summary, attach_command: 'anvilctl sessions attach demo', lifecycle: [{ kind: 'created', at: '2026-09-19T11:00:00Z' }], events: [{ id: 'prompt-1', at: '2026-09-19T11:58:00Z', kind: 'prompt', title: 'You', detail: 'Review the authentication flow.' }, { id: 'tool-1', at: '2026-09-19T11:58:30Z', kind: 'tool', tool: 'read', title: 'src/auth.js', detail: '24 lines read', status: 'completed' }, { id: 'agent-1', at: '2026-09-19T11:59:00Z', kind: 'message', title: 'Agent', detail: 'The session helper owns authentication.' }], event_window: { message_limit: 100, returned_messages: 3, loaded_messages: 3, next_cursor: null, truncated: false }, requests: [{ id: 'request-1', number: 1, origin: 'operator', state: 'running', started_at: '2026-09-19T11:58:00Z', last_activity_at: '2026-09-19T11:59:00Z', prompt: `selection anchor ${'long prompt '.repeat(500)}` }] })
   const server = createServer(async (request, response) => {
     const url = new URL(request.url, 'http://localhost')
     if (url.pathname === '/v1/sessions') {
@@ -35,12 +35,15 @@ test('production browser retains sessions, detail interactions, routes, and mobi
     await row.waitFor()
     await page.locator('.work-summary').waitFor()
     assert.equal(await page.locator('.session-status-label').count(), 1)
+    await page.locator('#activity-panel [data-event-id="prompt-1"]').waitFor()
+    assert.deepEqual(await page.locator('#activity-panel [data-event-id]').evaluateAll((rows) => rows.map((row) => row.dataset.eventId)), ['prompt-1', 'tool-1', 'agent-1'])
+    assert.equal((await page.locator('#activity-panel').textContent()).includes('Session created by controller'), false)
     const initialElapsed = await row.locator('.row-detail').textContent()
     await page.evaluate(() => {
       window.initialRow = document.querySelector('[data-session="demo"]')
       window.initialDetail = document.querySelector('.detail')
       window.initialActions = document.querySelector('.actions')
-      window.initialTab = document.querySelector('#logs-tab')
+      window.initialTab = document.querySelector('#activity-tab')
     })
 
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
@@ -58,6 +61,7 @@ test('production browser retains sessions, detail interactions, routes, and mobi
     const detail = page.locator('.detail'), actions = page.locator('.actions'), runtimeTab = page.locator('#runtime-tab')
     await detail.evaluate((element) => { element.style.height = '300px'; element.style.overflow = 'auto' })
     await detail.evaluate((element) => { element.scrollTop = 80 })
+    await page.locator('#trail-tab').click()
     await page.locator('.attach summary').click()
     const promptToggle = page.locator('.prompt-toggle')
     await promptToggle.scrollIntoViewIfNeeded()
@@ -74,7 +78,7 @@ test('production browser retains sessions, detail interactions, routes, and mobi
     assert.equal(await actions.count(), 1)
     assert.equal(await detail.evaluate((element) => element === window.initialDetail), true)
     assert.equal(await actions.evaluate((element) => element === window.initialActions), true)
-    assert.equal(await page.locator('#logs-tab').evaluate((element) => element === window.initialTab), true)
+    assert.equal(await page.locator('#activity-tab').evaluate((element) => element === window.initialTab), true)
     assert.equal(await page.locator('details').evaluate((element) => element.open), true)
     assert.equal(await prompt.evaluate((element) => element.classList.contains('expanded')), true)
     assert.equal(await detail.evaluate((element) => element.scrollTop), 80)
