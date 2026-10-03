@@ -1,0 +1,1 @@
+directory source passed through the shared Nix daemon
