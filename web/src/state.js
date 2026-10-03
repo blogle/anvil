@@ -46,6 +46,40 @@ export function statusFor(activity) {
   return 'starting'
 }
 
+function exactTimestamp(value) {
+  const match = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$/.exec(String(value || ''))
+  if (!match) return null
+  const seconds = Date.parse(`${match[1]}${match[3]}`)
+  if (!Number.isFinite(seconds)) return null
+  return { seconds: BigInt(Math.floor(seconds / 1000)), fraction: (match[2] || '').replace(/0+$/, '') }
+}
+
+function compareTimestamps(left, right) {
+  const a = exactTimestamp(left)
+  const b = exactTimestamp(right)
+  if (!a || !b) return a ? -1 : b ? 1 : 0
+  if (a.seconds !== b.seconds) return a.seconds < b.seconds ? -1 : 1
+  const length = Math.max(a.fraction.length, b.fraction.length)
+  const af = a.fraction.padEnd(length, '0')
+  const bf = b.fraction.padEnd(length, '0')
+  return af < bf ? -1 : af > bf ? 1 : 0
+}
+
+const compareStableText = (left, right) => left < right ? -1 : left > right ? 1 : 0
+
+// Preserve RFC3339 fractional precision. Exact same-source ties use lifecycle IDs
+// or transcript-ordered request number/ID; cross-source ties deterministically put
+// lifecycle first because no shared sequence exists (this is not causal ordering).
+export function chronologicalTimeline(activity) {
+  const items = [
+    ...(activity.lifecycle || []).map((event) => ({ type: 'event', value: event, at: event.at, id: event.id || `${event.kind}:${event.at}:${event.detail || ''}` })),
+    ...(activity.requests || []).map((request) => ({ type: 'request', value: request, at: request.started_at, number: request.number, id: request.id || '' })),
+  ]
+  return items.sort((a, b) => compareTimestamps(a.at, b.at) || (a.type === b.type
+    ? a.type === 'request' ? a.number - b.number || compareStableText(a.id, b.id) : compareStableText(a.id, b.id)
+    : a.type === 'event' ? -1 : 1))
+}
+
 export const stateLabel = (state) => ({ working: 'Working', 'needs-input': 'Needs input', 'ready-for-review': 'Ready for review', done: 'Done', problem: 'Problem', stopped: 'Stopped', starting: 'Starting' }[state] || 'Starting')
 export const timestamp = (value) => {
   if (!value) return null
