@@ -1,0 +1,39 @@
+name: Hestia cache GC
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Plan only; do not delete cache entries
+        type: boolean
+        default: false
+
+concurrency:
+  group: hestia-gc
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  gc:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Mic92/hestia@v3.1.0
+        with:
+          version: v3.1.0
+      - name: Collect unreferenced cache paths
+        env:
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          "$HESTIA_BIN" gc "${args[@]}"

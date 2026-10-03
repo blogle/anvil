@@ -9,6 +9,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+permissions:
+  actions: read
+  contents: read
+
 jobs:
   admission:
     name: PR admission
@@ -18,9 +22,12 @@ jobs:
       !startsWith(github.head_ref, 'mergify/merge-queue/')
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v31
+      - uses: DeterminateSystems/nix-installer-action@v19
+      - uses: Mic92/hestia@v3.1.0
         with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          version: v3.1.0
+          no-closure: true
+          upstream-cache-filter: true
       - name: Evaluate flake
         run: time nix flake check --no-build
       - name: Rust format
@@ -34,9 +41,12 @@ jobs:
       startsWith(github.head_ref, 'mergify/merge-queue/')
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v31
+      - uses: DeterminateSystems/nix-installer-action@v19
+      - uses: Mic92/hestia@v3.1.0
         with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          version: v3.1.0
+          no-closure: true
+          upstream-cache-filter: true
       - name: Configure GitHub Actions sccache backend
         uses: mozilla-actions/sccache-action@v0.0.11
         with:
