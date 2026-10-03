@@ -66,7 +66,6 @@ pub enum SessionsSubcommand {
     Delete { session: String },
     Preview { session: String, port: u16 },
     Attach { session: String },
-    Complete { session: String },
     Rebind(RebindArgs),
 }
 
@@ -460,16 +459,6 @@ async fn run_sessions(client: ApiClient, command: SessionsSubcommand, json: bool
             .await
         }
         SessionsSubcommand::Attach { session } => attach(client, &session).await,
-        SessionsSubcommand::Complete { session } => {
-            print_response(
-                &client,
-                Method::POST,
-                &format!("v1/sessions/{session}/complete"),
-                None,
-                json,
-            )
-            .await
-        }
         SessionsSubcommand::Rebind(args) => {
             print_response(
                 &client,
@@ -488,17 +477,14 @@ async fn list_sessions(client: &ApiClient, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&sessions)?);
     } else {
-        println!("{:<24} {:<16} {:<18}", "SESSION", "PROJECT", "WORK STATE");
+        println!(
+            "{:<24} {:<16} {:<14} {:<14}",
+            "SESSION", "PROJECT", "ENVIRONMENT", "EXECUTION"
+        );
         for session in sessions {
             println!(
-                "{:<24} {:<16} {}",
-                session.id,
-                session.project,
-                if session.work_state.is_empty() {
-                    "unknown"
-                } else {
-                    &session.work_state
-                }
+                "{:<24} {:<16} {:<14} {}",
+                session.id, session.project, session.environment_state, session.execution_state,
             );
         }
     }
