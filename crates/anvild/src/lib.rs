@@ -8818,10 +8818,7 @@ mod tests {
             let asset_urls = built_index
                 .split("/assets/")
                 .skip(1)
-                .filter_map(|part| {
-                    part.split(['\"', '\''])
-                        .next()
-                })
+                .filter_map(|part| part.split(['\"', '\'']).next())
                 .filter(|path| !path.is_empty())
                 .collect::<Vec<_>>();
             assert!(!asset_urls.is_empty(), "Vite index should reference assets");
