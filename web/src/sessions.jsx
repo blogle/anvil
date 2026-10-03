@@ -7,10 +7,13 @@ const React = { createElement: h }
 export const labels = [['all','All'], ['working','Working'], ['needs-input','Needs input'], ['ready-for-review','Ready for review'], ['done','Done'], ['problem','Problem']]
 
 export function SessionsWorkspace() {
-  return <aside class="sidebar" aria-label="Sessions"><div class="sidebar-head"><h1>Sessions</h1><span class="count">{sessions.value.length} total</span></div>
-    <div class="filters" aria-label="Session filters">{labels.map(([key, label]) => <button key={key} data-filter={key} class={`filter ${filter.value === key ? 'selected' : ''}`} aria-pressed={filter.value === key} onClick={() => { filter.value = key; if (selected.value && !visibleSessions.value.some((item) => item.id === selected.value)) navigate(null, false) }}>{label}</button>)}</div>
+  const visible = visibleSessions.value
+  return <section class="session-workspace" aria-label="Sessions workspace">
+    <div class="sidebar-head"><div><div class="eyebrow">Operations</div><h1>Sessions</h1></div><span class="count">{sessions.value.length} total</span></div>
+    <div class="filters" aria-label="Session filters">{labels.map(([key, label]) => <button key={key} data-filter={key} class={`filter ${filter.value === key ? 'selected' : ''}`} aria-pressed={filter.value === key} onClick={() => { filter.value = key }}>{label}</button>)}</div>
+    {!loading.value && !error.value && visible.length > 0 && <div class="workspace-summary"><div><strong>{visible.length} {visible.length === 1 ? 'session' : 'sessions'}</strong><span>Live work across your projects</span></div></div>}
     <SessionList/>
-  </aside>
+  </section>
 }
 
 function SessionList() {

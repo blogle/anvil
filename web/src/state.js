@@ -19,18 +19,42 @@ export function sessionUI(id) {
 
 export function routeFromHash(hash = location.hash) {
   const raw = hash.startsWith('#') ? hash.slice(1) : hash
-  if (!raw || raw === 'providers' || raw === 'settings') return null
-  try { return decodeURIComponent(raw.startsWith('session/') ? raw.slice(8) : raw) || null } catch { return null }
+  if (!raw || raw === 'sessions' || !raw.startsWith('session/')) return null
+  try { return decodeURIComponent(raw.slice('session/'.length)) || null } catch { return null }
+}
+
+export function routeFor(id) {
+  return id ? `#session/${encodeURIComponent(id)}` : '#sessions'
+}
+
+function setSelectedRoute(id) {
+  const previous = selected.value
+  if (previous === id) return
+  selected.value = id
+  const focus = () => {
+    if (id) {
+      document.querySelector('[data-session-detail] h2')?.focus({ preventScroll: true })
+      return
+    }
+    const row = [...document.querySelectorAll('[data-session]')].find((element) => element.dataset.session === previous && !element.hidden)
+    ;(row || document.querySelector(`[data-filter="${filter.value}"]`))?.focus({ preventScroll: true })
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(focus)
+  else setTimeout(focus, 0)
+}
+
+export function syncRouteFromHash() {
+  setSelectedRoute(routeFromHash())
 }
 
 export function navigate(id, push = true) {
-  const hash = id ? `#session/${encodeURIComponent(id)}` : ''
+  const hash = routeFor(id)
   if (location.hash !== hash) {
     const url = `${location.pathname}${location.search}${hash}`
     if (push) history.pushState(null, '', url)
     else history.replaceState(null, '', url)
   }
-  selected.value = routeFromHash()
+  syncRouteFromHash()
 }
 
 export function statusFor(activity) {
@@ -95,7 +119,7 @@ export async function refresh() {
     sessions.value = next
     activities.value = new Map(activityPairs.filter(([, activity]) => activity))
     const active = next.find((item) => item.id === selected.value)
-    if (selected.value && (!active || (filter.value !== 'all' && statusFor(activities.value.get(active.id)) !== filter.value))) navigate(null, false)
+    if (selected.value && !active) navigate(null, false)
     error.value = null
   } catch (cause) { error.value = cause.message }
   finally { loading.value = false; polling.value = false }
