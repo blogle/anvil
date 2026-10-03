@@ -44,9 +44,9 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .sidebar-head { padding: 28px 22px 18px; display: flex; align-items: center; justify-content: space-between; }
 .sidebar-head h1 { margin: 0; font-size: 16px; letter-spacing: -0.02em; }
 .count { color: var(--text-muted); font-size: 12px; }
-.filters { display: flex; gap: 6px; padding: 0 18px 16px; flex-wrap: wrap; }
-.filter { cursor: pointer; border: 1px solid transparent; border-radius: 7px; padding: 7px 10px; background: transparent; color: var(--text-muted); font-size: 12px; }
-.filter:hover, .filter.selected { color: var(--text-primary); border-color: var(--border); background: var(--surface); }
+.filters { display: grid; gap: 7px; padding: 0 18px 16px; }
+.filters label { color: var(--text-muted); font-size: 11px; }
+.filters input, .filters select { width: 100%; min-height: 34px; border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; color: var(--text-primary); background: var(--surface); font: inherit; font-size: 12px; }
 .session-list { padding: 0 10px 20px; }
 .session-row { width: 100%; display: block; text-align: left; cursor: pointer; border: 1px solid transparent; border-radius: 9px; padding: 14px 12px; margin-bottom: 4px; background: transparent; }
 .session-row:hover { background: var(--surface); }
@@ -55,17 +55,8 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .session-meta { display: flex; gap: 8px; margin-top: 7px; color: var(--text-secondary); font-size: 11px; white-space: nowrap; overflow: hidden; }
 .session-meta span { overflow: hidden; text-overflow: ellipsis; }
 .session-state { display: flex; gap: 7px; align-items: center; margin-top: 11px; font-size: 12px; color: var(--text-secondary); }
-.session-state .status-dot { flex: 0 0 auto; }
-.state-active .status-dot { background: var(--accent); box-shadow: 0 0 0 3px rgba(124, 169, 255, 0.11); }
-.state-idle .status-dot { background: var(--success); }
-.state-starting .status-dot { background: var(--warning); }
-.state-failed .status-dot { background: var(--danger); }
-.state-stopped .status-dot { background: var(--text-muted); }
-.state-working .status-dot { background: var(--accent); box-shadow: 0 0 0 3px rgba(124, 169, 255, 0.11); }
-.state-needs-input .status-dot { background: var(--warning); }
-.state-ready-for-review .status-dot, .state-done .status-dot { background: var(--success); }
-.state-problem .status-dot { background: var(--danger); }
-.row-detail { margin-left: auto; color: var(--text-secondary); }
+.factual-state { flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; color: var(--text-secondary); font-size: 11px; }
+.factual-state code { color: var(--text-primary); }
 
 .detail { min-width: 0; overflow: auto; }
 [hidden] { display: none !important; }
@@ -76,8 +67,6 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .detail h2 { margin: 8px 0 8px; font-size: clamp(24px, 3vw, 34px); line-height: 1.1; letter-spacing: -0.04em; }
 .detail-subtitle { display: flex; flex-wrap: wrap; gap: 8px 14px; color: var(--text-secondary); font-size: 13px; }
 .detail-subtitle code, code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
-.detail-status { display: inline-flex; align-items: center; gap: 8px; margin-top: 22px; color: var(--text-secondary); font-size: 13px; }
-.detail-status strong { color: var(--text-primary); }
 .description { max-width: 720px; color: var(--text-secondary); margin: 25px 0 0; white-space: pre-wrap; line-height: 1.55; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 26px 0 31px; }
 .button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; cursor: pointer; border: 1px solid var(--border-strong); border-radius: 7px; min-height: 36px; padding: 0 13px; color: var(--text-primary); background: var(--surface); font-size: 12px; font-weight: 650; }

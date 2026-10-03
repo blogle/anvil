@@ -16,49 +16,90 @@ const detailModule = await import('./src/detail.jsx')
 const { AppShell } = await import('./src/app.jsx')
 const state = await import('./src/state.js')
 
-const session = { id: 'demo', project: 'Demo', work_branch: 'main', environment_state: 'ready', work_state: 'in_progress', created_at: '2026-09-19T11:00:00Z', sandbox: 'sandbox', repository: 'https://example.test/repo', base_ref: 'main' }
-const activity = (execution_state = 'running', summary = 'First') => ({ session, environment_state: 'ready', execution_state, work_state: execution_state === 'idle' ? 'ready_for_review' : 'in_progress', work_state_changed_at: '2026-09-19T11:58:00Z', work_state_summary: summary, attach_command: 'anvilctl attach demo', lifecycle: [{ kind: 'created', at: '2026-09-19T11:00:00Z' }], requests: [{ id: 'request-1', number: 1, origin: 'operator', state: 'running', started_at: '2026-09-19T11:58:00Z', last_activity_at: '2026-09-19T11:59:00Z', prompt: 'x'.repeat(550) }] })
-
-test('elapsed display and status mappings retain current-main semantics', () => {
-  assert.equal(state.elapsed('2026-09-19T11:58:00Z', Date.parse('2026-09-19T12:00:10Z')), '2m 10s')
-  assert.equal(state.elapsed('1789819200Z', Date.parse('2026-09-19T12:00:10Z')), '10s')
-  assert.equal(state.statusFor({ environment_state: 'ready', execution_state: 'idle', work_state: 'in_progress' }), 'ready-for-review')
-  assert.equal(state.statusFor({ environment_state: 'suspended', execution_state: 'recovering' }), 'stopped')
-  state.sessions.value = [session]
-  state.activities.value = new Map([[session.id, activity('idle')]])
-  state.filter.value = 'ready-for-review'
-  assert.deepEqual(state.visibleSessions.value.map((item) => item.id), ['demo'])
-  state.filter.value = 'working'
-  assert.deepEqual(state.visibleSessions.value, [])
-  state.filter.value = 'all'
+const session = {
+  id: 'demo', project: 'Demo', work_branch: 'feature/search', environment_state: 'ready',
+  execution_state: 'idle', created_at: '2026-09-19T11:00:00Z', sandbox: 'sandbox',
+  repository: 'https://example.test/repo', base_ref: 'main',
+}
+const activity = (execution_state = 'running') => ({
+  session, environment_state: 'ready', execution_state,
+  attach_command: 'anvilctl attach demo', lifecycle: [{ kind: 'created', at: '2026-09-19T11:00:00Z' }],
+  requests: [{ id: 'request-1', number: 1, origin: 'operator', state: 'running', started_at: '2026-09-19T11:58:00Z', last_activity_at: '2026-09-19T11:59:00Z', prompt: 'x'.repeat(550) }],
 })
 
-function TestApp() { return h('div', { class: 'app-shell' }, h('aside', { class: 'sidebar' }, h('div', { class: 'session-list' }, state.sessions.value.map((item) => h(sessionsModule.SessionRow, { key: item.id, session: item })))), h(detailModule.SessionDetail)) }
+test('elapsed display remains deterministic', () => {
+  assert.equal(state.elapsed('2026-09-19T11:58:00Z', Date.parse('2026-09-19T12:00:10Z')), '2m 10s')
+  assert.equal(state.elapsed('1789819200Z', Date.parse('2026-09-19T12:00:10Z')), '10s')
+})
 
-test('keyed rows and selected detail remain mounted across polls and status transitions', async () => {
+test('search and factual filters compose with AND and use session fallback values', () => {
   state.sessions.value = [session]
-  state.activities.value = new Map([[session.id, activity()]])
+  state.activities.value = new Map()
+  state.search.value = 'FEATURE/SEARCH'
+  state.environmentFilter.value = 'ready'
+  state.executionFilter.value = 'idle'
+  assert.deepEqual(state.visibleSessions.value.map((item) => item.id), ['demo'])
+
+  state.search.value = 'missing'
+  assert.deepEqual(state.visibleSessions.value, [])
+  state.search.value = ''
+  state.environmentFilter.value = 'suspended'
+  assert.deepEqual(state.visibleSessions.value, [])
+  state.environmentFilter.value = ''
+  state.executionFilter.value = ''
+})
+
+test('selected raw filter values remain represented when absent from current data', async () => {
+  state.sessions.value = [session]
+  state.activities.value = new Map([[session.id, activity('idle')]])
+  state.environmentFilter.value = 'failed'
+  state.executionFilter.value = 'unavailable'
+  const root = document.getElementById('app')
+  await act(async () => render(h(sessionsModule.SessionsWorkspace), root))
+  assert.equal(root.querySelector('#environment-filter').value, 'failed')
+  assert.equal(root.querySelector('#execution-filter').value, 'unavailable')
+  assert.ok([...root.querySelector('#environment-filter').options].some((option) => option.value === 'failed'))
+  assert.ok([...root.querySelector('#execution-filter').options].some((option) => option.value === 'unavailable'))
+  state.environmentFilter.value = ''
+  state.executionFilter.value = ''
+  render(null, root)
+})
+
+function TestApp() {
+  return h('div', { class: 'app-shell' },
+    h('aside', { class: 'sidebar' }, h('div', { class: 'session-list' }, state.sessions.value.map((item) => h(sessionsModule.SessionRow, { key: item.id, session: item })))),
+    h(detailModule.SessionDetail))
+}
+
+test('keyed rows and selected detail retain identity while exposing raw axes', async () => {
+  state.sessions.value = [session]
+  state.activities.value = new Map([[session.id, activity('running')]])
   state.selected.value = session.id
   const root = document.getElementById('app')
   await act(async () => render(h(TestApp), root))
   const row = root.querySelector('[data-session="demo"]')
   const detail = root.querySelector('.detail')
-  assert.equal(root.querySelectorAll('.session-status-label').length, 1)
+  assert.match(row.textContent, /Environment: ready/)
+  assert.match(row.textContent, /Execution: running/)
+  assert.doesNotMatch(row.textContent, /Working|Ready for review|Done|Needs input/)
+  assert.doesNotMatch(root.querySelector('#runtime-panel').textContent, /Work state|Ready for review|Done|Needs input/)
   await act(async () => {
     state.sessions.value = [{ ...session }]
-    state.activities.value = new Map([[session.id, activity('running', 'Updated metadata')]])
+    state.activities.value = new Map([[session.id, activity('idle')]])
   })
   assert.equal(root.querySelector('[data-session="demo"]'), row)
   assert.equal(root.querySelector('.detail'), detail)
-  assert.equal(root.querySelector('.session-status-label').textContent, 'Working')
-  await act(async () => { state.activities.value = new Map([[session.id, activity('idle')]]) })
+  assert.match(row.textContent, /Environment: ready/)
+  assert.match(row.textContent, /Execution: idle/)
+  assert.equal(root.querySelectorAll('.factual-state').length, 2)
+  await act(async () => { state.activities.value = new Map() })
   assert.equal(root.querySelector('[data-session="demo"]'), row)
-  assert.equal(root.querySelector('.session-status-label').textContent, 'Ready for review')
-  assert.equal(root.querySelectorAll('.session-status-label').length, 1)
+  assert.match(row.textContent, /Environment: ready/)
+  assert.match(row.textContent, /Execution: idle/)
   render(null, root)
 })
 
-test('per-session attach, prompt expansion, tab, focus, selection and scroll state survives updates', async () => {
+test('per-session attach, prompt expansion, tab, focus, and scroll state survive updates', async () => {
   state.sessions.value = [session]
   state.activities.value = new Map([[session.id, activity()]])
   state.selected.value = session.id
@@ -76,7 +117,7 @@ test('per-session attach, prompt expansion, tab, focus, selection and scroll sta
   assert.equal(ui.attachOpen.value, true)
   assert.equal(root.querySelector('.prompt').classList.contains('expanded'), true)
   assert.equal(ui.tab.value, 'runtime')
-  await act(async () => { state.activities.value = new Map([[session.id, activity('running', 'Updated')]]) })
+  await act(async () => { state.activities.value = new Map([[session.id, activity('running')]]) })
   assert.equal(root.querySelector('.detail'), detail)
   assert.equal(root.querySelector('details').open, true)
   assert.equal(root.querySelector('.prompt').classList.contains('expanded'), true)
