@@ -5442,6 +5442,7 @@ fn build_activity(
 
     if let Some(at) = session.created_at.clone() {
         lifecycle.push(LifecycleEvent {
+            id: lifecycle_event_id("created", &at, &session.id),
             kind: "created".into(),
             at,
             detail: Some(format!(
@@ -5452,6 +5453,7 @@ fn build_activity(
     }
     if let Some(at) = session.ready_at.clone() {
         lifecycle.push(LifecycleEvent {
+            id: lifecycle_event_id("ready", &at, &session.id),
             kind: "ready".into(),
             at,
             detail: Some("Sandbox environment ready".into()),
@@ -5512,6 +5514,7 @@ fn build_activity(
             error: error.clone(),
         };
         lifecycle.push(LifecycleEvent {
+            id: lifecycle_event_id("request_started", &started_at, &id),
             kind: "request_started".into(),
             at: started_at,
             detail: Some(format!(
@@ -5522,6 +5525,15 @@ fn build_activity(
         });
         if let Some(completed_at) = completed_at {
             lifecycle.push(LifecycleEvent {
+                id: lifecycle_event_id(
+                    if error.is_some() {
+                        "request_failed"
+                    } else {
+                        "request_completed"
+                    },
+                    &completed_at,
+                    &id,
+                ),
                 kind: if error.is_some() {
                     "request_failed"
                 } else {
@@ -5585,6 +5597,10 @@ fn build_activity(
         previous_opencode_session_id: session.previous_opencode_session_id.clone(),
         session_binding_recovery_event: session.session_binding_recovery_event.clone(),
     }
+}
+
+fn lifecycle_event_id(kind: &str, at: &str, identity: &str) -> String {
+    format!("{kind}:{at}:{identity}")
 }
 
 fn merge_history(mut activity: SessionActivity, history: &[HistoryEvent]) -> SessionActivity {
@@ -5698,6 +5714,16 @@ fn merge_history(mut activity: SessionActivity, history: &[HistoryEvent]) -> Ses
         );
         if lifecycle_keys.insert(key) {
             activity.lifecycle.push(LifecycleEvent {
+                id: lifecycle_event_id(
+                    &event.kind,
+                    &event.at,
+                    event
+                        .request_id
+                        .as_deref()
+                        .or(event.run_id.as_deref())
+                        .or(event.detail.as_deref())
+                        .unwrap_or_default(),
+                ),
                 kind: event.kind.clone(),
                 at: event.at.clone(),
                 detail: event.detail.clone().or_else(|| event.run_id.clone()),
