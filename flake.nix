@@ -22,6 +22,17 @@
           nix2containerPkgs = nix2container.packages.${system};
           repoRoot = ./.;
         };
+        frontend = pkgs.buildNpmPackage {
+          pname = "anvil-web";
+          version = "0.1.0";
+          src = ./web;
+          npmDepsHash = "sha256-jSbL4XIRQbOg6DGmouNpFpiVHE9MNKLJn3Wxzfn0yfk=";
+          npmBuildScript = "build";
+          installPhase = ''
+            mkdir -p $out
+            cp -r dist/. $out/
+          '';
+        };
         sandbox = import ./nix/sandbox.nix {
           inherit pkgs opencode;
           nix2containerPkgs = nix2container.packages.${system};
@@ -32,12 +43,13 @@
           importSandboxImageK3sSource = ./scripts/import-sandbox-image-k3s.sh;
         };
         images = import ./nix/images.nix {
-          inherit pkgs rust;
+          inherit pkgs rust frontend;
         };
       in
       {
         packages.default = images.anvilImage;
         packages.anvild = rust.releaseBinaries.anvild;
+        packages.frontend = frontend;
         packages.anvil-mcp = rust.releaseBinaries.anvilMcp;
         packages.anvil-router = rust.releaseBinaries.anvilRouter;
         packages.anvilctl = rust.releaseBinaries.anvilCtl;
@@ -52,7 +64,7 @@
         packages.anvil-sandbox-image-push = sandbox.sandboxImagePush;
         packages.import-sandbox-image-k3s = sandbox.importSandboxImageK3s;
 
-        checks = rust.checks;
+        checks = rust.checks // { inherit frontend; };
         devShells.default = rust.devShell;
         # Kind already validates Rust in the independent local-first job. This
         # shell keeps the shared-daemon contract focused on environment entry

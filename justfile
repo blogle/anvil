@@ -5,10 +5,20 @@ fmt:
     cargo fmt --all
 
 check:
+    just frontend-check
     cargo fmt --check
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo nextest run --workspace
     just security-check
+
+frontend-build:
+    cd web && npm ci && npm run build
+
+frontend-test:
+    cd web && npm ci && npm test
+
+frontend-check:
+    cd web && npm ci && npm test && npm run build
 
 security-check:
     bash tests/credential-helper.sh
@@ -22,6 +32,7 @@ lint:
 
 # Build all development binaries with the workspace-wide Nix dependency cache.
 build:
+    just frontend-build
     cargo build --workspace
 
 build-ci-release:
@@ -34,12 +45,14 @@ nix-check:
     nix flake check
 
 dev:
+    just frontend-build
     mkdir -p .anvil/dev/profile/config .anvil/dev/profile/home
     cp dev/opencode-e2e.jsonc .anvil/dev/profile/config/opencode.jsonc
     cargo build -p anvild -p anvil-test-model
     PC_PORT_NUM=8090 process-compose -f dev/process-compose.yaml up
 
 dev-full:
+    just frontend-build
     mkdir -p .anvil/dev/profile/config .anvil/dev/profile/home
     cp dev/opencode-e2e.jsonc .anvil/dev/profile/config/opencode.jsonc
     cargo build -p anvild -p anvil-test-model -p anvil-mcp -p anvil-router
