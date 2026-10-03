@@ -1,5 +1,6 @@
 import { h } from 'preact'
 import { activities, api, navigate, refresh, selected, sessions, sessionUI, stateLabel, statusFor } from './state.js'
+import { Activity } from './activity.jsx'
 import { Clock } from './clock.jsx'
 import { Logs } from './logs.jsx'
 import { Runtime } from './runtime.jsx'
@@ -10,7 +11,7 @@ export function SessionDetail() {
   const id = selected.value
   const session = sessions.value.find((item) => item.id === id)
   const activity = activities.value.get(id)
-  if (!id) return <section class="detail"><div class="detail-inner"><div class="empty"><strong>Select a session</strong>Choose a session to inspect its lifecycle and requests.</div></div></section>
+  if (!id) return <section class="detail"><div class="detail-inner"><div class="empty"><strong>Select a session</strong>Choose a session to inspect its Activity and runtime.</div></div></section>
   if (!session) return <section class="detail"><div class="detail-inner"><div class="loading">Loading session...</div></div></section>
   return <section class="detail" key={id}><DetailContent session={session} activity={activity}/></section>
 }
@@ -22,8 +23,14 @@ function DetailContent({ session, activity }) {
     <div class="detail-header"><div><div class="eyebrow">Session overview</div><h2>{session.project || 'Anvil'} session</h2><div class="detail-subtitle"><span>{session.project}</span><span>·</span><code>{session.work_branch}</code></div><div class={`detail-status state-${status}`}><span class="status-dot"/><strong>{stateLabel(status)}</strong>{activity?.work_state_changed_at && <span>· <Clock value={activity.work_state_changed_at}/></span>}</div></div></div>
     {activity?.work_state_summary && <div class="work-summary"><div class="eyebrow">Work summary</div>{activity.work_state_summary}</div>}
     <SessionActions session={session} activity={activity} ui={ui}/>
-    <div class="tabs" role="tablist" aria-label="Session detail"><button id="logs-tab" class={`tab ${ui.tab.value === 'logs' ? 'active' : ''}`} role="tab" aria-selected={ui.tab.value === 'logs'} tabIndex={ui.tab.value === 'logs' ? 0 : -1} aria-controls="logs-panel" onClick={() => ui.tab.value = 'logs'}>Logs</button><button id="runtime-tab" class={`tab ${ui.tab.value === 'runtime' ? 'active' : ''}`} role="tab" aria-selected={ui.tab.value === 'runtime'} tabIndex={ui.tab.value === 'runtime' ? 0 : -1} aria-controls="runtime-panel" onClick={() => ui.tab.value = 'runtime'}>Runtime</button></div>
-    <div id="logs-panel" role="tabpanel" tabIndex="0" aria-labelledby="logs-tab" hidden={ui.tab.value !== 'logs'}><Logs activity={activity} ui={ui}/></div><div id="runtime-panel" role="tabpanel" tabIndex="0" aria-labelledby="runtime-tab" hidden={ui.tab.value !== 'runtime'}><Runtime activity={activity} session={session}/></div>
+    <div class="tabs" role="tablist" aria-label="Session detail">
+      <button id="activity-tab" class={`tab ${ui.tab.value === 'activity' ? 'active' : ''}`} role="tab" aria-selected={ui.tab.value === 'activity'} tabIndex={ui.tab.value === 'activity' ? 0 : -1} aria-controls="activity-panel" onClick={() => ui.tab.value = 'activity'}>Activity</button>
+      <button id="trail-tab" class={`tab ${ui.tab.value === 'trail' ? 'active' : ''}`} role="tab" aria-selected={ui.tab.value === 'trail'} tabIndex={ui.tab.value === 'trail' ? 0 : -1} aria-controls="trail-panel" onClick={() => ui.tab.value = 'trail'}>Trail</button>
+      <button id="runtime-tab" class={`tab ${ui.tab.value === 'runtime' ? 'active' : ''}`} role="tab" aria-selected={ui.tab.value === 'runtime'} tabIndex={ui.tab.value === 'runtime' ? 0 : -1} aria-controls="runtime-panel" onClick={() => ui.tab.value = 'runtime'}>Runtime</button>
+    </div>
+    <div id="activity-panel" role="tabpanel" tabIndex="0" aria-labelledby="activity-tab" hidden={ui.tab.value !== 'activity'}><Activity activity={activity} sessionId={session.id}/></div>
+    <div id="trail-panel" role="tabpanel" tabIndex="0" aria-labelledby="trail-tab" hidden={ui.tab.value !== 'trail'}><Logs activity={activity} ui={ui}/></div>
+    <div id="runtime-panel" role="tabpanel" tabIndex="0" aria-labelledby="runtime-tab" hidden={ui.tab.value !== 'runtime'}><Runtime activity={activity} session={session}/></div>
   </div>
 }
 
