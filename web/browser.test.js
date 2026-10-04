@@ -44,8 +44,22 @@ test('production browser retains sessions, detail interactions, routes, and mobi
       window.initialTab = document.querySelector('#logs-tab')
     })
 
+    await page.evaluate(() => {
+      window.noOpMutations = []
+      const row = document.querySelector('[data-session="demo"]')
+      window.noOpObserver = new MutationObserver((records) => window.noOpMutations.push(...records))
+      window.noOpObserver.observe(row, { subtree: true, childList: true, characterData: true, attributes: true })
+    })
+    const noOpResponse = page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/sessions/demo/activity')
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
-    await page.waitForTimeout(100)
+    await (await noOpResponse).finished()
+    const noOpMutations = await page.evaluate(async () => {
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+      window.noOpMutations.push(...window.noOpObserver.takeRecords())
+      window.noOpObserver.disconnect()
+      return window.noOpMutations.map(({ type, target }) => `${type}:${target.nodeName}`)
+    })
+    assert.deepEqual(noOpMutations, [])
     assert.equal(await row.evaluate((element) => element === window.initialRow), true)
 
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
