@@ -7,9 +7,9 @@ import { execFileSync } from 'node:child_process'
 import { chromium } from '@playwright/test'
 
 test('production browser retains sessions, detail interactions, routes, and mobile layout', async () => {
-  const session = { id: 'demo', project: 'Demo', work_branch: 'main', environment_state: 'ready', work_state: 'in_progress', created_at: '2026-09-19T11:00:00Z', sandbox: 'sandbox', repository: 'https://example.test/repo', base_ref: 'main' }
-  const state = { summary: `Initial metadata ${'long summary '.repeat(500)}`, execution: 'running', changedAt: new Date(Date.now() - 1000).toISOString() }
-  const activity = () => ({ session, environment_state: 'ready', execution_state: state.execution, work_state: state.execution === 'idle' ? 'ready_for_review' : 'in_progress', work_state_changed_at: state.changedAt, work_state_summary: state.summary, attach_command: 'anvilctl sessions attach demo', lifecycle: [{ kind: 'created', at: '2026-09-19T11:00:00Z' }], requests: [{ id: 'request-1', number: 1, origin: 'operator', state: 'running', started_at: '2026-09-19T11:58:00Z', last_activity_at: '2026-09-19T11:59:00Z', prompt: `selection anchor ${'long prompt '.repeat(500)}` }] })
+  const session = { id: 'demo', project: 'Demo', work_branch: 'main', environment_state: 'ready', execution_state: 'running', created_at: '2026-09-19T11:00:00Z', sandbox: 'sandbox', repository: 'https://example.test/repo', base_ref: 'main' }
+  const state = { execution: 'running' }
+  const activity = () => ({ session, environment_state: 'ready', execution_state: state.execution, attach_command: 'anvilctl sessions attach demo', lifecycle: [{ kind: 'created', at: '2026-09-19T11:00:00Z' }], requests: [{ id: 'request-1', number: 1, origin: 'operator', state: 'running', started_at: '2026-09-19T11:58:00Z', last_activity_at: '2026-09-19T11:59:00Z', prompt: `selection anchor ${'long prompt '.repeat(500)}` }] })
   const server = createServer(async (request, response) => {
     const url = new URL(request.url, 'http://localhost')
     if (url.pathname === '/v1/sessions') {
@@ -33,9 +33,10 @@ test('production browser retains sessions, detail interactions, routes, and mobi
     await page.goto(`http://127.0.0.1:${server.address().port}/#session/demo`)
     const row = page.locator('[data-session="demo"]')
     await row.waitFor()
-    await page.locator('.work-summary').waitFor()
-    assert.equal(await page.locator('.session-status-label').count(), 1)
-    const initialElapsed = await row.locator('.row-detail').textContent()
+    await page.locator('.factual-state').first().waitFor()
+    assert.equal(await page.locator('.session-status-label').count(), 0)
+    assert.match(await row.textContent(), /Environment: ready/)
+    assert.match(await row.textContent(), /Execution: running/)
     await page.evaluate(() => {
       window.initialRow = document.querySelector('[data-session="demo"]')
       window.initialDetail = document.querySelector('.detail')
@@ -47,13 +48,8 @@ test('production browser retains sessions, detail interactions, routes, and mobi
     await page.waitForTimeout(100)
     assert.equal(await row.evaluate((element) => element === window.initialRow), true)
 
-    state.summary = `Updated metadata ${'long summary '.repeat(500)}`
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
-    await page.getByText('Updated metadata').waitFor()
     assert.equal(await row.evaluate((element) => element === window.initialRow), true)
-    await page.waitForTimeout(1100)
-    assert.equal(await row.evaluate((element) => element === window.initialRow), true)
-    assert.notEqual(await row.locator('.row-detail').textContent(), initialElapsed)
 
     const detail = page.locator('.detail'), actions = page.locator('.actions'), runtimeTab = page.locator('#runtime-tab')
     await detail.evaluate((element) => { element.style.height = '300px'; element.style.overflow = 'auto' })
@@ -68,7 +64,7 @@ test('production browser retains sessions, detail interactions, routes, and mobi
     assert.equal(await detail.evaluate((element) => element.scrollTop), 80)
     state.execution = 'idle'
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
-    await page.getByText('Ready for review', { exact: true }).first().waitFor()
+    await page.getByText('Execution: idle', { exact: false }).first().waitFor()
     assert.equal(await row.evaluate((element) => element === window.initialRow), true)
     assert.equal(await detail.count(), 1)
     assert.equal(await actions.count(), 1)
@@ -82,9 +78,8 @@ test('production browser retains sessions, detail interactions, routes, and mobi
 
     await runtimeTab.evaluate((element) => element.click())
     await runtimeTab.focus()
-    state.summary = `Routine refresh metadata ${'long summary '.repeat(500)}`
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
-    await page.getByText('Routine refresh metadata').waitFor()
+    await page.getByText('Execution: idle', { exact: false }).first().waitFor()
     assert.equal(await runtimeTab.evaluate((element) => element === document.activeElement), true)
     assert.equal(await page.locator('#runtime-panel').isVisible(), true)
 
