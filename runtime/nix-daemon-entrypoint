@@ -11,6 +11,11 @@ if [ "${1:-}" = --bootstrap ]; then
   complete="$state/.anvil-bootstrap-complete"
   cold_attempt="$state/.anvil-cold-in-progress"
   staging_dir=/shared-nix/.anvil-import
+  normalize_build_state() {
+    mkdir -p /shared-nix/var "$state/builds"
+    chown root:root /shared-nix/var "$state" "$state/builds"
+    chmod 0755 /shared-nix/var "$state" "$state/builds"
+  }
   mkdir -p /shared-nix/store "$state"
   # A previous init may have been interrupted while copying a store path.
   # This private staging area never contains authoritative store paths.
@@ -62,6 +67,7 @@ if [ "${1:-}" = --bootstrap ]; then
       rm "$pending"
     fi
   fi
+  normalize_build_state
   # Keep all baseline image paths alive, including the tools needed to start
   # future containers, even if other sandboxes run nix store gc.
   mkdir -p "$state/gcroots/anvil-baseline"
