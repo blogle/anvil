@@ -31,7 +31,7 @@ Session controller routes are:
 | `GET` | `/v1/sessions/{id}/messages` | Read OpenCode messages |
 | `GET` | `/v1/sessions/{id}/status` | Read environment, execution, run, and binding state |
 | `GET` | `/v1/sessions/{id}/activity` | Read the normalized dashboard/activity model |
-| `GET` | `/v1/sessions/{id}/diff` | Read worker changes against its recorded base revision |
+| `GET` | `/v1/sessions/{id}/files` | Read worker changes against its recorded base revision |
 
 The diff response is `{ "status": "ready", "diff": { "base_revision": "<sha>",
 "files": [...], "truncated": false } }`. Files include `path`, optional
