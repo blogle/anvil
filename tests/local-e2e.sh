@@ -86,10 +86,10 @@ wait_for_state() {
   local id="$1" expected="$2" deadline=$((SECONDS + 60)) state=""
   while (( SECONDS < deadline )); do
     state="$(curl --max-time 3 -fsS "http://127.0.0.1:8080/v1/sessions/$id/status")" || true
-    if [ "$expected" = working ] && jq -e '.execution_state == "running" and .work_state == "in_progress"' <<<"$state" >/dev/null 2>&1; then
+    if [ "$expected" = running ] && jq -e '.execution_state == "running" and (.current_run.state == "running" or .current_run.state == "submitted")' <<<"$state" >/dev/null 2>&1; then
       return 0
     fi
-    if [ "$expected" = ready_for_review ] && jq -e '.execution_state == "idle" and .work_state == "ready_for_review" and .current_run == null' <<<"$state" >/dev/null 2>&1; then
+    if [ "$expected" = completed_run ] && jq -e '.execution_state == "idle" and .last_run.state == "completed" and .current_run == null' <<<"$state" >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.2
@@ -145,10 +145,10 @@ worker_health "$created"
 jq -e '(.plugin // []) | length == 0' "$profile/config/opencode.jsonc" >/dev/null
 test ! -e "$profile/plugins/anvil-report.ts"
 test ! -e "$runtime_dir/home/.config/opencode/plugins/anvil-report.ts"
-wait_for_state "$id" working
+wait_for_state "$id" running
 curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/activity" | jq -e '.execution_state == "running" and .telemetry.execution == "busy" and any(.telemetry.requests[]; (.prompt | contains("ANVIL-E2E:edit-file")) and .state == "running")' >/dev/null
 curl -fsS -X POST http://127.0.0.1:4098/__test/release >/dev/null
-wait_for_state "$id" ready_for_review
+wait_for_state "$id" completed_run
 state="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/status")"
 jq -e '.last_run.state == "completed" and (.last_run.finished_at | strings) and .current_run == null' <<<"$state" >/dev/null
 diff="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/diff")"
@@ -159,16 +159,16 @@ scenario_start=$SECONDS
 workspace="$runtime_dir/home/workspace/fixture"
 before_session="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id" | jq -r .opencode_session_id)"
 before_transcript="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages")"
-before_run="$(jq -r .work_state_run_id <<<"$state")"
+before_run="$(jq -r .last_run.id <<<"$state")"
 curl -fsS -X POST http://127.0.0.1:4098/__test/hold >/dev/null
 curl -fsS -H 'content-type: application/json' \
   -d '{"prompt":"ANVIL-E2E:followup ANVIL-E2E:wait-for-release confirm this remains the same conversation."}' \
   "http://127.0.0.1:8080/v1/sessions/$id/messages" >/dev/null
-wait_for_state "$id" working
+wait_for_state "$id" running
 follow_up_state="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/status")"
-test "$(jq -r .work_state_run_id <<<"$follow_up_state")" != "$before_run"
+test "$(jq -r .current_run.id <<<"$follow_up_state")" != "$before_run"
 curl -fsS -X POST http://127.0.0.1:4098/__test/release >/dev/null
-wait_for_state "$id" ready_for_review
+wait_for_state "$id" completed_run
 after_session="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id" | jq -r .opencode_session_id)"
 test "$before_session" = "$after_session"
 curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages" | jq -e '.. | strings | select(contains("Confirmed: this is the same OpenCode conversation."))' >/dev/null
@@ -190,7 +190,7 @@ resumed_pid="$(<"$runtime_dir/worker.pid")"
 test "$worker_pid" != "$resumed_pid"
 worker_health "$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id")"
 test "$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id" | jq -r .opencode_session_id)" = "$before_session"
-wait_for_state "$id" ready_for_review
+wait_for_state "$id" completed_run
 after_transcript="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages")"
 jq -e --argjson before "$before_transcript" 'length >= ($before | length)' <<<"$after_transcript" >/dev/null
 jq -e '.. | strings | select(contains("ANVIL-E2E:edit-file"))' <<<"$after_transcript" >/dev/null
@@ -198,7 +198,7 @@ test "$(<"$workspace/target.txt")" = after
 test "$(git -C "$workspace" status --porcelain)" = " M target.txt"
 curl -fsS -H 'content-type: application/json' -d '{"prompt":"ANVIL-E2E:restart-one-followup use the durable context from the first turn."}' \
   "http://127.0.0.1:8080/v1/sessions/$id/messages" >/dev/null
-wait_for_state "$id" ready_for_review
+wait_for_state "$id" completed_run
 curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages" | jq -e '.. | strings | select(contains("Confirmed restart one: prior conversation context is present."))' >/dev/null
 
 # A second full OpenCode process recreation proves that reconciliation is
@@ -213,14 +213,14 @@ second_resumed_pid="$(<"$runtime_dir/worker.pid")"
 test "$worker_pid" != "$second_resumed_pid"
 worker_health "$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id")"
 test "$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id" | jq -r .opencode_session_id)" = "$before_session"
-wait_for_state "$id" ready_for_review
+wait_for_state "$id" completed_run
 second_transcript="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages")"
 jq -e --argjson before "$before_transcript" 'length >= ($before | length)' <<<"$second_transcript" >/dev/null
 test "$(<"$workspace/target.txt")" = after
 test "$(git -C "$workspace" status --porcelain)" = " M target.txt"
 curl -fsS -H 'content-type: application/json' -d '{"prompt":"ANVIL-E2E:restart-two-followup continue using the first-turn context."}' \
   "http://127.0.0.1:8080/v1/sessions/$id/messages" >/dev/null
-wait_for_state "$id" ready_for_review
+wait_for_state "$id" completed_run
 curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/messages" | jq -e '.. | strings | select(contains("Confirmed restart two: prior conversation context is present."))' >/dev/null
 printf 'suspend/resume workspace, OpenCode binding, watcher reconciliation: %ds\n' "$((SECONDS - scenario_start))"
 
@@ -229,7 +229,7 @@ kill "$api_pid"
 wait "$api_pid" 2>/dev/null || true
 "$root/target/debug/anvild" >"$tmp/anvild-restarted.log" 2>&1 & api_pid=$!
 poll http://127.0.0.1:8080/readyz
-wait_for_state "$id" ready_for_review
+wait_for_state "$id" completed_run
 curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/activity" | jq -e '.telemetry.schema_version == 1 and any(.telemetry.requests[]; .prompt | contains("ANVIL-E2E:edit-file"))' >/dev/null
 printf 'anvild restart/materialized telemetry recovery: %ds\n' "$((SECONDS - scenario_start))"
 
@@ -259,11 +259,11 @@ test "$(jq -r .opencode_port <<<"$first_session")" != "$(jq -r .opencode_port <<
 test "$first_dir" != "$second_dir"
 worker_health "$first_session"
 worker_health "$second_session"
-wait_for_state "$first_id" working
-wait_for_state "$second_id" working
+wait_for_state "$first_id" running
+wait_for_state "$second_id" running
 curl -fsS -X POST http://127.0.0.1:4098/__test/release >/dev/null
-wait_for_state "$first_id" ready_for_review
-wait_for_state "$second_id" ready_for_review
+wait_for_state "$first_id" completed_run
+wait_for_state "$second_id" completed_run
 test "$(<"$first_dir/home/workspace/concurrent-one/target.txt")" = after
 test "$(<"$second_dir/home/workspace/concurrent-two/target.txt")" = after
 first_diff="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$first_id/diff")"

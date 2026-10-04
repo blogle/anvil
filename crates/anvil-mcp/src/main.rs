@@ -249,7 +249,6 @@ const CONTROLLER_OPERATIONS: &[&str] = &[
     "anvil_abort",
     "anvil_delete_session",
     "anvil_rebind_session",
-    "anvil_complete_session",
 ];
 
 #[rmcp::tool_router]
@@ -478,7 +477,7 @@ impl AnvilMcp {
         ))
     }
     #[rmcp::tool(
-        description = "Get independent environment, execution, work-state, and OpenCode conversation-binding status for a session."
+        description = "Get environment/runtime, OpenCode execution, run history, and conversation-binding status for a session."
     )]
     async fn anvil_get_status(
         &self,
@@ -489,23 +488,6 @@ impl AnvilMcp {
                 Method::GET,
                 &format!("v1/sessions/{}/status", p.session_id),
                 None,
-            )
-            .await?,
-        ))
-    }
-    #[rmcp::tool(
-        description = "Accept a session that is ready for review and mark its work completed."
-    )]
-    async fn anvil_complete_session(
-        &self,
-        Parameters(p): Parameters<MutationSession>,
-    ) -> Result<Json<Value>, ErrorData> {
-        Ok(Json(
-            self.mutation(
-                Method::POST,
-                &format!("v1/sessions/{}/complete", p.session_id),
-                None,
-                p.idempotency_key.as_deref(),
             )
             .await?,
         ))
@@ -899,7 +881,6 @@ mod tests {
             "anvil_abort",
             "anvil_delete_session",
             "anvil_rebind_session",
-            "anvil_complete_session",
             "anvil_get_messages",
             "anvil_get_diff",
             "anvil_get_preview",
@@ -966,6 +947,7 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect();
+        assert!(!names.contains("anvil_complete_session"));
         for operation in CONTROLLER_OPERATIONS {
             assert!(
                 names.contains(operation),
@@ -977,7 +959,6 @@ mod tests {
             "anvil_submit_batch",
             "anvil_create_attempt",
             "anvil_send_message",
-            "anvil_complete_session",
             "anvil_abort",
             "anvil_suspend",
             "anvil_resume",
@@ -1029,7 +1010,6 @@ mod tests {
             then.status(200).json_body(json!({
                 "environment_state": "ready",
                 "execution_state": "idle",
-                "work_state": "ready_for_review"
             }));
         });
         let mcp = AnvilMcp::new(reqwest::Url::parse(&format!("{}/", server.base_url())).unwrap())
@@ -1047,6 +1027,8 @@ mod tests {
         assert_eq!(result["session_id"], "demo-12345678");
         assert_eq!(result["result"]["session_binding_continuity"], "lost");
         assert_eq!(result["status"]["environment_state"], "ready");
+        assert_eq!(result["status"]["execution_state"], "idle");
+        assert!(result["status"].get("work_state").is_none());
     }
 
     #[tokio::test]

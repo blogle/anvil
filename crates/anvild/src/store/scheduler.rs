@@ -232,11 +232,23 @@ impl ControllerStore {
     }
 
     pub fn set_attempt_state(&self, attempt_id: &str, state: &str) -> Result<(), StoreError> {
-        self.set_attempt_and_task_state(attempt_id, state, state)
+        let mut c = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let raw_attempt: String = tx.query_row(
+            "SELECT payload_json FROM attempts WHERE attempt_id=?1",
+            [attempt_id],
+            |r| r.get(0),
+        )?;
+        let mut attempt: Value = serde_json::from_str(&raw_attempt)?;
+        attempt["state"] = Value::String(state.to_owned());
+        persist_attempt(&tx, attempt_id, &attempt)?;
+        tx.commit()?;
+        Ok(())
     }
 
-    /// Persist the execution-attempt lifecycle separately from the logical task
-    /// lifecycle. A finished attempt can leave its task awaiting human review.
     pub fn set_attempt_and_task_state(
         &self,
         attempt_id: &str,
@@ -253,11 +265,12 @@ impl ControllerStore {
             [attempt_id],
             |r| r.get(0),
         )?;
-        let mut attempt: Value = serde_json::from_str(&tx.query_row::<String, _, _>(
+        let raw_attempt: String = tx.query_row(
             "SELECT payload_json FROM attempts WHERE attempt_id=?1",
             [attempt_id],
             |r| r.get(0),
-        )?)?;
+        )?;
+        let mut attempt: Value = serde_json::from_str(&raw_attempt)?;
         attempt["state"] = Value::String(attempt_state.to_owned());
         persist_attempt(&tx, attempt_id, &attempt)?;
         set_task_state(&tx, &task_id, task_state)?;
@@ -572,8 +585,9 @@ mod tests {
             vec![2, 2]
         );
         store
-            .set_attempt_state(
+            .set_attempt_and_task_state(
                 claims[2].attempt["attempt_id"].as_str().unwrap(),
+                "completed",
                 "completed",
             )
             .unwrap();
@@ -715,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_for_review_attempt_releases_slot_and_preserves_review_task_state() {
+    fn completed_attempt_releases_capacity_without_accepting_the_logical_task() {
         let (_dir, store) = setup(&[(
             "review-batch",
             1,
@@ -729,7 +743,7 @@ mod tests {
             .set_attempt_and_task_state(
                 first[0].attempt["attempt_id"].as_str().unwrap(),
                 "completed",
-                "ready_for_review",
+                "running",
             )
             .unwrap();
 
@@ -742,7 +756,7 @@ mod tests {
         );
         assert_eq!(
             store.get_resource("task", "first").unwrap().unwrap()["state"],
-            "ready_for_review"
+            "running"
         );
         let capacity = store.capacity(1, 0, 3, 0, 0).unwrap();
         assert_eq!(capacity.available_slots, 1);
