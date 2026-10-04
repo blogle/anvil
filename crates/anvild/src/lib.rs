@@ -9529,7 +9529,7 @@ mod tests {
             "id":"demo-12345678", "sandbox":"anvil-demo-12345678", "service":"anvil-demo-12345678",
             "namespace":"anvil", "opencode_port":4096, "phase":"Ready", "project":"demo",
             "repository":"https://github.com/example/demo.git", "ref":"main", "work_branch":"anvil/demo-12345678",
-            "model":"openai/gpt-5.6-luna", "environment_state":"ready", "work_state":"in_progress",
+            "model":"openai/gpt-5.6-luna", "environment_state":"ready",
             "opencode_session_id":"ses-test", "created_at":"2026-05-28T20:26:00Z",
             "ready_at":"2026-05-28T20:26:01Z"
         })).unwrap();
@@ -9637,7 +9637,7 @@ mod tests {
             "id":"demo-12345678", "sandbox":"anvil-demo-12345678", "service":"anvil-demo-12345678",
             "namespace":"anvil", "opencode_port":4096, "phase":"Ready", "project":"demo",
             "repository":"https://github.com/example/demo.git", "ref":"main", "work_branch":"anvil/demo-12345678",
-            "model":"openai/gpt-5.6-luna", "environment_state":"ready", "work_state":"in_progress",
+            "model":"openai/gpt-5.6-luna", "environment_state":"ready",
             "opencode_session_id":"ses-test"
         })).unwrap();
         let messages = (0..125).map(|number| json!({
