@@ -153,7 +153,7 @@ pub fn working_tree_diff(dir: &Path, expected_base: Option<&str>) -> Result<Chan
                 &path,
             ]
         } else {
-            vec![
+            let mut args = vec![
                 "diff",
                 "--no-ext-diff",
                 "--no-color",
@@ -161,8 +161,12 @@ pub fn working_tree_diff(dir: &Path, expected_base: Option<&str>) -> Result<Chan
                 "--binary",
                 &base,
                 "--",
-                &path,
-            ]
+            ];
+            if let Some(old_path) = old_path.as_deref() {
+                args.push(old_path);
+            }
+            args.push(&path);
+            args
         };
         let (per_file, file_over_limit) = git_bounded(dir, &patch_args, MAX_FILE_DIFF)?;
         let (additions, deletions) = if is_untracked {
@@ -172,18 +176,19 @@ pub fn working_tree_diff(dir: &Path, expected_base: Option<&str>) -> Result<Chan
                 .count();
             (Some(count), Some(0))
         } else {
-            let numstat = git(
-                dir,
-                &[
-                    "diff",
-                    "--numstat",
-                    "-z",
-                    "--find-renames",
-                    &base,
-                    "--",
-                    &path,
-                ],
-            )?;
+            let mut numstat_args = vec![
+                "diff",
+                "--numstat",
+                "-z",
+                "--find-renames",
+                &base,
+                "--",
+            ];
+            if let Some(old_path) = old_path.as_deref() {
+                numstat_args.push(old_path);
+            }
+            numstat_args.push(&path);
+            let numstat = git(dir, &numstat_args)?;
             let stat_text = String::from_utf8_lossy(&numstat);
             let mut stat_fields = stat_text.split(['\t', '\0']);
             (
@@ -194,12 +199,12 @@ pub fn working_tree_diff(dir: &Path, expected_base: Option<&str>) -> Result<Chan
         let binary = additions.is_none()
             || deletions.is_none()
             || String::from_utf8_lossy(&per_file).contains("GIT binary patch");
-        let too_large =
-            file_over_limit || response_bytes.saturating_add(per_file.len()) > MAX_RESPONSE_DIFF;
-        response_bytes = response_bytes.saturating_add(per_file.len());
+        let too_large = file_over_limit
+            || (!binary && response_bytes.saturating_add(per_file.len()) > MAX_RESPONSE_DIFF);
         let diff = if binary || too_large {
             String::new()
         } else {
+            response_bytes = response_bytes.saturating_add(per_file.len());
             String::from_utf8_lossy(&per_file).into_owned()
         };
         changes.push(FileChange {
@@ -295,6 +300,16 @@ mod tests {
         assert_eq!(status.get("staged.txt"), Some(&"added"));
         assert_eq!(status.get("delete.txt"), Some(&"deleted"));
         assert_eq!(status.get("rename-new.txt"), Some(&"renamed"));
+        let renamed = result
+            .files
+            .iter()
+            .find(|file| file.path == "rename-new.txt")
+            .unwrap();
+        assert_eq!(renamed.old_path.as_deref(), Some("rename-old.txt"));
+        assert!(renamed.diff.contains("rename from rename-old.txt"));
+        assert!(renamed.diff.contains("rename to rename-new.txt"));
+        assert_eq!(renamed.additions, Some(0));
+        assert_eq!(renamed.deletions, Some(0));
         assert!(!status.contains_key("upstream-only.txt"));
         assert!(result
             .files
@@ -325,5 +340,32 @@ mod tests {
             .files
             .iter()
             .any(|file| file.path == "huge.txt" && file.too_large && file.diff.is_empty()));
+    }
+
+    #[test]
+    fn suppressed_binary_patches_do_not_consume_returned_diff_budget() {
+        let (tmp, base) = fixture();
+        let dir = tmp.path();
+        for index in 0..100 {
+            let bytes = (0..6000)
+                .map(|byte| ((byte * 31 + index * 17) % 256) as u8)
+                .collect::<Vec<_>>();
+            fs::write(dir.join(format!("a-binary-{index:03}.bin")), bytes).unwrap();
+        }
+        fs::write(dir.join("z-small.txt"), "small change\n").unwrap();
+        let result = working_tree_diff(dir, Some(&base)).unwrap();
+        let binary = result
+            .files
+            .iter()
+            .find(|file| file.path == "a-binary-000.bin")
+            .unwrap();
+        assert!(binary.binary);
+        let small = result
+            .files
+            .iter()
+            .find(|file| file.path == "z-small.txt")
+            .unwrap();
+        assert!(!small.too_large);
+        assert!(small.diff.contains("small change"));
     }
 }

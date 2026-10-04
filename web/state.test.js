@@ -158,10 +158,10 @@ test('filtering leaves the selected factual detail open and offers to clear filt
 test('direct links and browser history return to a useful Sessions landing', async () => {
   state.loading.value = false
   state.error.value = null
+  const root = document.getElementById('app')
   state.sessions.value = [session]
   state.activities.value = new Map([[session.id, activity()]])
   state.selected.value = 'demo'
-  const root = document.getElementById('app')
   await act(async () => render(h(AppShell), root))
   assert.equal(root.querySelector('.app-shell').classList.contains('mobile-detail'), true)
   await act(async () => { state.navigate(null); window.dispatchEvent(new window.PopStateEvent('popstate')) })
@@ -169,4 +169,32 @@ test('direct links and browser history return to a useful Sessions landing', asy
   assert.equal(root.querySelector('.detail h2'), null)
   assert.equal(root.querySelector('.session-workspace h1').textContent, 'Sessions')
   render(null, root)
+})
+
+test('Files tab fetches and renders immutable-base session diffs only when selected', async () => {
+  const filesSession = { ...session, id: 'files-demo' }
+  state.sessions.value = [filesSession]
+  state.activities.value = new Map([[filesSession.id, activity()]])
+  state.selected.value = filesSession.id
+  state.sessionUI(filesSession.id).tab.value = 'logs'
+  const requests = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (path) => {
+    requests.push(path)
+    return { ok: true, status: 200, json: async () => ({ status: 'ready', diff: { files: [{ path: 'src/example.txt', old_path: null, status: 'modified', additions: 2, deletions: 1, diff: '+updated' }] } }) }
+  }
+  const root = document.getElementById('app')
+  try {
+    await act(async () => render(h(TestApp), root))
+    assert.deepEqual(requests, [])
+    await act(async () => root.querySelector('#files-tab').click())
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)))
+    assert.deepEqual(requests, ['/v1/sessions/files-demo/files'])
+    assert.match(root.querySelector('#files-panel').textContent, /src\/example\.txt/)
+    assert.match(root.querySelector('#files-panel').textContent, /\+updated/)
+    assert.equal(root.querySelector('#files-panel').hidden, false)
+  } finally {
+    globalThis.fetch = originalFetch
+    render(null, root)
+  }
 })

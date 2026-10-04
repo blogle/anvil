@@ -2,6 +2,7 @@ import { h } from 'preact'
 import { activities, api, clearSessionFilters, environmentFor, executionFor, navigate, refresh, selected, sessions, sessionUI, visibleSessions } from './state.js'
 import { Logs } from './logs.jsx'
 import { Runtime } from './runtime.jsx'
+import { Files } from './files.jsx'
 
 const React = { createElement: h }
 
@@ -20,6 +21,7 @@ function DetailContent({ session, activity, outsideFilters }) {
   const tabs = [
     { id: 'logs', label: 'Logs', content: <Logs activity={activity} ui={ui}/> },
     { id: 'runtime', label: 'Runtime', content: <Runtime activity={activity} session={session}/> },
+    { id: 'files', label: 'Files', content: <Files sessionId={session.id} active={ui.tab.value === 'files'}/> },
   ]
   return <div class="detail-inner"><a class="back-link" href="#sessions" onClick={(event) => { event.preventDefault(); navigate(null) }}>← All sessions</a>
     {outsideFilters && <div class="filter-context" role="status">This session is open but hidden by the current search or runtime filters. <button class="text-button" onClick={clearSessionFilters}>Show all sessions</button></div>}

@@ -68,9 +68,55 @@ test("worker diff endpoint keeps immutable base and includes commits, index, wor
     assert.equal(files.get("delete.txt").status, "deleted")
     assert.equal(files.get("new-name.txt").status, "renamed")
     assert.equal(files.get("new-name.txt").old_path, "old-name.txt")
+    assert.match(files.get("new-name.txt").diff, /rename from old-name\.txt/)
+    assert.match(files.get("new-name.txt").diff, /rename to new-name\.txt/)
+    assert.equal(files.get("new-name.txt").additions, 0)
+    assert.equal(files.get("new-name.txt").deletions, 0)
     assert.equal(files.get("image.bin").binary, true)
     assert.equal(files.get("huge.txt").too_large, true)
     assert.equal(files.has("upstream-only.txt"), false)
+  } finally {
+    server?.kill("SIGTERM")
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("suppressed binary patches do not consume the returned diff budget", async () => {
+  const root = await mkdtemp(join(tmpdir(), "anvil-files-budget-"))
+  const project = join(root, "demo")
+  const port = 41000 + Math.floor(Math.random() * 10000)
+  let server
+  try {
+    await mkdir(project)
+    git(project, "init", "-b", "main")
+    git(project, "config", "user.name", "Test")
+    git(project, "config", "user.email", "test@example.invalid")
+    await writeFile(join(project, "small.txt"), "base\n")
+    git(project, "add", ".")
+    git(project, "commit", "-m", "base")
+    const base = git(project, "rev-parse", "HEAD")
+    git(project, "update-ref", "refs/anvil/session-base", base)
+    await writeFile(join(project, ".git/anvil-session-base"), `${base}\n`)
+    for (let index = 0; index < 100; index++) {
+      const data = Buffer.alloc(6000)
+      for (let byte = 0; byte < data.length; byte++) data[byte] = (byte * 31 + index * 17) % 256
+      await writeFile(join(project, `a-binary-${String(index).padStart(3, "0")}.bin`), data)
+    }
+    await writeFile(join(project, "small.txt"), "updated\n")
+    server = spawn(process.execPath, [resolve("runtime/git-diff-server.mjs")], {
+      env: { ...process.env, ANVIL_PROJECT: "demo", ANVIL_WORKSPACE_ROOT: root, ANVIL_DIFF_PORT: String(port) },
+      stdio: "ignore",
+    })
+    let response
+    for (let attempt = 0; attempt < 60; attempt++) {
+      try { response = await fetch(`http://127.0.0.1:${port}/v1/diff`); break } catch { await new Promise((resolve) => setTimeout(resolve, 50)) }
+    }
+    assert.ok(response)
+    const payload = await response.json()
+    const files = new Map(payload.diff.files.map((file) => [file.path, file]))
+    assert.equal(files.get("a-binary-000.bin").binary, true)
+    assert.match(files.get("small.txt").diff, /updated/)
+    assert.equal(files.get("small.txt").too_large, false)
   } finally {
     server?.kill("SIGTERM")
     await rm(root, { recursive: true, force: true })

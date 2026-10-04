@@ -478,7 +478,7 @@ impl SandboxApi for LocalSandboxApi {
             .ok_or(ServiceError::NotFound)
     }
 
-    async fn working_tree_diff(&self, id: &str) -> Result<serde_json::Value, ServiceError> {
+    async fn files_diff(&self, id: &str) -> Result<serde_json::Value, ServiceError> {
         let sessions = self.sessions.lock().await;
         let state = sessions.get(id).ok_or(ServiceError::NotFound)?;
         let project = state
@@ -1238,7 +1238,7 @@ mod tests {
         let project = fixture.runtime.join("diff-12345678/home/workspace/demo");
         std::fs::write(project.join("target.txt"), "worker change\n").unwrap();
         std::fs::write(project.join("uncommitted.txt"), "working tree\n").unwrap();
-        let result = api.working_tree_diff("diff-12345678").await.unwrap();
+        let result = api.files_diff("diff-12345678").await.unwrap();
         assert_eq!(result["status"], "ready");
         assert_eq!(result["diff"]["base_revision"], base);
         let files = result["diff"]["files"].as_array().unwrap();

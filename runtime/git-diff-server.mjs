@@ -51,7 +51,7 @@ async function diff() {
     const isUntracked = statusToken === "A" && (await git(["ls-files", "--error-unmatch", path]).catch(() => null)) === null
     const args = isUntracked
       ? ["diff", "--no-index", "--no-ext-diff", "--no-color", "--binary", "--", "/dev/null", path]
-      : ["diff", "--no-ext-diff", "--no-color", "--find-renames", "--binary", baseRevision, "--", path]
+      : ["diff", "--no-ext-diff", "--no-color", "--find-renames", "--binary", baseRevision, "--", ...(renamed ? [oldOrPath] : []), path]
     let patch
     try { patch = isUntracked ? await gitDiff(args, maxFileBytes + 1) : await git(args, maxFileBytes + 1) }
     catch (error) {
@@ -64,12 +64,12 @@ async function diff() {
     if (isUntracked) {
       additions = patch.toString("utf8").split("\n").filter((line) => line.startsWith("+") && !line.startsWith("+++" )).length
     } else {
-      const numstat = (await git(["diff", "--numstat", "-z", "--find-renames", baseRevision, "--", path])).toString().split("\t")
+      const numstat = (await git(["diff", "--numstat", "-z", "--find-renames", baseRevision, "--", ...(renamed ? [oldOrPath] : []), path])).toString().split("\t")
       if (numstat[0] === "-") { additions = null; deletions = null }
       else { additions = Number(numstat[0]) || 0; deletions = Number((numstat[1] || "").split("\0")[0]) || 0 }
     }
-    const overBudget = responseBytes + patch.length > maxResponseBytes
-    responseBytes += patch.length
+    const overBudget = !binary && responseBytes + patch.length > maxResponseBytes
+    if (!binary && !tooLarge && !overBudget) responseBytes += patch.length
     files.push({ path, old_path: renamed ? oldOrPath : null, status, additions, deletions, binary, too_large: tooLarge || overBudget, diff: binary || tooLarge || overBudget ? "" : patch.toString("utf8") })
   }
   return { status: "ready", diff: { base_revision: baseRevision, files, truncated } }

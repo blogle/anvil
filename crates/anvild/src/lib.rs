@@ -563,6 +563,12 @@ struct OpenCodeAuthorization {
 #[async_trait]
 pub trait SandboxApi: Send + Sync + 'static {
     async fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError>;
+    async fn files_diff(&self, _id: &str) -> Result<Value, ServiceError> {
+        Ok(json!({
+            "status": "unavailable",
+            "message": "Files are unavailable for this sandbox backend."
+        }))
+    }
     async fn create(
         &self,
         id: &str,
@@ -664,6 +670,9 @@ impl SandboxApi for MaterializingSandboxApi {
             current_records.push(current);
         }
         Ok(current_records)
+    }
+    async fn files_diff(&self, id: &str) -> Result<Value, ServiceError> {
+        self.inner.files_diff(id).await
     }
     async fn get(&self, id: &str) -> Result<SandboxRecord, ServiceError> {
         let lock = self.lock(id);
@@ -1530,6 +1539,24 @@ impl SandboxApi for KubeSandboxApi {
         .map_err(|e| ServiceError::Kubernetes(e.to_string()))
         .and_then(|object| sandbox_record_from(&object, &self.config))
     }
+    async fn files_diff(&self, id: &str) -> Result<Value, ServiceError> {
+        let record = self.get(id).await?;
+        let host = if record.session.service.is_empty() {
+            format!("anvil-{id}")
+        } else {
+            record.session.service
+        };
+        let response = reqwest::Client::new()
+            .get(format!("http://{host}:4097/v1/diff"))
+            .timeout(self.config.request_timeout)
+            .send()
+            .await
+            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+        response
+            .json()
+            .await
+            .map_err(|error| ServiceError::OpenCode(error.to_string()))
+    }
     async fn set_opencode_session(&self, id: &str, oc: &str) -> Result<(), ServiceError> {
         let mut annotations = serde_json::Map::new();
         annotations.insert(
@@ -1961,6 +1988,7 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
         .route("/v1/sessions/:id/rebind", post(rebind))
         .route("/v1/sessions/:id/status", get(status))
         .route("/v1/sessions/:id/diff", get(diff))
+        .route("/v1/sessions/:id/files", get(files_diff))
         .route("/v1/sessions/:id/abort", post(abort))
         .route("/v1/sessions/:id/suspend", post(suspend))
         .route("/v1/sessions/:id/resume", post(resume))
@@ -5086,6 +5114,12 @@ async fn diff(
         }
     }
     Ok(Json(result))
+}
+async fn files_diff(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ServiceError> {
+    Ok(Json(state.kube.files_diff(&id).await?))
 }
 async fn abort(p: Path<String>, s: State<AppState>) -> Result<Json<Value>, ServiceError> {
     proxy(p, s, "abort", reqwest::Method::POST, None).await
