@@ -6,10 +6,10 @@ pub mod store;
 pub use local::LocalSandboxApi;
 
 use anvil_core::{
-    branch_name, preview_hostname, GitRef, LifecycleEvent, LoginFlow, OpenCodeMessageId,
-    OperationTelemetry, Port, Project, Prompt, ProviderAuthMethod, ProviderListResponse,
-    ProviderStatus, ProviderSummary, Repository, Run, RunId, RunState, Session, SessionActivity,
-    SessionId, SessionRequest, SessionTelemetry,
+    branch_name, preview_hostname, ActivityEvent, ActivityEventWindow, GitRef, LifecycleEvent,
+    LoginFlow, OpenCodeMessageId, OperationTelemetry, Port, Project, Prompt, ProviderAuthMethod,
+    ProviderListResponse, ProviderStatus, ProviderSummary, Repository, Run, RunId, RunState,
+    Session, SessionActivity, SessionId, SessionRequest, SessionTelemetry,
 };
 use async_trait::async_trait;
 use axum::{
@@ -29,6 +29,7 @@ use kube::{
     },
     Client, ResourceExt,
 };
+use regex::Regex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -39,7 +40,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -84,6 +85,8 @@ const MANAGED: &str = "app.kubernetes.io/managed-by";
 const APP: &str = "app.kubernetes.io/name";
 const LOGIN_TTL: Duration = Duration::from_secs(10 * 60);
 const RUNTIME_LAYOUT: &str = "v2";
+const ACTIVITY_MESSAGE_LIMIT: usize = 100;
+const ACTIVITY_EVENT_LIMIT: usize = 500;
 
 fn shared_nix_volume(pvc: &str) -> Value {
     json!({"name":"shared-nix","persistentVolumeClaim":{"claimName":pvc}})
@@ -3884,6 +3887,7 @@ async fn session(
 
 async fn activity(
     Path(id): Path<String>,
+    Query(query): Query<ActivityQuery>,
     State(s): State<AppState>,
 ) -> Result<Json<SessionActivity>, ServiceError> {
     let object = s.kube.get(&id).await?;
@@ -3903,11 +3907,21 @@ async fn activity(
     } else {
         "recovering".into()
     };
+    let (raw_messages, next_cursor) = if query.include_events && binding_is_usable(&session) {
+        OpenCode::new(service_url(&session, &s.config), s.config.request_timeout)
+            .session_message_page(
+                session.opencode_session_id.as_deref().unwrap_or_default(),
+                query.before.as_deref(),
+            )
+            .await?
+    } else {
+        (Value::Null, None)
+    };
     let mut messages = build_activity(
         &session,
         &session.environment_state,
         operating_mode,
-        Value::Array(Vec::new()),
+        raw_messages,
         status,
         &s.config,
     );
@@ -3963,6 +3977,9 @@ async fn activity(
     }
     let history = s.history.for_session(&id).await;
     let mut activity = merge_history(messages, &history);
+    if let Some(window) = activity.event_window.as_mut() {
+        window.next_cursor = next_cursor;
+    }
     if !binding_is_usable(&session) && session.opencode_session_id.is_some() {
         activity.execution_state = "unavailable".into();
     }
@@ -4002,6 +4019,14 @@ async fn changed_since(
     Ok(Json(
         json!({"schema_version":1,"reset_required":false,"cursor":cursor,"snapshot":snapshot}),
     ))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ActivityQuery {
+    #[serde(default)]
+    include_events: bool,
+    #[serde(default)]
+    before: Option<String>,
 }
 async fn suspend(
     Path(id): Path<String>,
@@ -5312,6 +5337,214 @@ fn message_items(value: Value) -> Vec<Value> {
     }
 }
 
+fn bounded_message_items(value: Value, limit: usize) -> (Vec<Value>, Option<ActivityEventWindow>) {
+    let has_message_collection = value.is_array()
+        || value
+            .as_object()
+            .is_some_and(|object| object.get("items").is_some_and(Value::is_array));
+    if !has_message_collection {
+        return (Vec::new(), None);
+    }
+
+    let mut messages = message_items(value);
+    messages.sort_by(|left, right| {
+        let left_info = left.get("info").unwrap_or(left);
+        let right_info = right.get("info").unwrap_or(right);
+        let left_created =
+            timestamp_millis(left_info.get("time").and_then(|time| time.get("created")))
+                .unwrap_or_default();
+        let right_created =
+            timestamp_millis(right_info.get("time").and_then(|time| time.get("created")))
+                .unwrap_or_default();
+        left_created.cmp(&right_created).then_with(|| {
+            left_info
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .cmp(
+                    right_info
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )
+        })
+    });
+    let truncated = messages.len() > limit;
+    if messages.len() > limit {
+        messages.drain(..messages.len() - limit);
+    }
+    let window = ActivityEventWindow {
+        message_limit: limit as u32,
+        returned_messages: messages.len() as u32,
+        loaded_messages: messages.len() as u32,
+        next_cursor: None,
+        truncated,
+    };
+    (messages, Some(window))
+}
+
+fn activity_redaction_patterns() -> &'static [Regex; 5] {
+    static PATTERNS: OnceLock<[Regex; 5]> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        [
+            Regex::new(
+                r#"(?i)(authorization|proxy-authorization)\s*([:=]\s*)(?:[\"']?\s*)(?:bearer|basic)\s+[^\"'\s,;}\]]+"#,
+            )
+            .expect("valid authorization redaction regex"),
+            Regex::new(
+                r#"(?i)((?:[a-z0-9]+[_-])*(?:secret[_-]access[_-]key|authorization|proxy-authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|private[_-]?key|client[_-]?secret)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"#,
+            )
+            .expect("valid multi-component credential-field redaction regex"),
+            Regex::new(
+                r#"(?i)(--?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|client[_-]?secret)\s+)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"#,
+            )
+            .expect("valid credential-option redaction regex"),
+            Regex::new(
+                r#"(?i)((?:set-cookie|cookie)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,\"']+)"#,
+            )
+                .expect("valid cookie-header redaction regex"),
+            Regex::new(r#"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@(?=[^/\s]+)"#)
+                .expect("valid URL userinfo redaction regex"),
+        ]
+    })
+}
+
+fn sensitive_activity_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("authorization")
+        || key.contains("credential")
+        || key.contains("cookie")
+        || key.contains("token")
+        || key.contains("secret")
+        || key.contains("password")
+        || key.contains("passwd")
+        || key == "key"
+        || key == "auth"
+        || key.ends_with("_key")
+        || key.ends_with("-key")
+        || key.ends_with("apikey")
+        || key.ends_with("privatekey")
+}
+
+fn redact_activity_text(value: &str) -> String {
+    let patterns = activity_redaction_patterns();
+    let value = patterns[0].replace_all(value, "$1$2[REDACTED]");
+    let value = patterns[1].replace_all(&value, "$1[REDACTED]");
+    let value = patterns[2].replace_all(&value, "$1[REDACTED]");
+    let value = patterns[3].replace_all(&value, "$1[REDACTED]");
+    patterns[4]
+        .replace_all(&value, "$1[REDACTED]@")
+        .into_owned()
+}
+
+fn redact_activity_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        if sensitive_activity_key(key) {
+                            Value::String("[REDACTED]".into())
+                        } else {
+                            redact_activity_value(value)
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(redact_activity_value).collect()),
+        Value::String(value) => Value::String(redact_activity_text(value)),
+        _ => value.clone(),
+    }
+}
+
+fn safe_activity_text(value: &Value, max_chars: usize) -> String {
+    let redacted = redact_activity_value(value);
+    let text = match redacted {
+        Value::String(value) => value,
+        value => value.to_string(),
+    };
+    text.chars().take(max_chars).collect()
+}
+
+fn summarize_tool_input(tool: &str, input: &Value) -> Option<String> {
+    let input = redact_activity_value(input);
+    let object = input.as_object()?;
+    let tool = tool.to_ascii_lowercase();
+    let value = if matches!(tool.as_str(), "bash" | "shell") {
+        object
+            .get("command")
+            .or_else(|| object.get("cmd"))
+            .or_else(|| object.get("script"))
+    } else if matches!(tool.as_str(), "grep" | "glob" | "search") {
+        object
+            .get("pattern")
+            .or_else(|| object.get("query"))
+            .or_else(|| object.get("include"))
+    } else {
+        None
+    }?;
+    let value = value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string());
+    Some(value.chars().take(180).collect())
+}
+
+fn summarize_tool_output(tool: &str, output: &Value) -> Option<String> {
+    let output = redact_activity_value(output);
+    let object = output.as_object();
+    let summary = object.and_then(|object| {
+        ["summary", "message", "result"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(Value::as_str))
+    });
+    let text = summary
+        .map(str::to_owned)
+        .or_else(|| output.as_str().map(str::to_owned))
+        .unwrap_or_else(|| output.to_string());
+    let tool = tool.to_ascii_lowercase();
+    if tool == "read" {
+        let content = text
+            .split_once("<content>")
+            .map(|(_, content)| content.split("</content>").next().unwrap_or(content));
+        let lines = content
+            .unwrap_or(&text)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        return Some(format!(
+            "{lines} {} read",
+            if lines == 1 { "line" } else { "lines" }
+        ));
+    }
+    if matches!(tool.as_str(), "edit" | "write" | "apply_patch")
+        && text.to_ascii_lowercase().contains("success")
+    {
+        return Some("Change applied successfully".into());
+    }
+    if matches!(tool.as_str(), "grep" | "glob" | "search") {
+        if let Some(line) = text
+            .lines()
+            .find(|line| line.to_ascii_lowercase().contains("match"))
+        {
+            return Some(line.trim().chars().take(180).collect());
+        }
+    }
+    let useful = if matches!(tool.as_str(), "bash" | "shell") {
+        text.lines().rev().find(|line| {
+            let line = line.to_ascii_lowercase();
+            line.contains("passed") || line.contains("failed") || line.starts_with("ok ")
+        })
+    } else {
+        None
+    }
+    .or_else(|| text.lines().rev().find(|line| !line.trim().is_empty()))?;
+    Some(useful.trim().chars().take(180).collect())
+}
+
 fn text_parts(message: &Value) -> String {
     message
         .get("parts")
@@ -5425,7 +5658,7 @@ fn build_activity(
     status: Value,
     config: &Config,
 ) -> SessionActivity {
-    let messages = message_items(raw_messages);
+    let (messages, mut event_window) = bounded_message_items(raw_messages, ACTIVITY_MESSAGE_LIMIT);
     let user_messages = messages
         .iter()
         .filter(|message| {
@@ -5439,6 +5672,7 @@ fn build_activity(
         .is_some_and(|id| status_is_busy(&status, id));
     let mut requests = Vec::with_capacity(user_messages.len());
     let mut lifecycle = Vec::new();
+    let mut events = Vec::new();
 
     if let Some(at) = session.created_at.clone() {
         lifecycle.push(LifecycleEvent {
@@ -5535,6 +5769,171 @@ fn build_activity(
         requests.push(request);
     }
 
+    for message in &messages {
+        let info = message.get("info").unwrap_or(message);
+        let role = info.get("role").and_then(Value::as_str).unwrap_or_default();
+        if !matches!(role, "user" | "assistant") {
+            continue;
+        }
+        let created = timestamp_from_value(info.get("time").and_then(|time| time.get("created")))
+            .unwrap_or_else(|| session.created_at.clone().unwrap_or_default());
+        let visible_at =
+            timestamp_from_value(info.get("time").and_then(|time| time.get("completed")))
+                .unwrap_or_else(|| created.clone());
+        let message_id = info
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                format!(
+                    "{}:{}:{}",
+                    session
+                        .opencode_session_id
+                        .as_deref()
+                        .unwrap_or(&session.id),
+                    info.get("parentID")
+                        .and_then(Value::as_str)
+                        .unwrap_or("root"),
+                    created
+                )
+            });
+        if role == "user" {
+            let prompt = text_parts(message);
+            if !prompt.trim().is_empty() {
+                events.push(ActivityEvent {
+                    id: format!("{message_id}:prompt"),
+                    at: created,
+                    kind: "prompt".into(),
+                    title: "You".into(),
+                    tool: None,
+                    detail: Some(safe_activity_text(&Value::String(prompt), 1000)),
+                    status: None,
+                });
+            }
+            continue;
+        }
+        if let Some(parts) = message.get("parts").and_then(Value::as_array) {
+            for (part_index, part) in parts.iter().enumerate() {
+                let part_type = part.get("type").and_then(Value::as_str).unwrap_or_default();
+                let part_id = part
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("part-index-{part_index}"));
+                let state = part.get("state");
+                let (kind, tool_name, title, status, detail, at) = if part_type == "tool" {
+                    let tool = part.get("tool").and_then(Value::as_str).unwrap_or("Tool");
+                    let status = state
+                        .and_then(|value| value.get("status"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("pending");
+                    let title = state
+                        .and_then(|value| value.get("title"))
+                        .and_then(Value::as_str)
+                        .map(redact_activity_text)
+                        .unwrap_or_else(|| format!("{} tool", redact_activity_text(tool)))
+                        .chars()
+                        .take(250)
+                        .collect::<String>();
+                    let input = state
+                        .and_then(|value| value.get("input"))
+                        .or_else(|| part.get("input"))
+                        .and_then(|value| summarize_tool_input(tool, value));
+                    let output = state
+                        .and_then(|value| value.get("output"))
+                        .and_then(|value| summarize_tool_output(tool, value));
+                    let detail = match (input, output) {
+                        (Some(input), Some(output)) => Some(format!("{input} · {output}")),
+                        (Some(input), None) => Some(input),
+                        (None, Some(output)) => Some(output),
+                        (None, None) => None,
+                    }
+                    .map(|value| value.chars().take(750).collect::<String>());
+                    let is_finished = matches!(status, "completed" | "error" | "failed");
+                    let at = state
+                        .and_then(|value| value.get("time"))
+                        .and_then(|time| {
+                            if is_finished {
+                                time.get("end").or_else(|| time.get("start"))
+                            } else {
+                                time.get("start").or_else(|| time.get("end"))
+                            }
+                        })
+                        .or_else(|| {
+                            part.get("time").and_then(|time| {
+                                if is_finished {
+                                    time.get("end").or_else(|| time.get("start"))
+                                } else {
+                                    time.get("start").or_else(|| time.get("end"))
+                                }
+                            })
+                        })
+                        .and_then(|value| timestamp_from_value(Some(value)))
+                        .unwrap_or_else(|| created.clone());
+                    (
+                        "tool",
+                        Some(redact_activity_text(tool)),
+                        title,
+                        Some(status.to_owned()),
+                        detail,
+                        at,
+                    )
+                } else if part_type == "text" {
+                    let text = part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    (
+                        "message",
+                        None,
+                        "Agent".to_owned(),
+                        None,
+                        Some(safe_activity_text(&Value::String(text.to_owned()), 1000)),
+                        part.get("time")
+                            .and_then(|time| time.get("end").or_else(|| time.get("start")))
+                            .and_then(|value| timestamp_from_value(Some(value)))
+                            .unwrap_or_else(|| visible_at.clone()),
+                    )
+                } else {
+                    continue;
+                };
+                events.push(ActivityEvent {
+                    id: format!("{message_id}:{part_id}"),
+                    at,
+                    kind: kind.into(),
+                    title,
+                    tool: tool_name,
+                    detail,
+                    status,
+                });
+            }
+        }
+        if let Some(error) = assistant_error(message) {
+            events.push(ActivityEvent {
+                id: format!("{message_id}:error"),
+                at: visible_at,
+                kind: "error".into(),
+                title: "Agent error".into(),
+                tool: None,
+                detail: Some(redact_activity_text(&error).chars().take(1000).collect()),
+                status: Some("failed".into()),
+            });
+        }
+    }
+    events.sort_by(|left, right| left.at.cmp(&right.at).then_with(|| left.id.cmp(&right.id)));
+    // Primary transcript retention is independent from Trail's diagnostic lifecycle rows.
+    let event_capacity = ACTIVITY_EVENT_LIMIT;
+    if events.len() > event_capacity {
+        events.drain(..events.len() - event_capacity);
+        if let Some(window) = event_window.as_mut() {
+            window.truncated = true;
+        }
+    }
+
     let current = busy
         .then(|| requests.last().filter(|request| request.state == "running"))
         .flatten();
@@ -5569,6 +5968,8 @@ fn build_activity(
         last_activity_at,
         requests,
         lifecycle,
+        events,
+        event_window,
         preview_url: None,
         opencode_url,
         attach_command: format!("anvilctl sessions attach {}", session.id),
@@ -5707,7 +6108,36 @@ fn merge_history(mut activity: SessionActivity, history: &[HistoryEvent]) -> Ses
     activity
         .lifecycle
         .sort_by(|left, right| left.at.cmp(&right.at));
+    bound_activity_timeline(
+        &mut activity.events,
+        &mut activity.lifecycle,
+        &mut activity.event_window,
+    );
     activity
+}
+
+fn bound_activity_timeline(
+    events: &mut Vec<ActivityEvent>,
+    lifecycle: &mut Vec<LifecycleEvent>,
+    window: &mut Option<ActivityEventWindow>,
+) {
+    events.sort_by(|left, right| left.at.cmp(&right.at).then_with(|| left.id.cmp(&right.id)));
+    if events.len() > ACTIVITY_EVENT_LIMIT {
+        events.drain(..events.len() - ACTIVITY_EVENT_LIMIT);
+        window
+            .get_or_insert(ActivityEventWindow {
+                message_limit: ACTIVITY_MESSAGE_LIMIT as u32,
+                returned_messages: 0,
+                loaded_messages: 0,
+                next_cursor: None,
+                truncated: false,
+            })
+            .truncated = true;
+    }
+    // Trail diagnostics have a separate retention budget from conversation and tool events.
+    if lifecycle.len() > ACTIVITY_EVENT_LIMIT {
+        lifecycle.drain(..lifecycle.len() - ACTIVITY_EVENT_LIMIT);
+    }
 }
 
 #[derive(Clone)]
@@ -6109,8 +6539,51 @@ impl OpenCode {
             .await
     }
     async fn session_messages(&self, id: &str) -> Result<Value, ServiceError> {
-        self.request(&format!("session/{id}/message"), reqwest::Method::GET, None)
+        self.request(
+            &format!("session/{id}/message?limit={ACTIVITY_MESSAGE_LIMIT}"),
+            reqwest::Method::GET,
+            None,
+        )
+        .await
+    }
+    async fn session_message_page(
+        &self,
+        id: &str,
+        before: Option<&str>,
+    ) -> Result<(Value, Option<String>), ServiceError> {
+        let mut url = self
+            .base
+            .join(&format!("session/{id}/message"))
+            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("limit", &ACTIVITY_MESSAGE_LIMIT.to_string());
+            if let Some(before) = before {
+                query.append_pair("before", before);
+            }
+        }
+        let response = self
+            .client
+            .get(url)
+            .send()
             .await
+            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ServiceError::OpenCode(format!(
+                "HTTP {status} fetching OpenCode message page"
+            )));
+        }
+        let next_cursor = response
+            .headers()
+            .get("x-next-cursor")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let messages = response
+            .json::<Value>()
+            .await
+            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+        Ok((messages, next_cursor))
     }
     async fn event_stream(&self) -> Result<reqwest::Response, ServiceError> {
         let url = self
@@ -9048,6 +9521,341 @@ mod tests {
         assert_eq!(activity.requests.len(), 2);
         assert_eq!(activity.requests[0].prompt, "first prompt");
         assert_eq!(activity.requests[1].prompt, "second prompt");
+    }
+
+    #[test]
+    fn activity_projects_stable_user_visible_tool_and_text_parts_only() {
+        let session: Session = serde_json::from_value(json!({
+            "id":"demo-12345678", "sandbox":"anvil-demo-12345678", "service":"anvil-demo-12345678",
+            "namespace":"anvil", "opencode_port":4096, "phase":"Ready", "project":"demo",
+            "repository":"https://github.com/example/demo.git", "ref":"main", "work_branch":"anvil/demo-12345678",
+            "model":"openai/gpt-5.6-luna", "environment_state":"ready",
+            "opencode_session_id":"ses-test", "created_at":"2026-05-28T20:26:00Z",
+            "ready_at":"2026-05-28T20:26:01Z"
+        })).unwrap();
+        let transcript = json!([
+            {
+                "info":{"id":"user-1","role":"user","time":{"created":1779999999000i64}},
+                "parts":[{"id":"prompt-text","type":"text","text":"Inspect the retry path.","time":{"start":1779999999000i64,"end":1779999999100i64}}]
+            },
+            {
+                "info":{"id":"msg-1","parentID":"user-1","role":"assistant","time":{"created":1780000000000i64,"completed":1780000002000i64}},
+                "parts":[
+                    {"id":"part-tool","type":"tool","tool":"bash","state":{"status":"completed","title":"Ran tests","input":{"command":"terraform plan; AWS_SECRET_ACCESS_KEY=input-aws-secret; BUILD_DATABASE_PASSWORD='input-db-password'; curl https://deploy-user:input-url-password@deploy.example.test","api_key":"input-api-secret"},"output":{"message":"ok: Connected postgres://service-user:output-db-password@db.example.test/app; CI_SECRET_ACCESS_KEY=output-aws-secret; 61 tests passed","access_token":"output-token-secret"},"time":{"start":1780000001000i64,"end":1780000001500i64}}},
+                    {"id":"part-text","type":"text","text":"The retry path behaves as expected.","time":{"start":1780000001600i64,"end":1780000001700i64}},
+                    {"id":"part-reasoning","type":"reasoning","text":"private"}
+                ]
+            }
+        ]);
+        let response = build_activity(
+            &session,
+            "Ready",
+            None,
+            transcript.clone(),
+            json!({}),
+            &config("http://profile.test".into()),
+        );
+        assert_eq!(response.events.len(), 3);
+        assert_eq!(response.events[0].id, "user-1:prompt");
+        assert_eq!(response.events[0].kind, "prompt");
+        assert_eq!(response.events[0].title, "You");
+        assert_eq!(response.events[1].id, "msg-1:part-tool");
+        assert_eq!(response.events[1].kind, "tool");
+        assert_eq!(response.events[1].tool.as_deref(), Some("bash"));
+        assert_eq!(response.events[1].status.as_deref(), Some("completed"));
+        assert_eq!(
+            DateTime::parse_from_rfc3339(&response.events[1].at)
+                .unwrap()
+                .timestamp_millis(),
+            1_780_000_001_500
+        );
+        assert_eq!(response.events[2].kind, "message");
+        assert!(response.events[0].at < response.events[1].at);
+        assert!(response.events[1].at < response.events[2].at);
+        assert!(response
+            .lifecycle
+            .iter()
+            .any(|event| event.kind == "created"));
+        assert!(response.events.iter().all(|event| !matches!(
+            event.kind.as_str(),
+            "created" | "ready" | "request_started" | "request_completed"
+        )));
+        assert!(!response
+            .events
+            .iter()
+            .any(|event| event.detail.as_deref() == Some("private")));
+        let reloaded = build_activity(
+            &session,
+            "Ready",
+            None,
+            transcript,
+            json!({}),
+            &config("http://profile.test".into()),
+        );
+        assert_eq!(
+            response
+                .events
+                .iter()
+                .map(|event| &event.id)
+                .collect::<Vec<_>>(),
+            reloaded
+                .events
+                .iter()
+                .map(|event| &event.id)
+                .collect::<Vec<_>>()
+        );
+        assert!(response.events[1]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("curl"));
+        assert!(response.events[1].detail.as_deref().unwrap().contains("ok"));
+        let serialized_events = serde_json::to_string(&response.events).unwrap();
+        for secret in [
+            "input-auth-secret",
+            "input-api-secret",
+            "output-token-secret",
+            "input-aws-secret",
+            "input-db-password",
+            "input-url-password",
+            "deploy-user:input-url-password",
+            "output-db-password",
+            "service-user:output-db-password",
+            "output-aws-secret",
+        ] {
+            assert!(!serialized_events.contains(secret));
+        }
+        assert!(serialized_events.contains("terraform plan"));
+        assert!(serialized_events.contains("61 tests passed"));
+        assert!(serialized_events.contains("deploy.example.test"));
+        assert!(serialized_events.contains("db.example.test/app"));
+    }
+
+    #[test]
+    fn activity_uses_a_stable_latest_message_window_and_reports_truncation() {
+        let session: Session = serde_json::from_value(json!({
+            "id":"demo-12345678", "sandbox":"anvil-demo-12345678", "service":"anvil-demo-12345678",
+            "namespace":"anvil", "opencode_port":4096, "phase":"Ready", "project":"demo",
+            "repository":"https://github.com/example/demo.git", "ref":"main", "work_branch":"anvil/demo-12345678",
+            "model":"openai/gpt-5.6-luna", "environment_state":"ready",
+            "opencode_session_id":"ses-test"
+        })).unwrap();
+        let messages = (0..125).map(|number| json!({
+            "info":{"id":format!("message-{number:03}"),"role":"assistant","time":{"created":(1_780_000_000_000i64 + number as i64)}},
+            "parts":[{"id":format!("part-{number}"),"type":"text","text":format!("message {number}")}]
+        })).collect::<Vec<_>>();
+        let response = build_activity(
+            &session,
+            "Ready",
+            None,
+            Value::Array(messages),
+            json!({}),
+            &config("http://profile.test".into()),
+        );
+        assert_eq!(response.events.len(), ACTIVITY_MESSAGE_LIMIT);
+        assert_eq!(response.events.first().unwrap().id, "message-025:part-25");
+        assert_eq!(response.events.last().unwrap().id, "message-124:part-124");
+        let window = response.event_window.unwrap();
+        assert_eq!(window.message_limit, 100);
+        assert_eq!(window.returned_messages, 100);
+        assert!(window.truncated);
+    }
+
+    #[test]
+    fn activity_redacts_sensitive_fields_and_header_values_server_side() {
+        let payload = json!({
+            "command":"curl -H 'Authorization: Bearer header-token-value' -H 'Cookie: session-cookie-value' --token cli-token-value https://example.test",
+            "environment":{"GITHUB_TOKEN":"ghp-secret-value","api_key":"api-key-value","password":"pw-value"},
+            "output":"Authorization: Bearer output-token-value token=inline-token-value secret=inline-secret-value"
+        });
+        let safe = safe_activity_text(&payload, 2000);
+        for secret in [
+            "header-token-value",
+            "session-cookie-value",
+            "cli-token-value",
+            "ghp-secret-value",
+            "api-key-value",
+            "pw-value",
+            "output-token-value",
+            "inline-token-value",
+            "inline-secret-value",
+        ] {
+            assert!(!safe.contains(secret), "credential leaked in {safe}");
+        }
+        assert!(safe.contains("curl"));
+        assert!(safe.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn activity_redacts_multicomponent_env_and_url_credentials_in_raw_strings() {
+        let command = redact_activity_text(
+            "terraform plan; AWS_SECRET_ACCESS_KEY=aws-secret-value; BUILD_DATABASE_PASSWORD='db-password-value'; curl https://deploy-user:url-password-value@deploy.example.test; echo deployment started",
+        );
+        for secret in [
+            "aws-secret-value",
+            "db-password-value",
+            "url-password-value",
+            "deploy-user:url-password-value",
+        ] {
+            assert!(!command.contains(secret), "credential leaked in {command}");
+        }
+        assert!(command.contains("terraform plan"));
+        assert!(command.contains("curl https://[REDACTED]@deploy.example.test"));
+        assert!(command.contains("echo deployment started"));
+
+        let output = redact_activity_text(
+            "Connected to postgres://service-user:database-password-value@db.example.test/app; CI_SECRET_ACCESS_KEY=output-aws-secret-value; 61 tests passed",
+        );
+        for secret in [
+            "database-password-value",
+            "service-user:database-password-value",
+            "output-aws-secret-value",
+        ] {
+            assert!(!output.contains(secret), "credential leaked in {output}");
+        }
+        assert!(output.contains("postgres://[REDACTED]@db.example.test/app"));
+        assert!(output.contains("61 tests passed"));
+
+        let serialized_event = serde_json::to_string(&ActivityEvent {
+            id: "tool:raw-output".into(),
+            at: "2026-01-01T00:00:00Z".into(),
+            kind: "tool".into(),
+            title: "Database check".into(),
+            tool: Some("bash".into()),
+            detail: Some(output),
+            status: Some("completed".into()),
+        })
+        .unwrap();
+        assert!(!serialized_event.contains("database-password-value"));
+        assert!(!serialized_event.contains("output-aws-secret-value"));
+        assert!(serialized_event.contains("61 tests passed"));
+    }
+
+    #[test]
+    fn activity_tool_summaries_are_compact_and_recognizable() {
+        assert_eq!(
+            summarize_tool_output(
+                "read",
+                &Value::String("<content>\n1: before\n2: after\n</content>".into())
+            )
+            .as_deref(),
+            Some("2 lines read")
+        );
+        assert_eq!(
+            summarize_tool_input("bash", &json!({"command":"go test ./relay/..."})).as_deref(),
+            Some("go test ./relay/...")
+        );
+        assert_eq!(
+            summarize_tool_output(
+                "bash",
+                &Value::String("ok relay 1.2s\n61 tests passed".into())
+            )
+            .as_deref(),
+            Some("61 tests passed")
+        );
+        assert_eq!(
+            summarize_tool_output("edit", &Value::String("Edit applied successfully.".into()))
+                .as_deref(),
+            Some("Change applied successfully")
+        );
+        assert_eq!(
+            summarize_tool_output("grep", &Value::String("6 matches in 3 files".into())).as_deref(),
+            Some("6 matches in 3 files")
+        );
+    }
+
+    #[test]
+    fn merged_activity_window_reports_event_cap_truncation() {
+        let mut events = (0..10)
+            .map(|index| ActivityEvent {
+                id: format!("message:{index}"),
+                at: format!("2026-01-01T00:00:{index:02}Z"),
+                kind: "tool".into(),
+                title: "Tool".into(),
+                tool: Some("bash".into()),
+                detail: None,
+                status: Some("completed".into()),
+            })
+            .collect::<Vec<_>>();
+        let mut lifecycle = (0..600)
+            .map(|index| LifecycleEvent {
+                kind: "transition".into(),
+                at: format!("2026-01-01T00:{:02}:{:02}Z", index / 60, index % 60),
+                detail: Some(index.to_string()),
+            })
+            .collect::<Vec<_>>();
+        let mut window = None;
+        bound_activity_timeline(&mut events, &mut lifecycle, &mut window);
+        assert_eq!(
+            events.len(),
+            10,
+            "lifecycle diagnostics must not consume transcript capacity"
+        );
+        assert_eq!(lifecycle.len(), ACTIVITY_EVENT_LIMIT);
+        assert!(
+            window.is_none(),
+            "lifecycle truncation is not transcript truncation"
+        );
+        assert_eq!(lifecycle.first().unwrap().detail.as_deref(), Some("100"));
+
+        let mut oversized_events = (0..ACTIVITY_EVENT_LIMIT + 1)
+            .map(|index| ActivityEvent {
+                id: format!("tool:{index}"),
+                at: format!("2026-01-01T00:00:{index:04}Z"),
+                kind: "tool".into(),
+                title: "Tool".into(),
+                tool: Some("read".into()),
+                detail: None,
+                status: Some("completed".into()),
+            })
+            .collect::<Vec<_>>();
+        let mut no_lifecycle = Vec::new();
+        let mut transcript_window = None;
+        bound_activity_timeline(
+            &mut oversized_events,
+            &mut no_lifecycle,
+            &mut transcript_window,
+        );
+        assert_eq!(oversized_events.len(), ACTIVITY_EVENT_LIMIT);
+        assert!(transcript_window.unwrap().truncated);
+    }
+
+    #[test]
+    fn activity_query_defaults_to_lightweight_state_and_can_request_events() {
+        assert!(!ActivityQuery::default().include_events);
+        assert!(
+            serde_json::from_value::<ActivityQuery>(json!({ "include_events": true }))
+                .unwrap()
+                .include_events
+        );
+        let query = serde_json::from_value::<ActivityQuery>(json!({
+            "include_events": true,
+            "before": "opaque-cursor"
+        }))
+        .unwrap();
+        assert_eq!(query.before.as_deref(), Some("opaque-cursor"));
+    }
+
+    #[tokio::test]
+    async fn opencode_message_fetch_uses_bounded_cursor_window() {
+        let server = MockServer::start();
+        let page = server.mock(|when, then| {
+            when.method(GET)
+                .path("/session/ses-window/message")
+                .query_param("limit", ACTIVITY_MESSAGE_LIMIT.to_string())
+                .query_param("before", "opaque-cursor");
+            then.status(200)
+                .header("x-next-cursor", "next-opaque")
+                .json_body(json!([{"id":"older-message"}]));
+        });
+        let op = OpenCode::new(server.url(""), Duration::from_secs(5));
+        assert_eq!(
+            op.session_message_page("ses-window", Some("opaque-cursor"))
+                .await
+                .unwrap(),
+            (json!([{"id":"older-message"}]), Some("next-opaque".into()))
+        );
+        page.assert();
     }
 
     #[tokio::test]

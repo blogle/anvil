@@ -19,11 +19,12 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
       session: { ...session, environment_state: environment, execution_state: execution },
       environment_state: environment,
       execution_state: execution,
-      work_state_changed_at: id === 'demo' ? selectedState.changedAt : session.created_at,
       attach_command: `anvilctl sessions attach ${id}`,
       preview_url: 'https://preview.example.test',
       opencode_url: 'https://opencode.example.test',
       lifecycle: [{ kind: 'created', at: session.created_at }, { kind: 'ready', at: '2026-09-19T11:01:00Z', detail: 'Sandbox ready' }, ...(id === 'demo' && requestCount > 1 ? [{ kind: 'request_started', at: selectedState.changedAt, detail: 'A factual execution update arrived' }] : [])],
+      events: [{ id: `${id}:prompt`, at: '2026-09-19T11:58:00Z', kind: 'prompt', title: 'You', detail: 'Review the authentication flow.' }, { id: `${id}:tool`, at: '2026-09-19T11:58:30Z', kind: 'tool', tool: 'read', title: 'src/auth.js', detail: '24 lines read', status: 'completed' }, { id: `${id}:agent`, at: '2026-09-19T11:59:00Z', kind: 'message', title: 'Agent', detail: 'The session helper owns authentication.' }],
+      event_window: { message_limit: 100, returned_messages: 3, loaded_messages: 3, next_cursor: null, truncated: false },
       requests: Array.from({ length: requestCount }, (_, index) => ({ id: `request-${index + 1}`, number: index + 1, origin: 'operator', state: execution === 'running' ? 'running' : 'completed', started_at: session.created_at, last_activity_at: selectedState.changedAt, prompt: `Representative prompt ${index + 1}: ${'inspect session '.repeat(45)}` })),
     }
   }
@@ -92,7 +93,12 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
     await page.waitForFunction(() => location.hash === '#session/demo')
     assert.equal(await detail.locator('h2').textContent(), 'Demo session')
     assert.match(await detail.locator('.factual-state').textContent(), /Environment: ready.*Execution: idle/)
-    assert.match(await detail.locator('#logs-panel').textContent(), /Lifecycle & requests/)
+    await detail.locator('#activity-panel [data-event-id="demo:prompt"]').waitFor()
+    assert.equal(await detail.locator('#activity-tab').getAttribute('aria-selected'), 'true')
+    assert.deepEqual(await detail.locator('#activity-panel [data-event-id]').evaluateAll((rows) => rows.map((event) => event.dataset.eventId)), ['demo:prompt', 'demo:tool', 'demo:agent'])
+    assert.equal((await detail.locator('#activity-panel').textContent()).includes('Sandbox ready'), false)
+    await detail.locator('#logs-tab').click()
+    assert.match(await detail.locator('#logs-panel').textContent(), /Lifecycle & request diagnostics/)
     assert.match(await detail.locator('#runtime-panel').textContent(), /Runtime details/)
     await page.locator('.attach summary').click()
     const prompt = detail.locator('.prompt').first()
@@ -102,7 +108,7 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
     const detailScroll = await detail.evaluate((element) => { element.querySelector('.detail-inner').style.minHeight = '1400px'; element.scrollTop = 120; return element.scrollTop })
     assert.equal(detailScroll, 120)
     await page.evaluate(() => {
-      window.initialNodes = { row: document.querySelector('[data-session="demo"]'), detail: document.querySelector('.detail'), shell: document.querySelector('.detail-inner'), header: document.querySelector('.detail-header'), factual: document.querySelector('.detail .factual-state'), actions: document.querySelector('.actions'), tabs: document.querySelector('.tabs'), logs: document.querySelector('#logs-panel'), runtime: document.querySelector('#runtime-panel'), focus: document.activeElement }
+      window.initialNodes = { row: document.querySelector('[data-session="demo"]'), detail: document.querySelector('.detail'), shell: document.querySelector('.detail-inner'), header: document.querySelector('.detail-header'), factual: document.querySelector('.detail .factual-state'), actions: document.querySelector('.actions'), tabs: document.querySelector('.tabs'), activityTab: document.querySelector('#activity-tab'), activity: document.querySelector('#activity-panel'), logs: document.querySelector('#logs-panel'), runtime: document.querySelector('#runtime-panel'), focus: document.activeElement }
       window.noOpMutations = []
       window.noOpObserver = new MutationObserver((records) => window.noOpMutations.push(...records))
       window.noOpObserver.observe(window.initialNodes.row, { subtree: true, childList: true, characterData: true, attributes: true })
@@ -122,7 +128,7 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
     await page.waitForFunction(() => document.querySelector('.detail .factual-state')?.textContent.includes('Execution: running'))
     assert.match(await detail.locator('.factual-state').textContent(), /Execution: running/)
-    for (const [selector, key] of [['[data-session="demo"]', 'row'], ['.detail', 'detail'], ['.detail-inner', 'shell'], ['.detail-header', 'header'], ['.detail .factual-state', 'factual'], ['.actions', 'actions'], ['.tabs', 'tabs'], ['#logs-panel', 'logs'], ['#runtime-panel', 'runtime']]) {
+    for (const [selector, key] of [['[data-session="demo"]', 'row'], ['.detail', 'detail'], ['.detail-inner', 'shell'], ['.detail-header', 'header'], ['.detail .factual-state', 'factual'], ['.actions', 'actions'], ['.tabs', 'tabs'], ['#activity-tab', 'activityTab'], ['#activity-panel', 'activity'], ['#logs-panel', 'logs'], ['#runtime-panel', 'runtime']]) {
       assert.equal(await page.locator(selector).evaluate((element, name) => element === window.initialNodes[name], key), true, `${selector} remains mounted across selected factual updates`)
     }
     assert.equal(await row.locator('.session-status-label').count(), 0)
