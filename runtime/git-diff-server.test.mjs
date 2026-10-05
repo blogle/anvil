@@ -75,6 +75,10 @@ test("worker diff endpoint keeps immutable base and includes commits, index, wor
     assert.equal(files.get("image.bin").binary, true)
     assert.equal(files.get("huge.txt").too_large, true)
     assert.equal(files.has("upstream-only.txt"), false)
+    await writeFile(join(project, ".git/anvil-session-base"), `${"f".repeat(40)}\n`)
+    const mismatched = await (await fetch(`http://127.0.0.1:${port}/v1/diff`)).json()
+    assert.equal(mismatched.status, "unavailable")
+    assert.match(mismatched.message, /does not match the pinned workspace base/i)
   } finally {
     server?.kill("SIGTERM")
     await rm(root, { recursive: true, force: true })

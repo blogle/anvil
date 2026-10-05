@@ -328,6 +328,10 @@ mod tests {
         assert!(working_tree_diff(dir, None)
             .unwrap_err()
             .contains("no recorded worker base"));
+        let wrong_base = "f".repeat(40);
+        assert!(working_tree_diff(dir, Some(&wrong_base))
+            .unwrap_err()
+            .contains("does not match"));
         fs::write(dir.join("image.bin"), [0, 1, 2, 255]).unwrap();
         fs::write(dir.join("huge.txt"), vec![b'x'; 70 * 1024]).unwrap();
         git(dir, &["add", "."]);

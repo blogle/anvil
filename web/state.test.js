@@ -179,10 +179,20 @@ test('Files tab fetches and renders immutable-base session diffs only when selec
   state.sessionUI(filesSession.id).tab.value = 'logs'
   const requests = []
   const originalFetch = globalThis.fetch
+  const originalSetInterval = globalThis.setInterval
+  const originalClearInterval = globalThis.clearInterval
+  let refreshFiles
+  let calls = 0
   globalThis.fetch = async (path) => {
     requests.push(path)
-    return { ok: true, status: 200, json: async () => ({ status: 'ready', diff: { files: [{ path: 'src/example.txt', old_path: null, status: 'modified', additions: 2, deletions: 1, diff: '+updated' }] } }) }
+    calls++
+    const body = calls === 1
+      ? { status: 'pending', message: 'Waiting for the exact base.' }
+      : { status: 'ready', diff: { files: [{ path: 'src/example.txt', old_path: null, status: 'modified', additions: 2, deletions: 1, diff: '+updated' }] } }
+    return { ok: true, status: 200, json: async () => body }
   }
+  globalThis.setInterval = (callback) => { refreshFiles = callback; return 1 }
+  globalThis.clearInterval = () => {}
   const root = document.getElementById('app')
   try {
     await act(async () => render(h(TestApp), root))
@@ -190,11 +200,17 @@ test('Files tab fetches and renders immutable-base session diffs only when selec
     await act(async () => root.querySelector('#files-tab').click())
     await act(async () => new Promise((resolve) => setTimeout(resolve, 0)))
     assert.deepEqual(requests, ['/v1/sessions/files-demo/files'])
+    assert.match(root.querySelector('#files-panel').textContent, /Waiting for the exact base/)
+    await act(async () => refreshFiles())
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)))
+    assert.deepEqual(requests, ['/v1/sessions/files-demo/files', '/v1/sessions/files-demo/files'])
     assert.match(root.querySelector('#files-panel').textContent, /src\/example\.txt/)
     assert.match(root.querySelector('#files-panel').textContent, /\+updated/)
     assert.equal(root.querySelector('#files-panel').hidden, false)
   } finally {
     globalThis.fetch = originalFetch
+    globalThis.setInterval = originalSetInterval
+    globalThis.clearInterval = originalClearInterval
     render(null, root)
   }
 })

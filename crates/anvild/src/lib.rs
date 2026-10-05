@@ -1546,16 +1546,30 @@ impl SandboxApi for KubeSandboxApi {
         } else {
             record.session.service
         };
-        let response = reqwest::Client::new()
+        let client = reqwest::Client::new();
+        let Some(expected_base) = record.session.base_revision.as_deref() else {
+            let helper_result = match client
+                .get(format!("http://{host}:4097/v1/base"))
+                .timeout(self.config.request_timeout)
+                .send()
+                .await
+            {
+                Ok(response) => response.json::<Value>().await.ok(),
+                Err(_) => None,
+            };
+            return Ok(files_response_without_recorded_base(helper_result.as_ref()));
+        };
+        let response = client
             .get(format!("http://{host}:4097/v1/diff"))
             .timeout(self.config.request_timeout)
             .send()
             .await
             .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
-        response
+        let result: Value = response
             .json()
             .await
-            .map_err(|error| ServiceError::OpenCode(error.to_string()))
+            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+        Ok(validate_worker_diff_base(result, expected_base))
     }
     async fn set_opencode_session(&self, id: &str, oc: &str) -> Result<(), ServiceError> {
         let mut annotations = serde_json::Map::new();
@@ -1581,28 +1595,15 @@ impl SandboxApi for KubeSandboxApi {
             annotation_key(&self.config, "ready-at"),
             Value::String(at.to_owned()),
         );
-        let record = self.get(id).await?;
-        if record.session.base_revision.is_none() {
-            let host = if record.session.service.is_empty() {
-                format!("anvil-{id}")
-            } else {
-                record.session.service
-            };
-            let revision = capture_worker_base_revision(
-                &reqwest::Client::new(),
-                &format!("http://{host}:4097/v1/base"),
-                20,
-                Duration::from_millis(250),
-            )
-            .await
-            .map_err(ServiceError::OpenCode)?;
-            annotations.insert(
-                annotation_key(&self.config, "base-revision"),
-                Value::String(revision),
-            );
-        }
-        self.patch(id, json!({"metadata":{"annotations":annotations}}))
-            .await
+        let ready = self.patch(id, json!({"metadata":{"annotations":annotations}}));
+        let client = self.client.clone();
+        let config = self.config.clone();
+        let id = id.to_owned();
+        ready_then_spawn_base_capture(
+            ready,
+            async move { capture_and_persist_worker_base_revision(client, config, id).await },
+        )
+        .await
     }
     async fn set_run_record(&self, id: &str, state: &RunRecord) -> Result<(), ServiceError> {
         let annotations = run_record_annotations(&self.config, state);
@@ -1662,6 +1663,170 @@ impl SandboxApi for KubeSandboxApi {
         );
         self.patch(id, json!({"metadata":{"annotations":annotations}}))
             .await
+    }
+    async fn recover_startup(&self) -> Result<(), ServiceError> {
+        if let Ok(records) = self.list().await {
+            for record in records {
+                if record.session.ready_at.is_some() && record.session.base_revision.is_none() {
+                    let client = self.client.clone();
+                    let config = self.config.clone();
+                    let id = record.session.id;
+                    tokio::spawn(async move {
+                        capture_and_persist_worker_base_revision(client, config, id).await;
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn pending_files_diff() -> Value {
+    json!({
+        "status": "pending",
+        "message": "Waiting for the worker's exact base revision to be recorded."
+    })
+}
+
+fn files_response_without_recorded_base(helper_result: Option<&Value>) -> Value {
+    if helper_result.is_some_and(|result| {
+        result["status"] == "unavailable"
+            && result["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("does not match the pinned workspace base"))
+    }) {
+        json!({
+            "status": "unavailable",
+            "message": "The worker's recorded base does not match its pinned workspace base."
+        })
+    } else {
+        pending_files_diff()
+    }
+}
+
+fn validate_worker_diff_base(result: Value, expected_base: &str) -> Value {
+    if result["status"] == "ready"
+        && result.pointer("/diff/base_revision").and_then(Value::as_str) != Some(expected_base)
+    {
+        json!({
+            "status": "unavailable",
+            "message": "The worker diff base does not match the session's recorded base revision."
+        })
+    } else {
+        result
+    }
+}
+
+async fn ready_then_spawn_base_capture<Ready, Capture>(
+    ready: Ready,
+    capture: Capture,
+) -> Result<(), ServiceError>
+where
+    Ready: std::future::Future<Output = Result<(), ServiceError>>,
+    Capture: std::future::Future<Output = ()> + Send + 'static,
+{
+    ready.await?;
+    tokio::spawn(capture);
+    Ok(())
+}
+
+async fn capture_and_persist_worker_base_revision(client: Client, config: Config, id: String) {
+    let http_client = reqwest::Client::new();
+    let capture_client = client.clone();
+    let capture_config = config.clone();
+    let capture_id = id.clone();
+    let persist_client = client;
+    let persist_config = config;
+    let persist_id = id;
+    retry_worker_base_capture(
+        || async {
+            let record = kube_sandbox_record(&capture_client, &capture_config, &capture_id).await?;
+            if let Some(revision) = record.session.base_revision {
+                return Ok(revision);
+            }
+            let host = if record.session.service.is_empty() {
+                format!("anvil-{}", record.session.id)
+            } else {
+                record.session.service
+            };
+            capture_worker_base_revision(
+                &http_client,
+                &format!("http://{host}:4097/v1/base"),
+                1,
+                Duration::ZERO,
+            )
+            .await
+        },
+        |revision| async {
+            let api = Api::<DynamicObject>::namespaced_with(
+                persist_client.clone(),
+                &persist_config.namespace,
+                &sandbox_resource(),
+            );
+            let object = api
+                .get(&format!("anvil-{persist_id}"))
+                .await
+                .map_err(|error| error.to_string())?;
+            let record = sandbox_record_from(&object, &persist_config)
+                .map_err(|error| error.to_string())?;
+            if record.session.base_revision.is_some() {
+                return Ok(());
+            }
+            let mut annotations = serde_json::Map::new();
+            annotations.insert(
+                annotation_key(&persist_config, "base-revision"),
+                Value::String(revision),
+            );
+            api.patch(
+                &format!("anvil-{persist_id}"),
+                &PatchParams::default(),
+                &Patch::Merge(json!({"metadata":{"annotations":annotations}})),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+async fn kube_sandbox_record(
+    client: &Client,
+    config: &Config,
+    id: &str,
+) -> Result<SandboxRecord, String> {
+    Api::<DynamicObject>::namespaced_with(
+        client.clone(),
+        &config.namespace,
+        &sandbox_resource(),
+    )
+    .get(&format!("anvil-{id}"))
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|object| sandbox_record_from(&object, config).map_err(|error| error.to_string()))
+}
+
+async fn retry_worker_base_capture<Capture, CaptureFuture, Persist, PersistFuture>(
+    mut capture: Capture,
+    mut persist: Persist,
+    retry_delay: Duration,
+) where
+    Capture: FnMut() -> CaptureFuture,
+    CaptureFuture: std::future::Future<Output = Result<String, String>>,
+    Persist: FnMut(String) -> PersistFuture,
+    PersistFuture: std::future::Future<Output = Result<(), String>>,
+{
+    let max_retry_delay = Duration::from_secs(60);
+    let mut retry_delay = retry_delay.max(Duration::from_millis(1));
+    loop {
+        if let Ok(revision) = capture().await {
+            if persist(revision).await.is_ok() {
+                return;
+            }
+        }
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = retry_delay.saturating_mul(2).min(max_retry_delay);
     }
 }
 
@@ -9727,5 +9892,107 @@ mod tests {
         assert_eq!(revision, "0123456789012345678901234567890123456789");
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn ready_session_stays_available_while_base_capture_retries_in_background() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let base = Arc::new(Mutex::new(None::<String>));
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (unavailable_tx, unavailable_rx) = tokio::sync::oneshot::channel();
+        let (recover_tx, recover_rx) = tokio::sync::oneshot::channel();
+        let mut unavailable_tx = Some(unavailable_tx);
+        let mut recover_rx = Some(recover_rx);
+        let base_for_persist = base.clone();
+        let retry = retry_worker_base_capture(
+            move || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                let unavailable_tx = unavailable_tx.take();
+                let recover_rx = if attempt > 0 {
+                    recover_rx.take()
+                } else {
+                    None
+                };
+                async move {
+                    if attempt == 0 {
+                        let _ = unavailable_tx.expect("first attempt signal").send(());
+                        return Err("helper unavailable during startup".into());
+                    }
+                    if let Some(recover_rx) = recover_rx {
+                        let _ = recover_rx.await;
+                    }
+                    Ok("0123456789012345678901234567890123456789".into())
+                }
+            },
+            move |revision| {
+                let base = base_for_persist.clone();
+                async move {
+                    *base.lock().unwrap() = Some(revision);
+                    Ok(())
+                }
+            },
+            Duration::from_millis(1),
+        );
+        let ready_for_mark = ready.clone();
+        ready_then_spawn_base_capture(
+            async move {
+                ready_for_mark.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            retry,
+        )
+        .await
+        .unwrap();
+
+        assert!(ready.load(Ordering::SeqCst));
+        unavailable_rx.await.unwrap();
+        assert_eq!(pending_files_diff()["status"], "pending");
+        assert!(base.lock().unwrap().is_none());
+
+        recover_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if base.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("background retry should persist the recovered exact base");
+        assert_eq!(
+            base.lock().unwrap().as_deref(),
+            Some("0123456789012345678901234567890123456789")
+        );
+    }
+
+    #[test]
+    fn files_rejects_worker_diff_for_a_mismatched_pinned_base() {
+        assert_eq!(files_response_without_recorded_base(None)["status"], "pending");
+        assert_eq!(
+            files_response_without_recorded_base(Some(&json!({
+                "status": "unavailable",
+                "message": "Recorded worker base revision does not match the pinned workspace base."
+            })))["status"],
+            "unavailable"
+        );
+        let expected = "0123456789012345678901234567890123456789";
+        let wrong = "ffffffffffffffffffffffffffffffffffffffff";
+        let result = validate_worker_diff_base(
+            json!({"status":"ready","diff":{"base_revision":wrong,"files":[]}}),
+            expected,
+        );
+        assert_eq!(result["status"], "unavailable");
+        assert!(result["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not match"));
+        assert_eq!(
+            validate_worker_diff_base(
+                json!({"status":"ready","diff":{"base_revision":expected,"files":[]}}),
+                expected
+            )["status"],
+            "ready"
+        );
     }
 }

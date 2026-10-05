@@ -29,6 +29,7 @@ export function Files({ sessionId, active }) {
 
 function FilesResult({ result }) {
   if (!result || result.status === 'loading') return <div class="content-section"><div class="loading">Loading file changes...</div></div>
+  if (result.status === 'pending') return <div class="content-section"><div class="loading">{result.message || 'Waiting for the worker base revision before comparing files...'}</div></div>
   if (result.status === 'unavailable') return <div class="content-section"><div class="empty"><strong>Files unavailable</strong><span>{result.message || 'The worker base revision is unavailable.'}</span></div></div>
   const diff = result.diff
   const files = diff?.files || []
