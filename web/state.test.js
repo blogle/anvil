@@ -57,6 +57,24 @@ test('timeline preserves full timestamp precision and authoritative equal-time o
   assert.deepEqual(order({ requests: [...activity.requests].reverse(), lifecycle: [...activity.lifecycle].reverse() }), expected)
 })
 
+test('timeline ordering is independent of semantic execution and work-state snapshots', () => {
+  const activity = {
+    session: { id: 'demo', work_state: 'in_progress', execution_state: 'running' },
+    requests: [{ id: 'request-1', number: 1, started_at: '2026-09-19T12:00:01Z' }],
+    lifecycle: [
+      { id: 'created', kind: 'created', at: '2026-09-19T12:00:00Z' },
+      { id: 'idle', kind: 'opencode_idle', at: '2026-09-19T12:00:02Z' },
+    ],
+  }
+  const order = (value) => state.chronologicalTimeline(value).map((item) => `${item.type}:${item.value.id}`)
+  const expected = ['event:created', 'request:request-1', 'event:idle']
+  assert.deepEqual(order(activity), expected)
+  assert.deepEqual(order({
+    ...activity,
+    session: { id: 'demo', work_state: 'completed', execution_state: 'failed' },
+  }), expected)
+})
+
 test('Preact timeline interleaves cards and lifecycle events with one marker per item', async () => {
   const activity = {
     requests: [
