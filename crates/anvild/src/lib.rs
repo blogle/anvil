@@ -1,5 +1,6 @@
 //! HTTP control plane for Anvil Kubernetes sandboxes.
 
+mod git_diff;
 mod github;
 mod local;
 pub mod store;
@@ -1276,6 +1277,7 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
             .get(&annotation_key(config, "base-ref"))
             .cloned()
             .unwrap_or_default(),
+        base_revision: a.get(&annotation_key(config, "base-revision")).cloned(),
         work_branch: a
             .get(&annotation_key(config, "work-branch"))
             .cloned()
@@ -1491,6 +1493,7 @@ impl SandboxApi for KubeSandboxApi {
             project: r.project.clone(),
             repository: r.repository.clone(),
             base_ref: r.base_ref.clone(),
+            base_revision: None,
             work_branch: branch_name(&SessionId::parse(id).unwrap()),
             model: r.model.clone(),
             opencode_session_id: None,
@@ -8157,6 +8160,7 @@ mod tests {
             project: "demo".into(),
             repository: "https://github.com/example/demo.git".into(),
             base_ref: "main".into(),
+            base_revision: None,
             work_branch: "anvil/demo-12345678".into(),
             model: None,
             opencode_session_id: Some("ses_demo".into()),

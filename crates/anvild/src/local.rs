@@ -1211,7 +1211,7 @@ mod tests {
                 "diff-12345678",
                 &fixture.request("demo"),
                 &[],
-                &initial_work_state(),
+                &initial_run_record(),
             )
             .await
             .unwrap();
