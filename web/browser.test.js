@@ -93,6 +93,8 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
     await page.waitForFunction(() => location.hash === '#session/demo')
     assert.equal(await detail.locator('h2').textContent(), 'Demo session')
     assert.match(await detail.locator('.factual-state').textContent(), /Environment: ready.*Execution: idle/)
+    await detail.locator('#activity-panel [data-event-id="demo:prompt"]').waitFor()
+    assert.equal(await detail.locator('#activity-tab').getAttribute('aria-selected'), 'true')
     assert.deepEqual(await detail.locator('#activity-panel [data-event-id]').evaluateAll((rows) => rows.map((event) => event.dataset.eventId)), ['demo:prompt', 'demo:tool', 'demo:agent'])
     assert.equal((await detail.locator('#activity-panel').textContent()).includes('Sandbox ready'), false)
     await detail.locator('#logs-tab').click()
@@ -106,7 +108,7 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
     const detailScroll = await detail.evaluate((element) => { element.querySelector('.detail-inner').style.minHeight = '1400px'; element.scrollTop = 120; return element.scrollTop })
     assert.equal(detailScroll, 120)
     await page.evaluate(() => {
-      window.initialNodes = { row: document.querySelector('[data-session="demo"]'), detail: document.querySelector('.detail'), shell: document.querySelector('.detail-inner'), header: document.querySelector('.detail-header'), factual: document.querySelector('.detail .factual-state'), actions: document.querySelector('.actions'), tabs: document.querySelector('.tabs'), activity: document.querySelector('#activity-panel'), logs: document.querySelector('#logs-panel'), runtime: document.querySelector('#runtime-panel'), focus: document.activeElement }
+      window.initialNodes = { row: document.querySelector('[data-session="demo"]'), detail: document.querySelector('.detail'), shell: document.querySelector('.detail-inner'), header: document.querySelector('.detail-header'), factual: document.querySelector('.detail .factual-state'), actions: document.querySelector('.actions'), tabs: document.querySelector('.tabs'), activityTab: document.querySelector('#activity-tab'), activity: document.querySelector('#activity-panel'), logs: document.querySelector('#logs-panel'), runtime: document.querySelector('#runtime-panel'), focus: document.activeElement }
       window.noOpMutations = []
       window.noOpObserver = new MutationObserver((records) => window.noOpMutations.push(...records))
       window.noOpObserver.observe(window.initialNodes.row, { subtree: true, childList: true, characterData: true, attributes: true })
@@ -126,7 +128,7 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
     await page.waitForFunction(() => document.querySelector('.detail .factual-state')?.textContent.includes('Execution: running'))
     assert.match(await detail.locator('.factual-state').textContent(), /Execution: running/)
-    for (const [selector, key] of [['[data-session="demo"]', 'row'], ['.detail', 'detail'], ['.detail-inner', 'shell'], ['.detail-header', 'header'], ['.detail .factual-state', 'factual'], ['.actions', 'actions'], ['.tabs', 'tabs'], ['#activity-panel', 'activity'], ['#logs-panel', 'logs'], ['#runtime-panel', 'runtime']]) {
+    for (const [selector, key] of [['[data-session="demo"]', 'row'], ['.detail', 'detail'], ['.detail-inner', 'shell'], ['.detail-header', 'header'], ['.detail .factual-state', 'factual'], ['.actions', 'actions'], ['.tabs', 'tabs'], ['#activity-tab', 'activityTab'], ['#activity-panel', 'activity'], ['#logs-panel', 'logs'], ['#runtime-panel', 'runtime']]) {
       assert.equal(await page.locator(selector).evaluate((element, name) => element === window.initialNodes[name], key), true, `${selector} remains mounted across selected factual updates`)
     }
     assert.equal(await row.locator('.session-status-label').count(), 0)
