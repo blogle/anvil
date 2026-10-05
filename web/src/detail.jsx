@@ -2,6 +2,7 @@ import { h } from 'preact'
 import { activities, api, clearSessionFilters, environmentFor, executionFor, navigate, refresh, selected, sessions, sessionUI, visibleSessions } from './state.js'
 import { Logs } from './logs.jsx'
 import { Runtime } from './runtime.jsx'
+import { GitMetadata } from './git-metadata.jsx'
 
 const React = { createElement: h }
 
@@ -23,7 +24,8 @@ function DetailContent({ session, activity, outsideFilters }) {
   ]
   return <div class="detail-inner"><a class="back-link" href="#sessions" onClick={(event) => { event.preventDefault(); navigate(null) }}>← All sessions</a>
     {outsideFilters && <div class="filter-context" role="status">This session is open but hidden by the current search or runtime filters. <button class="text-button" onClick={clearSessionFilters}>Show all sessions</button></div>}
-    <div class="detail-header"><div><div class="eyebrow">Session overview</div><h2>{session.project || 'Anvil'} session</h2><div class="detail-subtitle"><span>{session.project}</span><span>·</span><code>{session.work_branch}</code></div><div class="detail-subtitle factual-state"><span>Environment: <code>{environmentFor(session, activity)}</code></span><span>Execution: <code>{executionFor(session, activity)}</code></span></div></div></div>
+    <div class="detail-header"><div><div class="eyebrow">Session overview</div><h2>{session.project || 'Anvil'} session</h2><div class="detail-subtitle"><span>{session.project}</span></div><div class="detail-subtitle factual-state"><span>Environment: <code>{environmentFor(session, activity)}</code></span><span>Execution: <code>{executionFor(session, activity)}</code></span></div></div></div>
+    <GitMetadata session={session}/>
     <SessionActions session={session} activity={activity} ui={ui}/>
     <div class="tabs" role="tablist" aria-label="Session detail">{tabs.map(({ id, label }) => <button key={id} id={`${id}-tab`} class={`tab ${ui.tab.value === id ? 'active' : ''}`} role="tab" aria-selected={ui.tab.value === id} tabIndex={ui.tab.value === id ? 0 : -1} aria-controls={`${id}-panel`} onClick={() => ui.tab.value = id}>{label}</button>)}</div>
     {tabs.map(({ id, content }) => <div key={id} id={`${id}-panel`} role="tabpanel" tabIndex="0" aria-labelledby={`${id}-tab`} hidden={ui.tab.value !== id}>{content}</div>)}
