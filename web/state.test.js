@@ -13,6 +13,7 @@ const { h, render } = await import('preact')
 const { act } = await import('preact/test-utils')
 const sessionsModule = await import('./src/sessions.jsx')
 const detailModule = await import('./src/detail.jsx')
+const { Logs } = await import('./src/logs.jsx')
 const { AppShell } = await import('./src/app.jsx')
 const state = await import('./src/state.js')
 
@@ -35,6 +36,48 @@ test('elapsed display and explicit Sessions routes stay deterministic', () => {
   assert.equal(state.routeFromHash('#session/demo%2Fdrawer'), 'demo/drawer')
   assert.equal(state.routeFor(null), '#sessions')
   assert.equal(state.routeFor('demo/drawer'), '#session/demo%2Fdrawer')
+})
+
+test('timeline preserves full timestamp precision and authoritative equal-time ordering', () => {
+  const activity = {
+    requests: [
+      { id: 'req-b', number: 2, started_at: '2026-09-19T12:00:00.123456900Z' },
+      { id: 'req-a', number: 1, started_at: '2026-09-19T12:00:00.123456100Z' },
+      { id: 'req-c', number: 3, started_at: '2026-09-19T12:00:00.123456100Z' },
+    ],
+    lifecycle: [
+      { id: 'event-b', kind: 'run_started', at: '2026-09-19T12:00:00.123456500Z' },
+      { id: 'event-z', kind: 'created', at: '2026-09-19T12:00:00.123456100Z' },
+      { id: 'event-a', kind: 'created', at: '2026-09-19T12:00:00.123456100Z' },
+    ],
+  }
+  const order = (value) => state.chronologicalTimeline(value).map((item) => `${item.type}:${item.value.id}`)
+  const expected = ['event:event-a', 'event:event-z', 'request:req-a', 'request:req-c', 'event:event-b', 'request:req-b']
+  assert.deepEqual(order(activity), expected)
+  assert.deepEqual(order({ requests: [...activity.requests].reverse(), lifecycle: [...activity.lifecycle].reverse() }), expected)
+})
+
+test('Preact timeline interleaves cards and lifecycle events with one marker per item', async () => {
+  const activity = {
+    requests: [
+      { id: 'r1', number: 1, origin: 'operator', state: 'completed', started_at: '2026-09-19T12:00:01Z', prompt: 'first request' },
+      { id: 'r2', number: 2, origin: 'operator', state: 'running', started_at: '2026-09-19T12:00:03Z', prompt: 'second request' },
+    ],
+    lifecycle: [
+      { id: 'created', kind: 'created', at: '2026-09-19T12:00:00Z' },
+      { id: 'run-started', kind: 'run_started', at: '2026-09-19T12:00:02Z' },
+      { id: 'turn-finished', kind: 'opencode_idle', at: '2026-09-19T12:00:04Z' },
+    ],
+  }
+  const root = document.getElementById('app')
+  await act(async () => render(h(Logs, { activity, ui: state.sessionUI('timeline') }), root))
+  const entries = [...root.querySelectorAll('.timeline > .timeline-event')]
+  assert.deepEqual(entries.map((entry) => entry.dataset.timelineItem === 'request' ? `request:${entry.dataset.requestNumber}` : `event:${entry.dataset.eventKind}`), [
+    'event:created', 'request:1', 'event:run_started', 'request:2', 'event:opencode_idle',
+  ])
+  assert.deepEqual(entries.map((entry) => entry.querySelectorAll('.event-marker').length), [1, 1, 1, 1, 1])
+  assert.equal(root.querySelectorAll('.request-card').length, 2)
+  render(null, root)
 })
 
 test('search and factual filters compose with AND and use session fallback values', () => {
