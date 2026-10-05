@@ -221,6 +221,10 @@ pub struct Session {
     #[serde(rename = "ref")]
     pub base_ref: String,
     pub work_branch: String,
+    #[serde(default)]
+    pub current_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PullRequest>,
     pub model: Option<String>,
     pub opencode_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -249,6 +253,34 @@ pub struct Session {
     pub previous_opencode_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_binding_recovery_event: Option<String>,
+}
+
+impl Session {
+    /// Apply authoritative runtime Git metadata, dropping stale PR state when
+    /// the checked-out branch changes or HEAD becomes detached.
+    pub fn update_git_metadata(
+        &mut self,
+        branch: Option<String>,
+        pull_request: Option<PullRequest>,
+    ) {
+        if branch.is_none() {
+            self.pull_request = None;
+        } else {
+            self.pull_request = pull_request;
+        }
+        self.current_branch = branch;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, alias = "isDraft", skip_serializing_if = "Option::is_none")]
+    pub draft: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -581,6 +613,29 @@ pub fn parse_preview_hostname(hostname: &str, base_domain: &str) -> Option<(Sess
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_metadata_clears_pr_on_branch_change_and_detached_head() {
+        let mut session: Session = serde_json::from_value(serde_json::json!({
+            "id":"session-1", "sandbox":"sandbox", "service":"service", "namespace":"anvil",
+            "opencode_port":4096, "phase":null, "project":"demo", "repository":"https://github.com/acme/repo",
+            "ref":"main", "work_branch":"anvil/session-1", "model":null, "opencode_session_id":null
+        })).unwrap();
+        let pr = PullRequest {
+            number: 1,
+            title: "PR".into(),
+            url: "https://github.com/acme/repo/pull/1".into(),
+            state: Some("open".into()),
+            draft: Some(false),
+        };
+        session.update_git_metadata(Some("agent/one".into()), Some(pr.clone()));
+        assert_eq!(session.pull_request, Some(pr));
+        session.update_git_metadata(Some("agent/two".into()), None);
+        assert_eq!(session.pull_request, None);
+        session.update_git_metadata(None, None);
+        assert_eq!(session.current_branch, None);
+        assert_eq!(session.pull_request, None);
+    }
 
     // ── Project ──────────────────────────────────────────────────────
 

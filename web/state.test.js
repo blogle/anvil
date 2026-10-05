@@ -91,14 +91,33 @@ test('keyed rows and selected factual detail remain mounted across polls', async
   assert.match(row.textContent, /Execution: running/)
   assert.equal(root.querySelectorAll('.session-status-label').length, 0)
   assert.doesNotMatch(root.textContent, /Work state|Ready for review|Done|Needs input/)
+  const withGitMetadata = {
+    ...session,
+    current_branch: 'agent/checked-out',
+    pull_request: { number: 42, title: 'Drawer overview metadata', url: 'https://github.com/acme/repo/pull/42', state: 'open', draft: false },
+  }
   await act(async () => {
-    state.sessions.value = [{ ...session }]
+    state.sessions.value = [withGitMetadata]
     state.activities.value = new Map([[session.id, activity('idle')]])
   })
   assert.equal(root.querySelector('[data-session="demo"]'), row)
   assert.equal(root.querySelector('.detail'), detail)
   assert.match(row.textContent, /Environment: ready/)
   assert.match(row.textContent, /Execution: idle/)
+  assert.equal(root.querySelector('[data-testid="git-branch"]').textContent, 'agent/checked-out')
+  const pullRequestLink = root.querySelector('.git-card-link')
+  assert.ok(pullRequestLink)
+  assert.equal(pullRequestLink.href, withGitMetadata.pull_request.url)
+  assert.match(pullRequestLink.textContent, /PR #42/)
+  const initialBranchLabel = [...root.querySelectorAll('.runtime-item label')].find((label) => label.textContent === 'Initial work branch')
+  assert.equal(initialBranchLabel?.nextElementSibling.textContent, session.work_branch)
+  await act(async () => {
+    state.sessions.value = [{ ...withGitMetadata, current_branch: null, pull_request: null }]
+  })
+  assert.equal(root.querySelector('[data-testid="git-branch"]').textContent, 'No current branch')
+  assert.equal(root.querySelector('.git-card-empty').textContent, 'No pull request')
+  assert.equal(root.querySelector('[data-session="demo"]'), row)
+  assert.equal(root.querySelector('.detail'), detail)
   render(null, root)
 })
 
