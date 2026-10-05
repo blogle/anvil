@@ -1,5 +1,5 @@
 import { h } from 'preact'
-import { activities, api, environmentFor, executionFor, navigate, refresh, selected, sessions, sessionUI } from './state.js'
+import { activities, api, clearSessionFilters, environmentFor, executionFor, navigate, refresh, selected, sessions, sessionUI, visibleSessions } from './state.js'
 import { Logs } from './logs.jsx'
 import { Runtime } from './runtime.jsx'
 
@@ -9,18 +9,24 @@ export function SessionDetail() {
   const id = selected.value
   const session = sessions.value.find((item) => item.id === id)
   const activity = activities.value.get(id)
-  if (!id) return <section class="detail"><div class="detail-inner"><div class="empty"><strong>Select a session</strong>Choose a session to inspect its lifecycle and requests.</div></div></section>
-  if (!session) return <section class="detail"><div class="detail-inner"><div class="loading">Loading session...</div></div></section>
-  return <section class="detail" key={id}><DetailContent session={session} activity={activity}/></section>
+  if (!id) return <aside class="detail" aria-label="Session details"/>
+  if (!session) return <aside class="detail" aria-label="Session details"><div class="detail-inner"><a class="back-link" href="#sessions" onClick={(event) => { event.preventDefault(); navigate(null) }}>← All sessions</a><div class="loading">Loading session...</div></div></aside>
+  const outsideFilters = !visibleSessions.value.some((item) => item.id === id)
+  return <aside class="detail" aria-label="Session details" data-session-detail key={id}><DetailContent session={session} activity={activity} outsideFilters={outsideFilters}/></aside>
 }
 
-function DetailContent({ session, activity }) {
+function DetailContent({ session, activity, outsideFilters }) {
   const ui = sessionUI(session.id)
-  return <div class="detail-inner"><a class="back-link" href={location.pathname} onClick={(event) => { event.preventDefault(); navigate(null) }}>All sessions</a>
+  const tabs = [
+    { id: 'logs', label: 'Logs', content: <Logs activity={activity} ui={ui}/> },
+    { id: 'runtime', label: 'Runtime', content: <Runtime activity={activity} session={session}/> },
+  ]
+  return <div class="detail-inner"><a class="back-link" href="#sessions" onClick={(event) => { event.preventDefault(); navigate(null) }}>← All sessions</a>
+    {outsideFilters && <div class="filter-context" role="status">This session is open but hidden by the current search or runtime filters. <button class="text-button" onClick={clearSessionFilters}>Show all sessions</button></div>}
     <div class="detail-header"><div><div class="eyebrow">Session overview</div><h2>{session.project || 'Anvil'} session</h2><div class="detail-subtitle"><span>{session.project}</span><span>·</span><code>{session.work_branch}</code></div><div class="detail-subtitle factual-state"><span>Environment: <code>{environmentFor(session, activity)}</code></span><span>Execution: <code>{executionFor(session, activity)}</code></span></div></div></div>
     <SessionActions session={session} activity={activity} ui={ui}/>
-    <div class="tabs" role="tablist" aria-label="Session detail"><button id="logs-tab" class={`tab ${ui.tab.value === 'logs' ? 'active' : ''}`} role="tab" aria-selected={ui.tab.value === 'logs'} tabIndex={ui.tab.value === 'logs' ? 0 : -1} aria-controls="logs-panel" onClick={() => ui.tab.value = 'logs'}>Logs</button><button id="runtime-tab" class={`tab ${ui.tab.value === 'runtime' ? 'active' : ''}`} role="tab" aria-selected={ui.tab.value === 'runtime'} tabIndex={ui.tab.value === 'runtime' ? 0 : -1} aria-controls="runtime-panel" onClick={() => ui.tab.value = 'runtime'}>Runtime</button></div>
-    <div id="logs-panel" role="tabpanel" tabIndex="0" aria-labelledby="logs-tab" hidden={ui.tab.value !== 'logs'}><Logs activity={activity} ui={ui}/></div><div id="runtime-panel" role="tabpanel" tabIndex="0" aria-labelledby="runtime-tab" hidden={ui.tab.value !== 'runtime'}><Runtime activity={activity} session={session}/></div>
+    <div class="tabs" role="tablist" aria-label="Session detail">{tabs.map(({ id, label }) => <button key={id} id={`${id}-tab`} class={`tab ${ui.tab.value === id ? 'active' : ''}`} role="tab" aria-selected={ui.tab.value === id} tabIndex={ui.tab.value === id ? 0 : -1} aria-controls={`${id}-panel`} onClick={() => ui.tab.value = id}>{label}</button>)}</div>
+    {tabs.map(({ id, content }) => <div key={id} id={`${id}-panel`} role="tabpanel" tabIndex="0" aria-labelledby={`${id}-tab`} hidden={ui.tab.value !== id}>{content}</div>)}
   </div>
 }
 
