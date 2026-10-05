@@ -176,14 +176,7 @@ pub fn working_tree_diff(dir: &Path, expected_base: Option<&str>) -> Result<Chan
                 .count();
             (Some(count), Some(0))
         } else {
-            let mut numstat_args = vec![
-                "diff",
-                "--numstat",
-                "-z",
-                "--find-renames",
-                &base,
-                "--",
-            ];
+            let mut numstat_args = vec!["diff", "--numstat", "-z", "--find-renames", &base, "--"];
             if let Some(old_path) = old_path.as_deref() {
                 numstat_args.push(old_path);
             }

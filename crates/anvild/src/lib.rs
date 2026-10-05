@@ -1599,10 +1599,9 @@ impl SandboxApi for KubeSandboxApi {
         let client = self.client.clone();
         let config = self.config.clone();
         let id = id.to_owned();
-        ready_then_spawn_base_capture(
-            ready,
-            async move { capture_and_persist_worker_base_revision(client, config, id).await },
-        )
+        ready_then_spawn_base_capture(ready, async move {
+            capture_and_persist_worker_base_revision(client, config, id).await
+        })
         .await
     }
     async fn set_run_record(&self, id: &str, state: &RunRecord) -> Result<(), ServiceError> {
@@ -1706,7 +1705,10 @@ fn files_response_without_recorded_base(helper_result: Option<&Value>) -> Value 
 
 fn validate_worker_diff_base(result: Value, expected_base: &str) -> Value {
     if result["status"] == "ready"
-        && result.pointer("/diff/base_revision").and_then(Value::as_str) != Some(expected_base)
+        && result
+            .pointer("/diff/base_revision")
+            .and_then(Value::as_str)
+            != Some(expected_base)
     {
         json!({
             "status": "unavailable",
@@ -1767,8 +1769,8 @@ async fn capture_and_persist_worker_base_revision(client: Client, config: Config
                 .get(&format!("anvil-{persist_id}"))
                 .await
                 .map_err(|error| error.to_string())?;
-            let record = sandbox_record_from(&object, &persist_config)
-                .map_err(|error| error.to_string())?;
+            let record =
+                sandbox_record_from(&object, &persist_config).map_err(|error| error.to_string())?;
             if record.session.base_revision.is_some() {
                 return Ok(());
             }
@@ -1796,15 +1798,11 @@ async fn kube_sandbox_record(
     config: &Config,
     id: &str,
 ) -> Result<SandboxRecord, String> {
-    Api::<DynamicObject>::namespaced_with(
-        client.clone(),
-        &config.namespace,
-        &sandbox_resource(),
-    )
-    .get(&format!("anvil-{id}"))
-    .await
-    .map_err(|error| error.to_string())
-    .and_then(|object| sandbox_record_from(&object, config).map_err(|error| error.to_string()))
+    Api::<DynamicObject>::namespaced_with(client.clone(), &config.namespace, &sandbox_resource())
+        .get(&format!("anvil-{id}"))
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|object| sandbox_record_from(&object, config).map_err(|error| error.to_string()))
 }
 
 async fn retry_worker_base_capture<Capture, CaptureFuture, Persist, PersistFuture>(
@@ -9908,11 +9906,7 @@ mod tests {
             move || {
                 let attempt = attempts.fetch_add(1, Ordering::SeqCst);
                 let unavailable_tx = unavailable_tx.take();
-                let recover_rx = if attempt > 0 {
-                    recover_rx.take()
-                } else {
-                    None
-                };
+                let recover_rx = if attempt > 0 { recover_rx.take() } else { None };
                 async move {
                     if attempt == 0 {
                         let _ = unavailable_tx.expect("first attempt signal").send(());
@@ -9968,7 +9962,10 @@ mod tests {
 
     #[test]
     fn files_rejects_worker_diff_for_a_mismatched_pinned_base() {
-        assert_eq!(files_response_without_recorded_base(None)["status"], "pending");
+        assert_eq!(
+            files_response_without_recorded_base(None)["status"],
+            "pending"
+        );
         assert_eq!(
             files_response_without_recorded_base(Some(&json!({
                 "status": "unavailable",
