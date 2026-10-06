@@ -98,6 +98,8 @@ let
   '';
   sandboxEntrypoint = pkgs.writeShellScriptBin "sandbox-entrypoint"
     (builtins.readFile sandboxEntrypointSource);
+  gitDiffServer = pkgs.writeTextDir "bin/anvil-git-diff-server.mjs"
+    (builtins.readFile ./../runtime/git-diff-server.mjs);
   sandboxMutableHome = pkgs.runCommand "anvil-sandbox-home" {} ''
     mkdir -p "$out/home/anvil"
   '';
@@ -123,7 +125,7 @@ let
     pathsToLink = [ "/bin" ];
   };
   sandboxRuntimeFiles = [
-    nixConf credentialHelper sessionCapabilityHelper gitIdentity ghWrapper sandboxUsrBin sandboxBin
+    nixConf credentialHelper sessionCapabilityHelper gitIdentity ghWrapper sandboxUsrBin sandboxBin gitDiffServer
   ] ++ userFiles ++ [ sandboxMutableHome sandboxMutableTmp ];
   sandboxBaseLayer = nix2containerPkgs.nix2container.buildLayer {
     deps = sandboxBaseTools;

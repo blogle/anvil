@@ -220,6 +220,10 @@ pub struct Session {
     pub repository: String,
     #[serde(rename = "ref")]
     pub base_ref: String,
+    /// Exact commit checked out for this worker's initial workspace. Legacy
+    /// sessions have no value because their original checkout cannot be proven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_revision: Option<String>,
     pub work_branch: String,
     #[serde(default)]
     pub current_branch: Option<String>,
@@ -637,6 +641,26 @@ mod tests {
         session.update_git_metadata(None, None);
         assert_eq!(session.current_branch, None);
         assert_eq!(session.pull_request, None);
+    }
+
+    #[test]
+    fn legacy_session_without_base_revision_remains_explicitly_unknown() {
+        let legacy = serde_json::json!({
+            "id": "demo-12345678",
+            "sandbox": "anvil-demo-12345678",
+            "service": "",
+            "namespace": "local",
+            "opencode_port": 4096,
+            "phase": null,
+            "project": "demo",
+            "repository": "https://example.com/demo.git",
+            "ref": "main",
+            "work_branch": "anvil/demo-12345678",
+            "model": null,
+            "opencode_session_id": null
+        });
+        let session: Session = serde_json::from_value(legacy).unwrap();
+        assert_eq!(session.base_revision, None);
     }
 
     // ── Project ──────────────────────────────────────────────────────

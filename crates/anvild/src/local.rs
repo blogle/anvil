@@ -565,6 +565,22 @@ impl SandboxApi for LocalSandboxApi {
         Ok(state.record.clone())
     }
 
+    async fn files_diff(&self, id: &str) -> Result<serde_json::Value, ServiceError> {
+        let sessions = self.sessions.lock().await;
+        let state = sessions.get(id).ok_or(ServiceError::NotFound)?;
+        let project = state
+            .directory
+            .join("home/workspace")
+            .join(&state.record.session.project);
+        match super::git_diff::working_tree_diff(
+            &project,
+            state.record.session.base_revision.as_deref(),
+        ) {
+            Ok(diff) => Ok(serde_json::json!({"status":"ready","diff":diff})),
+            Err(message) => Ok(serde_json::json!({"status":"unavailable","message":message})),
+        }
+    }
+
     async fn create(
         &self,
         id: &str,
@@ -614,6 +630,41 @@ impl SandboxApi for LocalSandboxApi {
                     String::from_utf8_lossy(&output.stderr)
                 )));
             }
+            let base_output = Command::new("git")
+                .args([
+                    "-C",
+                    project.to_str().unwrap(),
+                    "rev-parse",
+                    "--verify",
+                    "HEAD",
+                ])
+                .output()
+                .await
+                .map_err(local_error)?;
+            if !base_output.status.success() {
+                return Err(ServiceError::Kubernetes(
+                    "unable to identify worker base revision".into(),
+                ));
+            }
+            let base_revision = String::from_utf8_lossy(&base_output.stdout)
+                .trim()
+                .to_owned();
+            let pin = Command::new("git")
+                .args([
+                    "-C",
+                    project.to_str().unwrap(),
+                    "update-ref",
+                    "refs/anvil/session-base",
+                    &base_revision,
+                ])
+                .status()
+                .await
+                .map_err(local_error)?;
+            if !pin.success() {
+                return Err(ServiceError::Kubernetes(
+                    "unable to pin worker base revision".into(),
+                ));
+            }
             let session_id = SessionId::parse(id)
                 .ok_or_else(|| ServiceError::Invalid("invalid session ID".into()))?;
             let work_branch = branch_name(&session_id);
@@ -647,6 +698,7 @@ impl SandboxApi for LocalSandboxApi {
                 project: request.project.clone(),
                 repository: request.repository.clone(),
                 base_ref: request.base_ref.clone(),
+                base_revision: Some(base_revision),
                 work_branch,
                 current_branch: None,
                 pull_request: None,
@@ -1252,6 +1304,59 @@ mod tests {
         restarted.delete(&session.id).await.unwrap();
         assert!(!directory.exists());
         assert!(!pid_is_alive(third_pid));
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn local_diff_uses_recorded_checkout_after_upstream_moves_and_includes_worktree() {
+        let fixture = Fixture::new();
+        let api = fixture.api();
+        let session = api
+            .create(
+                "diff-12345678",
+                &fixture.request("demo"),
+                &[],
+                &initial_run_record(),
+            )
+            .await
+            .unwrap();
+        let base = session
+            .base_revision
+            .clone()
+            .expect("creation records exact checkout SHA");
+        std::fs::write(fixture.repo.join("target.txt"), "upstream movement\n").unwrap();
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&fixture.repo)
+            .args(["add", "target.txt"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&fixture.repo)
+            .args(["commit", "-m", "upstream movement"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        let project = fixture.runtime.join("diff-12345678/home/workspace/demo");
+        std::fs::write(project.join("target.txt"), "worker change\n").unwrap();
+        std::fs::write(project.join("uncommitted.txt"), "working tree\n").unwrap();
+        let result = api.files_diff("diff-12345678").await.unwrap();
+        assert_eq!(result["status"], "ready");
+        assert_eq!(result["diff"]["base_revision"], base);
+        let files = result["diff"]["files"].as_array().unwrap();
+        assert!(files.iter().any(|file| file["path"] == "target.txt"
+            && file["diff"].as_str().unwrap().contains("worker change")));
+        assert!(files
+            .iter()
+            .any(|file| file["path"] == "uncommitted.txt" && file["status"] == "added"));
+        assert!(!files.iter().any(|file| file["diff"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("upstream movement")));
+        api.delete("diff-12345678").await.unwrap();
         fixture.cleanup();
     }
 

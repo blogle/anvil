@@ -1,5 +1,6 @@
 //! HTTP control plane for Anvil Kubernetes sandboxes.
 
+mod git_diff;
 mod github;
 mod local;
 pub mod store;
@@ -563,6 +564,12 @@ struct OpenCodeAuthorization {
 #[async_trait]
 pub trait SandboxApi: Send + Sync + 'static {
     async fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError>;
+    async fn files_diff(&self, _id: &str) -> Result<Value, ServiceError> {
+        Ok(json!({
+            "status": "unavailable",
+            "message": "Files are unavailable for this sandbox backend."
+        }))
+    }
     async fn create(
         &self,
         id: &str,
@@ -672,6 +679,9 @@ impl SandboxApi for MaterializingSandboxApi {
             current_records.push(current);
         }
         Ok(current_records)
+    }
+    async fn files_diff(&self, id: &str) -> Result<Value, ServiceError> {
+        self.inner.files_diff(id).await
     }
     async fn get(&self, id: &str) -> Result<SandboxRecord, ServiceError> {
         let lock = self.lock(id);
@@ -1286,6 +1296,7 @@ fn session_from(o: &DynamicObject, config: &Config) -> Result<Session, ServiceEr
             .get(&annotation_key(config, "base-ref"))
             .cloned()
             .unwrap_or_default(),
+        base_revision: a.get(&annotation_key(config, "base-revision")).cloned(),
         work_branch: a
             .get(&annotation_key(config, "work-branch"))
             .cloned()
@@ -1505,6 +1516,7 @@ impl SandboxApi for KubeSandboxApi {
             project: r.project.clone(),
             repository: r.repository.clone(),
             base_ref: r.base_ref.clone(),
+            base_revision: None,
             work_branch: branch_name(&SessionId::parse(id).unwrap()),
             current_branch: None,
             pull_request: None,
@@ -1555,6 +1567,38 @@ impl SandboxApi for KubeSandboxApi {
         .map_err(|e| ServiceError::Kubernetes(e.to_string()))
         .and_then(|object| sandbox_record_from(&object, &self.config))
     }
+    async fn files_diff(&self, id: &str) -> Result<Value, ServiceError> {
+        let record = self.get(id).await?;
+        let host = if record.session.service.is_empty() {
+            format!("anvil-{id}")
+        } else {
+            record.session.service
+        };
+        let client = reqwest::Client::new();
+        let Some(expected_base) = record.session.base_revision.as_deref() else {
+            let helper_result = match client
+                .get(format!("http://{host}:4097/v1/base"))
+                .timeout(self.config.request_timeout)
+                .send()
+                .await
+            {
+                Ok(response) => response.json::<Value>().await.ok(),
+                Err(_) => None,
+            };
+            return Ok(files_response_without_recorded_base(helper_result.as_ref()));
+        };
+        let response = client
+            .get(format!("http://{host}:4097/v1/diff"))
+            .timeout(self.config.request_timeout)
+            .send()
+            .await
+            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+        let result: Value = response
+            .json()
+            .await
+            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+        Ok(validate_worker_diff_base(result, expected_base))
+    }
     async fn set_opencode_session(&self, id: &str, oc: &str) -> Result<(), ServiceError> {
         let mut annotations = serde_json::Map::new();
         annotations.insert(
@@ -1579,8 +1623,14 @@ impl SandboxApi for KubeSandboxApi {
             annotation_key(&self.config, "ready-at"),
             Value::String(at.to_owned()),
         );
-        self.patch(id, json!({"metadata":{"annotations":annotations}}))
-            .await
+        let ready = self.patch(id, json!({"metadata":{"annotations":annotations}}));
+        let client = self.client.clone();
+        let config = self.config.clone();
+        let id = id.to_owned();
+        ready_then_spawn_base_capture(ready, async move {
+            capture_and_persist_worker_base_revision(client, config, id).await
+        })
+        .await
     }
     async fn set_git_metadata(
         &self,
@@ -1661,6 +1711,201 @@ impl SandboxApi for KubeSandboxApi {
         self.patch(id, json!({"metadata":{"annotations":annotations}}))
             .await
     }
+    async fn recover_startup(&self) -> Result<(), ServiceError> {
+        if let Ok(records) = self.list().await {
+            for record in records {
+                if record.session.ready_at.is_some() && record.session.base_revision.is_none() {
+                    let client = self.client.clone();
+                    let config = self.config.clone();
+                    let id = record.session.id;
+                    tokio::spawn(async move {
+                        capture_and_persist_worker_base_revision(client, config, id).await;
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn pending_files_diff() -> Value {
+    json!({
+        "status": "pending",
+        "message": "Waiting for the worker's exact base revision to be recorded."
+    })
+}
+
+fn files_response_without_recorded_base(helper_result: Option<&Value>) -> Value {
+    if helper_result.is_some_and(|result| {
+        result["status"] == "unavailable"
+            && result["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("does not match the pinned workspace base"))
+    }) {
+        json!({
+            "status": "unavailable",
+            "message": "The worker's recorded base does not match its pinned workspace base."
+        })
+    } else {
+        pending_files_diff()
+    }
+}
+
+fn validate_worker_diff_base(result: Value, expected_base: &str) -> Value {
+    if result["status"] == "ready"
+        && result
+            .pointer("/diff/base_revision")
+            .and_then(Value::as_str)
+            != Some(expected_base)
+    {
+        json!({
+            "status": "unavailable",
+            "message": "The worker diff base does not match the session's recorded base revision."
+        })
+    } else {
+        result
+    }
+}
+
+async fn ready_then_spawn_base_capture<Ready, Capture>(
+    ready: Ready,
+    capture: Capture,
+) -> Result<(), ServiceError>
+where
+    Ready: std::future::Future<Output = Result<(), ServiceError>>,
+    Capture: std::future::Future<Output = ()> + Send + 'static,
+{
+    ready.await?;
+    tokio::spawn(capture);
+    Ok(())
+}
+
+async fn capture_and_persist_worker_base_revision(client: Client, config: Config, id: String) {
+    let http_client = reqwest::Client::new();
+    let capture_client = client.clone();
+    let capture_config = config.clone();
+    let capture_id = id.clone();
+    let persist_client = client;
+    let persist_config = config;
+    let persist_id = id;
+    retry_worker_base_capture(
+        || async {
+            let record = kube_sandbox_record(&capture_client, &capture_config, &capture_id).await?;
+            if let Some(revision) = record.session.base_revision {
+                return Ok(revision);
+            }
+            let host = if record.session.service.is_empty() {
+                format!("anvil-{}", record.session.id)
+            } else {
+                record.session.service
+            };
+            capture_worker_base_revision(
+                &http_client,
+                &format!("http://{host}:4097/v1/base"),
+                1,
+                Duration::ZERO,
+            )
+            .await
+        },
+        |revision| async {
+            let api = Api::<DynamicObject>::namespaced_with(
+                persist_client.clone(),
+                &persist_config.namespace,
+                &sandbox_resource(),
+            );
+            let object = api
+                .get(&format!("anvil-{persist_id}"))
+                .await
+                .map_err(|error| error.to_string())?;
+            let record =
+                sandbox_record_from(&object, &persist_config).map_err(|error| error.to_string())?;
+            if record.session.base_revision.is_some() {
+                return Ok(());
+            }
+            let mut annotations = serde_json::Map::new();
+            annotations.insert(
+                annotation_key(&persist_config, "base-revision"),
+                Value::String(revision),
+            );
+            api.patch(
+                &format!("anvil-{persist_id}"),
+                &PatchParams::default(),
+                &Patch::Merge(json!({"metadata":{"annotations":annotations}})),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+async fn kube_sandbox_record(
+    client: &Client,
+    config: &Config,
+    id: &str,
+) -> Result<SandboxRecord, String> {
+    Api::<DynamicObject>::namespaced_with(client.clone(), &config.namespace, &sandbox_resource())
+        .get(&format!("anvil-{id}"))
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|object| sandbox_record_from(&object, config).map_err(|error| error.to_string()))
+}
+
+async fn retry_worker_base_capture<Capture, CaptureFuture, Persist, PersistFuture>(
+    mut capture: Capture,
+    mut persist: Persist,
+    retry_delay: Duration,
+) where
+    Capture: FnMut() -> CaptureFuture,
+    CaptureFuture: std::future::Future<Output = Result<String, String>>,
+    Persist: FnMut(String) -> PersistFuture,
+    PersistFuture: std::future::Future<Output = Result<(), String>>,
+{
+    let max_retry_delay = Duration::from_secs(60);
+    let mut retry_delay = retry_delay.max(Duration::from_millis(1));
+    loop {
+        if let Ok(revision) = capture().await {
+            if persist(revision).await.is_ok() {
+                return;
+            }
+        }
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = retry_delay.saturating_mul(2).min(max_retry_delay);
+    }
+}
+
+async fn capture_worker_base_revision(
+    client: &reqwest::Client,
+    url: &str,
+    attempts: usize,
+    retry_delay: Duration,
+) -> Result<String, String> {
+    for attempt in 0..attempts {
+        if let Ok(response) = client.get(url).timeout(Duration::from_secs(2)).send().await {
+            if response.status().is_success() {
+                if let Ok(body) = response.json::<Value>().await {
+                    if body["status"] == "ready" {
+                        if let Some(revision) = body["base_revision"].as_str() {
+                            if matches!(revision.len(), 40 | 64)
+                                && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            {
+                                return Ok(revision.to_ascii_lowercase());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(retry_delay).await;
+        }
+    }
+    Err(
+        "worker became ready without publishing its recorded base revision after retries; refusing to mark the session as a legacy unknown-base session"
+            .into(),
+    )
 }
 impl KubeSandboxApi {
     async fn patch(&self, id: &str, v: Value) -> Result<(), ServiceError> {
@@ -1957,6 +2202,7 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
         .route("/v1/sessions/:id/rebind", post(rebind))
         .route("/v1/sessions/:id/status", get(status))
         .route("/v1/sessions/:id/diff", get(diff))
+        .route("/v1/sessions/:id/files", get(files_diff))
         .route("/v1/sessions/:id/abort", post(abort))
         .route("/v1/sessions/:id/suspend", post(suspend))
         .route("/v1/sessions/:id/resume", post(resume))
@@ -5246,6 +5492,12 @@ async fn diff(
     }
     Ok(Json(result))
 }
+async fn files_diff(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ServiceError> {
+    Ok(Json(state.kube.files_diff(&id).await?))
+}
 async fn abort(p: Path<String>, s: State<AppState>) -> Result<Json<Value>, ServiceError> {
     proxy(p, s, "abort", reqwest::Method::POST, None).await
 }
@@ -8158,6 +8410,7 @@ mod tests {
             project: "demo".into(),
             repository: "https://github.com/example/demo.git".into(),
             base_ref: "main".into(),
+            base_revision: None,
             work_branch: "anvil/demo-12345678".into(),
             current_branch: None,
             pull_request: None,
@@ -9856,5 +10109,143 @@ mod tests {
         assert_eq!(body["theme"], "dark");
         assert_eq!(body["provider"]["openai"]["api_key"], "[redacted]");
         assert_eq!(body["nested"][0]["access_token"], "[redacted]");
+    }
+
+    async fn base_available_after_startup(
+        State(attempts): State<Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> Json<Value> {
+        let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if attempt < 2 {
+            Json(json!({"status":"unavailable","message":"worker startup"}))
+        } else {
+            Json(
+                json!({"status":"ready","base_revision":"0123456789012345678901234567890123456789"}),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_base_capture_retries_until_worker_endpoint_is_listening() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/base", get(base_available_after_startup))
+            .with_state(attempts.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let revision = capture_worker_base_revision(
+            &reqwest::Client::new(),
+            &format!("http://{address}/v1/base"),
+            5,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(revision, "0123456789012345678901234567890123456789");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ready_session_stays_available_while_base_capture_retries_in_background() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let base = Arc::new(Mutex::new(None::<String>));
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (unavailable_tx, unavailable_rx) = tokio::sync::oneshot::channel();
+        let (recover_tx, recover_rx) = tokio::sync::oneshot::channel();
+        let mut unavailable_tx = Some(unavailable_tx);
+        let mut recover_rx = Some(recover_rx);
+        let base_for_persist = base.clone();
+        let retry = retry_worker_base_capture(
+            move || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                let unavailable_tx = unavailable_tx.take();
+                let recover_rx = if attempt > 0 { recover_rx.take() } else { None };
+                async move {
+                    if attempt == 0 {
+                        let _ = unavailable_tx.expect("first attempt signal").send(());
+                        return Err("helper unavailable during startup".into());
+                    }
+                    if let Some(recover_rx) = recover_rx {
+                        let _ = recover_rx.await;
+                    }
+                    Ok("0123456789012345678901234567890123456789".into())
+                }
+            },
+            move |revision| {
+                let base = base_for_persist.clone();
+                async move {
+                    *base.lock().unwrap() = Some(revision);
+                    Ok(())
+                }
+            },
+            Duration::from_millis(1),
+        );
+        let ready_for_mark = ready.clone();
+        ready_then_spawn_base_capture(
+            async move {
+                ready_for_mark.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            retry,
+        )
+        .await
+        .unwrap();
+
+        assert!(ready.load(Ordering::SeqCst));
+        unavailable_rx.await.unwrap();
+        assert_eq!(pending_files_diff()["status"], "pending");
+        assert!(base.lock().unwrap().is_none());
+
+        recover_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if base.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("background retry should persist the recovered exact base");
+        assert_eq!(
+            base.lock().unwrap().as_deref(),
+            Some("0123456789012345678901234567890123456789")
+        );
+    }
+
+    #[test]
+    fn files_rejects_worker_diff_for_a_mismatched_pinned_base() {
+        assert_eq!(
+            files_response_without_recorded_base(None)["status"],
+            "pending"
+        );
+        assert_eq!(
+            files_response_without_recorded_base(Some(&json!({
+                "status": "unavailable",
+                "message": "Recorded worker base revision does not match the pinned workspace base."
+            })))["status"],
+            "unavailable"
+        );
+        let expected = "0123456789012345678901234567890123456789";
+        let wrong = "ffffffffffffffffffffffffffffffffffffffff";
+        let result = validate_worker_diff_base(
+            json!({"status":"ready","diff":{"base_revision":wrong,"files":[]}}),
+            expected,
+        );
+        assert_eq!(result["status"], "unavailable");
+        assert!(result["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not match"));
+        assert_eq!(
+            validate_worker_diff_base(
+                json!({"status":"ready","diff":{"base_revision":expected,"files":[]}}),
+                expected
+            )["status"],
+            "ready"
+        );
     }
 }
