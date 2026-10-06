@@ -16,6 +16,7 @@ const detailModule = await import('./src/detail.jsx')
 const { Logs } = await import('./src/logs.jsx')
 const { AppShell } = await import('./src/app.jsx')
 const state = await import('./src/state.js')
+const { openCodeConversationUrl, openCodeLinkState } = await import('./src/opencode-link.js')
 
 const session = { id: 'demo', project: 'Demo', work_branch: 'feature/search', environment_state: 'ready', execution_state: 'idle', created_at: '2026-09-19T11:00:00Z', sandbox: 'sandbox', repository: 'https://example.test/repo', base_ref: 'main' }
 const activity = (execution_state = 'running') => ({
@@ -36,6 +37,18 @@ test('elapsed display and explicit Sessions routes stay deterministic', () => {
   assert.equal(state.routeFromHash('#session/demo%2Fdrawer'), 'demo/drawer')
   assert.equal(state.routeFor(null), '#sessions')
   assert.equal(state.routeFor('demo/drawer'), '#session/demo%2Fdrawer')
+})
+
+test('OpenCode links target the encoded server conversation and distinguish missing from invalid metadata', () => {
+  const serverKey = btoa('https://opencode.example.test').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')
+  assert.equal(openCodeConversationUrl('https://opencode.example.test/', 'ses/one?#'), `https://opencode.example.test/server/${serverKey}/session/ses%2Fone%3F%23`)
+  assert.equal(openCodeConversationUrl('file:///tmp/opencode', 'ses-1'), null)
+  assert.deepEqual(openCodeLinkState({ opencode_session_id: null }, { opencode_url: 'https://opencode.example.test' }), {
+    url: null, label: 'Open in OpenCode (waiting for conversation)', disabled: true,
+  })
+  assert.deepEqual(openCodeLinkState({ opencode_session_id: 'ses-1' }, { opencode_url: 'not a URL' }), {
+    url: null, label: 'Open in OpenCode (unavailable)', disabled: true,
+  })
 })
 
 test('timeline preserves full timestamp precision and authoritative equal-time ordering', () => {
