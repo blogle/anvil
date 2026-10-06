@@ -30,7 +30,7 @@ Session controller routes are:
 | `POST` | `/v1/sessions/{id}/messages` | Send steering to the current OpenCode session |
 | `GET` | `/v1/sessions/{id}/messages` | Read OpenCode messages |
 | `GET` | `/v1/sessions/{id}/status` | Read environment, execution, run, and binding state |
-| `GET` | `/v1/sessions/{id}/activity` | Read the normalized dashboard/activity model |
+| `GET` | `/v1/sessions/{id}/activity` | Read normalized state; `?include_events=true` adds bounded OpenCode Activity events |
 | `GET` | `/v1/sessions/{id}/files` | Read worker changes against its recorded base revision |
 
 The diff response is `{ "status": "ready", "diff": { "base_revision": "<sha>",
@@ -108,6 +108,17 @@ than rebuilding it from the full conversation on every read. The snapshot uses
 Anvil-owned `schema_version`, execution, observer-health, operation, timestamp,
 wait, and agent-authored todo fields; todo data is planning telemetry, never a
 completion estimate. Raw OpenCode event payloads are not part of this contract.
+When `include_events=true`, OpenCode's durable message API is requested with a
+100-message limit. Anvil retains the newest messages in chronological order,
+projects user-visible text and tool events, redacts credential-shaped data on the
+server, and caps the combined Activity timeline at 500 events. The optional
+`event_window` response object reports the per-page message limit and count, the
+merged number of loaded messages, the OpenCode `next_cursor`, and whether the
+500-event projection cap dropped entries.
+Pass `before=<next_cursor>` with `include_events=true` to load an older page. Each
+poll reads only the latest page; older pages load on demand. Consumers must
+preserve the cursor/truncation metadata rather than interpreting a bounded page
+as a complete transcript. Hidden reasoning parts are excluded.
 The watcher reconciles OpenCode status and the exact bound current session on
 startup/reconnect and uses message identity only to correlate an active Anvil
 run. No model tool call is required for lifecycle transitions.
