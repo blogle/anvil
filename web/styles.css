@@ -136,6 +136,11 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .prompt { overflow: hidden; max-height: 116px; margin: 0; padding: 13px; border: 1px solid var(--border); border-radius: 6px; background: var(--background-deep); color: #d8e3f3; font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 12px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 .prompt.expanded { max-height: none; }
 .prompt-toggle { display: block; width: max-content; min-width: 96px; border: 0; padding: 7px 0 0; cursor: pointer; color: var(--accent); background: none; font-size: 11px; }
+.file-diffs { display: grid; gap: 12px; }
+.file-diff { overflow: hidden; border: 1px solid var(--border); border-radius: 7px; background: var(--background-deep); }
+.file-diff-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 13px; border-bottom: 1px solid var(--border); color: var(--text-muted); font-size: 12px; }
+.file-diff-heading strong { overflow-wrap: anywhere; color: var(--text-primary); font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-weight: 500; }
+.file-diff-content { overflow: auto; max-height: 560px; margin: 0; padding: 13px; color: #d8e3f3; font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 11px; line-height: 1.55; white-space: pre; }
 .request-info { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 13px; color: var(--text-muted); font-size: 11px; }
 .request-info code { color: var(--text-secondary); }
 .failure { margin-top: 13px; color: var(--danger); font-size: 12px; }
