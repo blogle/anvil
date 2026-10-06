@@ -31,10 +31,18 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
   }
   const server = createServer(async (request, response) => {
     const url = new URL(request.url, 'http://localhost')
+    if (url.pathname === '/__test/recover-selected' && request.method === 'POST') {
+      sessions[0].opencode_session_id = 'ses/recovered?#1'
+      response.writeHead(204); response.end(); return
+    }
     if (url.pathname === '/__test/change-selected' && request.method === 'POST') {
       selectedState.execution = 'running'
       selectedState.changedAt = new Date().toISOString()
       selectedState.requestCount = 3
+      response.writeHead(204); response.end(); return
+    }
+    if (url.pathname === '/__test/rebind-selected' && request.method === 'POST') {
+      sessions[0].opencode_session_id = 'ses/rebound'
       response.writeHead(204); response.end(); return
     }
     if (url.pathname === '/v1/sessions') {
@@ -93,6 +101,23 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
     await row.click()
     await page.waitForFunction(() => location.hash === '#session/demo')
     assert.equal(await detail.locator('h2').textContent(), 'Demo session')
+    const unavailableOpenCode = detail.locator('[data-opencode-disabled]')
+    assert.equal(await unavailableOpenCode.isDisabled(), true)
+    assert.match(await unavailableOpenCode.getAttribute('aria-label'), /waiting for conversation/)
+    assert.equal(await detail.locator('[data-opencode-link]').count(), 0, 'missing conversation metadata never links to the OpenCode root')
+    const recoveredActivity = page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/sessions/demo/activity')
+    await page.evaluate("fetch('/__test/recover-selected', {method:'POST'})")
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+    await (await recoveredActivity).finished()
+    const recoveredLink = detail.locator('[data-opencode-link]')
+    await recoveredLink.waitFor()
+    const expectedServerKey = btoa('https://opencode.example.test').replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')
+    assert.equal(await recoveredLink.getAttribute('href'), `https://opencode.example.test/server/${expectedServerKey}/session/ses%2Frecovered%3F%231`)
+    const reboundActivity = page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/sessions/demo/activity')
+    await page.evaluate("fetch('/__test/rebind-selected', {method:'POST'})")
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+    await (await reboundActivity).finished()
+    await page.waitForFunction(() => document.querySelector('[data-opencode-link]')?.getAttribute('href')?.endsWith('/session/ses%2Frebound'))
     assert.match(await detail.locator('.factual-state').textContent(), /Environment: ready.*Execution: idle/)
     assert.match(await detail.locator('#logs-panel').textContent(), /Lifecycle & requests/)
     assert.match(await detail.locator('#runtime-panel').textContent(), /Runtime details/)
