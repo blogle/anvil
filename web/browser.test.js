@@ -19,7 +19,6 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
       session: { ...session, environment_state: environment, execution_state: execution },
       environment_state: environment,
       execution_state: execution,
-      work_state_changed_at: id === 'demo' ? selectedState.changedAt : session.created_at,
       attach_command: `anvilctl sessions attach ${id}`,
       preview_url: 'https://preview.example.test',
       opencode_url: 'https://opencode.example.test',
@@ -27,6 +26,8 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
         ? [{ id: 'created', kind: 'created', at: session.created_at }, { id: 'ready', kind: 'ready', at: '2026-09-19T11:01:00Z', detail: 'Sandbox ready' }, { id: 'run-started', kind: 'run_started', at: '2026-09-19T11:58:30Z' }, { id: 'turn-finished', kind: 'opencode_idle', at: '2026-09-19T12:01:00Z' }]
         : [{ id: 'created', kind: 'created', at: session.created_at }, { id: 'ready', kind: 'ready', at: '2026-09-19T11:01:00Z', detail: 'Sandbox ready' }],
       requests: Array.from({ length: requestCount }, (_, index) => ({ id: `request-${index + 1}`, number: index + 1, origin: 'operator', state: index === 0 ? 'completed' : 'running', started_at: id === 'demo' ? ['2026-09-19T11:58:00Z', '2026-09-19T11:59:00Z', '2026-09-19T12:02:00Z'][index] : session.created_at, completed_at: index === 0 ? '2026-09-19T11:58:20Z' : undefined, last_activity_at: selectedState.changedAt, prompt: index === 0 ? `Representative prompt ${index + 1}: ${'inspect session '.repeat(45)}` : `Follow-up request ${index + 1}` })),
+      events: [{ id: `${id}:prompt`, at: '2026-09-19T11:58:00Z', kind: 'prompt', title: 'You', detail: 'Review the authentication flow.' }, { id: `${id}:tool`, at: '2026-09-19T11:58:30Z', kind: 'tool', tool: 'read', title: 'src/auth.js', detail: '24 lines read', status: 'completed' }, { id: `${id}:agent`, at: '2026-09-19T11:59:00Z', kind: 'message', title: 'Agent', detail: 'The session helper owns authentication.' }],
+      event_window: { message_limit: 100, returned_messages: 3, loaded_messages: 3, next_cursor: null, truncated: false },
     }
   }
   const server = createServer(async (request, response) => {
@@ -51,6 +52,9 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
     const activityMatch = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/activity$/)
     if (activityMatch) {
       response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify(activityFor(decodeURIComponent(activityMatch[1])))); return
+    }
+    if (url.pathname === '/v1/sessions/demo/files') {
+      response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify({ status: 'ready', diff: { base_revision: 'abc123', files: [], truncated: false } })); return
     }
     const asset = url.pathname === '/' || !url.pathname.startsWith('/assets/') ? 'index.html' : url.pathname.slice(1)
     try {
@@ -101,6 +105,10 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
     await row.click()
     await page.waitForFunction(() => location.hash === '#session/demo')
     assert.equal(await detail.locator('h2').textContent(), 'Demo session')
+    await detail.locator('#activity-panel [data-event-id="demo:prompt"]').waitFor()
+    assert.equal(await detail.locator('#activity-tab').getAttribute('aria-selected'), 'true')
+    assert.deepEqual(await detail.locator('#activity-panel [data-event-id]').evaluateAll((entries) => entries.map((entry) => entry.dataset.eventId)), ['demo:prompt', 'demo:tool', 'demo:agent'])
+    assert.equal((await detail.locator('#activity-panel').textContent()).includes('Sandbox ready'), false)
     const unavailableOpenCode = detail.locator('[data-opencode-disabled]')
     assert.equal(await unavailableOpenCode.isDisabled(), true)
     assert.match(await unavailableOpenCode.getAttribute('aria-label'), /waiting for conversation/)
@@ -119,7 +127,17 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
     await (await reboundActivity).finished()
     await page.waitForFunction(() => document.querySelector('[data-opencode-link]')?.getAttribute('href')?.endsWith('/session/ses%2Frebound'))
     assert.match(await detail.locator('.factual-state').textContent(), /Environment: ready.*Execution: idle/)
-    assert.match(await detail.locator('#logs-panel').textContent(), /Lifecycle & requests/)
+    await detail.locator('#activity-panel [data-event-id="demo:prompt"]').waitFor()
+    assert.equal(await detail.locator('#activity-tab').getAttribute('aria-selected'), 'true')
+    assert.deepEqual(await detail.locator('#activity-panel [data-event-id]').evaluateAll((rows) => rows.map((event) => event.dataset.eventId)), ['demo:prompt', 'demo:tool', 'demo:agent'])
+    assert.equal((await detail.locator('#activity-panel').textContent()).includes('Sandbox ready'), false)
+    assert.deepEqual(await detail.locator('.tabs [role="tab"]').allTextContents(), ['Activity', 'Trail', 'Runtime', 'Files'])
+    await detail.locator('#files-tab').click()
+    await detail.locator('#files-panel').getByText('No file changes').waitFor()
+    await detail.locator('#activity-tab').click()
+    assert.equal(await detail.locator('#activity-panel').isVisible(), true)
+    await detail.locator('#logs-tab').click()
+    assert.match(await detail.locator('#logs-panel').textContent(), /Trail · Lifecycle & requests/)
     assert.match(await detail.locator('#runtime-panel').textContent(), /Runtime details/)
     const timeline = detail.locator('.timeline > .timeline-event')
     assert.deepEqual(await timeline.evaluateAll((entries) => entries.map((entry) => entry.dataset.timelineItem === 'request' ? `request:${entry.dataset.requestNumber}` : `event:${entry.dataset.eventKind}`)), [
@@ -136,7 +154,7 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
     const detailScroll = await detail.evaluate((element) => { element.querySelector('.detail-inner').style.minHeight = '1400px'; element.scrollTop = 120; return element.scrollTop })
     assert.equal(detailScroll, 120)
     await page.evaluate(() => {
-      window.initialNodes = { row: document.querySelector('[data-session="demo"]'), detail: document.querySelector('.detail'), shell: document.querySelector('.detail-inner'), header: document.querySelector('.detail-header'), factual: document.querySelector('.detail .factual-state'), actions: document.querySelector('.actions'), tabs: document.querySelector('.tabs'), logs: document.querySelector('#logs-panel'), runtime: document.querySelector('#runtime-panel'), focus: document.activeElement }
+      window.initialNodes = { row: document.querySelector('[data-session="demo"]'), detail: document.querySelector('.detail'), shell: document.querySelector('.detail-inner'), header: document.querySelector('.detail-header'), factual: document.querySelector('.detail .factual-state'), actions: document.querySelector('.actions'), tabs: document.querySelector('.tabs'), activityTab: document.querySelector('#activity-tab'), activity: document.querySelector('#activity-panel'), logs: document.querySelector('#logs-panel'), runtime: document.querySelector('#runtime-panel'), files: document.querySelector('#files-panel'), focus: document.activeElement }
       window.noOpMutations = []
       window.noOpObserver = new MutationObserver((records) => window.noOpMutations.push(...records))
       window.noOpObserver.observe(window.initialNodes.row, { subtree: true, childList: true, characterData: true, attributes: true })
@@ -156,7 +174,7 @@ test('Preact Sessions workspace preserves routing, detail state, factual polling
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
     await page.waitForFunction(() => document.querySelector('.detail .factual-state')?.textContent.includes('Execution: running'))
     assert.match(await detail.locator('.factual-state').textContent(), /Execution: running/)
-    for (const [selector, key] of [['[data-session="demo"]', 'row'], ['.detail', 'detail'], ['.detail-inner', 'shell'], ['.detail-header', 'header'], ['.detail .factual-state', 'factual'], ['.actions', 'actions'], ['.tabs', 'tabs'], ['#logs-panel', 'logs'], ['#runtime-panel', 'runtime']]) {
+    for (const [selector, key] of [['[data-session="demo"]', 'row'], ['.detail', 'detail'], ['.detail-inner', 'shell'], ['.detail-header', 'header'], ['.detail .factual-state', 'factual'], ['.actions', 'actions'], ['.tabs', 'tabs'], ['#activity-tab', 'activityTab'], ['#activity-panel', 'activity'], ['#logs-panel', 'logs'], ['#runtime-panel', 'runtime'], ['#files-panel', 'files']]) {
       assert.equal(await page.locator(selector).evaluate((element, name) => element === window.initialNodes[name], key), true, `${selector} remains mounted across selected factual updates`)
     }
     assert.equal(await row.locator('.session-status-label').count(), 0)
