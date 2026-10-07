@@ -83,5 +83,27 @@ if [ "${1:-}" = --bootstrap ]; then
   exit 0
 fi
 
-mkdir -p /nix/var/nix/daemon-socket
-exec env -u NIX_REMOTE nix-daemon --daemon
+mkdir -p /nix/var /nix/var/nix /nix/var/nix/builds /nix/var/nix/daemon-socket
+chown root:root /nix/var /nix/var/nix /nix/var/nix/builds
+chmod 0755 /nix/var /nix/var/nix /nix/var/nix/builds
+nix_daemon_pid=''
+forward_signal() {
+  if [ -n "$nix_daemon_pid" ]; then
+    kill -TERM "$nix_daemon_pid" 2>/dev/null || true
+  fi
+}
+trap forward_signal INT TERM
+env -u NIX_REMOTE nix-daemon --daemon &
+nix_daemon_pid=$!
+for _ in {1..100}; do
+  if [ -S /nix/var/nix/daemon-socket/socket ]; then
+    break
+  fi
+  if ! kill -0 "$nix_daemon_pid" 2>/dev/null; then
+    wait "$nix_daemon_pid"
+  fi
+  sleep 0.1
+done
+chown root:root /nix/var /nix/var/nix /nix/var/nix/builds
+chmod 0755 /nix/var /nix/var/nix /nix/var/nix/builds
+wait "$nix_daemon_pid"
