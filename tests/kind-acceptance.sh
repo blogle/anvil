@@ -199,14 +199,17 @@ kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anv
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-router --timeout=180s
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-nix-daemon --timeout=600s
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c '
+  config="$(</etc/nix/nix.conf)"
   test -s /nix/var/nix/db/db.sqlite
   test -f /nix/var/nix/.anvil-bootstrap-complete
   test -d /nix/var/nix/gcroots/anvil-baseline
-  grep -Fx "build-users-group = nixbld" /etc/nix/nix.conf
-  ! grep -Eq "^filter-syscalls[[:space:]]*=[[:space:]]*false" /etc/nix/nix.conf
+  case "$config" in *"build-users-group = nixbld"*) ;; *) exit 1 ;; esac
+  case "$config" in *filter-syscalls*false*) exit 1 ;; esac
   nix store info >/dev/null
   for path in /nix/var /nix/var/nix /nix/var/nix/builds; do
-    test "$(stat -c "%u:%g:%a" "$path")" = 0:0:755
+    actual="$(stat -c "%u:%g:%a" "$path" 2>/dev/null || printf 'stat-failed')"
+    printf 'shared Nix state %s: %s\n' "$path" "$actual" >&2
+    test "$actual" = 0:0:755
   done
 '
 
@@ -433,15 +436,27 @@ test -n "$pod_name"
 # container must remove setgid rather than relying on a fresh volume.
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c '
   chmod 2775 /nix/var /nix/var/nix /nix/var/nix/builds
-  test "$(stat -c "%u:%g:%a" /nix/var/nix/builds)" = 0:0:2775
+  for path in /nix/var /nix/var/nix /nix/var/nix/builds; do
+    actual="$(stat -c "%u:%g:%a" "$path" 2>/dev/null || printf 'stat-failed')"
+    printf 'intentionally corrupted shared Nix state %s: %s\n' "$path" "$actual" >&2
+    test "$actual" = 0:0:2775
+  done
 '
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout restart deployment/anvil-nix-daemon
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-nix-daemon --timeout=300s
-kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c '
+if ! kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c '
+  failed=0
   for path in /nix/var /nix/var/nix /nix/var/nix/builds; do
-    test "$(stat -c "%u:%g:%a" "$path")" = 0:0:755
+    actual="$(stat -c "%u:%g:%a" "$path" 2>/dev/null || printf 'stat-failed')"
+    printf 'shared Nix state %s: %s\n' "$path" "$actual" >&2
+    [ "$actual" = 0:0:755 ] || failed=1
   done
-'
+  exit "$failed"
+'; then
+  printf '\n--- bootstrap-store logs after persistent PVC restart ---\n' >&2
+  kubectl --kubeconfig "$kubeconfig" -n "$namespace" logs deployment/anvil-nix-daemon -c bootstrap-store --tail=-1 >&2 || true
+  exit 1
+fi
 agent_exec "$api_b_pod" /bin/bash -c 'nix store info >/dev/null && test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null' -- "$shared_path"
 
 # Upgrade the baseline on the populated PVC; registration must merge into the
