@@ -137,6 +137,11 @@ are reused immediately across sandboxes. The daemon performs builds with its
 own `nixbld` users. This is single-node/RWO; multi-node distribution is future
 work.
 
+The `anvil-nix-gc` CronJob runs daily at 03:00 UTC on the daemon's node and
+uses the daemon protocol against the same PVC. It skips GC at 20% free space
+or more; below that threshold it requests enough collection to target 30% free
+space. It never removes profiles or roots manually.
+
 ## GitHub broker setup
 
 Populate the `github-app-credentials` Secret through the deployment's secret

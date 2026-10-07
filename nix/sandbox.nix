@@ -227,15 +227,22 @@ let
     paths = [ pkgs.bash pkgs.coreutils pkgs.nix pkgs.gnutar pkgs.findutils ];
     pathsToLink = [ "/bin" ];
   };
+  daemonEntrypoint = pkgs.writeShellScriptBin "anvil-nix-daemon"
+    (builtins.readFile ./../runtime/nix-daemon-entrypoint);
+  # Merge the command derivations before handing them to nix2container. Direct
+  # copyToRoot entries can retain store paths without materializing /bin links
+  # in the final OCI root filesystem.
+  daemonCopyToRoot = nix2containerBuildPkgs.symlinkJoin {
+    name = "anvil-nix-daemon-root";
+    paths = [ daemonBin daemonConf ] ++ daemonUsers ++ [ daemonEntrypoint ];
+  };
   # Include the same explicit sandbox layers so the initialized image DB
   # contains the entire runtime closure before a PVC is ever mounted.
   mkDaemonImage = { tag ? "main", extraStorePaths ? [] }:
     nix2containerPkgs.nix2container.buildImage {
     name = "ghcr.io/blogle/anvil-nix-daemon";
     inherit tag;
-    copyToRoot = [ daemonBin daemonConf ] ++ daemonUsers ++ [
-      (pkgs.writeShellScriptBin "anvil-nix-daemon" (builtins.readFile ./../runtime/nix-daemon-entrypoint))
-    ];
+      copyToRoot = [ daemonCopyToRoot ];
     initializeNixDatabase = true;
     layers = [ sandboxBaseLayer sandboxDeveloperLayer
       (nix2containerPkgs.nix2container.buildLayer {
