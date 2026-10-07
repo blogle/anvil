@@ -15,6 +15,7 @@ if [ "${1:-}" = --bootstrap ]; then
     mkdir -p /shared-nix/var "$state/builds"
     chown root:root /shared-nix/var "$state" "$state/builds"
     chmod 0755 /shared-nix/var "$state" "$state/builds"
+    chmod u-s,g-s /shared-nix/var "$state" "$state/builds"
   }
   mkdir -p /shared-nix/store "$state"
   # A previous init may have been interrupted while copying a store path.
@@ -86,6 +87,7 @@ fi
 mkdir -p /nix/var /nix/var/nix /nix/var/nix/builds /nix/var/nix/daemon-socket
 chown root:root /nix/var /nix/var/nix /nix/var/nix/builds
 chmod 0755 /nix/var /nix/var/nix /nix/var/nix/builds
+chmod u-s,g-s /nix/var /nix/var/nix /nix/var/nix/builds
 rm -f /nix/var/nix/daemon-socket/socket
 nix_daemon_pid=''
 forward_signal() {
@@ -107,4 +109,5 @@ for _ in {1..100}; do
 done
 chown root:root /nix/var /nix/var/nix /nix/var/nix/builds
 chmod 0755 /nix/var /nix/var/nix /nix/var/nix/builds
+chmod u-s,g-s /nix/var /nix/var/nix /nix/var/nix/builds
 wait "$nix_daemon_pid"
