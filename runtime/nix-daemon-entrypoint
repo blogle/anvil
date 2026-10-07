@@ -97,7 +97,7 @@ trap forward_signal INT TERM
 env -u NIX_REMOTE nix-daemon --daemon &
 nix_daemon_pid=$!
 for _ in {1..100}; do
-  if [ -S /nix/var/nix/daemon-socket/socket ]; then
+  if [ -S /nix/var/nix/daemon-socket/socket ] && NIX_REMOTE=daemon nix store info >/dev/null 2>&1; then
     break
   fi
   if ! kill -0 "$nix_daemon_pid" 2>/dev/null; then
