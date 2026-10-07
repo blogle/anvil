@@ -436,7 +436,11 @@ test -n "$pod_name"
 # container must remove setgid rather than relying on a fresh volume.
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c '
   chmod 2775 /nix/var /nix/var/nix /nix/var/nix/builds
-  test "$(stat -c "%u:%g:%a" /nix/var/nix/builds)" = 0:0:2775
+  for path in /nix/var /nix/var/nix /nix/var/nix/builds; do
+    actual="$(stat -c "%u:%g:%a" "$path" 2>/dev/null || printf 'stat-failed')"
+    printf 'intentionally corrupted shared Nix state %s: %s\n' "$path" "$actual" >&2
+    test "$actual" = 0:0:2775
+  done
 '
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout restart deployment/anvil-nix-daemon
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-nix-daemon --timeout=300s
