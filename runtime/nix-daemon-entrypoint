@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+normalize_build_state() {
+  local nix_root="$1"
+  local state="$nix_root/var/nix"
+
+  mkdir -p "$nix_root/var" "$state/builds"
+  chown root:root "$nix_root/var" "$state" "$state/builds"
+  chmod 0755 "$nix_root/var" "$state" "$state/builds"
+  printf 'normalized %s: %s\n' "$nix_root/var" "$(stat -c '%u:%g:%a' "$nix_root/var")" >&2
+  printf 'normalized %s: %s\n' "$state" "$(stat -c '%u:%g:%a' "$state")" >&2
+  printf 'normalized %s: %s\n' "$state/builds" "$(stat -c '%u:%g:%a' "$state/builds")" >&2
+}
+
 if [ "${1:-}" = --bootstrap ]; then
   # Kind's local-path provisioner creates volume roots world-writable; Nix
   # refuses to execute builds unless every component of /nix is secure.
@@ -11,11 +23,6 @@ if [ "${1:-}" = --bootstrap ]; then
   complete="$state/.anvil-bootstrap-complete"
   cold_attempt="$state/.anvil-cold-in-progress"
   staging_dir=/shared-nix/.anvil-import
-  normalize_build_state() {
-    mkdir -p /shared-nix/var "$state/builds"
-    chown root:root /shared-nix/var "$state" "$state/builds"
-    chmod 0755 /shared-nix/var "$state" "$state/builds"
-  }
   mkdir -p /shared-nix/store "$state"
   # A previous init may have been interrupted while copying a store path.
   # This private staging area never contains authoritative store paths.
@@ -67,7 +74,7 @@ if [ "${1:-}" = --bootstrap ]; then
       rm "$pending"
     fi
   fi
-  normalize_build_state
+  normalize_build_state /shared-nix
   # Keep all baseline image paths alive, including the tools needed to start
   # future containers, even if other sandboxes run nix store gc.
   mkdir -p "$state/gcroots/anvil-baseline"
@@ -83,5 +90,6 @@ if [ "${1:-}" = --bootstrap ]; then
   exit 0
 fi
 
+normalize_build_state /nix
 mkdir -p /nix/var/nix/daemon-socket
 exec env -u NIX_REMOTE nix-daemon --daemon
