@@ -199,11 +199,12 @@ kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anv
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-router --timeout=180s
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-nix-daemon --timeout=600s
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c '
+  config="$(</etc/nix/nix.conf)"
   test -s /nix/var/nix/db/db.sqlite
   test -f /nix/var/nix/.anvil-bootstrap-complete
   test -d /nix/var/nix/gcroots/anvil-baseline
-  grep -Fx "build-users-group = nixbld" /etc/nix/nix.conf
-  ! grep -Eq "^filter-syscalls[[:space:]]*=[[:space:]]*false" /etc/nix/nix.conf
+  case "$config" in *"build-users-group = nixbld"*) ;; *) exit 1 ;; esac
+  case "$config" in *filter-syscalls*false*) exit 1 ;; esac
   nix store info >/dev/null
   for path in /nix/var /nix/var/nix /nix/var/nix/builds; do
     printf "%s: " "$path"

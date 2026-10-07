@@ -86,6 +86,7 @@ fi
 mkdir -p /nix/var /nix/var/nix /nix/var/nix/builds /nix/var/nix/daemon-socket
 chown root:root /nix/var /nix/var/nix /nix/var/nix/builds
 chmod 0755 /nix/var /nix/var/nix /nix/var/nix/builds
+rm -f /nix/var/nix/daemon-socket/socket
 nix_daemon_pid=''
 forward_signal() {
   if [ -n "$nix_daemon_pid" ]; then
