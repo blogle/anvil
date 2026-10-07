@@ -11,6 +11,7 @@ resources:
   - anvil-history-pvc.yaml
   - anvil-nix-pvc.yaml
   - anvil-nix-daemon.yaml
+  - anvil-nix-gc.yaml
   - deployments.yaml
   - anvil-profile-deployment.yaml
   - services.yaml

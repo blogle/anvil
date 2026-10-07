@@ -206,6 +206,8 @@ kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-dae
   ! grep -Eq "^filter-syscalls[[:space:]]*=[[:space:]]*false" /etc/nix/nix.conf
   nix store info >/dev/null
   for path in /nix/var /nix/var/nix /nix/var/nix/builds; do
+    printf "%s: " "$path"
+    stat -c "%u:%g:%a" "$path"
     test "$(stat -c "%u:%g:%a" "$path")" = 0:0:755
   done
 '
@@ -439,6 +441,8 @@ kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout restart deployment/an
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-nix-daemon --timeout=300s
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c '
   for path in /nix/var /nix/var/nix /nix/var/nix/builds; do
+    printf "%s: " "$path"
+    stat -c "%u:%g:%a" "$path"
     test "$(stat -c "%u:%g:%a" "$path")" = 0:0:755
   done
 '
