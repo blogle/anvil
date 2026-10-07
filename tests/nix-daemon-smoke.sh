@@ -4,7 +4,19 @@ set -euo pipefail
 image="${1:?usage: nix-daemon-smoke.sh IMAGE}"
 container="anvil-nix-daemon-smoke-$$"
 bootstrap_dir="$(mktemp -d)"
-trap 'docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$bootstrap_dir"' EXIT
+cleanup() {
+  set +e
+  docker rm -f "$container" >/dev/null 2>&1
+  if [ -d "$bootstrap_dir" ]; then
+    # Bootstrap runs as root in the image. Remove its files from a root-owned
+    # bind mount in a root container, then the host can remove the directory.
+    docker run --rm --entrypoint /bin/bash \
+      --volume "$bootstrap_dir:/shared-nix" "$image" -c \
+      'find /shared-nix -mindepth 1 -delete' >/dev/null 2>&1
+    rmdir "$bootstrap_dir" >/dev/null 2>&1
+  fi
+}
+trap cleanup EXIT
 
 docker run --rm --entrypoint /bin/bash "$image" -c \
   'test -x /bin/anvil-nix-daemon'
