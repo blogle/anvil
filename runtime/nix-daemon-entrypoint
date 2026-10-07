@@ -83,5 +83,7 @@ if [ "${1:-}" = --bootstrap ]; then
   exit 0
 fi
 
-mkdir -p /nix/var/nix/daemon-socket
+mkdir -p /nix/var /nix/var/nix /nix/var/nix/builds /nix/var/nix/daemon-socket
+chown root:root /nix/var /nix/var/nix /nix/var/nix/builds
+chmod 0755 /nix/var /nix/var/nix /nix/var/nix/builds
 exec env -u NIX_REMOTE nix-daemon --daemon
