@@ -1,0 +1,70 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: anvil-nix-gc
+spec:
+  # Daily at 03:00 UTC; GC is deliberately infrequent to preserve the shared cache.
+  schedule: "0 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: anvil-nix-gc
+        spec:
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          restartPolicy: OnFailure
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: anvil-nix-daemon
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: gc
+              image: ghcr.io/blogle/anvil-nix-daemon:main
+              imagePullPolicy: Always
+              env:
+                - name: NIX_REMOTE
+                  value: daemon
+              command: [/bin/bash, -c]
+              args:
+                - |
+                  set -euo pipefail
+                  read -r block_size blocks available < <(stat -f -c '%S %b %a' /nix)
+                  total_bytes=$((block_size * blocks))
+                  free_bytes=$((block_size * available))
+                  free_percent=$((free_bytes * 100 / total_bytes))
+                  echo "Nix store free before: ${free_bytes} bytes (${free_percent}%)"
+                  if [ "$free_bytes" -ge $((total_bytes * 20 / 100)) ]; then
+                    echo 'Nix store has at least 20% free; skipping garbage collection'
+                    exit 0
+                  fi
+                  target_bytes=$((total_bytes * 30 / 100))
+                  max_bytes=$((target_bytes - free_bytes))
+                  echo "Nix store below 20%; requesting up to ${max_bytes} bytes of GC"
+                  nix store gc --max "$max_bytes"
+                  read -r block_size blocks available < <(stat -f -c '%S %b %a' /nix)
+                  free_bytes=$((block_size * available))
+                  free_percent=$((free_bytes * 100 / (block_size * blocks)))
+                  echo "Nix store free after: ${free_bytes} bytes (${free_percent}%)"
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  memory: 512Mi
+              volumeMounts:
+                - name: nix
+                  mountPath: /nix
+          volumes:
+            - name: nix
+              persistentVolumeClaim:
+                claimName: anvil-nix
