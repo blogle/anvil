@@ -5644,11 +5644,11 @@ fn activity_redaction_patterns() -> &'static [Regex; 5] {
             )
             .expect("valid authorization redaction regex"),
             Regex::new(
-                r#"(?i)((?:[a-z0-9]+[_-])*(?:secret[_-]access[_-]key|authorization|proxy-authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|private[_-]?key|client[_-]?secret)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"#,
+                r#"(?i)((?:\b(?:[a-z0-9]+[_-])*(?:secret[_-]access[_-]key|authorization|proxy-authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|private[_-]?key|client[_-]?secret|key))\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"#,
             )
             .expect("valid multi-component credential-field redaction regex"),
             Regex::new(
-                r#"(?i)(--?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|client[_-]?secret)\s+)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"#,
+                r#"(?i)(--?(?:[a-z0-9]+[_-])*(?:secret[_-]access[_-]key|authorization|proxy-authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|private[_-]?key|client[_-]?secret|credential|key)\s+)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"#,
             )
             .expect("valid credential-option redaction regex"),
             Regex::new(
@@ -9943,7 +9943,7 @@ mod tests {
     #[test]
     fn activity_redacts_sensitive_fields_and_header_values_server_side() {
         let payload = json!({
-            "command":"curl -H 'Authorization: Bearer header-token-value' -H 'Cookie: session-cookie-value' --token cli-token-value https://example.test",
+            "command":"curl -H 'Authorization: Bearer header-token-value' -H 'Cookie: session-cookie-value' --token cli-token-value --aws-secret-access-key aws-cli-secret-value --database-password db-cli-secret-value --private-key private-cli-secret-value https://example.test",
             "environment":{"GITHUB_TOKEN":"ghp-secret-value","api_key":"api-key-value","password":"pw-value"},
             "output":"Authorization: Bearer output-token-value token=inline-token-value secret=inline-secret-value"
         });
@@ -9952,6 +9952,9 @@ mod tests {
             "header-token-value",
             "session-cookie-value",
             "cli-token-value",
+            "aws-cli-secret-value",
+            "db-cli-secret-value",
+            "private-cli-secret-value",
             "ghp-secret-value",
             "api-key-value",
             "pw-value",
