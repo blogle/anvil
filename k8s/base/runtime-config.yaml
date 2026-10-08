@@ -11,7 +11,7 @@ data:
   ANVIL_PREVIEW_DOMAIN: preview.example.invalid
   ANVIL_ANNOTATION_PREFIX: anvil.example.invalid
   ANVIL_PROFILE_PVC: anvil-opencode-profile
-  ANVIL_NIX_PVC: anvil-nix
+  ANVIL_NIX_PVC: anvil-nix-shared
   ANVIL_PROFILE_OPENCODE_URL: http://anvil-profile.anvil.svc.cluster.local:4096
   ANVIL_API_URL: http://anvild:8080
   ANVIL_CREDENTIAL_URL: http://anvild:8080
