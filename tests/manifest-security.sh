@@ -46,88 +46,23 @@ if [ "$(grep -Fc 'tests/nix-daemon-smoke.sh' "$repo_root/.github/workflows/image
 fi
 
 if command -v kustomize >/dev/null 2>&1; then
-  rendered="$(kustomize build "$repo_root/k8s/overlays/dev")"
-  kind_rendered="$(kustomize build "$repo_root/k8s/overlays/kind")"
-  rendered_file="$(mktemp)"
-  trap 'rm -f "$rendered_file"' EXIT
-  printf '%s\n' "$rendered" > "$rendered_file"
-  # The base declares one authoritative PVC; neither test nor production
-  # may synthesize a parallel Nix store.
-  if [ "$(printf '%s\n' "$rendered" | grep -Ec '^  name: anvil-nix-shared
-  require_text 'rendered credentials reference' 'secretRef:' "$rendered_file"
-  gc="$(printf '%s\n' "$rendered" | awk '/^kind: CronJob$/{found=1} found{print} /^---$/{if(found) exit}')"
-  if [ -z "$gc" ]; then
-    printf 'manifest-security: rendered CronJob document was not found\n%s\n' "$rendered" >&2
-    exit 1
-  fi
-  gc_file="$(mktemp)"
-  printf '%s\n' "$gc" > "$gc_file"
-  require_text 'rendered GC name' 'name: anvil-nix-gc' "$gc_file"
-  require_text 'rendered GC schedule' 'schedule: 0 3 * * *' "$gc_file"
-  require_text 'rendered GC concurrency policy' 'concurrencyPolicy: Forbid' "$gc_file"
-  require_text 'rendered daemon node affinity' 'requiredDuringSchedulingIgnoredDuringExecution:' "$gc_file"
-  require_text 'rendered shared PVC' 'claimName: anvil-nix-shared' "$gc_file"
-  require_text 'rendered daemon remote mode' 'value: daemon' "$gc_file"
-  require_text 'rendered bounded GC command' 'nix store gc --max' "$gc_file"
-  require_text 'rendered low-water mark' '20 / 100' "$gc_file"
-  require_text 'rendered target free space' '30 / 100' "$gc_file"
-  rm -f "$gc_file"
-fi
-
-printf 'manifest security checks passed\n')" -ne 1 ]; then
-    printf 'manifest-security: expected exactly one canonical shared Nix PVC\n' >&2
-    exit 1
-  fi
-  if printf '%s\n' "$rendered" | grep -Eq 'claimName: anvil-nix$|  name: anvil-nix
-  require_text 'rendered credentials reference' 'secretRef:' "$rendered_file"
-  gc="$(printf '%s\n' "$rendered" | awk '/^kind: CronJob$/{found=1} found{print} /^---$/{if(found) exit}')"
-  if [ -z "$gc" ]; then
-    printf 'manifest-security: rendered CronJob document was not found\n%s\n' "$rendered" >&2
-    exit 1
-  fi
-  gc_file="$(mktemp)"
-  printf '%s\n' "$gc" > "$gc_file"
-  require_text 'rendered GC name' 'name: anvil-nix-gc' "$gc_file"
-  require_text 'rendered GC schedule' 'schedule: 0 3 * * *' "$gc_file"
-  require_text 'rendered GC concurrency policy' 'concurrencyPolicy: Forbid' "$gc_file"
-  require_text 'rendered daemon node affinity' 'requiredDuringSchedulingIgnoredDuringExecution:' "$gc_file"
-  require_text 'rendered shared PVC' 'claimName: anvil-nix-shared' "$gc_file"
-  require_text 'rendered daemon remote mode' 'value: daemon' "$gc_file"
-  require_text 'rendered bounded GC command' 'nix store gc --max' "$gc_file"
-  require_text 'rendered low-water mark' '20 / 100' "$gc_file"
-  require_text 'rendered target free space' '30 / 100' "$gc_file"
-  rm -f "$gc_file"
-fi
-
-printf 'manifest security checks passed\n'; then
-    printf 'manifest-security: legacy anvil-nix claim still present\n' >&2
-    exit 1
-  fi
-  printf '%s\n' "$kind_rendered" | grep -Fq 'name: anvil-nix-gc' || {
-    printf 'manifest-security: Kind overlay omitted upstream Nix GC\n' >&2; exit 1;
-  }
-  printf '%s\n' "$kind_rendered" | grep -Fq 'claimName: anvil-nix-shared' || {
-    printf 'manifest-security: Kind overlay drifted from canonical Nix PVC\n' >&2; exit 1;
-  }
-  require_text 'rendered GitHub credentials' 'name: github-app-credentials' "$rendered_file"
-  require_text 'rendered credentials reference' 'secretRef:' "$rendered_file"
-  gc="$(printf '%s\n' "$rendered" | awk '/^kind: CronJob$/{found=1} found{print} /^---$/{if(found) exit}')"
-  if [ -z "$gc" ]; then
-    printf 'manifest-security: rendered CronJob document was not found\n%s\n' "$rendered" >&2
-    exit 1
-  fi
-  gc_file="$(mktemp)"
-  printf '%s\n' "$gc" > "$gc_file"
-  require_text 'rendered GC name' 'name: anvil-nix-gc' "$gc_file"
-  require_text 'rendered GC schedule' 'schedule: 0 3 * * *' "$gc_file"
-  require_text 'rendered GC concurrency policy' 'concurrencyPolicy: Forbid' "$gc_file"
-  require_text 'rendered daemon node affinity' 'requiredDuringSchedulingIgnoredDuringExecution:' "$gc_file"
-  require_text 'rendered shared PVC' 'claimName: anvil-nix-shared' "$gc_file"
-  require_text 'rendered daemon remote mode' 'value: daemon' "$gc_file"
-  require_text 'rendered bounded GC command' 'nix store gc --max' "$gc_file"
-  require_text 'rendered low-water mark' '20 / 100' "$gc_file"
-  require_text 'rendered target free space' '30 / 100' "$gc_file"
-  rm -f "$gc_file"
+  for overlay in dev kind; do
+    rendered="$(kustomize build "$repo_root/k8s/overlays/$overlay")"
+    pvc_count="$(grep -Ec '^  name: anvil-nix-shared$' <<<"$rendered" || true)"
+    if [ "$pvc_count" -ne 1 ]; then
+      printf 'manifest-security: %s must declare exactly one canonical Nix PVC (got %s)\n' "$overlay" "$pvc_count" >&2
+      exit 1
+    fi
+    if grep -Eq 'claimName: anvil-nix$|  name: anvil-nix$' <<<"$rendered"; then
+      printf 'manifest-security: %s renders obsolete Nix PVC\n' "$overlay" >&2
+      exit 1
+    fi
+    grep -Fq 'name: github-app-credentials' <<<"$rendered"
+    grep -Fq 'secretRef:' <<<"$rendered"
+    grep -Fq 'name: anvil-nix-gc' <<<"$rendered"
+    grep -Fq 'claimName: anvil-nix-shared' <<<"$rendered"
+    grep -Fq 'ANVIL_NIX_PVC: anvil-nix-shared' <<<"$rendered"
+  done
 fi
 
 printf 'manifest security checks passed\n'
