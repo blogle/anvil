@@ -42,6 +42,7 @@ require_text "fresh Nix derivation" "nonce: derivation" "$canary_script"
 require_text "canary performs a real build" "nix-store --realise" "$canary_script"
 require_text "directory-source chmod canary" "chmod -R u+w source" "$canary_script"
 require_text "canary script baked into daemon" "daemonCanary" "$repo_root/nix/sandbox.nix"
+require_text "OCI smoke executes canary" 'docker exec "$container" /bin/anvil-nix-deployment-canary' "$repo_root/tests/nix-daemon-smoke.sh"
 require_text "deployment startup canary" "command: [/bin/anvil-nix-deployment-canary]" "$repo_root/k8s/base/anvil-nix-daemon.yaml"
 
 smoke_script="$repo_root/tests/nix-daemon-smoke.sh"

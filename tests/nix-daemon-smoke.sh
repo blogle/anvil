@@ -19,7 +19,7 @@ cleanup() {
 trap cleanup EXIT
 
 docker run --rm --entrypoint /bin/bash "$image" -c \
-  'test -x /bin/anvil-nix-daemon'
+  'test -x /bin/anvil-nix-daemon && test -x /bin/anvil-nix-deployment-canary'
 
 docker run --detach --name "$container" "$image" >/dev/null
 for _ in $(seq 1 60); do
@@ -31,6 +31,9 @@ for _ in $(seq 1 60); do
 done
 docker exec "$container" /bin/bash -c \
   'NIX_REMOTE=daemon nix store info >/dev/null'
+# The exact same fresh-build contract used by Kubernetes startupProbe must
+# pass in the publish-loaded image, before tags are pushed.
+docker exec "$container" /bin/anvil-nix-deployment-canary
 
 chmod 0755 "$bootstrap_dir"
 docker run --rm --entrypoint /bin/anvil-nix-daemon \
