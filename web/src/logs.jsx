@@ -8,8 +8,8 @@ const eventTitle = (kind) => ({ created: 'Session created by controller', sessio
 
 export function Logs({ activity, ui }) {
   if (!activity) return <div class="content-section"><div class="loading">Loading activity...</div></div>
-  if (!activity.requests?.length && !activity.lifecycle?.length) return <div class="content-section"><div class="empty"><strong>No activity recorded</strong>OpenCode has not recorded any requests for this session yet.</div></div>
-  return <div class="content-section"><div class="section-heading"><h3>Lifecycle &amp; requests</h3><span>{activity.requests.length} request{activity.requests.length === 1 ? '' : 's'}</span></div><div class="timeline">{chronologicalTimeline(activity).map(({ type, value }) => type === 'request' ? <RequestTimelineItem key={value.id || value.number} request={value} ui={ui}/> : <LifecycleItem key={value.id || `${value.kind}:${value.at}:${value.detail || ''}`} event={value}/>)}</div></div>
+  if (!activity.requests?.length && !activity.lifecycle?.length) return <div class="content-section"><div class="empty"><strong>No Trail entries</strong>Controller lifecycle events and request diagnostics will appear here.</div></div>
+  return <div class="content-section"><div class="section-heading"><h3>Trail · Lifecycle &amp; requests</h3><span>{activity.requests.length} request{activity.requests.length === 1 ? '' : 's'}</span></div><div class="timeline">{chronologicalTimeline(activity).map(({ type, value }) => type === 'request' ? <RequestTimelineItem key={value.id || value.number} request={value} ui={ui}/> : <LifecycleItem key={value.id || `${value.kind}:${value.at}:${value.detail || ''}`} event={value}/>)}</div></div>
 }
 
 function LifecycleItem({ event }) {

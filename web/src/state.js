@@ -9,6 +9,7 @@ export const executionFilter = signal('')
 export const loading = signal(true)
 export const error = signal(null)
 export const polling = signal(false)
+export const ACTIVITY_EVENT_LIMIT = 500
 export const visibleSessions = computed(() => sessions.value.filter((session) => matchesSessionFilters(session, activities.value.get(session.id), {
   search: search.value,
   environment: environmentFilter.value,
@@ -26,7 +27,7 @@ export const uiBySession = new Map()
 
 export function sessionUI(id) {
   if (!uiBySession.has(id)) uiBySession.set(id, {
-    tab: signal('logs'), attachOpen: signal(false), expandedPrompts: signal(new Set()), copyStatus: signal(null),
+    tab: signal('activity'), attachOpen: signal(false), expandedPrompts: signal(new Set()), copyStatus: signal(null), loadingOlder: signal(false), olderError: signal(null),
   })
   return uiBySession.get(id)
 }
@@ -69,8 +70,62 @@ export function navigate(id, push = true) {
     else history.replaceState(null, '', url)
   }
   syncRouteFromHash()
+  if (selected.value) refreshActivityEvents(selected.value).catch(() => {})
 }
 
+export function orderedActivityEvents(activity, limit = ACTIVITY_EVENT_LIMIT) {
+  const unique = new Map()
+  for (const event of activity?.events || []) {
+    const key = event.id || `${event.kind}:${event.at}:${event.title || ''}`
+    if (!unique.has(key)) unique.set(key, event)
+  }
+  return [...unique.values()]
+    .sort((a, b) => String(a.at).localeCompare(String(b.at)) || String(a.id || a.kind).localeCompare(String(b.id || b.kind)))
+    .slice(-Math.max(0, limit))
+}
+
+export function mergeActivityPages(latest, previous, olderPage = false, limit = ACTIVITY_EVENT_LIMIT) {
+  if (!latest) return previous
+  const mergedEvents = [...(latest.events || []), ...(previous?.events || [])]
+  const uniqueCount = new Set(mergedEvents.map((event) => event.id || `${event.kind}:${event.at}:${event.title || ''}`)).size
+  const events = orderedActivityEvents({ events: mergedEvents }, limit)
+  const latestWindow = latest.event_window || {}
+  const previousWindow = previous?.event_window || {}
+  const loadedOlder = Boolean(olderPage || previousWindow.loaded_older)
+  const latestLoaded = latestWindow.loaded_messages ?? latestWindow.returned_messages ?? 0
+  const previousLoaded = previousWindow.loaded_messages ?? previousWindow.returned_messages ?? 0
+  const hasWindow = latest.event_window || previous?.event_window
+  return {
+    ...latest,
+    events,
+    ...(hasWindow ? {
+      event_window: {
+        ...previousWindow,
+        ...latestWindow,
+        loaded_messages: olderPage ? latestLoaded + previousLoaded : Math.max(latestLoaded, previousLoaded),
+        next_cursor: olderPage || loadedOlder ? previousWindow.next_cursor : latestWindow.next_cursor ?? previousWindow.next_cursor,
+        loaded_older: loadedOlder,
+        truncated: Boolean(latestWindow.truncated || previousWindow.truncated || uniqueCount > limit),
+      },
+    } : {}),
+  }
+}
+
+export function activityKindLabel(event) {
+  if (event.kind === 'prompt') return 'YOU'
+  if (event.kind === 'message') return 'AGENT'
+  if (event.kind === 'error') return 'ERROR'
+  if (event.kind !== 'tool') return String(event.kind || 'ACTIVITY').toUpperCase()
+  const tool = String(event.tool || 'tool').toLowerCase()
+  return ({ bash: 'BASH', read: 'READ', edit: 'EDIT', write: 'WRITE', grep: 'GREP', glob: 'SEARCH' })[tool] || tool.toUpperCase()
+}
+
+export function activityHistoryNotice(activity) {
+  const window = activity?.event_window
+  if (!window?.truncated) return null
+  const loaded = window.loaded_messages ?? window.returned_messages
+  return `Showing activity from ${loaded} OpenCode messages (page limit ${window.message_limit}); the 500-event transcript cap may omit older events.`
+}
 export function environmentFor(session, activity) {
   return activity?.environment_state || session.environment_state || 'unknown'
 }
@@ -169,6 +224,37 @@ export async function api(path, options) {
   return response.status === 204 ? null : response.json()
 }
 
+function updateActivity(id, latest, previous, olderPage = false) {
+  const next = new Map(activities.value)
+  next.set(id, mergeActivityPages(latest, previous, olderPage))
+  activities.value = next
+}
+
+export async function refreshActivityEvents(id = selected.value) {
+  if (!id) return
+  const latest = await api(`/v1/sessions/${encodeURIComponent(id)}/activity?include_events=true`)
+  updateActivity(id, latest, activities.value.get(id))
+}
+
+export async function loadOlderActivity(id) {
+  const activity = activities.value.get(id)
+  const cursor = activity?.event_window?.next_cursor
+  if (!cursor) return
+  const ui = sessionUI(id)
+  if (ui.loadingOlder.value) return
+  ui.loadingOlder.value = true
+  ui.olderError.value = null
+  try {
+    const older = await api(`/v1/sessions/${encodeURIComponent(id)}/activity?include_events=true&before=${encodeURIComponent(cursor)}`)
+    updateActivity(id, activities.value.get(id) || activity, older, true)
+  } catch (cause) {
+    ui.olderError.value = cause.message
+    throw cause
+  } finally {
+    ui.loadingOlder.value = false
+  }
+}
+
 export async function refresh() {
   if (polling.value || document.visibilityState === 'hidden') return
   polling.value = true
@@ -179,9 +265,16 @@ export async function refresh() {
       catch { return [session.id, activities.value.get(session.id)] }
     }))
     sessions.value = next
-    activities.value = new Map(activityPairs.filter(([, activity]) => activity))
+    const nextActivities = new Map()
+    for (const [id, activity] of activityPairs) {
+      if (activity) nextActivities.set(id, mergeActivityPages(activity, activities.value.get(id)))
+    }
+    activities.value = nextActivities
     const active = next.find((item) => item.id === selected.value)
     if (selected.value && !active) navigate(null, false)
+    else if (active) {
+      try { await refreshActivityEvents(active.id) } catch { /* Keep the last transcript while OpenCode reconnects. */ }
+    }
     error.value = null
   } catch (cause) { error.value = cause.message }
   finally { loading.value = false; polling.value = false }
