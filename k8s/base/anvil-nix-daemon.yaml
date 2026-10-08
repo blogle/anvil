@@ -51,4 +51,4 @@ spec:
       volumes:
         - name: nix
           persistentVolumeClaim:
-            claimName: anvil-nix
+            claimName: anvil-nix-shared

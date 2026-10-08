@@ -77,11 +77,15 @@ kubectl kustomize k8s/overlays/dev
 ```
 
 The development overlay remains in the `anvil` namespace and renders the
-portable base with placeholder preview values. It pulls the public `main`
+portable base with placeholder preview values. The checked-in
+`k8s/overlays/kind` overlay uses the **same** `k8s/base` Kustomization
+(including the daemon, PVC, and GC) with only Kind image and runtime overrides. It pulls the public `main`
 images from GHCR; immutable SHA tags should be selected by an
 environment-specific overlay for a controlled deployment. Hostnames, TLS,
 Ingress, middleware, storage classes, and platform service URLs belong in that
-overlay.
+overlay. The upstream base owns the single shared Nix PVC named
+`anvil-nix-shared`; consumers can patch only storage class/capacity, without
+creating a second PVC or rewriting the daemon/GC claim references.
 
 Before a platform owner considers a deployment, independently verify all of:
 
@@ -125,7 +129,7 @@ The shared profile is stored in `anvil-opencode-profile`, mounted at
 new Agent Sandboxes. The current ZFS storage is single-node `ReadWriteOnce`,
 not RWX; do not schedule this PoC across multiple nodes.
 
-`anvil-nix-daemon` is the sole writer of the dedicated `anvil-nix` PVC. Its
+`anvil-nix-daemon` is the sole writer of the dedicated `anvil-nix-shared` PVC. Its
 init container seeds the image's complete runtime store and Nix database on a
 fresh PVC and pins the baseline with GC roots; subsequent restarts preserve the
 database and builds. New daemon images merge any added runtime store paths and

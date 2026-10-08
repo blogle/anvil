@@ -34,7 +34,7 @@ application base.
 ## Shared Nix store
 
 `anvil-nix-daemon` runs a single root Nix daemon and eight build users against
-Anvil's dedicated RWO `anvil-nix` PVC. An init container automatically seeds a
+Anvil's dedicated RWO `anvil-nix-shared` PVC. An init container automatically seeds a
 new volume with the sandbox runtime closure and Nix database and GC-roots the
 baseline. Image upgrades merge new baseline paths into the existing database
 without replacing previously built paths. Every sandbox mounts the same
