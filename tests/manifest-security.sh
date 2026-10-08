@@ -36,6 +36,14 @@ if grep -Eiq 'rm[[:space:]]+-rf|nix-store[[:space:]]+--delete|delete-generations
   exit 1
 fi
 
+
+canary_script="$repo_root/runtime/nix-deployment-canary"
+require_text "fresh Nix derivation" "nonce: derivation" "$canary_script"
+require_text "canary performs a real build" "nix-store --realise" "$canary_script"
+require_text "directory-source chmod canary" "chmod -R u+w source" "$canary_script"
+require_text "canary script baked into daemon" "daemonCanary" "$repo_root/nix/sandbox.nix"
+require_text "deployment startup canary" "command: [/bin/anvil-nix-deployment-canary]" "$repo_root/k8s/base/anvil-nix-daemon.yaml"
+
 smoke_script="$repo_root/tests/nix-daemon-smoke.sh"
 require_text 'daemon executable smoke' 'test -x /bin/anvil-nix-daemon' "$smoke_script"
 require_text 'daemon RPC smoke' 'NIX_REMOTE=daemon nix store info' "$smoke_script"

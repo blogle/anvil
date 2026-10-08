@@ -34,6 +34,14 @@ spec:
           volumeMounts:
             - name: nix
               mountPath: /nix
+          # A real fresh build must succeed before this daemon is admitted.
+          # Startup probes stop after success; ordinary readiness stays cheap.
+          startupProbe:
+            exec:
+              command: [/bin/anvil-nix-deployment-canary]
+            periodSeconds: 10
+            timeoutSeconds: 30
+            failureThreshold: 60
           readinessProbe:
             exec:
               command: [/bin/bash, -c, 'test -S /nix/var/nix/daemon-socket/socket && nix store info >/dev/null']
