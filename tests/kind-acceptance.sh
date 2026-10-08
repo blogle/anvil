@@ -106,81 +106,9 @@ kubectl --kubeconfig "$kubeconfig" -n agent-sandbox-system rollout status deploy
 kubectl --kubeconfig "$kubeconfig" wait --for=condition=Established --timeout=120s crd/sandboxes.agents.x-k8s.io
 kubectl --kubeconfig "$kubeconfig" explain sandbox.spec --api-version=agents.x-k8s.io/v1beta1
 
-# Render the checked-in deployment with local image tags and Never/IfNotPresent
-# behavior so this lane cannot fall back to GHCR images.
-mkdir -p "$tmp/kind-base"
-cp -a "$root/k8s/base/." "$tmp/kind-base/"
-cat >"$tmp/kind-base/kustomization.yaml" <<'EOF'
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-namespace: anvil
-resources:
-  - namespace.yaml
-  - service-account.yaml
-  - rbac.yaml
-  - runtime-config.yaml
-  - github-app-secret.yaml
-  - opencode-profile-pvc.yaml
-  - anvil-history-pvc.yaml
-  - anvil-nix-pvc.yaml
-  - anvil-nix-daemon.yaml
-  - deployments.yaml
-  - anvil-profile-deployment.yaml
-  - services.yaml
-  - anvil-profile-service.yaml
-images:
-  - name: ghcr.io/blogle/anvil
-    newTag: kind-e2e
-  - name: ghcr.io/blogle/anvil-sandbox
-    newTag: kind-e2e
-  - name: ghcr.io/blogle/anvil-nix-daemon
-    newTag: kind-e2e
-patches:
-  - target:
-      version: v1
-      kind: Deployment
-      name: anvil-nix-daemon
-    patch: |-
-      - op: replace
-        path: /spec/template/spec/initContainers/0/imagePullPolicy
-        value: IfNotPresent
-      - op: replace
-        path: /spec/template/spec/containers/0/imagePullPolicy
-        value: IfNotPresent
-  - target:
-      version: v1
-      kind: Deployment
-      name: anvild
-    patch: |-
-      - op: replace
-        path: /spec/template/spec/containers/0/imagePullPolicy
-        value: IfNotPresent
-  - target:
-      version: v1
-      kind: Deployment
-      name: anvil-mcp
-    patch: |-
-      - op: replace
-        path: /spec/template/spec/containers/0/imagePullPolicy
-        value: IfNotPresent
-  - target:
-      version: v1
-      kind: Deployment
-      name: anvil-router
-    patch: |-
-      - op: replace
-        path: /spec/template/spec/containers/0/imagePullPolicy
-        value: IfNotPresent
-  - target:
-      version: v1
-      kind: Deployment
-      name: anvil-profile
-    patch: |-
-      - op: replace
-        path: /spec/template/spec/containers/0/imagePullPolicy
-        value: IfNotPresent
-EOF
-kustomize build "$tmp/kind-base" | kubectl --kubeconfig "$kubeconfig" apply -f -
+# Render and apply the checked-in Kind overlay. It consumes the exact same
+# k8s/base Kustomization as production, including the GC CronJob.
+kustomize build "$root/k8s/overlays/kind" | kubectl --kubeconfig "$kubeconfig" apply -f -
 
 session_secret="kind-only-session-signing-secret-0123456789abcdef"
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" create secret generic github-app-credentials \
@@ -189,11 +117,6 @@ kubectl --kubeconfig "$kubeconfig" -n "$namespace" create secret generic github-
   --from-literal=ANVIL_GITHUB_PRIVATE_KEY=unused-in-kind-acceptance \
   --from-literal=ANVIL_SESSION_SIGNING_SECRET="$session_secret" \
   --dry-run=client -o yaml | kubectl --kubeconfig "$kubeconfig" apply -f -
-kubectl --kubeconfig "$kubeconfig" -n "$namespace" patch configmap anvil-runtime --type merge -p \
-  '{"data":{"ANVIL_SANDBOX_IMAGE":"ghcr.io/blogle/anvil-sandbox:kind-e2e","ANVIL_PREVIEW_DOMAIN":"preview.kind.test","ANVIL_ANNOTATION_PREFIX":"anvil.example","AGENT_SANDBOX_ROUTER_URL":"http://anvild.anvil.svc.cluster.local:8080","BASE_DOMAIN":"preview.kind.test"}}'
-kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout restart deployment/anvild
-kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout restart deployment/anvil-router
-
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvild --timeout=180s
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-profile --timeout=180s
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-router --timeout=180s
@@ -300,7 +223,7 @@ jq -n \
               {name:"shared-nix",mountPath:"/nix/var/nix/daemon-socket",subPath:"var/nix/daemon-socket",readOnly:true}
             ]
           }],
-          volumes:[{name:"shared-profile",persistentVolumeClaim:{claimName:"anvil-opencode-profile"}},{name:"shared-nix",persistentVolumeClaim:{claimName:"anvil-nix",readOnly:true}}]
+          volumes:[{name:"shared-profile",persistentVolumeClaim:{claimName:"anvil-opencode-profile"}},{name:"shared-nix",persistentVolumeClaim:{claimName:"anvil-nix-shared",readOnly:true}}]
         }
       },
       volumeClaimTemplates:[{
@@ -348,7 +271,7 @@ api_b_name="anvil-$api_b_id"
 for name in "$api_a_name" "$api_b_name"; do
   kubectl --kubeconfig "$kubeconfig" -n "$namespace" get sandbox "$name" -o json | jq -e '
     .spec.podTemplate.spec as $pod |
-    any($pod.volumes[]; .name == "shared-nix" and .persistentVolumeClaim.claimName == "anvil-nix" and (.persistentVolumeClaim | has("readOnly") | not)) and
+    any($pod.volumes[]; .name == "shared-nix" and .persistentVolumeClaim.claimName == "anvil-nix-shared" and (.persistentVolumeClaim | has("readOnly") | not)) and
     ([$pod.containers[] | select(.name == "sandbox") | .volumeMounts[] | select(.name == "shared-nix")] | length == 2 and
       all(.[]; .readOnly == true and ((.mountPath == "/nix/store" and .subPath == "store") or (.mountPath == "/nix/var/nix/daemon-socket" and .subPath == "var/nix/daemon-socket"))))' >/dev/null
 done
@@ -487,4 +410,4 @@ ANVIL_NAMESPACE="$namespace" \
 ANVIL_SHARED_NIX=0 \
   bash "$root/tests/sandbox-acceptance.sh"
 
-printf 'Kind Agent Sandbox reconciliation, PVC, suspend/resume, RBAC, router/preview and shared runtime acceptance passed\n'
+printf 'Kind canonical base/overlay, Nix daemon + GC/PVC, sandbox reconciliation, suspend/resume, RBAC, router/preview and shared runtime acceptance passed\n'
