@@ -25,6 +25,9 @@ jobs:
           set -euo pipefail
           start=$SECONDS
           kubectl kustomize k8s/overlays/dev > /tmp/anvil-rendered.yaml
+          kubectl kustomize k8s/overlays/kind > /tmp/anvil-kind-rendered.yaml
+          grep -F 'name: anvil-nix-gc' /tmp/anvil-kind-rendered.yaml
+          grep -F 'claimName: anvil-nix-shared' /tmp/anvil-kind-rendered.yaml
           if grep -En 'image: (anvil(:|/)|anvil-sandbox:|anvil-nix-daemon:)|imagePullPolicy: Never' /tmp/anvil-rendered.yaml; then
             echo 'rendered manifests contain a local image or Never pull policy'
             exit 1
@@ -33,7 +36,7 @@ jobs:
           grep -En 'image: ghcr.io/blogle/anvil-sandbox:main' /tmp/anvil-rendered.yaml
           grep -En 'image: ghcr.io/blogle/anvil-nix-daemon:main' /tmp/anvil-rendered.yaml
           grep -En 'ANVIL_SANDBOX_IMAGE: ghcr.io/blogle/anvil-sandbox:main' /tmp/anvil-rendered.yaml
-          grep -En 'ANVIL_NIX_PVC: anvil-nix' /tmp/anvil-rendered.yaml
+          grep -En 'ANVIL_NIX_PVC: anvil-nix-shared' /tmp/anvil-rendered.yaml
           printf 'render-and-contract-seconds=%s\n' "$((SECONDS - start))"
 
   pr-artifacts:
