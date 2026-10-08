@@ -6,8 +6,8 @@ set -euo pipefail
 # rather than just looking up a cached output. No nixpkgs evaluation required.
 export NIX_REMOTE=daemon
 nonce="$(date +%s%N)-$$"
-expression='nonce: derivation { name = "anvil-deployment-canary-" + nonce; system = "@SYSTEM@"; builder = "@BASH@"; src = "@SOURCE@"; args = [ "-c" "@COREUTILS@/bin/cp -r \"$src\" source; @COREUTILS@/bin/chmod -R u+w source; @COREUTILS@/bin/cat source/fixture.txt > \"$out\"" ]; }'
-drv="$(nix-instantiate --expr "$expression" --argstr nonce "$nonce")"
+expression='derivation { name = "anvil-deployment-canary-'"$nonce"'"; system = "@SYSTEM@"; builder = "@BASH@"; src = "@SOURCE@"; args = [ "-c" "@COREUTILS@/bin/cp -r \"$src\" source; @COREUTILS@/bin/chmod -R u+w source; @COREUTILS@/bin/cat source/fixture.txt > \"$out\"" ]; }'
+drv="$(nix-instantiate --expr "$expression")"
 output="$(nix-store --realise "$drv")"
 if [ "$(cat "$output")" != 'anvil-nix-deployment-canary-ok' ]; then
   echo 'Anvil Nix deployment canary: unexpected build output' >&2

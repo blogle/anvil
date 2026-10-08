@@ -37,7 +37,12 @@ if grep -Eiq 'rm[[:space:]]+-rf|nix-store[[:space:]]+--delete|delete-generations
 fi
 
 canary_script="$repo_root/runtime/nix-deployment-canary"
-require_text "fresh Nix derivation" "nonce: derivation" "$canary_script"
+require_text "fresh Nix derivation" "name = \"anvil-deployment-canary-" "$canary_script"
+require_text "direct derivation expression" "expression='derivation {" "$canary_script"
+if grep -Fq -- '--argstr nonce' "$canary_script"; then
+  printf 'manifest-security: canary must not pass an unapplied lambda to nix-instantiate\n' >&2
+  exit 1
+fi
 require_text "canary performs a real build" "nix-store --realise" "$canary_script"
 require_text "directory-source chmod canary" "chmod -R u+w source" "$canary_script"
 require_text "canary script baked into daemon" "daemonCanary" "$repo_root/nix/sandbox.nix"
