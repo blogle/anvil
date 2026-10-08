@@ -36,7 +36,6 @@ if grep -Eiq 'rm[[:space:]]+-rf|nix-store[[:space:]]+--delete|delete-generations
   exit 1
 fi
 
-
 canary_script="$repo_root/runtime/nix-deployment-canary"
 require_text "fresh Nix derivation" "nonce: derivation" "$canary_script"
 require_text "canary performs a real build" "nix-store --realise" "$canary_script"
