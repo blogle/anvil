@@ -75,7 +75,7 @@ impl ControllerStore {
         }
         drop(batches_stmt);
 
-        let mut stmt = tx.prepare("SELECT t.task_id,t.batch_id,t.payload_json,b.payload_json,t.state FROM tasks t LEFT JOIN batches b USING(batch_id) WHERE t.state IN ('queued','retry_wait','provisioning') ORDER BY t.rowid")?;
+        let mut stmt = tx.prepare("SELECT t.task_id,t.batch_id,t.payload_json,b.payload_json,t.state,COALESCE(d.operator_hold,0),COALESCE(d.controller_mode,'legacy') FROM tasks t LEFT JOIN batches b USING(batch_id) LEFT JOIN task_durable_state d USING(task_id) WHERE t.state IN ('queued','retry_wait','provisioning') ORDER BY t.rowid")?;
         let candidates = stmt
             .query_map([], |r| {
                 Ok((
@@ -84,12 +84,26 @@ impl ControllerStore {
                     r.get::<_, String>(2)?,
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, bool>(5)?,
+                    r.get::<_, String>(6)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
         let mut claims = Vec::new();
-        for (task_id, batch_id, task_json, batch_json, task_state) in candidates {
+        for (
+            task_id,
+            batch_id,
+            task_json,
+            batch_json,
+            task_state,
+            operator_hold,
+            controller_mode,
+        ) in candidates
+        {
+            if operator_hold || controller_mode != "legacy" {
+                continue;
+            }
             let batch_id = batch_id.unwrap_or_default();
             let task: Value = serde_json::from_str(&task_json)?;
             let batch: Value = batch_json
@@ -525,10 +539,10 @@ fn count_runnable(
 ) -> Result<u32, StoreError> {
     let sql = match batch_id {
         Some(_) => {
-            "SELECT task_id,state,payload_json FROM tasks WHERE batch_id=?1 AND state IN ('queued','retry_wait') ORDER BY rowid"
+            "SELECT t.task_id,t.state,t.payload_json FROM tasks t JOIN task_durable_state d USING(task_id) WHERE t.batch_id=?1 AND t.state IN ('queued','retry_wait') AND d.operator_hold=0 AND d.controller_mode='legacy' ORDER BY t.rowid"
         }
         None => {
-            "SELECT task_id,state,payload_json FROM tasks WHERE state IN ('queued','retry_wait') ORDER BY rowid"
+            "SELECT t.task_id,t.state,t.payload_json FROM tasks t JOIN task_durable_state d USING(task_id) WHERE t.state IN ('queued','retry_wait') AND d.operator_hold=0 AND d.controller_mode='legacy' ORDER BY t.rowid"
         }
     };
     let mut statement = c.prepare(sql)?;
