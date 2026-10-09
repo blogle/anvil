@@ -431,13 +431,24 @@ fn persist_attempt(
     attempt_id: &str,
     attempt: &Value,
 ) -> Result<(), StoreError> {
-    let encoded = serde_json::to_string(attempt)?;
-    tx.execute(
-        "UPDATE attempts SET payload_json=?2 WHERE attempt_id=?1",
-        params![attempt_id, encoded],
+    let current: i64 = tx.query_row(
+        "SELECT version FROM attempts WHERE attempt_id=?1",
+        [attempt_id],
+        |row| row.get(0),
     )?;
+    let next = current + 1;
+    let mut attempt = attempt.clone();
+    attempt["version"] = serde_json::json!(next);
+    let encoded = serde_json::to_string(&attempt)?;
+    let updated = tx.execute(
+        "UPDATE attempts SET payload_json=?2,version=?3 WHERE attempt_id=?1 AND version=?4",
+        params![attempt_id, encoded, next, current],
+    )?;
+    if updated != 1 {
+        return Err(StoreError::Conflict);
+    }
     tx.execute("UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='attempt' AND resource_id=?1", params![attempt_id,encoded,chrono::Utc::now().to_rfc3339()])?;
-    super::append_resource_change(tx, "attempt", attempt_id, attempt)?;
+    super::append_resource_change(tx, "attempt", attempt_id, &attempt)?;
     Ok(())
 }
 fn task_is_runnable(
