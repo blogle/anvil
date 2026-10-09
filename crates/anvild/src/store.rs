@@ -3,7 +3,7 @@
 //! A store handle serializes its own operations with a mutex; separate handles/processes
 //! use SQLite WAL for reader/writer concurrency and SQLite's writer lock for arbitration.
 //! FULL synchronous commits make accepted results durable before provisioning begins.
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -532,10 +532,12 @@ impl ControllerStore {
             .collect();
         if !suppressed.is_empty() {
             accepted_batch["queued_count"] = serde_json::json!(new_tasks.len());
-            accepted_batch["runnable_count"] = serde_json::json!(new_tasks
-                .iter()
-                .filter(|(_, task)| task["dependencies"].as_array().is_none_or(Vec::is_empty))
-                .count());
+            accepted_batch["runnable_count"] = serde_json::json!(
+                new_tasks
+                    .iter()
+                    .filter(|(_, task)| task["dependencies"].as_array().is_none_or(Vec::is_empty))
+                    .count()
+            );
             if let Some(ids) = accepted_batch
                 .get_mut("accepted_task_ids")
                 .and_then(Value::as_array_mut)
@@ -646,6 +648,60 @@ impl ControllerStore {
             .optional()?
             .map(|value| serde_json::from_str(&value).map_err(StoreError::from))
             .transpose()
+    }
+
+    /// Read the durable controller ownership/version tuple. The scheduler remains
+    /// the capacity authority; this row fences future controller ownership changes.
+    pub fn task_control(&self, task_id: &str) -> Result<Option<Value>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        connection.query_row(
+            "SELECT version,operator_hold,controller_mode,reconcile_generation,parent_task_id,
+                    execution_target_json,work_branch,pull_request_binding_json,base_revision,
+                    completion_policy_json,verification_spec_json,budget_json,terminal_json,retry_due_ms
+             FROM task_durable_state WHERE task_id=?1",
+            [task_id],
+            |row| Ok(serde_json::json!({
+                "version":row.get::<_,i64>(0)?, "operator_hold":row.get::<_,bool>(1)?,
+                "controller_mode":row.get::<_,String>(2)?, "reconcile_generation":row.get::<_,i64>(3)?,
+                "parent_task_id":row.get::<_,Option<String>>(4)?,
+                "execution_target":row.get::<_,Option<String>>(5)?, "work_branch":row.get::<_,Option<String>>(6)?,
+                "pull_request_binding":row.get::<_,Option<String>>(7)?, "base_revision":row.get::<_,Option<String>>(8)?,
+                "completion_policy":row.get::<_,String>(9)?, "verification_spec":row.get::<_,String>(10)?,
+                "budget":row.get::<_,String>(11)?, "terminal":row.get::<_,Option<String>>(12)?,
+                "retry_due_ms":row.get::<_,Option<i64>>(13)?
+            })),
+        ).optional().map_err(StoreError::from)
+    }
+
+    /// Compare-and-swap the mutable controller fields. Immutable task intent is
+    /// deliberately not exposed through this mutation.
+    pub fn set_task_control(
+        &self,
+        task_id: &str,
+        expected_version: u64,
+        operator_hold: bool,
+        controller_mode: &str,
+    ) -> Result<u64, StoreError> {
+        if !matches!(controller_mode, "legacy" | "shadow" | "reconciler") {
+            return Err(StoreError::InvalidState(controller_mode.to_owned()));
+        }
+        let connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let changed = connection.execute(
+            "UPDATE task_durable_state SET version=version+1,operator_hold=?3,controller_mode=?4,
+                 reconcile_generation=reconcile_generation+CASE WHEN controller_mode<>?4 THEN 1 ELSE 0 END,
+                 updated_at=?5 WHERE task_id=?1 AND version=?2",
+            params![task_id, expected_version as i64, operator_hold, controller_mode, chrono::Utc::now().to_rfc3339()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        Ok(expected_version + 1)
     }
 
     /// Create the next durable execution attempt for an already accepted logical task.
@@ -1030,6 +1086,89 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
             [chrono::Utc::now().to_rfc3339()],
         )?;
     }
+    if version < 9 {
+        // Extend the existing canonical Task/Attempt store. Batch membership remains
+        // an optional grouping concern in the durable metadata, while old rows and
+        // their IDs/session/idempotency bindings are preserved verbatim.
+        tx.execute_batch(
+            "CREATE TABLE task_durable_state (
+                task_id TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE CASCADE,
+                version INTEGER NOT NULL DEFAULT 1,
+                completion_policy_json TEXT NOT NULL DEFAULT '{\"kind\":\"evidence\",\"required_kinds\":[\"legacy_scheduler_exit\"]}',
+                verification_spec_json TEXT NOT NULL DEFAULT '{\"holdout_scenarios\":[]}',
+                budget_json TEXT NOT NULL DEFAULT '{}',
+                operator_hold INTEGER NOT NULL DEFAULT 0 CHECK(operator_hold IN (0,1)),
+                controller_mode TEXT NOT NULL DEFAULT 'legacy' CHECK(controller_mode IN ('legacy','shadow','reconciler')),
+                reconcile_generation INTEGER NOT NULL DEFAULT 0,
+                parent_task_id TEXT REFERENCES tasks(task_id),
+                execution_target_json TEXT,
+                work_branch TEXT,
+                pull_request_binding_json TEXT,
+                base_revision TEXT,
+                terminal_json TEXT,
+                retry_due_ms INTEGER,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO task_durable_state(task_id,updated_at)
+                SELECT task_id,created_at FROM tasks;
+            CREATE TABLE task_dependencies (
+                predecessor_task_id TEXT NOT NULL REFERENCES tasks(task_id),
+                successor_task_id TEXT NOT NULL REFERENCES tasks(task_id),
+                PRIMARY KEY(predecessor_task_id,successor_task_id),
+                CHECK(predecessor_task_id <> successor_task_id)
+            );
+            CREATE INDEX task_dependencies_by_successor ON task_dependencies(successor_task_id);
+            CREATE TABLE task_observation_sequences (
+                task_id TEXT NOT NULL REFERENCES tasks(task_id), key TEXT NOT NULL,
+                next_sequence INTEGER NOT NULL CHECK(next_sequence > 0),
+                PRIMARY KEY(task_id,key)
+            );
+            CREATE TABLE task_observations (
+                id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id),
+                key TEXT NOT NULL, value_json TEXT NOT NULL,
+                provenance TEXT NOT NULL CHECK(provenance IN ('runtime','platform','external','agent')),
+                observed_at TEXT NOT NULL, recorded_at TEXT NOT NULL,
+                version INTEGER NOT NULL, collection_seq INTEGER NOT NULL,
+                expires_at TEXT, UNIQUE(task_id,key,collection_seq)
+            );
+            CREATE TABLE task_observation_current (
+                task_id TEXT NOT NULL REFERENCES tasks(task_id), key TEXT NOT NULL,
+                observation_id TEXT NOT NULL REFERENCES task_observations(id),
+                PRIMARY KEY(task_id,key)
+            );
+            CREATE TABLE task_blockers (
+                blocker_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id),
+                attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id), version INTEGER NOT NULL DEFAULT 1,
+                question TEXT NOT NULL, context TEXT NOT NULL, created_at TEXT NOT NULL,
+                resolution_json TEXT
+            );
+            CREATE UNIQUE INDEX one_unresolved_blocker_per_task ON task_blockers(task_id) WHERE resolution_json IS NULL;
+            CREATE TABLE task_budget_grants (
+                grant_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id),
+                actor_json TEXT NOT NULL, reason TEXT NOT NULL,
+                additional_attempts INTEGER NOT NULL, additional_continuations INTEGER NOT NULL,
+                additional_ci_retries INTEGER NOT NULL, additional_execution_seconds INTEGER NOT NULL,
+                recorded_at TEXT NOT NULL
+            );
+            CREATE TABLE task_external_refs (
+                id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id),
+                provider TEXT NOT NULL, external_id TEXT NOT NULL, source_hash TEXT NOT NULL, url TEXT,
+                task_open INTEGER NOT NULL DEFAULT 1 CHECK(task_open IN (0,1))
+            );
+            CREATE UNIQUE INDEX one_open_external_task_ref ON task_external_refs(provider,external_id) WHERE task_open=1;
+            CREATE UNIQUE INDEX one_live_attempt_per_task_role ON attempts(task_id,COALESCE(json_extract(payload_json,'$.role'),'implementation'))
+                WHERE json_extract(payload_json,'$.state') NOT IN ('ended','completed','failed','canceled','abandoned','orphaned','replaced','exhausted');
+            CREATE TABLE legacy_scheduler_operations (
+                task_id TEXT NOT NULL REFERENCES tasks(task_id), operation_key TEXT NOT NULL,
+                operation_kind TEXT NOT NULL, state TEXT NOT NULL, payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL, PRIMARY KEY(task_id,operation_key)
+            );",
+        )?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (9, ?1)",
+            [chrono::Utc::now().to_rfc3339()],
+        )?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -1311,7 +1450,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
     #[test]
     fn migration_is_repeatable_and_indexed() {
@@ -1331,9 +1470,46 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(latest, 8);
+        assert_eq!(latest, 9);
         let index: i64=connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='orchestration_by_attempt'",[],|row|row.get(0)).unwrap();
         assert_eq!(index, 1);
+    }
+
+    #[test]
+    fn durable_task_control_is_versioned_and_compare_and_swap() {
+        let (_dir, store) = store();
+        let batch = serde_json::json!({"batch_id":"control-batch","project":"demo","repository":"https://example.test/r","requested_revision":"main","base_commit":"abc"});
+        let task = serde_json::json!({"task_id":"control-task","project":"demo","repository":"https://example.test/r","prompt":"durable work","state":"queued"});
+        store
+            .accept_batch(BatchAcceptance {
+                key: "control-key",
+                scope: "test",
+                request: &serde_json::json!({"control":true}),
+                batch_id: "control-batch",
+                batch: &batch,
+                tasks: &[("control-task".into(), task)],
+                allow_competing: true,
+            })
+            .unwrap();
+        let initial = store.task_control("control-task").unwrap().unwrap();
+        assert_eq!(initial["version"], 1);
+        assert_eq!(initial["controller_mode"], "legacy");
+        assert_eq!(initial["operator_hold"], false);
+        assert_eq!(
+            store
+                .set_task_control("control-task", 1, true, "shadow")
+                .unwrap(),
+            2
+        );
+        assert!(matches!(
+            store.set_task_control("control-task", 1, false, "legacy"),
+            Err(StoreError::Conflict)
+        ));
+        let after = store.task_control("control-task").unwrap().unwrap();
+        assert_eq!(after["version"], 2);
+        assert_eq!(after["controller_mode"], "shadow");
+        assert_eq!(after["reconcile_generation"], 1);
+        assert_eq!(after["operator_hold"], true);
     }
 
     #[test]
