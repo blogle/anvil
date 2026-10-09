@@ -141,6 +141,13 @@ are reused immediately across sandboxes. The daemon performs builds with its
 own `nixbld` users. This is single-node/RWO; multi-node distribution is future
 work.
 
+On every daemon container startup, Kubernetes runs `/bin/anvil-nix-deployment-canary`
+as a startup probe. It realizes a unique, tiny derivation through the real
+shared Nix daemon, including a directory-source copy and chmod. Only after
+that succeeds do ordinary socket/database readiness probes take over. The
+Docker image smoke test runs the same canary before publication. This avoids
+a full project `nix develop` during deployments.
+
 The `anvil-nix-gc` CronJob runs daily at 03:00 UTC on the daemon's node and
 uses the daemon protocol against the same PVC. It skips GC at 20% free space
 or more; below that threshold it requests enough collection to target 30% free

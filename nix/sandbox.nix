@@ -229,12 +229,18 @@ let
   };
   daemonEntrypoint = pkgs.writeShellScriptBin "anvil-nix-daemon"
     (builtins.readFile ./../runtime/nix-daemon-entrypoint);
+  daemonCanarySource = pkgs.writeTextDir "fixture.txt" "anvil-nix-deployment-canary-ok\n";
+  daemonCanary = pkgs.writeShellScriptBin "anvil-nix-deployment-canary"
+    (builtins.replaceStrings
+      [ "@SYSTEM@" "@BASH@" "@COREUTILS@" "@SOURCE@" ]
+      [ pkgs.system "${pkgs.bash}/bin/bash" "${pkgs.coreutils}" "${daemonCanarySource}" ]
+      (builtins.readFile ./../runtime/nix-deployment-canary));
   # Merge the command derivations before handing them to nix2container. Direct
   # copyToRoot entries can retain store paths without materializing /bin links
   # in the final OCI root filesystem.
   daemonCopyToRoot = nix2containerBuildPkgs.symlinkJoin {
     name = "anvil-nix-daemon-root";
-    paths = [ daemonBin daemonConf ] ++ daemonUsers ++ [ daemonEntrypoint ];
+    paths = [ daemonBin daemonConf ] ++ daemonUsers ++ [ daemonEntrypoint daemonCanary ];
   };
   # Include the same explicit sandbox layers so the initialized image DB
   # contains the entire runtime closure before a PVC is ever mounted.
