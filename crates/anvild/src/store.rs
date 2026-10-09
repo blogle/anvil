@@ -1410,6 +1410,55 @@ impl ControllerStore {
         Ok(expected_version + 1)
     }
 
+    pub fn grant_task_budget(
+        &self,
+        task_id: &str,
+        expected_version: u64,
+        actor: &str,
+        reason: &str,
+        attempts: u32,
+        continuations: u32,
+        ci_retries: u32,
+        execution_seconds: u64,
+    ) -> Result<u64, StoreError> {
+        if actor.trim().is_empty()
+            || reason.trim().is_empty()
+            || (attempts == 0 && continuations == 0 && ci_retries == 0 && execution_seconds == 0)
+        {
+            return Err(StoreError::InvalidState(
+                "budget grant requires an actor, reason, and positive allocation".into(),
+            ));
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let grant_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed=tx.execute("UPDATE task_durable_state SET version=version+1,updated_at=?3 WHERE task_id=?1 AND version=?2",params![task_id,expected_version as i64,now])?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        tx.execute("INSERT INTO task_budget_grants(grant_id,task_id,actor_json,reason,additional_attempts,additional_continuations,additional_ci_retries,additional_execution_seconds,recorded_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![grant_id,task_id,serde_json::json!({"kind":"operator","id":actor}).to_string(),reason,attempts,continuations,ci_retries,execution_seconds,now])?;
+        let payload: String = tx.query_row(
+            "SELECT payload_json FROM tasks WHERE task_id=?1",
+            [task_id],
+            |r| r.get(0),
+        )?;
+        let mut task: Value = serde_json::from_str(&payload)?;
+        task["version"] = serde_json::json!(expected_version + 1);
+        let encoded = serde_json::to_string(&task)?;
+        tx.execute(
+            "UPDATE tasks SET payload_json=?2 WHERE task_id=?1",
+            params![task_id, encoded],
+        )?;
+        tx.execute("UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='task' AND resource_id=?1",params![task_id,encoded,now])?;
+        append_resource_change(&tx, "task", task_id, &task)?;
+        tx.commit()?;
+        Ok(expected_version + 1)
+    }
+
     /// Create the next durable execution attempt for an already accepted logical task.
     pub fn create_attempt(
         &self,
@@ -1497,9 +1546,15 @@ impl ControllerStore {
         let mut attempt: Value = serde_json::from_str(&json)?;
         attempt["session_id"] = Value::String(session_id.to_owned());
         attempt["state"] = Value::String("provisioning".into());
+        let version: i64 = tx.query_row(
+            "SELECT version+1 FROM attempts WHERE attempt_id=?1",
+            [attempt_id],
+            |row| row.get(0),
+        )?;
+        attempt["version"] = serde_json::json!(version);
         tx.execute(
-            "UPDATE attempts SET session_id=?2,payload_json=?3 WHERE attempt_id=?1",
-            params![attempt_id, session_id, serde_json::to_string(&attempt)?],
+            "UPDATE attempts SET session_id=?2,payload_json=?3,version=?4 WHERE attempt_id=?1 AND version=?4-1",
+            params![attempt_id, session_id, serde_json::to_string(&attempt)?, version],
         )?;
         tx.execute("UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='attempt' AND resource_id=?1", params![attempt_id,serde_json::to_string(&attempt)?,chrono::Utc::now().to_rfc3339()])?;
         append_resource_change(&tx, "attempt", attempt_id, &attempt)?;
@@ -1622,8 +1677,8 @@ pub(super) fn create_attempt_tx(
         |row| row.get(0),
     )?;
     let now = chrono::Utc::now().to_rfc3339();
-    let attempt = serde_json::json!({"attempt_id":attempt_id,"task_id":task_id,"ordinal":ordinal,"session_id":null,"state":"queued","created_at":now});
-    tx.execute("INSERT INTO attempts(attempt_id,task_id,ordinal,session_id,payload_json,created_at) VALUES(?1,?2,?3,NULL,?4,?5)", params![attempt_id,task_id,ordinal,serde_json::to_string(&attempt)?,now])?;
+    let attempt = serde_json::json!({"attempt_id":attempt_id,"task_id":task_id,"ordinal":ordinal,"version":1,"role":"implementation","session_id":null,"state":"queued","created_at":now});
+    tx.execute("INSERT INTO attempts(attempt_id,task_id,ordinal,session_id,payload_json,created_at,version) VALUES(?1,?2,?3,NULL,?4,?5,1)", params![attempt_id,task_id,ordinal,serde_json::to_string(&attempt)?,now])?;
     tx.execute(
         "INSERT INTO attempt_submissions(idempotency_key,task_id,attempt_id) VALUES(?1,?2,?3)",
         params![idempotency_key, task_id, attempt_id],
@@ -1947,6 +2002,14 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
             INSERT INTO schema_migrations(version,applied_at) VALUES (10,datetime('now'));",
         )?;
     }
+    let latest: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if latest < 11 {
+        tx.execute_batch("ALTER TABLE attempts ADD COLUMN version INTEGER NOT NULL DEFAULT 1; UPDATE attempts SET payload_json=json_set(payload_json,'$.version',1) WHERE json_type(payload_json,'$.version') IS NULL; INSERT INTO schema_migrations(version,applied_at) VALUES(11,datetime('now'));")?;
+    }
     tx.commit()?;
     connection.execute_batch("PRAGMA foreign_keys=ON;")?;
     let mut check = connection.prepare("PRAGMA foreign_key_check")?;
@@ -2233,7 +2296,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
     #[test]
     fn migration_is_repeatable_and_indexed() {
@@ -2253,7 +2316,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(latest, 10);
+        assert_eq!(latest, 11);
         let index: i64=connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='orchestration_by_attempt'",[],|row|row.get(0)).unwrap();
         assert_eq!(index, 1);
         let state_mappings: i64 = connection
@@ -2307,6 +2370,30 @@ mod tests {
         assert_eq!(after["controller_mode"], "shadow");
         assert_eq!(after["reconcile_generation"], 1);
         assert_eq!(after["operator_hold"], true);
+    }
+
+    #[test]
+    fn budget_grants_are_audited_append_only_and_visible_in_snapshot() {
+        let (_dir, store) = store();
+        let spec = serde_json::json!({"outcome":"bounded work"});
+        store
+            .accept_task("grant-task", "test", &spec, "grant-me", &spec)
+            .unwrap();
+        assert_eq!(
+            store
+                .grant_task_budget("grant-me", 1, "operator-1", "approved retry", 2, 1, 3, 900)
+                .unwrap(),
+            2
+        );
+        assert!(matches!(
+            store.grant_task_budget("grant-me", 1, "operator-1", "stale", 1, 0, 0, 0),
+            Err(StoreError::Conflict)
+        ));
+        let snapshot = store.task_snapshot("grant-me", 42).unwrap().unwrap();
+        assert_eq!(snapshot["budget_usage"]["grants"]["attempts"], 2);
+        assert_eq!(snapshot["budget_usage"]["grants"]["continuations"], 1);
+        assert_eq!(snapshot["budget_usage"]["grants"]["ci_retries"], 3);
+        assert_eq!(snapshot["budget_usage"]["grants"]["execution_seconds"], 900);
     }
 
     #[test]

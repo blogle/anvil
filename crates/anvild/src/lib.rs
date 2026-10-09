@@ -2195,6 +2195,11 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
         .route("/v1/tasks/:id/complete", post(complete_task))
         .route("/v1/tasks/:id/cancel", post(cancel_task))
         .route("/v1/tasks/:id/obviate", post(obviate_task))
+        .route(
+            "/v1/tasks/:id/controller-mode",
+            post(set_task_controller_mode),
+        )
+        .route("/v1/tasks/:id/budget-grants", post(grant_task_budget))
         .route("/v1/tasks/:id/snapshot", get(get_task_snapshot))
         .route("/v1/tasks/:id", get(get_task))
         .route(
@@ -3440,6 +3445,78 @@ async fn obviate_task(
         )
         .map(Json)
         .map_err(map_task_terminal_error)
+}
+
+#[derive(Deserialize)]
+struct ControllerModeMutation {
+    expected_version: u64,
+    operator_hold: bool,
+    controller_mode: anvil_core::ControllerMode,
+}
+
+async fn set_task_controller_mode(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ControllerModeMutation>,
+) -> Result<Json<Value>, ServiceError> {
+    let mode = match request.controller_mode {
+        anvil_core::ControllerMode::Legacy => "legacy",
+        anvil_core::ControllerMode::Shadow => "shadow",
+        anvil_core::ControllerMode::Reconciler => "reconciler",
+    };
+    let store = state.store().map_err(|e| ServiceError::Store(e.into()))?;
+    let version = store
+        .set_task_control(&id, request.expected_version, request.operator_hold, mode)
+        .map_err(map_task_terminal_error)?;
+    store
+        .get_resource("task", &id)
+        .map_err(|e| ServiceError::Store(e.to_string()))?
+        .map(|mut task| {
+            task["version"] = json!(version);
+            task["operator_hold"] = json!(request.operator_hold);
+            task["controller_mode"] = json!(mode);
+            Json(task)
+        })
+        .ok_or(ServiceError::NotFound)
+}
+
+#[derive(Deserialize)]
+struct BudgetGrantMutation {
+    expected_version: u64,
+    actor: String,
+    reason: String,
+    additional_attempts: u32,
+    additional_continuations: u32,
+    additional_ci_retries: u32,
+    additional_execution_seconds: u64,
+}
+
+async fn grant_task_budget(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<BudgetGrantMutation>,
+) -> Result<Json<Value>, ServiceError> {
+    let store = state.store().map_err(|e| ServiceError::Store(e.into()))?;
+    let version = store
+        .grant_task_budget(
+            &id,
+            request.expected_version,
+            &request.actor,
+            &request.reason,
+            request.additional_attempts,
+            request.additional_continuations,
+            request.additional_ci_retries,
+            request.additional_execution_seconds,
+        )
+        .map_err(map_task_terminal_error)?;
+    store
+        .get_resource("task", &id)
+        .map_err(|e| ServiceError::Store(e.to_string()))?
+        .map(|mut task| {
+            task["version"] = json!(version);
+            Json(task)
+        })
+        .ok_or(ServiceError::NotFound)
 }
 
 fn map_task_terminal_error(error: store::StoreError) -> ServiceError {
