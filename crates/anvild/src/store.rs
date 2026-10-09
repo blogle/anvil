@@ -1546,6 +1546,8 @@ impl ControllerStore {
         let mut attempt: Value = serde_json::from_str(&json)?;
         attempt["session_id"] = Value::String(session_id.to_owned());
         attempt["state"] = Value::String("provisioning".into());
+        attempt["lifecycle"] = Value::String("provisioning".into());
+        attempt["exit_reason"] = Value::Null;
         let version: i64 = tx.query_row(
             "SELECT version+1 FROM attempts WHERE attempt_id=?1",
             [attempt_id],
@@ -1677,7 +1679,7 @@ pub(super) fn create_attempt_tx(
         |row| row.get(0),
     )?;
     let now = chrono::Utc::now().to_rfc3339();
-    let attempt = serde_json::json!({"attempt_id":attempt_id,"task_id":task_id,"ordinal":ordinal,"version":1,"role":"implementation","session_id":null,"state":"queued","created_at":now});
+    let attempt = serde_json::json!({"attempt_id":attempt_id,"task_id":task_id,"ordinal":ordinal,"version":1,"role":"implementation","session_id":null,"state":"queued","lifecycle":"queued","exit_reason":null,"created_at":now});
     tx.execute("INSERT INTO attempts(attempt_id,task_id,ordinal,session_id,payload_json,created_at,version) VALUES(?1,?2,?3,NULL,?4,?5,1)", params![attempt_id,task_id,ordinal,serde_json::to_string(&attempt)?,now])?;
     tx.execute(
         "INSERT INTO attempt_submissions(idempotency_key,task_id,attempt_id) VALUES(?1,?2,?3)",
@@ -2010,6 +2012,14 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
     if latest < 11 {
         tx.execute_batch("ALTER TABLE attempts ADD COLUMN version INTEGER NOT NULL DEFAULT 1; UPDATE attempts SET payload_json=json_set(payload_json,'$.version',1) WHERE json_type(payload_json,'$.version') IS NULL; INSERT INTO schema_migrations(version,applied_at) VALUES(11,datetime('now'));")?;
     }
+    let latest: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if latest < 12 {
+        tx.execute_batch("CREATE TABLE attempt_state_migration_map(legacy_state TEXT PRIMARY KEY,lifecycle TEXT NOT NULL,exit_reason TEXT); INSERT INTO attempt_state_migration_map VALUES ('queued','queued',NULL),('provisioning','provisioning',NULL),('running','running',NULL),('completed','ended','completed_turn'),('succeeded','ended','completed_turn'),('failed','ended','failed'),('retry_wait','ended','failed'),('exhausted','ended','failed'),('canceled','ended','canceled'),('cancelled','ended','canceled'),('abandoned','ended','abandoned'),('orphaned','ended','orphaned'),('replaced','ended','replaced'); UPDATE attempts SET payload_json=json_set(payload_json,'$.lifecycle',CASE WHEN json_extract(payload_json,'$.state') IN ('queued','provisioning','running') THEN json_extract(payload_json,'$.state') ELSE 'ended' END,'$.exit_reason',CASE json_extract(payload_json,'$.state') WHEN 'completed' THEN 'completed_turn' WHEN 'succeeded' THEN 'completed_turn' WHEN 'failed' THEN 'failed' WHEN 'retry_wait' THEN 'failed' WHEN 'exhausted' THEN 'failed' WHEN 'canceled' THEN 'canceled' WHEN 'cancelled' THEN 'canceled' WHEN 'abandoned' THEN 'abandoned' WHEN 'orphaned' THEN 'orphaned' WHEN 'replaced' THEN 'replaced' ELSE NULL END) WHERE json_type(payload_json,'$.lifecycle') IS NULL; UPDATE attempts SET payload_json=json_set(payload_json,'$.failure',json_object('domain',CASE json_extract(payload_json,'$.failure_class') WHEN 'infrastructure' THEN 'platform' WHEN 'execution' THEN 'work' ELSE 'unknown' END,'code','legacy_'||COALESCE(json_extract(payload_json,'$.failure_class'),'unclassified'),'summary',substr(COALESCE(json_extract(payload_json,'$.failure_reason'),''),1,512),'artifact_refs',json('[]'))) WHERE json_type(payload_json,'$.failure_class') IS NOT NULL; INSERT INTO schema_migrations(version,applied_at) VALUES(12,datetime('now'));")?;
+    }
     tx.commit()?;
     connection.execute_batch("PRAGMA foreign_keys=ON;")?;
     let mut check = connection.prepare("PRAGMA foreign_key_check")?;
@@ -2296,7 +2306,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
     }
     #[test]
     fn migration_is_repeatable_and_indexed() {
@@ -2316,7 +2326,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(latest, 11);
+        assert_eq!(latest, 12);
         let index: i64=connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='orchestration_by_attempt'",[],|row|row.get(0)).unwrap();
         assert_eq!(index, 1);
         let state_mappings: i64 = connection
@@ -2333,6 +2343,14 @@ mod tests {
             .unwrap();
         assert_eq!(state_mappings, 12);
         assert_eq!(failure_mappings, 4);
+        let attempt_mappings: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM attempt_state_migration_map",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt_mappings, 13);
     }
 
     #[test]
