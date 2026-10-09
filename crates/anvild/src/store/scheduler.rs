@@ -75,14 +75,14 @@ impl ControllerStore {
         }
         drop(batches_stmt);
 
-        let mut stmt = tx.prepare("SELECT t.task_id,t.batch_id,t.payload_json,b.payload_json,t.state FROM tasks t JOIN batches b USING(batch_id) WHERE t.state IN ('queued','retry_wait','provisioning') ORDER BY t.rowid")?;
+        let mut stmt = tx.prepare("SELECT t.task_id,t.batch_id,t.payload_json,b.payload_json,t.state FROM tasks t LEFT JOIN batches b USING(batch_id) WHERE t.state IN ('queued','retry_wait','provisioning') ORDER BY t.rowid")?;
         let candidates = stmt
             .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(3)?,
                     r.get::<_, String>(4)?,
                 ))
             })?
@@ -90,9 +90,16 @@ impl ControllerStore {
         drop(stmt);
         let mut claims = Vec::new();
         for (task_id, batch_id, task_json, batch_json, task_state) in candidates {
+            let batch_id = batch_id.unwrap_or_default();
             let task: Value = serde_json::from_str(&task_json)?;
-            let batch: Value = serde_json::from_str(&batch_json)?;
-            let ceiling = batch["requested_concurrency"].as_u64().unwrap_or(1) as u32;
+            let batch: Value = batch_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?
+                .unwrap_or(Value::Null);
+            let ceiling = batch["requested_concurrency"]
+                .as_u64()
+                .unwrap_or(global_limit as u64) as u32;
             let previous: Option<(i64, String, Option<String>)> = tx.query_row("SELECT ordinal,payload_json,session_id FROM attempts WHERE task_id=?1 ORDER BY ordinal DESC LIMIT 1", [&task_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
             let previous_payload = previous
                 .as_ref()
@@ -107,7 +114,10 @@ impl ControllerStore {
             if !resume && active_global >= global_limit {
                 break;
             }
-            if !resume && active_batches.get(&batch_id).copied().unwrap_or(0) >= ceiling {
+            if !resume
+                && !batch_id.is_empty()
+                && active_batches.get(&batch_id).copied().unwrap_or(0) >= ceiling
+            {
                 continue;
             }
             if !dependencies_satisfied(&tx, &task)? {
@@ -399,7 +409,14 @@ fn set_task_state(tx: &Transaction<'_>, task_id: &str, state: &str) -> Result<()
         |r| r.get(0),
     )?;
     let mut payload: Value = serde_json::from_str(&raw)?;
+    let retry_due: Option<i64> = if state == "retry_wait" {
+        tx.query_row("SELECT json_extract(payload_json,'$.retry_at_ms') FROM attempts WHERE task_id=?1 ORDER BY ordinal DESC LIMIT 1",[task_id],|r|r.get(0))?
+    } else {
+        None
+    };
+    let version:i64=tx.query_row("UPDATE task_durable_state SET version=version+1,retry_due_ms=?2,updated_at=?3 WHERE task_id=?1 RETURNING version",params![task_id,retry_due,chrono::Utc::now().to_rfc3339()],|r|r.get(0))?;
     payload["state"] = Value::String(state.to_owned());
+    payload["version"] = serde_json::json!(version);
     let encoded = serde_json::to_string(&payload)?;
     tx.execute(
         "UPDATE tasks SET state=?2,payload_json=?3 WHERE task_id=?1",

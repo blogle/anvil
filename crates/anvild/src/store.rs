@@ -78,6 +78,12 @@ pub struct AttemptAcceptance {
     pub created: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct TaskAcceptance {
+    pub task: Value,
+    pub created: bool,
+}
+
 #[derive(Clone)]
 pub struct ControllerStore {
     connection: Arc<Mutex<Connection>>,
@@ -564,6 +570,22 @@ impl ControllerStore {
                 }
             }
             tx.execute("INSERT INTO tasks(task_id,batch_id,client_task_id,project,repository,prompt,state,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,'queued',?7,?8)", params![task_id,batch_id,task["requested_task_id"].as_str().unwrap_or(&task_id),task["project"].as_str().unwrap_or_default(),task["repository"].as_str().unwrap_or_default(),task["prompt"].as_str().unwrap_or_default(),serde_json::to_string(&task)?,now])?;
+            let execution_target = serde_json::json!({
+                "kind":"git_repository", "project":task["project"], "repository":task["repository"],
+                "base_ref":task["requested_revision"], "delivery":{"kind":"pull_request"}
+            });
+            let completion_policy =
+                serde_json::json!({"kind":"evidence","required_kinds":["legacy_scheduler_exit"]});
+            let budget = serde_json::json!({"max_attempts":3,"max_continuations_per_reason":2,"max_verifier_cycles":0,"max_ci_retries":2,"max_execution_seconds":14400,"max_model_cost":null});
+            tx.execute(
+                "INSERT INTO task_durable_state(task_id,completion_policy_json,verification_spec_json,budget_json,execution_target_json,work_branch,base_revision,updated_at) VALUES(?1,?2,'{\"holdout_scenarios\":[]}',?3,?4,?5,?6,?7)",
+                params![task_id,serde_json::to_string(&completion_policy)?,serde_json::to_string(&budget)?,serde_json::to_string(&execution_target)?,format!("anvil/{task_id}"),task["base_id"].as_str().or(task["base_commit"].as_str()),now],
+            )?;
+            if let Some(dependencies) = task["dependencies"].as_array() {
+                for predecessor in dependencies.iter().filter_map(Value::as_str) {
+                    tx.execute("INSERT INTO task_dependencies(predecessor_task_id,successor_task_id) VALUES(?1,?2)",params![predecessor,task_id])?;
+                }
+            }
             tx.execute("INSERT INTO orchestration_resources (resource_type, resource_id, batch_id, task_id, attempt_id, payload_json, created_at, updated_at) VALUES ('task',?1,?2,?1,NULL,?3,?4,?4)", params![task_id, batch_id, serde_json::to_string(&task)?, now])?;
             append_resource_change(&tx, "task", &task_id, &task)?;
         }
@@ -650,6 +672,265 @@ impl ControllerStore {
             .transpose()
     }
 
+    /// Accept one Task without requiring a Batch. Intent, durable metadata, the
+    /// resource projection, and the idempotency binding commit atomically.
+    pub fn accept_task(
+        &self,
+        key: &str,
+        scope: &str,
+        request: &Value,
+        task_id: &str,
+        specification: &Value,
+    ) -> Result<TaskAcceptance, StoreError> {
+        let hash = format!("{:x}", Sha256::digest(canonical_json(request).as_bytes()));
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = tx.query_row(
+            "SELECT operation_kind,scope,request_hash,canonicalization_version,result_reference,result_json FROM idempotency_records WHERE idempotency_key=?1",
+            [key],
+            |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?)),
+        ).optional()?;
+        if let Some((kind, stored_scope, stored_hash, canonical_version, _reference, json)) =
+            existing
+        {
+            if kind != "create_task"
+                || stored_scope != scope
+                || stored_hash != hash
+                || canonical_version != CANONICALIZATION_VERSION
+            {
+                return Err(StoreError::Conflict);
+            }
+            let task = serde_json::from_str(&json)?;
+            tx.commit()?;
+            return Ok(TaskAcceptance {
+                task,
+                created: false,
+            });
+        }
+        if tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE task_id=?1)",
+            [task_id],
+            |row| row.get::<_, bool>(0),
+        )? {
+            return Err(StoreError::Conflict);
+        }
+        let outcome = specification["outcome"].as_str().unwrap_or_default();
+        let target = specification
+            .get("execution_target")
+            .filter(|v| !v.is_null());
+        let project = target
+            .and_then(|v| v["project"].as_str())
+            .unwrap_or_default();
+        let repository = target
+            .and_then(|v| v["repository"].as_str())
+            .unwrap_or_default();
+        let runnable = target.is_some();
+        let state = if runnable { "queued" } else { "open" };
+        let completion_policy = specification
+            .get("completion_policy")
+            .cloned()
+            .unwrap_or_else(|| {
+                if runnable {
+                    serde_json::json!({"kind":"evidence","required_kinds":["delivery_complete"]})
+                } else {
+                    serde_json::json!({"kind":"all_children_completed"})
+                }
+            });
+        let verification = specification
+            .get("verification_spec")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"holdout_scenarios":[]}));
+        let budget = specification.get("budget").cloned().unwrap_or_else(|| {
+            serde_json::json!({
+                "max_attempts":3,"max_continuations_per_reason":2,"max_verifier_cycles":0,
+                "max_ci_retries":2,"max_execution_seconds":14400,"max_model_cost":null
+            })
+        });
+        let branch = runnable.then(|| format!("anvil/{task_id}"));
+        let parent_task_id = specification["parent_task_id"].as_str();
+        if let Some(parent) = parent_task_id {
+            if parent == task_id
+                || !tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tasks WHERE task_id=?1)",
+                    [parent],
+                    |r| r.get::<_, bool>(0),
+                )?
+            {
+                return Err(StoreError::InvalidState(
+                    "parent task does not exist or is self".into(),
+                ));
+            }
+        }
+        let task = serde_json::json!({
+            "task_id":task_id,"batch_id":null,"outcome":outcome,
+            "acceptance_criteria":specification["acceptance_criteria"],
+            "execution_target":target,"work_branch":branch,"completion_policy":completion_policy,
+            "verification_spec":verification,"budget":budget,"parent_task_id":parent_task_id,
+            "dependencies":[],"state":state,"version":1
+        });
+        tx.execute(
+            "INSERT INTO tasks(task_id,batch_id,client_task_id,project,repository,prompt,state,payload_json,created_at) VALUES(?1,NULL,?1,?2,?3,?4,?5,?6,?7)",
+            params![task_id,project,repository,outcome,state,serde_json::to_string(&task)?,now],
+        )?;
+        tx.execute(
+            "INSERT INTO task_durable_state(task_id,completion_policy_json,verification_spec_json,budget_json,parent_task_id,execution_target_json,work_branch,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![task_id,serde_json::to_string(&completion_policy)?,serde_json::to_string(&verification)?,serde_json::to_string(&budget)?,parent_task_id,target.map(serde_json::to_string).transpose()?,branch,now],
+        )?;
+        tx.execute("INSERT INTO orchestration_resources(resource_type,resource_id,batch_id,task_id,attempt_id,payload_json,created_at,updated_at) VALUES('task',?1,NULL,?1,NULL,?2,?3,?3)", params![task_id,serde_json::to_string(&task)?,now])?;
+        append_resource_change(&tx, "task", task_id, &task)?;
+        tx.execute("INSERT INTO idempotency_records(idempotency_key,operation_kind,scope,request_hash,canonicalization_version,result_reference,result_json,state,created_at,updated_at) VALUES(?1,'create_task',?2,?3,?4,?5,?6,'accepted',?7,?7)",params![key,scope,hash,CANONICALIZATION_VERSION,task_id,serde_json::to_string(&task)?,now])?;
+        tx.commit()?;
+        Ok(TaskAcceptance {
+            task,
+            created: true,
+        })
+    }
+
+    /// Submit a bounded task graph as one idempotent SQLite transaction. Client node
+    /// keys are request-local; returned durable IDs and all edges commit together.
+    pub fn accept_task_graph(
+        &self,
+        key: &str,
+        scope: &str,
+        request: &Value,
+        nodes: &[(String, String, Value)],
+        edges: &[(String, String)],
+    ) -> Result<TaskAcceptance, StoreError> {
+        if nodes.is_empty() || nodes.len() > 256 || edges.len() > 2048 {
+            return Err(StoreError::InvalidState(
+                "task graph exceeds configured bounds".into(),
+            ));
+        }
+        let hash = format!("{:x}", Sha256::digest(canonical_json(request).as_bytes()));
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing=tx.query_row("SELECT operation_kind,scope,request_hash,canonicalization_version,result_json FROM idempotency_records WHERE idempotency_key=?1",[key],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?))).optional()?;
+        if let Some((kind, stored_scope, stored_hash, version, result)) = existing {
+            if kind != "create_task_graph"
+                || stored_scope != scope
+                || stored_hash != hash
+                || version != CANONICALIZATION_VERSION
+            {
+                return Err(StoreError::Conflict);
+            }
+            let result: Value = serde_json::from_str(&result)?;
+            tx.commit()?;
+            return Ok(TaskAcceptance {
+                task: result,
+                created: false,
+            });
+        }
+        let ids: std::collections::HashMap<_, _> = nodes
+            .iter()
+            .map(|(key, id, _)| (key.clone(), id.clone()))
+            .collect();
+        if ids.len() != nodes.len()
+            || edges
+                .iter()
+                .any(|(a, b)| a == b || !ids.contains_key(a) || !ids.contains_key(b))
+        {
+            return Err(StoreError::InvalidState(
+                "graph has duplicate, self, or unknown node references".into(),
+            ));
+        }
+        if nodes.iter().any(|(key, _, spec)| {
+            spec["parent_node_key"]
+                .as_str()
+                .is_some_and(|parent| parent == key || !ids.contains_key(parent))
+        }) {
+            return Err(StoreError::InvalidState(
+                "graph has a self or unknown parent node key".into(),
+            ));
+        }
+        for (client_key, task_id, spec) in nodes {
+            if tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE task_id=?1)",
+                [task_id],
+                |r| r.get::<_, bool>(0),
+            )? {
+                return Err(StoreError::Conflict);
+            }
+            let outcome = spec["outcome"].as_str().unwrap_or_default();
+            if outcome.trim().is_empty() {
+                return Err(StoreError::InvalidState(format!(
+                    "node {client_key} has no outcome"
+                )));
+            }
+            let target = spec.get("execution_target").filter(|v| !v.is_null());
+            let project = target
+                .and_then(|v| v["project"].as_str())
+                .unwrap_or_default();
+            let repository = target
+                .and_then(|v| v["repository"].as_str())
+                .unwrap_or_default();
+            let state = if target.is_some() { "queued" } else { "open" };
+            let deps: Vec<_> = edges
+                .iter()
+                .filter(|(_, successor)| successor == client_key)
+                .filter_map(|(predecessor, _)| ids.get(predecessor))
+                .cloned()
+                .collect();
+            let parent = spec["parent_node_key"]
+                .as_str()
+                .and_then(|value| ids.get(value))
+                .cloned();
+            let task = json!({"task_id":task_id,"batch_id":null,"node_key":client_key,"outcome":outcome,"acceptance_criteria":spec["acceptance_criteria"],"execution_target":target,"completion_policy":spec["completion_policy"],"parent_task_id":parent,"dependencies":deps,"state":state,"version":1});
+            tx.execute("INSERT INTO tasks(task_id,batch_id,client_task_id,project,repository,prompt,state,payload_json,created_at) VALUES(?1,NULL,?1,?2,?3,?4,?5,?6,?7)",params![task_id,project,repository,outcome,state,serde_json::to_string(&task)?,now])?;
+            let policy = spec.get("completion_policy").cloned().unwrap_or_else(|| {
+                if target.is_some() {
+                    json!({"kind":"evidence","required_kinds":["delivery_complete"]})
+                } else {
+                    json!({"kind":"all_children_completed"})
+                }
+            });
+            let budget=spec.get("budget").cloned().unwrap_or_else(||json!({"max_attempts":3,"max_continuations_per_reason":2,"max_verifier_cycles":0,"max_ci_retries":2,"max_execution_seconds":14400,"max_model_cost":null}));
+            let verification = spec
+                .get("verification_spec")
+                .cloned()
+                .unwrap_or_else(|| json!({"holdout_scenarios":[]}));
+            tx.execute("INSERT INTO task_durable_state(task_id,completion_policy_json,verification_spec_json,budget_json,execution_target_json,work_branch,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![task_id,serde_json::to_string(&policy)?,serde_json::to_string(&verification)?,serde_json::to_string(&budget)?,target.map(serde_json::to_string).transpose()?,target.map(|_|format!("anvil/{task_id}")),now])?;
+            tx.execute("INSERT INTO orchestration_resources(resource_type,resource_id,batch_id,task_id,attempt_id,payload_json,created_at,updated_at) VALUES('task',?1,NULL,?1,NULL,?2,?3,?3)",params![task_id,serde_json::to_string(&task)?,now])?;
+            append_resource_change(&tx, "task", task_id, &task)?;
+        }
+        for (_client_key, task_id, spec) in nodes {
+            if let Some(parent_id) = spec["parent_node_key"]
+                .as_str()
+                .and_then(|parent| ids.get(parent))
+            {
+                tx.execute(
+                    "UPDATE task_durable_state SET parent_task_id=?2 WHERE task_id=?1",
+                    params![task_id, parent_id],
+                )?;
+            }
+        }
+        for (predecessor, successor) in edges {
+            tx.execute("INSERT INTO task_dependencies(predecessor_task_id,successor_task_id) VALUES(?1,?2)",params![ids[predecessor],ids[successor]])?;
+        }
+        let dependency_cycle:i64=tx.query_row("WITH RECURSIVE reach(start,node) AS (SELECT predecessor_task_id,successor_task_id FROM task_dependencies UNION SELECT r.start,d.successor_task_id FROM reach r JOIN task_dependencies d ON d.predecessor_task_id=r.node) SELECT EXISTS(SELECT 1 FROM reach WHERE start=node)",[],|r|r.get(0))?;
+        let parent_cycle:i64=tx.query_row("WITH RECURSIVE chain(start,node) AS (SELECT task_id,parent_task_id FROM task_durable_state WHERE parent_task_id IS NOT NULL UNION SELECT c.start,s.parent_task_id FROM chain c JOIN task_durable_state s ON s.task_id=c.node WHERE s.parent_task_id IS NOT NULL) SELECT EXISTS(SELECT 1 FROM chain WHERE start=node)",[],|r|r.get(0))?;
+        if dependency_cycle != 0 || parent_cycle != 0 {
+            return Err(StoreError::InvalidState(
+                "task graph contains a cycle".into(),
+            ));
+        }
+        let result = json!({"tasks":nodes.iter().map(|(client,id,_)|json!({"node_key":client,"task_id":id})).collect::<Vec<_>>()});
+        tx.execute("INSERT INTO idempotency_records(idempotency_key,operation_kind,scope,request_hash,canonicalization_version,result_reference,result_json,state,created_at,updated_at) VALUES(?1,'create_task_graph',?2,?3,?4,?5,?6,'accepted',?7,?7)",params![key,scope,hash,CANONICALIZATION_VERSION,key,serde_json::to_string(&result)?,now])?;
+        tx.commit()?;
+        Ok(TaskAcceptance {
+            task: result,
+            created: true,
+        })
+    }
+
     /// Read the durable controller ownership/version tuple. The scheduler remains
     /// the capacity authority; this row fences future controller ownership changes.
     pub fn task_control(&self, task_id: &str) -> Result<Option<Value>, StoreError> {
@@ -676,6 +957,412 @@ impl ControllerStore {
         ).optional().map_err(StoreError::from)
     }
 
+    pub fn task_page(
+        &self,
+        after: i64,
+        limit: usize,
+    ) -> Result<(Vec<Value>, Option<i64>), StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let mut statement = connection.prepare(
+            "SELECT rowid,payload_json FROM tasks WHERE rowid>?1 ORDER BY rowid LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![after, limit.clamp(1, 100) as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut values = Vec::new();
+        let mut cursor = None;
+        for row in rows {
+            let (sequence, json) = row?;
+            cursor = Some(sequence);
+            values.push(serde_json::from_str(&json)?);
+        }
+        Ok((values, cursor))
+    }
+
+    /// Reserve a durable per-Task/key sequence before a provider request starts.
+    pub fn reserve_observation_sequence(
+        &self,
+        task_id: &str,
+        key: &str,
+    ) -> Result<u64, StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("INSERT INTO task_observation_sequences(task_id,key,next_sequence) VALUES(?1,?2,2) ON CONFLICT(task_id,key) DO UPDATE SET next_sequence=next_sequence+1",params![task_id,key])?;
+        let next: i64 = tx.query_row(
+            "SELECT next_sequence-1 FROM task_observation_sequences WHERE task_id=?1 AND key=?2",
+            params![task_id, key],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(next as u64)
+    }
+
+    /// Persist a collected fact. Arrival order cannot let an older in-flight
+    /// collection replace the current value; same-sequence disagreement is invalid.
+    pub fn record_observation(
+        &self,
+        observation_id: &str,
+        task_id: &str,
+        key: &str,
+        value: &Value,
+        provenance: &str,
+        collection_seq: u64,
+        expires_at: Option<&str>,
+    ) -> Result<(), StoreError> {
+        if !matches!(provenance, "runtime" | "platform" | "external" | "agent") {
+            return Err(StoreError::InvalidState(
+                "invalid observation provenance".into(),
+            ));
+        }
+        let canonical = canonical_json(value);
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reserved: Option<i64> = tx
+            .query_row(
+                "SELECT next_sequence FROM task_observation_sequences WHERE task_id=?1 AND key=?2",
+                params![task_id, key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if reserved.is_none_or(|next| collection_seq as i64 >= next) {
+            return Err(StoreError::InvalidState(
+                "observation sequence was not reserved".into(),
+            ));
+        }
+        let same:Option<String>=tx.query_row("SELECT value_json FROM task_observations WHERE task_id=?1 AND key=?2 AND collection_seq=?3",params![task_id,key,collection_seq as i64],|r|r.get(0)).optional()?;
+        if let Some(existing) = same {
+            if canonical_json(&serde_json::from_str::<Value>(&existing)?) != canonical {
+                return Err(StoreError::InvalidState(
+                    "same collection sequence has conflicting value".into(),
+                ));
+            }
+            tx.commit()?;
+            return Ok(());
+        }
+        let latest_id: Option<String> = tx
+            .query_row(
+                "SELECT observation_id FROM task_observation_current WHERE task_id=?1 AND key=?2",
+                params![task_id, key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let version: i64 = latest_id
+            .as_ref()
+            .map(|id| {
+                tx.query_row(
+                    "SELECT version FROM task_observations WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+            })
+            .transpose()?
+            .unwrap_or(0)
+            + 1;
+        tx.execute("INSERT INTO task_observations(id,task_id,key,value_json,provenance,observed_at,recorded_at,version,collection_seq,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![observation_id,task_id,key,serde_json::to_string(value)?,provenance,now,chrono::Utc::now().to_rfc3339(),version,collection_seq as i64,expires_at])?;
+        tx.execute("INSERT INTO task_observation_current(task_id,key,observation_id) VALUES(?1,?2,?3) ON CONFLICT(task_id,key) DO UPDATE SET observation_id=excluded.observation_id WHERE (SELECT collection_seq FROM task_observations WHERE id=task_observation_current.observation_id)<(SELECT collection_seq FROM task_observations WHERE id=excluded.observation_id)",params![task_id,key,observation_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The single compatibility completion boundary for Legacy scheduler exits and
+    /// future trusted observers. Completion is policy-evaluated and Task-CAS fenced.
+    pub fn complete_task(
+        &self,
+        task_id: &str,
+        expected_version: u64,
+        evidence_ids: &[String],
+    ) -> Result<Value, StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (task_json,state,version,policy_json):(String,String,i64,String)=tx.query_row(
+            "SELECT t.payload_json,t.state,d.version,d.completion_policy_json FROM tasks t JOIN task_durable_state d USING(task_id) WHERE task_id=?1",
+            [task_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).optional()?.ok_or(StoreError::NotFound)?;
+        if matches!(
+            state.as_str(),
+            "completed" | "canceled" | "obviated" | "superseded" | "failed_exhausted"
+        ) {
+            return Err(StoreError::InvalidState(
+                "terminal Task state is immutable".into(),
+            ));
+        }
+        if version as u64 != expected_version {
+            return Err(StoreError::Conflict);
+        }
+        let policy: anvil_core::CompletionPolicy = serde_json::from_str(&policy_json)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut refs = Vec::new();
+        let mut trusted = Vec::new();
+        for id in evidence_ids {
+            let row:Option<(String,String,i64,Option<String>)>=tx.query_row("SELECT o.key,o.provenance,o.version,o.expires_at FROM task_observations o JOIN task_observation_current c ON c.observation_id=o.id WHERE o.id=?1 AND o.task_id=?2",params![id,task_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+            let Some((key, provenance, obs_version, expires_at)) = row else {
+                continue;
+            };
+            if provenance == "agent"
+                || expires_at
+                    .as_deref()
+                    .is_some_and(|deadline| deadline <= now)
+            {
+                continue;
+            }
+            let kind = match key.rsplit('.').next().unwrap_or(key.as_str()) {
+                "legacy_scheduler_exit" => anvil_core::EvidenceKind::LegacySchedulerExit,
+                "delivery_complete" => anvil_core::EvidenceKind::DeliveryComplete,
+                "deterministic_verification" => anvil_core::EvidenceKind::DeterministicVerification,
+                "manual_completion" => anvil_core::EvidenceKind::ManualCompletion,
+                _ => continue,
+            };
+            let reference = anvil_core::ObservationRef {
+                id: id.clone(),
+                version: obs_version as u64,
+                kind,
+            };
+            let source = match provenance.as_str() {
+                "runtime" => anvil_core::ObservationProvenance::Runtime,
+                "platform" => anvil_core::ObservationProvenance::Platform,
+                "external" => anvil_core::ObservationProvenance::External,
+                _ => anvil_core::ObservationProvenance::Agent,
+            };
+            if let Ok(item) =
+                anvil_core::TrustedEvidence::from_observation(reference.clone(), source)
+            {
+                trusted.push(item);
+                refs.push(reference);
+            }
+        }
+        let children: Vec<anvil_core::TaskTerminal> = {
+            let mut stmt=tx.prepare("SELECT t.state,d.terminal_json FROM tasks t JOIN task_durable_state d USING(task_id) WHERE d.parent_task_id=?1 ORDER BY t.task_id")?;
+            let rows = stmt.query_map([task_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?;
+            let mut result = Vec::new();
+            for row in rows {
+                let (state, raw) = row?;
+                let terminal = raw
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_else(|| match state.as_str() {
+                        "canceled" => anvil_core::TaskTerminal::Canceled {
+                            actor: "unknown".into(),
+                            reason: "legacy terminal state".into(),
+                        },
+                        "obviated" => anvil_core::TaskTerminal::Obviated {
+                            reason: "legacy terminal state".into(),
+                        },
+                        "superseded" => anvil_core::TaskTerminal::Superseded {
+                            by_task_id: String::new(),
+                        },
+                        "failed_exhausted" => anvil_core::TaskTerminal::FailedExhausted {
+                            attempt_budget: 0,
+                            last_failure: None,
+                        },
+                        _ => anvil_core::TaskTerminal::Canceled {
+                            actor: "system".into(),
+                            reason: "child is not completed".into(),
+                        },
+                    });
+                result.push(terminal);
+            }
+            result
+        };
+        if !anvil_core::completion_policy_satisfied(&policy, &trusted, &children) {
+            return Err(StoreError::InvalidState(
+                "completion policy is not satisfied by fresh trusted evidence".into(),
+            ));
+        }
+        let terminal = anvil_core::TaskTerminal::Completed { evidence: refs };
+        let terminal_json = serde_json::to_string(&terminal)?;
+        let mut task: Value = serde_json::from_str(&task_json)?;
+        task["state"] = Value::String("completed".into());
+        task["terminal"] = serde_json::to_value(&terminal)?;
+        task["version"] = serde_json::json!(expected_version + 1);
+        let encoded = serde_json::to_string(&task)?;
+        let changed=tx.execute("UPDATE task_durable_state SET version=version+1,terminal_json=?3,updated_at=?4 WHERE task_id=?1 AND version=?2",params![task_id,expected_version as i64,terminal_json,now])?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        tx.execute(
+            "UPDATE tasks SET state='completed',payload_json=?2 WHERE task_id=?1",
+            params![task_id, encoded],
+        )?;
+        tx.execute("UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='task' AND resource_id=?1",params![task_id,encoded,now])?;
+        append_resource_change(&tx, "task", task_id, &task)?;
+        tx.commit()?;
+        Ok(task)
+    }
+
+    /// Persist a typed non-success terminal before any best-effort runtime shutdown.
+    pub fn terminate_task(
+        &self,
+        task_id: &str,
+        expected_version: u64,
+        terminal: anvil_core::TaskTerminal,
+    ) -> Result<Value, StoreError> {
+        let state = match &terminal {
+            anvil_core::TaskTerminal::Canceled { .. } => "canceled",
+            anvil_core::TaskTerminal::Obviated { .. } => "obviated",
+            anvil_core::TaskTerminal::Superseded { .. } => "superseded",
+            anvil_core::TaskTerminal::FailedExhausted { .. } => "failed_exhausted",
+            anvil_core::TaskTerminal::Completed { .. } => {
+                return Err(StoreError::InvalidState(
+                    "Completed requires trusted completion-policy evaluation".into(),
+                ));
+            }
+        };
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let raw:Option<(String,String,i64)>=tx.query_row("SELECT t.payload_json,t.state,d.version FROM tasks t JOIN task_durable_state d USING(task_id) WHERE task_id=?1",[task_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let (raw, old_state, version) = raw.ok_or(StoreError::NotFound)?;
+        if version as u64 != expected_version {
+            return Err(StoreError::Conflict);
+        }
+        if matches!(
+            old_state.as_str(),
+            "completed" | "canceled" | "obviated" | "superseded" | "failed_exhausted"
+        ) {
+            return Err(StoreError::InvalidState(
+                "terminal Task state is immutable".into(),
+            ));
+        }
+        let terminal_json = serde_json::to_string(&terminal)?;
+        let mut task: Value = serde_json::from_str(&raw)?;
+        task["state"] = Value::String(state.into());
+        task["terminal"] = serde_json::to_value(&terminal)?;
+        task["version"] = serde_json::json!(expected_version + 1);
+        let encoded = serde_json::to_string(&task)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed=tx.execute("UPDATE task_durable_state SET version=version+1,terminal_json=?3,updated_at=?4 WHERE task_id=?1 AND version=?2",params![task_id,expected_version as i64,terminal_json,now])?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        tx.execute(
+            "UPDATE tasks SET state=?2,payload_json=?3 WHERE task_id=?1",
+            params![task_id, state, encoded],
+        )?;
+        tx.execute("UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='task' AND resource_id=?1",params![task_id,encoded,now])?;
+        append_resource_change(&tx, "task", task_id, &task)?;
+        tx.commit()?;
+        Ok(task)
+    }
+
+    /// Construct bounded decision input using a single SQLite read transaction.
+    pub fn task_snapshot(
+        &self,
+        task_id: &str,
+        logical_time: i64,
+    ) -> Result<Option<Value>, StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let task: Option<String> = tx
+            .query_row(
+                "SELECT payload_json FROM tasks WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(task_json) = task else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let task: Value = serde_json::from_str(&task_json)?;
+        let control: (i64,bool,String,i64,String,String,String,Option<i64>,Option<String>,Option<String>,Option<String>) = tx.query_row(
+            "SELECT version,operator_hold,controller_mode,reconcile_generation,completion_policy_json,budget_json,verification_spec_json,retry_due_ms,execution_target_json,work_branch,pull_request_binding_json FROM task_durable_state WHERE task_id=?1",
+            [task_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?)),
+        )?;
+        let dependencies: Vec<Value> = {
+            let mut stmt=tx.prepare("SELECT predecessor_task_id,t.state FROM task_dependencies d JOIN tasks t ON t.task_id=d.predecessor_task_id WHERE d.successor_task_id=?1 ORDER BY d.predecessor_task_id")?;
+            stmt.query_map([task_id],|row|Ok(serde_json::json!({"task_id":row.get::<_,String>(0)?,"state":row.get::<_,String>(1)?})))?.collect::<Result<_,_>>()?
+        };
+        let children: Vec<Value> = {
+            let mut stmt=tx.prepare("SELECT task_id,state FROM tasks WHERE json_extract(payload_json,'$.parent_task_id')=?1 ORDER BY task_id LIMIT 256")?;
+            stmt.query_map([task_id],|row|Ok(serde_json::json!({"task_id":row.get::<_,String>(0)?,"state":row.get::<_,String>(1)?})))?.collect::<Result<_,_>>()?
+        };
+        let attempts: Vec<Value> = {
+            let mut stmt = tx.prepare(
+                "SELECT payload_json FROM attempts WHERE task_id=?1 ORDER BY ordinal DESC LIMIT 16",
+            )?;
+            stmt.query_map([task_id], |row| row.get::<_, String>(0))?
+                .map(|r| Ok(serde_json::from_str(&r?)?))
+                .collect::<Result<_, StoreError>>()?
+        };
+        let active: Vec<Value> = attempts
+            .iter()
+            .filter(|a| {
+                !matches!(
+                    a["state"].as_str(),
+                    Some(
+                        "ended"
+                            | "completed"
+                            | "failed"
+                            | "canceled"
+                            | "abandoned"
+                            | "orphaned"
+                            | "replaced"
+                            | "exhausted"
+                    )
+                )
+            })
+            .cloned()
+            .collect();
+        let blocker: Option<Value> = tx.query_row("SELECT json_object('id',blocker_id,'attempt_id',attempt_id,'question',question,'context',context,'version',version) FROM task_blockers WHERE task_id=?1 AND resolution_json IS NULL",[task_id],|row|row.get::<_,String>(0)).optional()?.map(|v|serde_json::from_str(&v)).transpose()?;
+        let observations: Vec<Value> = {
+            let mut stmt=tx.prepare("SELECT o.id,o.key,o.value_json,o.provenance,o.observed_at,o.recorded_at,o.version,o.collection_seq,o.expires_at FROM task_observation_current c JOIN task_observations o ON o.id=c.observation_id WHERE c.task_id=?1 ORDER BY o.key LIMIT 128")?;
+            stmt.query_map([task_id],|row|Ok(serde_json::json!({"id":row.get::<_,String>(0)?,"key":row.get::<_,String>(1)?,"value":serde_json::from_str::<Value>(&row.get::<_,String>(2)?).unwrap_or(Value::Null),"provenance":row.get::<_,String>(3)?,"observed_at":row.get::<_,String>(4)?,"recorded_at":row.get::<_,String>(5)?,"version":row.get::<_,i64>(6)?,"collection_seq":row.get::<_,i64>(7)?,"expires_at":row.get::<_,Option<String>>(8)?})))?.collect::<Result<_,_>>()?
+        };
+        let attempt_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM attempts WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        let grants: Value=tx.query_row("SELECT json_object('attempts',COALESCE(SUM(additional_attempts),0),'continuations',COALESCE(SUM(additional_continuations),0),'ci_retries',COALESCE(SUM(additional_ci_retries),0),'execution_seconds',COALESCE(SUM(additional_execution_seconds),0)) FROM task_budget_grants WHERE task_id=?1",[task_id],|row|row.get::<_,String>(0))?;
+        let mode = control.2;
+        let controller_mode = match mode.as_str() {
+            "shadow" => "shadow",
+            "reconciler" => "reconciler",
+            _ => "legacy",
+        };
+        let has_execution_target = control.8.is_some();
+        let dependencies_unresolved = dependencies
+            .iter()
+            .any(|item| item["state"] != "completed" && item["state"] != "succeeded");
+        let phase = anvil_core::derive_task_phase(
+            task["state"].as_str().unwrap_or("open"),
+            blocker.is_some() || dependencies_unresolved,
+            !active.is_empty(),
+            has_execution_target,
+        );
+        let snapshot = serde_json::json!({
+            "schema_version":1,"task_id":task_id,"task_version":control.0,"logical_time":logical_time,
+            "lifecycle":task["state"],"completion_policy":serde_json::from_str::<Value>(&control.4)?,
+            "operator_hold":control.1,"controller_mode":controller_mode,"reconcile_generation":control.3,
+            "execution_target":control.8.as_deref().map(serde_json::from_str::<Value>).transpose()? ,"delivery":{"branch":control.9,"pull_request":control.10,"head_sha":null},
+            "dependency_summary":{"predecessors":dependencies},"child_summary":{"children":children},
+            "active_attempts":active,"blocker":blocker,"current_observations":observations,
+            "action_history":{"recent":[]},"budget_usage":{"attempt_count":attempt_count,"grants":serde_json::from_str::<Value>(&grants)?,"spec":serde_json::from_str::<Value>(&control.5)?},
+            "retry_schedule":{"due_at_ms":control.7},"verification_spec":serde_json::from_str::<Value>(&control.6)?,"phase":phase
+        });
+        tx.commit()?;
+        Ok(Some(snapshot))
+    }
+
     /// Compare-and-swap the mutable controller fields. Immutable task intent is
     /// deliberately not exposed through this mutation.
     pub fn set_task_control(
@@ -688,11 +1375,12 @@ impl ControllerStore {
         if !matches!(controller_mode, "legacy" | "shadow" | "reconciler") {
             return Err(StoreError::InvalidState(controller_mode.to_owned()));
         }
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .expect("controller store lock poisoned");
-        let changed = connection.execute(
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
             "UPDATE task_durable_state SET version=version+1,operator_hold=?3,controller_mode=?4,
                  reconcile_generation=reconcile_generation+CASE WHEN controller_mode<>?4 THEN 1 ELSE 0 END,
                  updated_at=?5 WHERE task_id=?1 AND version=?2",
@@ -701,6 +1389,24 @@ impl ControllerStore {
         if changed != 1 {
             return Err(StoreError::Conflict);
         }
+        let payload: String = tx.query_row(
+            "SELECT payload_json FROM tasks WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        let mut task: Value = serde_json::from_str(&payload)?;
+        task["version"] = serde_json::json!(expected_version + 1);
+        task["operator_hold"] = serde_json::json!(operator_hold);
+        task["controller_mode"] = serde_json::json!(controller_mode);
+        let encoded = serde_json::to_string(&task)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE tasks SET payload_json=?2 WHERE task_id=?1",
+            params![task_id, encoded],
+        )?;
+        tx.execute("UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='task' AND resource_id=?1", params![task_id, encoded, now])?;
+        append_resource_change(&tx, "task", task_id, &task)?;
+        tx.commit()?;
         Ok(expected_version + 1)
     }
 
@@ -924,7 +1630,16 @@ pub(super) fn create_attempt_tx(
     )?;
     tx.execute("INSERT INTO orchestration_resources(resource_type,resource_id,batch_id,task_id,attempt_id,payload_json,created_at,updated_at) SELECT 'attempt',?1,batch_id,?2,?1,?3,?4,?4 FROM orchestration_resources WHERE resource_type='task' AND resource_id=?2", params![attempt_id,task_id,serde_json::to_string(&attempt)?,now])?;
     append_resource_change(tx, "attempt", attempt_id, &attempt)?;
-    let _: Value = serde_json::from_str(&task)?;
+    let mut task: Value = serde_json::from_str(&task)?;
+    let task_version:i64=tx.query_row("UPDATE task_durable_state SET version=version+1,updated_at=?2 WHERE task_id=?1 RETURNING version",params![task_id,now],|row|row.get(0))?;
+    task["version"] = serde_json::json!(task_version);
+    let task_payload = serde_json::to_string(&task)?;
+    tx.execute(
+        "UPDATE tasks SET payload_json=?2 WHERE task_id=?1",
+        params![task_id, task_payload],
+    )?;
+    tx.execute("UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='task' AND resource_id=?1",params![task_id,task_payload,now])?;
+    append_resource_change(tx, "task", task_id, &task)?;
     Ok(AttemptAcceptance {
         attempt,
         created: true,
@@ -1001,6 +1716,10 @@ fn append_resource_change(
 
 fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
     connection.execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);")?;
+    // SQLite only permits changing foreign-key enforcement outside a transaction.
+    // Migration 10 rebuilds tasks to make Batch membership genuinely optional;
+    // the copy is checked before enforcement is restored below.
+    connection.execute_batch("PRAGMA foreign_keys=OFF;")?;
     let tx = connection.unchecked_transaction()?;
     let mut version: i64 = tx.query_row(
         "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
@@ -1111,6 +1830,12 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
             );
             INSERT INTO task_durable_state(task_id,updated_at)
                 SELECT task_id,created_at FROM tasks;
+            UPDATE task_durable_state SET
+                parent_task_id=(SELECT json_extract(t.payload_json,'$.parent_task_id') FROM tasks t WHERE t.task_id=task_durable_state.task_id),
+                execution_target_json=(SELECT CASE WHEN t.project<>'' AND t.repository<>'' THEN json_object('kind','git_repository','project',t.project,'repository',t.repository,'base_ref',COALESCE(json_extract(t.payload_json,'$.requested_revision'),'main'),'delivery',json_object('kind','pull_request')) END FROM tasks t WHERE t.task_id=task_durable_state.task_id),
+                work_branch='anvil/'||task_id,
+                base_revision=(SELECT COALESCE(json_extract(t.payload_json,'$.base_id'),json_extract(t.payload_json,'$.base_commit')) FROM tasks t WHERE t.task_id=task_durable_state.task_id),
+                retry_due_ms=(SELECT json_extract(a.payload_json,'$.retry_at_ms') FROM attempts a WHERE a.task_id=task_durable_state.task_id ORDER BY a.ordinal DESC LIMIT 1);
             CREATE TABLE task_dependencies (
                 predecessor_task_id TEXT NOT NULL REFERENCES tasks(task_id),
                 successor_task_id TEXT NOT NULL REFERENCES tasks(task_id),
@@ -1118,6 +1843,30 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
                 CHECK(predecessor_task_id <> successor_task_id)
             );
             CREATE INDEX task_dependencies_by_successor ON task_dependencies(successor_task_id);
+            INSERT OR IGNORE INTO task_dependencies(predecessor_task_id,successor_task_id)
+                SELECT json_each.value,t.task_id FROM tasks t,json_each(t.payload_json,'$.dependencies')
+                WHERE json_each.type='text' AND EXISTS(SELECT 1 FROM tasks p WHERE p.task_id=json_each.value);
+            CREATE TABLE task_state_migration_map(legacy_state TEXT PRIMARY KEY,canonical_state TEXT NOT NULL,terminal_kind TEXT);
+            INSERT INTO task_state_migration_map VALUES
+                ('queued','open',NULL),('provisioning','open',NULL),('running','open',NULL),('retry_wait','open',NULL),
+                ('completed','completed','completed'),('succeeded','completed','completed'),
+                ('canceled','canceled','canceled'),('cancelled','canceled','canceled'),
+                ('obviated','obviated','obviated'),('superseded','superseded','superseded'),
+                ('failed','open',NULL),('exhausted','open',NULL);
+            CREATE TABLE task_failure_migration_map(legacy_failure TEXT PRIMARY KEY,canonical_domain TEXT NOT NULL,canonical_code TEXT NOT NULL);
+            INSERT INTO task_failure_migration_map VALUES
+                ('infrastructure','platform','legacy_infrastructure'),('execution','work','legacy_execution'),
+                ('non_retryable','unknown','legacy_non_retryable'),('unclassified','unknown','legacy_unclassified');
+            UPDATE task_durable_state SET terminal_json=(
+                SELECT CASE t.state
+                    WHEN 'completed' THEN json_object('kind','completed','evidence',json_array(json_object('id','legacy-exit:'||t.task_id,'version',1,'kind','legacy_scheduler_exit')))
+                    WHEN 'succeeded' THEN json_object('kind','completed','evidence',json_array(json_object('id','legacy-exit:'||t.task_id,'version',1,'kind','legacy_scheduler_exit')))
+                    WHEN 'canceled' THEN json_object('kind','canceled','actor','legacy_migration','reason','historical canceled state')
+                    WHEN 'cancelled' THEN json_object('kind','canceled','actor','legacy_migration','reason','historical canceled state')
+                    WHEN 'obviated' THEN json_object('kind','obviated','reason','historical obviated state')
+                    WHEN 'superseded' THEN json_object('kind','superseded','by_task_id',COALESCE(json_extract(t.payload_json,'$.superseded_by_task_id'),'legacy-unknown'))
+                    ELSE NULL END FROM tasks t WHERE t.task_id=task_durable_state.task_id
+            );
             CREATE TABLE task_observation_sequences (
                 task_id TEXT NOT NULL REFERENCES tasks(task_id), key TEXT NOT NULL,
                 next_sequence INTEGER NOT NULL CHECK(next_sequence > 0),
@@ -1136,6 +1885,13 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
                 observation_id TEXT NOT NULL REFERENCES task_observations(id),
                 PRIMARY KEY(task_id,key)
             );
+            INSERT INTO task_observation_sequences(task_id,key,next_sequence)
+                SELECT task_id,'evidence.legacy_scheduler_exit',2 FROM tasks WHERE state IN ('completed','succeeded');
+            INSERT INTO task_observations(id,task_id,key,value_json,provenance,observed_at,recorded_at,version,collection_seq,expires_at)
+                SELECT 'legacy-exit:'||task_id,task_id,'evidence.legacy_scheduler_exit',json_object('migration','schema_v9','legacy_state',state),'runtime',created_at,datetime('now'),1,1,NULL
+                FROM tasks WHERE state IN ('completed','succeeded');
+            INSERT INTO task_observation_current(task_id,key,observation_id)
+                SELECT task_id,'evidence.legacy_scheduler_exit','legacy-exit:'||task_id FROM tasks WHERE state IN ('completed','succeeded');
             CREATE TABLE task_blockers (
                 blocker_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id),
                 attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id), version INTEGER NOT NULL DEFAULT 1,
@@ -1157,7 +1913,7 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
             );
             CREATE UNIQUE INDEX one_open_external_task_ref ON task_external_refs(provider,external_id) WHERE task_open=1;
             CREATE UNIQUE INDEX one_live_attempt_per_task_role ON attempts(task_id,COALESCE(json_extract(payload_json,'$.role'),'implementation'))
-                WHERE json_extract(payload_json,'$.state') NOT IN ('ended','completed','failed','canceled','abandoned','orphaned','replaced','exhausted');
+                WHERE json_extract(payload_json,'$.state') IN ('queued','provisioning','running');
             CREATE TABLE legacy_scheduler_operations (
                 task_id TEXT NOT NULL REFERENCES tasks(task_id), operation_key TEXT NOT NULL,
                 operation_kind TEXT NOT NULL, state TEXT NOT NULL, payload_json TEXT NOT NULL,
@@ -1168,8 +1924,35 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
             "INSERT INTO schema_migrations(version, applied_at) VALUES (9, ?1)",
             [chrono::Utc::now().to_rfc3339()],
         )?;
+        version = 9;
+    }
+    if version < 10 {
+        tx.execute_batch(
+            "CREATE TABLE tasks_v10 (
+                task_id TEXT PRIMARY KEY,
+                batch_id TEXT REFERENCES batches(batch_id),
+                client_task_id TEXT NOT NULL,
+                project TEXT NOT NULL,
+                repository TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                state TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO tasks_v10 SELECT task_id,batch_id,client_task_id,project,repository,prompt,state,payload_json,created_at FROM tasks;
+            DROP TABLE tasks;
+            ALTER TABLE tasks_v10 RENAME TO tasks;
+            CREATE INDEX tasks_by_batch ON tasks(batch_id);
+            CREATE INDEX active_logical_tasks ON tasks(project,repository,prompt,state);
+            INSERT INTO schema_migrations(version,applied_at) VALUES (10,datetime('now'));",
+        )?;
     }
     tx.commit()?;
+    connection.execute_batch("PRAGMA foreign_keys=ON;")?;
+    let mut check = connection.prepare("PRAGMA foreign_key_check")?;
+    if check.query([])?.next()?.is_some() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     Ok(())
 }
 
@@ -1450,7 +2233,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
     #[test]
     fn migration_is_repeatable_and_indexed() {
@@ -1470,9 +2253,23 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(latest, 9);
+        assert_eq!(latest, 10);
         let index: i64=connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='orchestration_by_attempt'",[],|row|row.get(0)).unwrap();
         assert_eq!(index, 1);
+        let state_mappings: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_state_migration_map", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let failure_mappings: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_failure_migration_map",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_mappings, 12);
+        assert_eq!(failure_mappings, 4);
     }
 
     #[test]
@@ -1510,6 +2307,189 @@ mod tests {
         assert_eq!(after["controller_mode"], "shadow");
         assert_eq!(after["reconcile_generation"], 1);
         assert_eq!(after["operator_hold"], true);
+    }
+
+    #[test]
+    fn detached_task_acceptance_is_atomic_replayable_and_snapshotable() {
+        let (dir, store) = store();
+        let request = serde_json::json!({"outcome":"compile the project","execution_target":{"kind":"git_repository","project":"demo","repository":"https://example.test/r","base_ref":"main","delivery":{"kind":"local_branch"}}});
+        let spec = request.clone();
+        let first = store
+            .accept_task("detached-key", "test", &request, "task-detached", &spec)
+            .unwrap();
+        assert!(first.created);
+        assert_eq!(first.task["batch_id"], Value::Null);
+        assert_eq!(first.task["work_branch"], "anvil/task-detached");
+        let replay = store
+            .accept_task("detached-key", "test", &request, "generated-new-id", &spec)
+            .unwrap();
+        assert!(!replay.created);
+        assert_eq!(replay.task, first.task);
+        let snapshot = store.task_snapshot("task-detached", 123).unwrap().unwrap();
+        assert_eq!(snapshot["task_id"], "task-detached");
+        assert_eq!(snapshot["logical_time"], 123);
+        assert_eq!(snapshot["phase"], "runnable");
+        drop(store);
+        let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
+        assert_eq!(
+            reopened
+                .get_resource("task", "task-detached")
+                .unwrap()
+                .unwrap(),
+            first.task
+        );
+        let claims = reopened.claim_runnable(1, 0, 3, 0).unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].task_id, "task-detached");
+        assert!(matches!(
+            reopened.create_attempt("task-detached", "duplicate-live", "duplicate-live-key"),
+            Err(StoreError::Sqlite(_))
+        ));
+    }
+
+    #[test]
+    fn graph_cycle_rejection_rolls_back_all_nodes_and_edges() {
+        let (_dir, store) = store();
+        let request = serde_json::json!({"nodes":["a","b"],"dependencies":[["a","b"],["b","a"]]});
+        let nodes = vec![
+            (
+                "a".into(),
+                "task-a".into(),
+                serde_json::json!({"outcome":"A"}),
+            ),
+            (
+                "b".into(),
+                "task-b".into(),
+                serde_json::json!({"outcome":"B"}),
+            ),
+        ];
+        let edges = vec![("a".into(), "b".into()), ("b".into(), "a".into())];
+        assert!(matches!(
+            store.accept_task_graph("cycle", "test", &request, &nodes, &edges),
+            Err(StoreError::InvalidState(_))
+        ));
+        let count: i64 = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn observation_sequences_prevent_out_of_order_overwrite_and_conflicting_replay() {
+        let (_dir, store) = store();
+        let request = serde_json::json!({"outcome":"observe"});
+        store
+            .accept_task("observation-task", "test", &request, "observed", &request)
+            .unwrap();
+        let first = store
+            .reserve_observation_sequence("observed", "git.head")
+            .unwrap();
+        let second = store
+            .reserve_observation_sequence("observed", "git.head")
+            .unwrap();
+        store
+            .record_observation(
+                "newer",
+                "observed",
+                "git.head",
+                &serde_json::json!({"sha":"new"}),
+                "runtime",
+                second,
+                None,
+            )
+            .unwrap();
+        store
+            .record_observation(
+                "older",
+                "observed",
+                "git.head",
+                &serde_json::json!({"sha":"old"}),
+                "runtime",
+                first,
+                None,
+            )
+            .unwrap();
+        let snapshot = store.task_snapshot("observed", 0).unwrap().unwrap();
+        assert_eq!(snapshot["current_observations"][0]["value"]["sha"], "new");
+        assert!(matches!(
+            store.record_observation(
+                "conflict",
+                "observed",
+                "git.head",
+                &serde_json::json!({"sha":"different"}),
+                "runtime",
+                second,
+                None
+            ),
+            Err(StoreError::InvalidState(_))
+        ));
+    }
+
+    #[test]
+    fn completion_is_fresh_trusted_policy_checked_and_terminal_cas_fenced() {
+        let (_dir, store) = store();
+        let specification = serde_json::json!({"outcome":"deliver","completion_policy":{"kind":"evidence","required_kinds":["delivery_complete"]}});
+        store
+            .accept_task(
+                "complete-task",
+                "test",
+                &specification,
+                "complete-me",
+                &specification,
+            )
+            .unwrap();
+        let agent_seq = store
+            .reserve_observation_sequence("complete-me", "evidence.delivery_complete")
+            .unwrap();
+        store
+            .record_observation(
+                "agent-proof",
+                "complete-me",
+                "evidence.delivery_complete",
+                &serde_json::json!({"claimed":true}),
+                "agent",
+                agent_seq,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.complete_task("complete-me", 1, &["agent-proof".into()]),
+            Err(StoreError::InvalidState(_))
+        ));
+        let trusted_seq = store
+            .reserve_observation_sequence("complete-me", "evidence.delivery_complete")
+            .unwrap();
+        store
+            .record_observation(
+                "trusted-proof",
+                "complete-me",
+                "evidence.delivery_complete",
+                &serde_json::json!({"merged":true}),
+                "external",
+                trusted_seq,
+                None,
+            )
+            .unwrap();
+        let completed = store
+            .complete_task("complete-me", 1, &["trusted-proof".into()])
+            .unwrap();
+        assert_eq!(completed["state"], "completed");
+        assert_eq!(completed["terminal"]["kind"], "completed");
+        assert_eq!(completed["terminal"]["evidence"][0]["id"], "trusted-proof");
+        assert!(matches!(
+            store.terminate_task(
+                "complete-me",
+                2,
+                anvil_core::TaskTerminal::Canceled {
+                    actor: "operator".into(),
+                    reason: "late".into()
+                }
+            ),
+            Err(StoreError::InvalidState(_))
+        ));
     }
 
     #[test]

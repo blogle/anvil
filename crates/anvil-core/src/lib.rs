@@ -63,6 +63,26 @@ impl TrustedEvidence {
     }
 }
 
+pub fn completion_policy_satisfied(
+    policy: &CompletionPolicy,
+    evidence: &[TrustedEvidence],
+    children: &[TaskTerminal],
+) -> bool {
+    match policy {
+        CompletionPolicy::Evidence { required_kinds } => required_kinds.iter().all(|required| {
+            evidence
+                .iter()
+                .any(|trusted| trusted.observation().kind == *required)
+        }),
+        CompletionPolicy::AllChildrenCompleted => children
+            .iter()
+            .all(|child| matches!(child, TaskTerminal::Completed { .. })),
+        CompletionPolicy::Manual => evidence
+            .iter()
+            .any(|trusted| trusted.observation().kind == EvidenceKind::ManualCompletion),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum TaskTerminal {
@@ -98,6 +118,63 @@ pub enum ControllerMode {
 pub enum AttemptRole {
     Implementation,
     Verification,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptLifecycle {
+    Queued,
+    Provisioning,
+    Running,
+    Ended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptExitReason {
+    CompletedTurn,
+    RuntimeLost,
+    Orphaned,
+    Canceled,
+    Abandoned,
+    Failed,
+    Replaced,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureDomain {
+    Work,
+    Agent,
+    Sandbox,
+    Platform,
+    Dependency,
+    Orchestrator,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Failure {
+    pub domain: FailureDomain,
+    pub code: String,
+    pub summary: String,
+    pub artifact_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attempt {
+    pub id: String,
+    pub version: u64,
+    pub task_id: String,
+    pub ordinal: u32,
+    pub role: AttemptRole,
+    pub session_id: Option<String>,
+    pub start_revision: Option<String>,
+    pub lifecycle: AttemptLifecycle,
+    pub exit_reason: Option<AttemptExitReason>,
+    pub failure: Option<Failure>,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +216,7 @@ pub fn derive_task_phase(
     lifecycle: &str,
     has_blocker: bool,
     has_active_attempt: bool,
+    has_execution_target: bool,
 ) -> &'static str {
     if matches!(
         lifecycle,
@@ -149,8 +227,10 @@ pub fn derive_task_phase(
         "blocked"
     } else if has_active_attempt {
         "running"
-    } else if matches!(lifecycle, "queued" | "open") {
+    } else if lifecycle == "queued" || (lifecycle == "open" && has_execution_target) {
         "runnable"
+    } else if lifecycle == "open" {
+        "waiting"
     } else {
         "waiting"
     }
@@ -792,11 +872,18 @@ mod tests {
 
     #[test]
     fn task_phase_derivation_is_coarse_and_pure() {
-        assert_eq!(derive_task_phase("completed", false, false), "terminal");
-        assert_eq!(derive_task_phase("open", true, true), "blocked");
-        assert_eq!(derive_task_phase("open", false, true), "running");
-        assert_eq!(derive_task_phase("queued", false, false), "runnable");
-        assert_eq!(derive_task_phase("retry_wait", false, false), "waiting");
+        assert_eq!(
+            derive_task_phase("completed", false, false, false),
+            "terminal"
+        );
+        assert_eq!(derive_task_phase("open", true, true, true), "blocked");
+        assert_eq!(derive_task_phase("open", false, true, true), "running");
+        assert_eq!(derive_task_phase("queued", false, false, true), "runnable");
+        assert_eq!(derive_task_phase("open", false, false, false), "waiting");
+        assert_eq!(
+            derive_task_phase("retry_wait", false, false, true),
+            "waiting"
+        );
     }
 
     #[test]
