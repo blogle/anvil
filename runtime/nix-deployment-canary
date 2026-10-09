@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Executed once by the daemon startupProbe before Kubernetes reports Ready.
+# A new derivation name on each container start ensures a real, tiny build,
+# rather than just looking up a cached output. No nixpkgs evaluation required.
+export NIX_REMOTE=daemon
+nonce="$(date +%s%N)-$$"
+expression='derivation { name = "anvil-deployment-canary-'"$nonce"'"; system = "@SYSTEM@"; builder = "@BASH@"; src = "@SOURCE@"; args = [ "-c" "@COREUTILS@/bin/cp -r \"$src\" source; @COREUTILS@/bin/chmod -R u+w source; @COREUTILS@/bin/cat source/fixture.txt > \"$out\"" ]; }'
+drv="$(nix-instantiate --expr "$expression")"
+output="$(nix-store --realise "$drv")"
+if [ "$(cat "$output")" != 'anvil-nix-deployment-canary-ok' ]; then
+  echo 'Anvil Nix deployment canary: unexpected build output' >&2
+  exit 1
+fi
+echo 'Anvil Nix deployment canary: fresh derivation built successfully'
