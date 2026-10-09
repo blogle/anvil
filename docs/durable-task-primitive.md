@@ -2,7 +2,7 @@
 
 ## Status
 
-Canonical specification for the first-wave durable Task foundation. This supersedes the older batch-centric orchestration design where it conflicts.
+Canonical specification for the first-wave durable Task foundation. Revised 2026-10-08 to resolve snapshot/action-history completeness, controller ownership and cutover, retry/capacity contracts, and observation ordering. This supersedes the older batch-centric orchestration design where it conflicts.
 
 ## Objective
 
@@ -60,6 +60,8 @@ struct Task {
     budget: TaskBudget,
 
     operator_hold: bool,
+    controller_mode: ControllerMode, // Legacy | Shadow | Reconciler
+    reconcile_generation: u64,
 
     lifecycle: TaskLifecycle,
 
@@ -217,9 +219,9 @@ enum TaskTerminal {
 
 Historical terminal state is immutable. A later revert or external change creates new work rather than reopening historical completion.
 
-## Task budget
+## Task budget and audited grants
 
-Every Task has an immutable execution envelope:
+Each Task has an immutable **initial** execution allocation and an append-only grant ledger. Exhaustion does **not** automatically terminalize a Task; it becomes Open with attention reason `needs_budget`. Explicit operator `give_up` may terminalize it as `FailedExhausted`; an operator may instead authorize a `BudgetGrant`. Accepted Tasks are never silently superseded to raise limits.
 
 ```rust
 struct TaskBudget {
@@ -227,12 +229,24 @@ struct TaskBudget {
     max_continuations_per_reason: u32,
     max_verifier_cycles: u32,
     max_ci_retries: u32,
-    max_wall_clock_seconds: u64,
+    max_execution_seconds: u64,
     max_model_cost: Option<Money>,
+}
+struct BudgetGrant {
+    task_id: TaskId,
+    actor: ActorRef,
+    reason: String,
+    additional_attempts: u32,
+    additional_continuations: u32,
+    additional_ci_retries: u32,
+    additional_execution_seconds: u64,
+    recorded_at: Timestamp,
 }
 ```
 
-Not every field must be enforced in this lane, but the execution envelope must already be part of the durable Task.
+Time budget counts **active agent runtime/turn time**, not operator hold, waiting for CI/merge, an unresolved blocker, or external-provider downtime. Use a separate merge-wait deadline for `waiting_for_merge_too_long` attention. BudgetUsage aggregates from durable Attempts, Actions, execution-time intervals, and grants; never rely on model prose or an in-memory counter. R1 enforces attempts, continuations, CI retries and execution-time budgets. Cost enforcement is optional until trustworthy telemetry exists.
+
+`POST /v1/tasks/{id}/budget-grants` is an authenticated, audited operator-only mutation using Task CAS. `FailedExhausted` is an explicit terminal give-up, not a side effect of reaching a configured budget.
 
 ## Verification specification
 
@@ -374,6 +388,7 @@ task_observations
   observed_at
   recorded_at
   version
+  collection_seq
   expires_at NULL
 ```
 
@@ -410,25 +425,18 @@ enum ObservationProvenance {
 
 Only non-Agent provenance may convert to `TrustedEvidence`.
 
-### Ordering
+### Ordering: collection sequence, not provider timestamps
+
+`observed_at` represents Anvil collection time; provider event timestamps remain attributes inside `value_json`. Anvil's observer allocates a **durable monotonically increasing sequence for each task/key collection** before initiating a request. Store `collection_seq` on observations and reserve a new sequence for each poll.
 
 For one `(task_id, key)`:
+- newer `collection_seq` wins;
+- older sequence cannot overwrite newer, even if it finishes later;
+- same sequence plus identical canonical JSON is a duplicate;
+- same sequence plus different JSON is a collection invariant error;
+- `recorded_at` is when persistence succeeded, not a provider's timestamp.
 
-```text
-new observed_at > current observed_at
-    accept
-
-new observed_at < current observed_at
-    ignore as stale
-
-same observed_at + same canonical JSON
-    duplicate/no-op
-
-same observed_at + different canonical JSON
-    conflict/error; arrival order must not pick a winner
-```
-
-Store both provider-observed time and Anvil-recorded time.
+Do not derive ordering from second-resolution timestamps or arrival order. A failed fetch must record collection failure/backoff separately, not overwrite a previously valid fact with an invented success.
 
 ### Equality/history
 
@@ -580,53 +588,47 @@ If a terminal source reopens/changes, later importer logic surfaces new/supersed
 
 Source deletion does not cancel a Task.
 
-## Minimal TaskSnapshot
+## Canonical TaskSnapshot: complete pure-decision input
 
-Build a bounded canonical read model in one DB read transaction:
+Build a bounded, canonically ordered snapshot from **one database read transaction**. Never require runtime/client I/O during snapshot construction. The reconciler needs not only current observations but also the action history that prevents duplicate continuations, budget usage, retry deadlines, durable delivery identity, operator hold, controller ownership, and a fencing generation.
 
 ```rust
 struct TaskSnapshot {
     schema_version: u32,
-
     task_id: TaskId,
     task_version: u64,
+    logical_time: LogicalTime,  // supplied for evaluation, excluded from semantic hash
 
-    as_of: Timestamp,
-
-    task: TaskSummary,
     lifecycle: TaskLifecycle,
     completion_policy: CompletionPolicy,
+    operator_hold: bool,
+    controller_mode: ControllerMode,
+    reconcile_generation: u64,
 
+    execution_target: Option<ExecutionTarget>,
+    delivery: Option<DeliverySummary>, // branch + PR binding + head SHA
     dependency_summary: DependencySummary,
     child_summary: ChildSummary,
-
     active_attempts: Vec<ActiveAttemptSummary>,
     blocker: Option<BlockerSummary>,
 
     current_observations: Vec<Observation>,
-    delivery: Option<DeliverySummary>,
-
+    action_history: ActionHistorySummary,
+    budget_usage: BudgetUsage,
+    retry_schedule: RetrySchedule,
     phase: TaskPhase,
 }
 ```
 
-Initial phase stays intentionally small:
+`ActionHistorySummary` includes at least action kind, attempt binding, cause fingerprint, idempotency key, state, outcome/turn identity, and when last dispatched for each still-relevant cause. It is bounded and may point to full cursor-paginated Action history.
 
-```rust
-enum TaskPhase {
-    Terminal,
-    Blocked,
-    Running,
-    Runnable,
-    Waiting,
-}
-```
+`BudgetUsage` includes attempt count, continuations by reason, verifier cycles, CI reruns, active execution seconds, and applied grant totals. `RetrySchedule` includes due time and failure cause/class (and may include observer/merge-wait deadlines when relevant). All are derived from persisted records rather than in-memory counters.
 
-`derive_phase(facts, now)` is pure and fixture-tested.
+The **semantic snapshot hash** is calculated from canonically ordered decision-relevant fields, excluding `logical_time`, volatile `recorded_at`, and other arrival-only metadata. Preserve deadline values themselves and evaluate due-time transitions using the separately persisted logical time. Canonical ordering is required for map/set/vector fields.
 
-Detailed attention semantics belong to the reconciler lane.
+Initial coarse phase: `Terminal | Blocked | Running | Runnable | Waiting`. `derive_phase(snapshot, logical_time)` is pure and fixture-tested. Detailed attention reasons belong to the reconciler.
 
-Children and Attempt history are separately cursor-paginated.
+Children, Attempt history, Actions and decisions have separate cursor-paginated APIs; the decision snapshot carries only bounded decision-essential summaries.
 
 ## API
 
@@ -642,6 +644,8 @@ POST /v1/tasks/graph
 
 POST /v1/tasks/{id}/cancel
 POST /v1/tasks/{id}/obviate
+POST /v1/tasks/{id}/budget-grants
+POST /v1/tasks/{id}/controller-mode
 
 GET  /v1/tasks/{id}/attempts
 GET  /v1/attempts/{id}
@@ -674,22 +678,19 @@ Same key + different body returns HTTP 409.
 
 Reuse existing Anvil idempotency machinery.
 
-## Legacy scheduler bridge
+## Legacy scheduler bridge and controller cutover
 
-Before the new reconciler exists, today's scheduler still needs to finish existing batch Tasks.
+Persist `ControllerMode = Legacy | Shadow | Reconciler` per Task, with explicit version/CAS transition. Existing Tasks begin in Legacy. New reconciliation-managed Tasks begin in Reconciler once R1 is enabled; the rollout may choose Shadow.
 
-Add one explicit compatibility function:
+**Legacy:** existing scheduler is the sole execution authority and may call exactly one greppable `complete_task(task_id, TrustedEvidence::LegacySchedulerExit(...))` compatibility entrypoint.
 
-```rust
-complete_task(
-    task_id,
-    TrustedEvidence::LegacySchedulerExit(...)
-)
-```
+**Shadow:** legacy remains sole execution authority. The new controller may observe real facts and persist replayable decisions, but its Actions are never dispatched. Shadow must not count as an extra Attempt or consume budgets.
 
-Only the legacy scheduler path calls it.
+**Reconciler:** transfer is transactional and fenced. Existing Attempt/session is adopted when viable; no duplicate attempt or lost continuity. The legacy scheduler must not dispatch or complete this Task after ownership transfers. Terminal state/legacy pending operations must be reconciled before takeover. Downgrading ownership requires an explicit operator migration, not an automatic fallback.
 
-The call site must be singular and greppable. The reconciler later replaces/removes it.
+A controller-mode transition is an audited Task CAS write. Cutover must be tested with a running Attempt, a completed turn, and a pending legacy retry.
+
+**Global capacity:** the pure reconciler only proposes `CreateAttempt`; existing transactional scheduler admission owns the global capacity claim. `Deferred(capacity)` is not a failure, Attempt, retry-budget debit, or reason to duplicate Actions.
 
 ## Migration
 
@@ -766,6 +767,9 @@ Include a harness where constructing an OpenCode client panics and prove durable
 21. Task recovery works without constructing an OpenCode client.
 22. `nix develop -c just check` passes.
 23. Existing local E2E remains green.
+24. Decision snapshots include action-history summary, budget usage, retry due, controller mode, operator hold, generation and durable delivery identity.
+25. Collection-sequence ordering prevents an older in-flight poll from overwriting newer facts.
+26. Shadow controller has no side effects; live cutover adopts existing Attempts and preserves transactional global-capacity admission.
 
 ## Explicit non-goals
 
