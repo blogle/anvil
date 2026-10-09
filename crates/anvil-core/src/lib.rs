@@ -5,6 +5,157 @@ use std::{fmt, net::IpAddr};
 use thiserror::Error;
 use url::Url;
 
+/// Immutable completion contract attached to an accepted durable Task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum CompletionPolicy {
+    Evidence { required_kinds: Vec<EvidenceKind> },
+    AllChildrenCompleted,
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    LegacySchedulerExit,
+    DeliveryComplete,
+    DeterministicVerification,
+    ManualCompletion,
+}
+
+/// Provenance is carried at the type boundary so agent claims cannot be promoted
+/// to completion evidence by callers of the completion evaluator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationProvenance {
+    Runtime,
+    Platform,
+    External,
+    Agent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationRef {
+    pub id: String,
+    pub version: u64,
+    pub kind: EvidenceKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrustedEvidence(ObservationRef);
+
+impl TrustedEvidence {
+    pub fn from_observation(
+        reference: ObservationRef,
+        provenance: ObservationProvenance,
+    ) -> Result<Self, ValidationError> {
+        if provenance == ObservationProvenance::Agent {
+            return Err(ValidationError::Invalid {
+                field: "completion_evidence",
+                reason: "agent-provenance observations are not trusted completion evidence".into(),
+            });
+        }
+        Ok(Self(reference))
+    }
+
+    pub fn observation(&self) -> &ObservationRef {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TaskTerminal {
+    Completed {
+        evidence: Vec<ObservationRef>,
+    },
+    Canceled {
+        actor: String,
+        reason: String,
+    },
+    Obviated {
+        reason: String,
+    },
+    Superseded {
+        by_task_id: String,
+    },
+    FailedExhausted {
+        attempt_budget: u32,
+        last_failure: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerMode {
+    Legacy,
+    Shadow,
+    Reconciler,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptRole {
+    Implementation,
+    Verification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskBudget {
+    pub max_attempts: u32,
+    pub max_continuations_per_reason: u32,
+    pub max_verifier_cycles: u32,
+    pub max_ci_retries: u32,
+    pub max_execution_seconds: u64,
+    pub max_model_cost: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSnapshot {
+    pub schema_version: u32,
+    pub task_id: String,
+    pub task_version: u64,
+    pub logical_time: i64,
+    pub lifecycle: String,
+    pub completion_policy: CompletionPolicy,
+    pub operator_hold: bool,
+    pub controller_mode: ControllerMode,
+    pub reconcile_generation: u64,
+    pub execution_target: Option<serde_json::Value>,
+    pub delivery: Option<serde_json::Value>,
+    pub dependency_summary: serde_json::Value,
+    pub child_summary: serde_json::Value,
+    pub active_attempts: Vec<serde_json::Value>,
+    pub blocker: Option<serde_json::Value>,
+    pub current_observations: Vec<serde_json::Value>,
+    pub action_history: serde_json::Value,
+    pub budget_usage: serde_json::Value,
+    pub retry_schedule: serde_json::Value,
+    pub phase: String,
+}
+
+/// Coarse snapshot phase. This function deliberately performs no I/O.
+pub fn derive_task_phase(
+    lifecycle: &str,
+    has_blocker: bool,
+    has_active_attempt: bool,
+) -> &'static str {
+    if matches!(
+        lifecycle,
+        "completed" | "canceled" | "obviated" | "superseded" | "failed_exhausted"
+    ) {
+        "terminal"
+    } else if has_blocker {
+        "blocked"
+    } else if has_active_attempt {
+        "running"
+    } else if matches!(lifecycle, "queued" | "open") {
+        "runnable"
+    } else {
+        "waiting"
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
     #[error("{field} must not be empty")]
@@ -619,6 +770,34 @@ pub fn parse_preview_hostname(hostname: &str, base_domain: &str) -> Option<(Sess
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_observations_cannot_become_trusted_completion_evidence() {
+        let reference = ObservationRef {
+            id: "observation-1".into(),
+            version: 1,
+            kind: EvidenceKind::DeliveryComplete,
+        };
+        assert!(
+            TrustedEvidence::from_observation(reference.clone(), ObservationProvenance::Agent)
+                .is_err()
+        );
+        assert_eq!(
+            TrustedEvidence::from_observation(reference.clone(), ObservationProvenance::External)
+                .unwrap()
+                .observation(),
+            &reference
+        );
+    }
+
+    #[test]
+    fn task_phase_derivation_is_coarse_and_pure() {
+        assert_eq!(derive_task_phase("completed", false, false), "terminal");
+        assert_eq!(derive_task_phase("open", true, true), "blocked");
+        assert_eq!(derive_task_phase("open", false, true), "running");
+        assert_eq!(derive_task_phase("queued", false, false), "runnable");
+        assert_eq!(derive_task_phase("retry_wait", false, false), "waiting");
+    }
 
     #[test]
     fn git_metadata_clears_pr_on_branch_change_and_detached_head() {

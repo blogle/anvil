@@ -2,7 +2,7 @@
 //! records. Queue order is durable task insertion order (`tasks.rowid`), which is
 //! the acceptance order within a batch and is stable across controller restarts.
 use super::{ControllerStore, StoreError};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -466,8 +466,12 @@ fn count_runnable(
     max_attempts: u32,
 ) -> Result<u32, StoreError> {
     let sql = match batch_id {
-        Some(_) => "SELECT task_id,state,payload_json FROM tasks WHERE batch_id=?1 AND state IN ('queued','retry_wait') ORDER BY rowid",
-        None => "SELECT task_id,state,payload_json FROM tasks WHERE state IN ('queued','retry_wait') ORDER BY rowid",
+        Some(_) => {
+            "SELECT task_id,state,payload_json FROM tasks WHERE batch_id=?1 AND state IN ('queued','retry_wait') ORDER BY rowid"
+        }
+        None => {
+            "SELECT task_id,state,payload_json FROM tasks WHERE state IN ('queued','retry_wait') ORDER BY rowid"
+        }
     };
     let mut statement = c.prepare(sql)?;
     let mut count = 0;
@@ -550,9 +554,11 @@ mod tests {
         let other = ControllerStore::open(_dir.path().join("controller.sqlite3")).unwrap();
         let recovered = other.claim_runnable(8, 100, 3, 0).unwrap();
         assert_eq!(recovered.len(), 4);
-        assert!(recovered.iter().all(|attempt| first
-            .iter()
-            .any(|claimed| { claimed.attempt["attempt_id"] == attempt.attempt["attempt_id"] })));
+        assert!(recovered.iter().all(|attempt| {
+            first
+                .iter()
+                .any(|claimed| claimed.attempt["attempt_id"] == attempt.attempt["attempt_id"])
+        }));
         assert_eq!(other.capacity(8, 100, 3, 0, 0).unwrap().provisioning, 4);
     }
 
