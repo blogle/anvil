@@ -362,7 +362,9 @@ On startup and periodically, poll exact known Task resources rather than global 
 
 **CI check semantics:** for the exact observed head SHA, collect GitHub Checks API runs **and commit statuses** relevant to the applicable branch-protection/ruleset-required contexts. Normalize each required context to `Pending | Passing | Failing | Unknown`; optional checks do not automatically cause a ChecksFailed continuation. Missing/unreported required checks are Pending/Unknown, never Passing. If required context policy is inaccessible or ambiguous, mark unknown and avoid claiming green. Check summaries/logs require repo-scoped least-privilege credentials, bounded excerpts, redaction and explicit untrusted-input labeling.
 
-Observations of `delivery.checks` include **head SHA** plus requiredness, check names, provider identifiers, states, collection sequence and freshness/expiry. A head change invalidates prior checks and verification. Provider event timestamps are metadata; Anvil-assigned collection sequence establishes ordering.
+**Two Git identities are mandatory:** `pr_head_sha` is the submitted code identity, while `evaluation_sha` is the specific commit GitHub requires checks on: PR head, GitHub-generated test-merge commit, or merge-group commit. Include `evaluation_kind = Head | TestMerge | MergeGroup` and merge-group identity when applicable. GitHub can require a passing test-merge result instead of head-only checks and merge queues run on their own commit SHA. A change to PR head invalidates its previous verification; a changed test-merge/merge-group evaluation SHA invalidates the corresponding integration-check evidence. Do not send a `ChecksFailed` implementation continuation for a merge-group-only regression unless it is attributable to the worker's code; otherwise route to integration attention.
+
+Observations of `delivery.checks` include both SHA identities, requiredness, names/provider identifiers, states, collection sequence and freshness/expiry. Provider timestamps are metadata; Anvil-assigned collection sequence establishes ordering.
 
 A green, review-ready PR that never merges remains waiting until the configured merge-wait deadline; then surface `waiting_for_merge_too_long` attention.
 
@@ -388,13 +390,9 @@ Queue membership, auto-merge enabled, approval, mergeability, and green checks a
 
 ## Head fencing
 
-All CI/verification evidence is bound to a concrete delivery head SHA.
+All CI/verification evidence is bound to the submitted PR head SHA **and** the exact evaluation commit SHA (head, test merge, or merge group).
 
-If head changes:
-
-- prior check evidence cannot satisfy the new head;
-- prior verification evidence cannot satisfy the new head;
-- reconciliation waits for fresh evidence.
+If the PR head changes, invalidate its prior verification/check facts. If a test-merge or merge-group evaluation SHA changes, invalidate the relevant integration checks even if PR head stays unchanged. Reconciliation obtains fresh evidence for the evaluation SHA GitHub actually requires.
 
 A later revert after merge is new work. Historical Task completion remains immutable.
 
@@ -911,4 +909,5 @@ Do not include in first-wave implementation:
 - mob coordination;
 - Anvil-executed merge;
 - multi-repository writable sandboxes;
+- ChatGPT callbacks/backlinks.
 - ChatGPT callbacks/backlinks.
