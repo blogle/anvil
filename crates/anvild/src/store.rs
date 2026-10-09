@@ -2388,6 +2388,7 @@ mod tests {
         assert_eq!(after["controller_mode"], "shadow");
         assert_eq!(after["reconcile_generation"], 1);
         assert_eq!(after["operator_hold"], true);
+        assert!(store.claim_runnable(2, 0, 3, 0).unwrap().is_empty());
     }
 
     #[test]
