@@ -438,6 +438,36 @@ fn persist_attempt(
     )?;
     let next = current + 1;
     let mut attempt = attempt.clone();
+    let state = attempt["state"].as_str().unwrap_or_default();
+    let (lifecycle, exit_reason) = match state {
+        "queued" => ("queued", Value::Null),
+        "provisioning" => ("provisioning", Value::Null),
+        "running" => ("running", Value::Null),
+        "completed" | "succeeded" => ("ended", serde_json::json!("completed_turn")),
+        "canceled" | "cancelled" => ("ended", serde_json::json!("canceled")),
+        "abandoned" => ("ended", serde_json::json!("abandoned")),
+        "orphaned" => ("ended", serde_json::json!("orphaned")),
+        "replaced" => ("ended", serde_json::json!("replaced")),
+        "failed" | "retry_wait" | "exhausted" => ("ended", serde_json::json!("failed")),
+        "suspended" => ("running", Value::Null),
+        _ => ("ended", serde_json::json!("failed")),
+    };
+    attempt["lifecycle"] = Value::String(lifecycle.into());
+    attempt["exit_reason"] = exit_reason;
+    if attempt["failure_class"].is_string() {
+        let domain = match attempt["failure_class"].as_str().unwrap_or_default() {
+            "infrastructure" => "platform",
+            "execution" => "work",
+            _ => "unknown",
+        };
+        let summary: String = attempt["failure_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .chars()
+            .take(512)
+            .collect();
+        attempt["failure"] = serde_json::json!({"domain":domain,"code":format!("legacy_{}",attempt["failure_class"].as_str().unwrap_or("unknown")),"summary":summary,"artifact_refs":[]});
+    }
     attempt["version"] = serde_json::json!(next);
     let encoded = serde_json::to_string(&attempt)?;
     let updated = tx.execute(
