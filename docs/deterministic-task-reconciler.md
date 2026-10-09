@@ -2,7 +2,7 @@
 
 ## Status
 
-Canonical specification for Anvil's deterministic task-convergence controller. This supersedes older batch-supervision designs where they conflict.
+Canonical specification for Anvil's deterministic task-convergence controller. Revised 2026-10-08 for complete decision inputs, stable action intent, shadow cutover, OpenCode ambiguity, and observer correctness. This supersedes older batch-supervision designs where they conflict.
 
 ## Objective
 
@@ -32,50 +32,17 @@ The controller decision is deterministic:
 
 > For the same serialized TaskSnapshot and logical time, reconciliation must produce the same ordered Action set.
 
-## Milestones
+## Milestones and implementation order
 
-This specification describes the full reconciler architecture, but implementation must land incrementally.
+This document defines the eventual system, but only R1 is first-wave. Track R1 under ANVIL-56, with three independently reviewable integration slices **not** separate top-level Lific tickets:
 
-### R1 — first-wave MVP
+- **R1a kernel:** complete TaskSnapshot contract from the companion Task spec, pure reconciler, logical time, stable action-intent comparison, replay, durable outbox/fencing and tests. Freeze adapter interfaces here.
+- **R1b adapters:** GitHub polling/check semantics and in-process/local protocol fakes; `anvil-test-world`; OpenCode SendTurn acceptance/idempotency spike. R1b may begin in parallel after R1a interfaces are frozen.
+- **R1c convergence:** CI repair, no-progress/attention, terminal/GC, observer scheduling, named failpoints/crash recovery, and recursive offline factory E2E.
 
-Implement:
+Do **not** grant autonomous production authority until both the SendTurn ambiguity gate and Legacy→Shadow→Reconciler cutover have passed.
 
-- versioned/hashable TaskSnapshot input;
-- pure reconciler;
-- serializable logical time;
-- deterministic continuation priority;
-- per-Task single-flight;
-- reconcile-generation fencing;
-- durable Action outbox;
-- GitHub polling adapter;
-- CI-failure → continuation loop;
-- Pull Request merged terminal predicate;
-- LocalBranch terminal predicate for offline tests;
-- completion-policy evaluation;
-- Task garbage collection;
-- `attention=true`;
-- recursive local E2E;
-- restart/crash tests.
-
-Stop after R1 works.
-
-### R2 — event latency
-
-Add GitHub webhooks, durable webhook inbox/deduplication, and event-driven wakeups. Periodic polling remains correctness authority.
-
-### R3 — verification
-
-Add deterministic holdout execution, Verification Attempts, head-SHA-bound verifier/fixer loops, and bounded verifier cycles.
-
-### R4 — external work queues
-
-Add Lific WorkSource ingestion, source hashing/drift detection, and blocker/status reflection.
-
-### R5 — infrastructure incidents
-
-Add richer failure classification, cross-task correlation, Incident objects, incident TTL/re-probe, and manual detach.
-
-Do not combine all milestones into one implementation ticket.
+R2 adds GitHub webhooks/inbox/wakeups; polling remains correctness authority. R3 adds independent verification and holdouts. R4 adds Lific queue adapter. R5 adds shared infrastructure incidents. None belongs in R1 unless needed to correct an R1 invariant.
 
 ## Architecture
 
@@ -135,48 +102,36 @@ Adapters normalize external reality into Task facts and execute typed Actions.
 
 Agent claims may block work or trigger investigation. They may not create trusted completion evidence.
 
-## Durable reconcile artifact
+## Durable reconcile decision, canonical hashing, and replay
 
-Reuse the Task Primitive's canonical `TaskSnapshot`.
-
-For every committed reconciliation persist:
+Use **the canonical TaskSnapshot defined in `durable-task-primitive.md`**; do not create a parallel snapshot type. It contains action-history summary, budget usage, retry deadlines, controller mode, operator hold, generation, delivery/branch binding, facts, attempts, blockers, dependencies.
 
 ```rust
 struct ReconcileDecision {
     schema_version: u32,
-
+    reconciler_version: String, // exact logical evaluator version
     task_id: TaskId,
     task_version: u64,
-
     generation: u64,
-
     logical_time: LogicalTime,
-
-    snapshot_json: Value,
-    snapshot_hash: Hash,
-
-    actions_json: Value,
+    snapshot_json: Value,       // complete exact evaluated input
+    snapshot_hash: Hash,       // excludes logical_time and volatile collection metadata
+    actions_json: Value,       // deterministic ordered desired Actions
     actions_hash: Hash,
-
+    rule_id: String,           // stable chosen decision row/reason
     created_at: Timestamp,
 }
 ```
 
-The snapshot is built in one DB read transaction and is the exact input used to decide the persisted Actions.
+Canonical serialization sorts keys, set-like vectors, dependency lists, relevant action history, and other unordered collections. Do not hash Rust `HashMap` iteration order.
 
-### Replay invariant
+**Semantic snapshot hash** excludes `logical_time`, `recorded_at` and other collection-only churn; action eligibility still evaluates logical time against persisted deadlines.
 
-For every stored decision:
+A periodic wake does **not** necessarily commit a decision. Persist when the semantic snapshot hash changes, an action-intent set changes, or a previously recorded deadline becomes due. In the absence of meaningful new input/action/deadline, reuse the prior decision. An unchanged snapshot may still yield a different action set after a due time; that must be recorded.
 
-```text
-reconcile(stored_snapshot, stored_logical_time)
-==
-stored_actions
-```
+**Replay:** `reconcile(snapshot_json, stored_logical_time, stored_reconciler_version)` must reproduce `actions_json` and `rule_id`. CI retains versioned golden traces. Intentional changes to logic require reviewed golden fixture updates rather than claiming old traces match the new binary. A missing old evaluator version is reported as unsupported replay version, not silently reinterpreted.
 
-Test this in unit tests and checked-in replay fixtures.
-
-A production orchestration defect should be reducible to a stored snapshot/action trace and replayed offline.
+Expose `GET /v1/tasks/{id}/decisions` with cursors, rule IDs, snapshot/action hashes and detail expansion.
 
 ## Logical time
 
@@ -192,37 +147,21 @@ Wall-clock acquisition occurs outside the pure reconciler.
 
 Retry deadlines, stale observations, and wall-clock budgets are evaluated relative to the supplied logical time.
 
-## Per-Task concurrency and fencing
+## Single-flight, stable desired-action sets, and fencing
 
-### Single flight
+Use an in-process per-Task single-flight key plus transactional CAS on the task/reconcile generation. The lock improves efficiency; CAS is the durability guarantee.
 
-Only one reconciliation pass for a Task may actively construct/commit a decision at a time within one `anvild`.
+**Two counters must not be conflated:** a recorded-decision sequence for audit and a **desired-action generation** for the authorization state. Repeated polls and unchanged input must not continuously increment the action generation or cancel pending work.
 
-Use a per-Task keyed lock.
+On meaningful decision change, atomically compare new desired Action keys to active outbox keys and commit the snapshot, rule and resulting action-intent delta with CAS on the generation read:
+- Insert desired Actions using unique `idempotency_key` with insert-or-ignore / replay of existing authoritative row.
+- Retain prior pending/executing Actions whose keys are still desired.
+- Supersede only pending/unclaimed Actions whose keys are no longer desired.
+- An executing external request cannot be retroactively retracted. Record `UnknownOutcome` as needed and reconcile by observation.
+- An executor transactionally claims an Action and verifies its key remains authorized by the Task's current desired-action set, controller mode, and hold state immediately before starting side effects.
+- Never allow a newer no-op periodic sweep to revoke an otherwise valid in-flight Action.
 
-This is not the only correctness mechanism.
-
-### Reconcile generation
-
-Every committed reconciliation increments:
-
-```text
-task.reconcile_generation
-```
-
-Every Action carries that generation.
-
-Immediately before execution:
-
-```text
-action.generation == task.current_generation
-```
-
-must still be true.
-
-Otherwise the Action becomes `superseded` and performs no side effect.
-
-This fences webhook, periodic, runtime, blocker, and startup wakes racing one another.
+Actions are protected against concurrency and stale intent, not promised exactly-once execution at an unreliable external API boundary.
 
 ## Pure reconciler
 
@@ -246,30 +185,27 @@ It:
 
 Action ordering is deterministic.
 
-## Reconcile decision priority
+## Explicit total-order reconciliation rules
 
-Implement one exhaustive decision/match function rather than scattered overlapping rules.
+Use one exhaustive, table-driven decision reducer with stable `rule_id` values. The following priorities are normative (terminal cleanup may still run while held):
 
-Initial total order:
+1. **Already terminal:** observe/cleanup safely, never dispatch implementation.
+2. **Completion policy satisfied:** commit completion from *fresh trusted* evidence, even when operator-held. Suppress destructive GC while held.
+3. **Controller mode Legacy or Shadow:** no automatic side effects. Shadow records nonexecuted decisions for comparison/replay.
+4. **Operator hold / unresolved blocker:** continue passive observation; stop autonomous work.
+5. **Unrecoverable delivery:** PR closed unmerged, branch missing, unexpected force-push/unbound head, or changes-requested review → structured attention in R1. Do not blindly create a new PR or override reviewers.
+6. **Budget exhausted:** stay Open, `needs_budget` attention. Accept an audited `BudgetGrant` or explicit give-up; no unbounded retries.
+7. **Retry backoff pending:** do nothing until durable due time.
+8. **Platform/runtime failure:** bounded recovery based on factual health; never treat provider unavailability as runtime absence.
+9. **Active turn running/submitted:** observe only, no new SendTurn.
+10. **Known CI failure:** one `ChecksFailed` continuation for current head/cause, subject to no-progress and budget rules.
+11. **Completed continuation made no progress:** same head/worktree and same failure → `no_progress` attention, not silence or infinite repeat.
+12. **Verification rejection:** `VerificationFailed` (R3 only); verifier PASS alone cannot complete.
+13. **Merge conflict / incomplete delivery:** bounded continuation when actionable.
+14. **No viable Attempt and runnable Task:** propose `CreateAttempt` (capacity claimed separately).
+15. **Otherwise:** wait, including PR green but not yet merged; a persisted merge-wait deadline raises `waiting_for_merge_too_long` attention when exceeded.
 
-```text
-1. Task terminal
-2. operator_hold
-3. unresolved blocker
-4. active platform/runtime recovery condition
-5. active Attempt currently executing a turn
-6. merge conflict requiring worker action
-7. CI/check failure requiring worker action
-8. verification rejection requiring worker action
-9. missing/incomplete delivery requiring worker action
-10. completed worker turn + unfinished workspace/delivery
-11. resolved blocker requiring continuation
-12. no viable active Attempt + runnable Task
-13. completion policy now satisfied
-14. waiting
-```
-
-Table-driven and property tests must cover simultaneous/conflicting facts.
+Completion always outranks CI repair, dirty workspace and stale red checks. Changes-requested reviews are routed to attention in R1, not automatically dismissed.
 
 ## Runtime facts
 
@@ -356,27 +292,15 @@ enum ActionClass {
 
 R1 contains no irreversible merge Action.
 
-## Idempotency derivation
+## Idempotency keys and unknown outcomes
 
-Pin Action idempotency to:
+Derive the stable key from `(task_id, attempt_id?, action_kind, cause_fingerprint)`, except `CreateAttempt` which is keyed from **`(task_id, role, ordinal)`**. Never use mutable Task version in that key.
 
-```text
-(task_id, attempt_id?, action_kind, cause_fingerprint)
-```
+For `ChecksFailed`, cause includes head SHA, failing required check identities and normalized failure fingerprint. For `FinishDelivery`, cause includes completed run identity, observed head and worktree fact hash. `SendTurn` records the requested message/turn identity when supported.
 
-canonicalized and hashed.
+Outbox rows are unique by key, insert-or-ignore. After a restart an uncertain SendTurn is **not blindly resent**. First query the actual OpenCode session/message/run; classify observed accepted/executing/completed, safely-not-applied, or `UnknownOutcome`. Ambiguity yields explicit attention unless adapter-proven safe resubmission exists. OpenCode `messageID` support must be validated against Anvil's pinned version, not assumed to provide exactly-once execution.
 
-Examples:
-
-```text
-ChecksFailed + headSHA + check-suite-state-hash
-FinishDelivery + turnID + workspace-head + dirty-state-hash
-CreateAttempt + taskVersion + ordinal
-```
-
-The same cause must not generate duplicate continuations after restart/reconciliation.
-
-A changed cause may produce a new Action.
+Every Action records `rule_id` and a declared recovery strategy; `GET /v1/tasks/{id}/decisions` explains why decisions were made.
 
 ## Action/state ownership
 
@@ -430,34 +354,17 @@ GitHubCodeHost
 
 Do not build a generic plugin framework for this.
 
-## GitHub polling is authoritative in R1
+## Separate observer scheduler and GitHub authority
 
-For every active PullRequest-delivery Task, poll exact known resources.
+**Observation collection is NOT the pure reconciler.** A separate observer scheduler persists next-poll due time, latest collection sequence, last success/failure, provider error class, backoff, and head-related refresh triggers. It polls Task-linked repo/branch/PR and obtains facts through CodeHostAdapter; changed facts wake reconciliation. A provider error does not erase healthy prior facts or become a coding failure; stale facts cannot complete.
 
-Observe:
+On startup and periodically, poll exact known Task resources rather than global PR scans. When PR binding is absent, discover by repository + deterministic work branch and independently persist the result.
 
-```text
-work branch/head
-associated Pull Request
-Pull Request head SHA
-Pull Request open/closed/merged
-checks/check suites
-review state where useful
-mergeability where useful
-```
+**CI check semantics:** for the exact observed head SHA, collect GitHub Checks API runs **and commit statuses** relevant to the applicable branch-protection/ruleset-required contexts. Normalize each required context to `Pending | Passing | Failing | Unknown`; optional checks do not automatically cause a ChecksFailed continuation. Missing/unreported required checks are Pending/Unknown, never Passing. If required context policy is inaccessible or ambiguous, mark unknown and avoid claiming green. Check summaries/logs require repo-scoped least-privilege credentials, bounded excerpts, redaction and explicit untrusted-input labeling.
 
-Do not globally scan every open PR.
+Observations of `delivery.checks` include **head SHA** plus requiredness, check names, provider identifiers, states, collection sequence and freshness/expiry. A head change invalidates prior checks and verification. Provider event timestamps are metadata; Anvil-assigned collection sequence establishes ordering.
 
-Before a durable PR binding exists, discover it by exact repository + Task work branch/head.
-
-Once found, persist the binding.
-
-Poll:
-
-- on startup;
-- after relevant worker turns;
-- periodically while active;
-- after adapter-error retry deadlines.
+A green, review-ready PR that never merges remains waiting until the configured merge-wait deadline; then surface `waiting_for_merge_too_long` attention.
 
 ## Who merges?
 
@@ -493,15 +400,9 @@ A later revert after merge is new work. Historical Task completion remains immut
 
 ## LocalBranch delivery
 
-Offline/self-hosted execution must not require GitHub.
+Retain the offline `LocalBranch` completion kind, but do **not** invent a generic `just check` contract for arbitrary Nix projects. In R1 its minimal evidence producer is Anvil's trusted Workspace/Git observer: verify the deterministic branch and a durable committed checkpoint at an exact SHA, with no uncommitted state required by the policy. Emit trusted `delivery_complete` for that checkpoint. If the Task separately requires `deterministic_verification`, it cannot complete until a real evidence-producing verifier exists; do not fabricate that fact.
 
-For `DeliveryKind::LocalBranch`, trusted `delivery_complete` evidence may be produced when:
-
-- the deterministic Task branch exists;
-- the expected durable Git checkpoint exists;
-- required deterministic local verification evidence is present according to the Task completion policy.
-
-This lets inner Anvil exercise actual completion semantics entirely on localhost.
+The main recursive factory E2E exercises the PullRequest flow through fake GitHub and does not require LocalBranch to impersonate GitHub.
 
 ## Continuation reasons
 
@@ -566,26 +467,15 @@ If unchanged and a continuation was already delivered, do not issue another iden
 
 A rerun without worker changes is appropriate only when explicit policy classifies the failure as transient/infrastructure.
 
-## Budgets
+## Budgets, no-progress, and deferred capacity
 
-Enforce at minimum in R1:
+The Task's immutable budget is an initial allocation plus audited `BudgetGrant` entries. R1 enforces attempts, per-reason continuations, CI reruns and **active execution seconds**; time on hold, blocked, provider-down, or awaiting CI/merge is not execution time. Exhaustion leaves the Task Open with `needs_budget` attention. Explicit operator give-up may transition to `FailedExhausted`.
 
-- `max_attempts`;
-- `max_continuations_per_reason`;
-- `max_ci_retries`;
-- `max_wall_clock_seconds`.
+Stable CI failure on unchanged head/worktree after a completed continuation is `no_progress` attention rather than repeatedly prompting or silently waiting. Repeat the same check without code changes only when deterministic policy classified the failure as transient.
 
-When exhausted, surface attention rather than continuing silently.
+A per-Task pure reconciler cannot enforce controller-wide capacity. `CreateAttempt` is a proposal; the **existing transactional global-capacity admission/claim** performs the actual allocation. `Deferred(capacity)` is a non-failure with future wakeup, not an Attempt nor a budget debit.
 
-Infrastructure retry delay:
-
-```text
-delay = min(10s * 2^(n-1), 300s)
-```
-
-evaluated against logical time.
-
-Cost/token enforcement may follow when telemetry is trustworthy; the Task schema already reserves it.
+Retry backoff is durable and surfaced in the TaskSnapshot. Preserve explicit exponential retry policy (10s base, 300s cap), with logical-time evaluation.
 
 ## Completion evaluation
 
@@ -652,19 +542,17 @@ After resolution:
 - reuse the healthy existing Attempt/session via `BlockerResolved`;
 - otherwise create a replacement Attempt subject to budget.
 
-## Startup recovery
+## Startup recovery and controlled migration of authority
 
-On `anvild` startup:
+1. Open/migrate durable store and inspect `ControllerMode`.
+2. Reconcile ambiguous in-flight outbox Actions **by observation**; do not immediately resend SendTurn or claim an Attempt vanished due to an unreachable provider.
+3. End definitively orphaned Attempts through factual runtime absence, preserving continuity if runtime still exists.
+4. Recover snapshot/action-intent generation and observer next-poll deadlines.
+5. In Shadow mode, record decisions but never dispatch Actions. Compare against legacy execution traces before takeover.
+6. Transfer ownership `Legacy → Reconciler` transactionally/CAS for an explicit cohort, adopting healthy existing Attempts and fencing legacy scheduler dispatch/completion.
+7. Reconcile all nonterminal Tasks; only then admit new queued work.
 
-1. open/migrate durable store;
-2. recover unfinished Actions;
-3. reconcile `Executing` Actions into succeeded, retryable pending, or `UnknownOutcome` based on observation;
-4. recover orphaned Attempts from factual runtime observations;
-5. build fresh snapshots for every nonterminal Task;
-6. reconcile every nonterminal Task;
-7. only then admit new queued work.
-
-Do not recover semantic Task state by reading model transcripts.
+No automatic fallback from Reconciler to Legacy. An ambiguous pending side effect is `UnknownOutcome`/attention until outcome can be established.
 
 ## Garbage collection
 
@@ -675,6 +563,8 @@ Task is terminal
 AND no unresolved Action requires runtime
 AND no active Attempt remains
 AND required durable evidence/bindings are persisted
+AND operator_hold is false
+AND no preservation/grace-period requirement applies
 ```
 
 R1 may delete Session, local/Kubernetes Sandbox, and disposable workspace.
@@ -697,7 +587,7 @@ terminal cleanup candidate
 orphan
 ```
 
-No indefinite runtime graveyard.
+Non-success terminals such as explicit `FailedExhausted` receive an operator-inspection GC grace period. Operator-held Tasks are not destructively GC'd. Preserve dirty/uncommitted work; use non-destructive local checkpoint refs/snapshots as an opt-in preservation mechanism, not automatic commits/pushes on every turn. No indefinite runtime graveyard.
 
 ## Attention API
 
@@ -715,6 +605,10 @@ unresolved blocker
 budget exhausted
 terminal predecessor blocks dependency
 unknown Action outcome
+no_progress
+needs_budget
+waiting_for_merge_too_long
+closed_unmerged / changed_requested_review / branch_deleted
 orchestrator invariant failure
 ambiguous delivery/provider state
 ```
@@ -923,27 +817,20 @@ Task accepted
 
 Then exercise process crashes at persistence boundaries.
 
-## Crash injection
+## Named compile-gated failpoints and crash injection
 
-R1 E2E kills/restarts Anvil at least:
+Implement a **test-only, compile-gated named failpoint mechanism**, inert/unavailable in production builds. Name at least these eight boundaries:
 
-```text
-after snapshot persisted, before Actions persisted
-after decision/action transaction committed
-before Action execution
-while Action is executing
-after side effect, before Action success persisted
-after observation persisted, before next reconcile
-during terminal transition
-during GC scheduling
-```
+1. `reconcile.before_decision_commit` — before atomic decision+action transaction commit (rollback must be total).
+2. `reconcile.after_decision_commit`.
+3. `outbox.before_claim`.
+4. `outbox.after_claim_before_dispatch`.
+5. `outbox.after_side_effect_before_result_commit`.
+6. `observer.after_observation_commit_before_wake`.
+7. `task.before_terminal_commit`.
+8. `gc.after_schedule_before_cleanup`.
 
-After restart:
-
-- no duplicate irreversible behavior;
-- no duplicate worker continuation for same cause;
-- Task converges or surfaces explicit unknown/attention state;
-- DB invariants hold.
+Crash/restart from each boundary against the same durable SQLite store. Assert no duplicate cause-based continuation or Attempt allocation, no lost Task or falsely inferred runtime absence, and an explicitly recorded unknown outcome when neither replay nor observation can prove an external effect.
 
 ## Convergence/property testing
 
@@ -973,6 +860,9 @@ The invariant is not deterministic external history; it is deterministic decisio
 
 ## R1 definition of done
 
+**Pre-production gates:** verify pinned OpenCode SendTurn/message identity and ambiguous-response behavior; prove Legacy/Shadow decisions replay correctly and cut over an existing Attempt without duplicate execution. Do not dispatch production autonomous work before these pass.
+
+
 1. `reconcile(snapshot, logical_time)` is pure and deterministic.
 2. Every decision persists serialized/versioned/hashable snapshot and Actions.
 3. Stored decisions pass replay validation.
@@ -1000,6 +890,11 @@ The invariant is not deterministic external history; it is deterministic decisio
 25. Crash injection covers major outbox boundaries.
 26. `nix develop -c just check` passes.
 27. `nix develop -c just e2e` passes.
+28. Snapshot/action-history and budget counters prevent repeat action on unchanged failure and expose no_progress.
+29. No-op periodic sweeps do not continuously persist decisions, bump action generation or cancel in-flight Actions.
+30. GitHub observations distinguish required/optional checks and statuses; provider failure cannot turn stale facts into success.
+31. Shadow cutover and pinned OpenCode ambiguous-turn recovery gates have executable evidence.
+32. Eight named failpoints and decision-rule trace API are tested.
 
 ## Explicit R1 non-goals
 
