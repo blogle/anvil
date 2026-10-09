@@ -4,6 +4,8 @@
 
 Canonical specification for Anvil's deterministic task-convergence controller. Revised 2026-10-08 for complete decision inputs, stable action intent, shadow cutover, OpenCode ambiguity, and observer correctness. This supersedes older batch-supervision designs where they conflict.
 
+**Pinned dependency/API research and unverified executable gates:** [R1 Integration Research](reconciler-integration-research.md). That note records the OpenCode v1.18.30 source inspection, GitHub required-check/merge-queue contracts, shadow-cutover spike and failpoint proof obligations.
+
 ## Objective
 
 Build the deterministic control loop that advances accepted Anvil Tasks toward their declared completion policies without ChatGPT or a human babysitting OpenCode sessions.
@@ -909,5 +911,6 @@ Do not include in first-wave implementation:
 - mob coordination;
 - Anvil-executed merge;
 - multi-repository writable sandboxes;
+- ChatGPT callbacks/backlinks.
 - ChatGPT callbacks/backlinks.
 - ChatGPT callbacks/backlinks.
