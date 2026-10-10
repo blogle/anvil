@@ -7,14 +7,13 @@ pub mod store;
 pub use local::LocalSandboxApi;
 
 use anvil_core::{
-    GitRef, LifecycleEvent, LoginFlow, OpenCodeMessageId, OperationTelemetry, Port, Project,
-    Prompt, ProviderAuthMethod, ProviderListResponse, ProviderStatus, ProviderSummary, Repository,
-    Run, RunId, RunState, Session, SessionActivity, SessionId, SessionRequest, SessionTelemetry,
-    branch_name, preview_hostname,
+    branch_name, preview_hostname, GitRef, LifecycleEvent, LoginFlow, OpenCodeMessageId,
+    OperationTelemetry, Port, Project, Prompt, ProviderAuthMethod, ProviderListResponse,
+    ProviderStatus, ProviderSummary, Repository, Run, RunId, RunState, Session, SessionActivity,
+    SessionId, SessionRequest, SessionTelemetry,
 };
 use async_trait::async_trait;
 use axum::{
-    Json, Router,
     body::Body,
     extract::{Extension, Path, Query, State},
     http::StatusCode,
@@ -22,32 +21,33 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
+    Json, Router,
 };
 use chrono::{DateTime, Utc};
 use kube::{
-    Client, ResourceExt,
     api::{
         Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams, PostParams,
     },
+    Client, ResourceExt,
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     env,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{
     io::AsyncWriteExt,
-    sync::{Mutex as AsyncMutex, watch},
+    sync::{watch, Mutex as AsyncMutex},
 };
 use tracing::{info, warn};
 
@@ -7689,12 +7689,10 @@ mod tests {
             .await
             .1;
         assert!(human["text"].as_str().unwrap().contains("Batch digest-100"));
-        assert!(
-            human["text"]
-                .as_str()
-                .unwrap()
-                .contains("dependency failed")
-        );
+        assert!(human["text"]
+            .as_str()
+            .unwrap()
+            .contains("dependency failed"));
         assert!(human["text"].as_str().unwrap().contains("1.5s"));
 
         // Prove the row's Task ID and Attempt IDs resolve through existing detail routes.
@@ -7995,12 +7993,10 @@ mod tests {
         let attempts = store.attempts_for_task("logical-task").unwrap();
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0]["failure_class"], "infrastructure");
-        assert!(
-            attempts[0]["failure_reason"]
-                .as_str()
-                .unwrap()
-                .contains("gone-session")
-        );
+        assert!(attempts[0]["failure_reason"]
+            .as_str()
+            .unwrap()
+            .contains("gone-session"));
         assert_eq!(attempts[1]["ordinal"], 2);
         assert_eq!(attempts[1]["task_id"], attempts[0]["task_id"]);
         assert_eq!(
@@ -8235,12 +8231,11 @@ mod tests {
     #[async_trait]
     impl SandboxApi for LifecycleSandbox {
         async fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError> {
-            Ok(vec![
-                self.record
-                    .lock()
-                    .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?
-                    .clone(),
-            ])
+            Ok(vec![self
+                .record
+                .lock()
+                .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?
+                .clone()])
         }
 
         async fn create(
@@ -8711,13 +8706,11 @@ mod tests {
             vec![],
         );
         let _: DynamicObject = serde_json::from_value(manifest.clone()).unwrap();
-        assert!(
-            manifest["metadata"]["annotations"]
-                .as_object()
-                .unwrap()
-                .values()
-                .all(Value::is_string)
-        );
+        assert!(manifest["metadata"]["annotations"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(Value::is_string));
         let spec = &manifest["spec"]["podTemplate"]["spec"];
         assert!(spec["containers"][0]["ports"]
             .as_array()
@@ -8731,39 +8724,31 @@ mod tests {
         let mounts = spec["containers"][0]["volumeMounts"].as_array().unwrap();
         assert!(mounts.contains(&shared_nix_store_mount()));
         assert!(mounts.contains(&shared_nix_socket_mount()));
-        assert!(
-            mounts
-                .iter()
-                .filter(|m| m["name"] == "shared-nix")
-                .all(|m| m["readOnly"] == true)
-        );
+        assert!(mounts
+            .iter()
+            .filter(|m| m["name"] == "shared-nix")
+            .all(|m| m["readOnly"] == true));
         assert!(spec["initContainers"][0].get("volumeMounts").is_none());
-        assert!(
-            spec["volumes"][1]["persistentVolumeClaim"]
-                .get("readOnly")
-                .is_none()
-        );
+        assert!(spec["volumes"][1]["persistentVolumeClaim"]
+            .get("readOnly")
+            .is_none());
     }
 
     #[test]
     fn sandbox_committer_env_and_real_git_metadata_preserve_author() {
         let mut configured = config("http://profile".into());
         configured.git_committer_email = "anvil@noreply.thejeffer.net".into();
-        assert!(
-            !configured
-                .git_committer_email
-                .contains("@users.noreply.github.com")
-        );
+        assert!(!configured
+            .git_committer_email
+            .contains("@users.noreply.github.com"));
         assert!(!DEFAULT_GIT_COMMITTER_EMAIL.contains("@users.noreply.github.com"));
         assert!(!DEFAULT_GIT_COMMITTER_EMAIL.contains("thejeffer.net"));
         assert_eq!(DEFAULT_GIT_COMMITTER_NAME, "Anvil");
         let defaults = config("http://profile".into());
         assert_eq!(defaults.git_committer_email, "anvil@anvil.local");
-        assert!(
-            !defaults
-                .git_committer_email
-                .contains("@users.noreply.github.com")
-        );
+        assert!(!defaults
+            .git_committer_email
+            .contains("@users.noreply.github.com"));
         let mut env: Vec<Value> = git_committer_environment(&configured)
             .into_iter()
             .map(|(name, value)| json!({"name":name,"value":value}))
@@ -8829,13 +8814,11 @@ mod tests {
 
         let default_repo = tempfile::tempdir().unwrap();
         std::fs::write(default_repo.path().join("file"), "content").unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .args(["init", default_repo.path().to_str().unwrap()])
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(std::process::Command::new("git")
+            .args(["init", default_repo.path().to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
         let default_home = tempfile::tempdir().unwrap();
         let default_commit = std::process::Command::new("bash")
             .arg("-c")
@@ -9046,12 +9029,10 @@ mod tests {
         let completed = legacy_run_record(&completed.to_string()).unwrap();
         assert!(completed.current.is_none());
         assert_eq!(completed.last_run().unwrap().state, RunState::Completed);
-        assert!(
-            serde_json::to_value(completed)
-                .unwrap()
-                .get("state")
-                .is_none()
-        );
+        assert!(serde_json::to_value(completed)
+            .unwrap()
+            .get("state")
+            .is_none());
     }
 
     #[test]
@@ -9193,18 +9174,14 @@ mod tests {
         assert!(
             matches!(lifecycle_event(&permission_replied).unwrap(), (_, LifecycleObservation::Telemetry(NormalizedTelemetryEvent { fact: TelemetryFact::Wait(ref wait), .. })) if wait["id"] == "per-1" && wait["state"] == "replied")
         );
-        assert!(
-            lifecycle_event(
-                &json!({"type":"question.asked","properties":{"sessionID":"ses_demo"}})
-            )
-            .is_none()
-        );
-        assert!(
-            lifecycle_event(
-                &json!({"type":"permission.asked","properties":{"sessionID":"ses_demo"}})
-            )
-            .is_none()
-        );
+        assert!(lifecycle_event(
+            &json!({"type":"question.asked","properties":{"sessionID":"ses_demo"}})
+        )
+        .is_none());
+        assert!(lifecycle_event(
+            &json!({"type":"permission.asked","properties":{"sessionID":"ses_demo"}})
+        )
+        .is_none());
         let message_update = json!({
             "type":"message.updated",
             "properties":{
@@ -9617,11 +9594,9 @@ mod tests {
         let index_body = axum::body::to_bytes(index.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert!(
-            std::str::from_utf8(&index_body)
-                .unwrap()
-                .contains("/assets/app-abc.js")
-        );
+        assert!(std::str::from_utf8(&index_body)
+            .unwrap()
+            .contains("/assets/app-abc.js"));
 
         let javascript = static_app
             .clone()
@@ -9658,11 +9633,9 @@ mod tests {
         let session_body = axum::body::to_bytes(session_route.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert!(
-            std::str::from_utf8(&session_body)
-                .unwrap()
-                .contains("/assets/app-abc.js")
-        );
+        assert!(std::str::from_utf8(&session_body)
+            .unwrap()
+            .contains("/assets/app-abc.js"));
         let missing_api = static_app
             .oneshot(Request::get("/v1/missing").body(Body::empty()).unwrap())
             .await
@@ -9690,16 +9663,14 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::OK, "asset {path}");
-                assert!(
-                    response.headers()["content-type"]
-                        .to_str()
-                        .unwrap()
-                        .starts_with(if path.ends_with(".css") {
-                            "text/css"
-                        } else {
-                            "text/javascript"
-                        })
-                );
+                assert!(response.headers()["content-type"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with(if path.ends_with(".css") {
+                        "text/css"
+                    } else {
+                        "text/javascript"
+                    }));
             }
         }
     }
@@ -10140,12 +10111,10 @@ mod tests {
         assert_eq!(activity.requests[0].state, "completed");
         assert_eq!(activity.requests[0].duration_ms, Some(6_000));
         assert_eq!(activity.requests[0].provider.as_deref(), Some("openai"));
-        assert!(
-            activity
-                .lifecycle
-                .iter()
-                .any(|event| event.kind == "request_completed")
-        );
+        assert!(activity
+            .lifecycle
+            .iter()
+            .any(|event| event.kind == "request_completed"));
     }
 
     #[test]
@@ -10239,23 +10208,17 @@ mod tests {
             run.started_at.clone(),
         );
         let annotations = run_record_annotations(&config("http://profile.test".into()), &record);
-        assert!(
-            annotations
-                .values()
-                .all(|value| value.is_string() || value.is_null())
-        );
-        assert!(
-            annotations
-                .get("anvil.example/run-record")
-                .and_then(Value::as_str)
-                .and_then(|value| serde_json::from_str::<RunRecord>(value).ok())
-                .is_some()
-        );
-        assert!(
-            annotations
-                .iter()
-                .all(|(key, value)| value.is_null() || !key.contains("work-state"))
-        );
+        assert!(annotations
+            .values()
+            .all(|value| value.is_string() || value.is_null()));
+        assert!(annotations
+            .get("anvil.example/run-record")
+            .and_then(Value::as_str)
+            .and_then(|value| serde_json::from_str::<RunRecord>(value).ok())
+            .is_some());
+        assert!(annotations
+            .iter()
+            .all(|(key, value)| value.is_null() || !key.contains("work-state")));
         assert_eq!(
             annotations
                 .get("anvil.example/run-current")
@@ -10727,12 +10690,10 @@ mod tests {
             expected,
         );
         assert_eq!(result["status"], "unavailable");
-        assert!(
-            result["message"]
-                .as_str()
-                .unwrap()
-                .contains("does not match")
-        );
+        assert!(result["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not match"));
         assert_eq!(
             validate_worker_diff_base(
                 json!({"status":"ready","diff":{"base_revision":expected,"files":[]}}),

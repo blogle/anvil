@@ -2,7 +2,7 @@
 //! records. Queue order is durable task insertion order (`tasks.rowid`), which is
 //! the acceptance order within a batch and is stable across controller restarts.
 use super::{ControllerStore, StoreError};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
