@@ -2025,6 +2025,22 @@ mod tests {
         );
     }
     #[test]
+    fn local_branch_checkpoint_uses_same_trusted_completion_policy() {
+        let mut s = snap();
+        // The offline workspace observer supplies a trusted checkpoint without a PR binding.
+        s.completion_evidence.push(CompletionEvidence {
+            kind: "delivery_complete".into(),
+            provenance: ObservationProvenance::Platform,
+            fresh: true,
+            trusted: true,
+            subject_sha: Some("local-checkpoint-sha".into()),
+        });
+        assert_eq!(
+            reconcile(&s, LogicalTime(0)).rule_id,
+            "completion_satisfied"
+        );
+    }
+    #[test]
     fn empty_aggregate_is_not_vacuously_complete() {
         let mut s = snap();
         s.completion_policy = Some(CompletionPolicy::AllChildrenCompleted);

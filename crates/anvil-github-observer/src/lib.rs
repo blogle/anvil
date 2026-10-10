@@ -252,8 +252,10 @@ impl GitHubReadPort for GitHubRestPort {
         }
 
         // Effective active branch rules include repository/org rulesets.
-        let rules = self
-            .get_optional(self.endpoint(&["repos", owner, repo, "rules", "branches", base_ref])?)?;
+        let mut rules_url =
+            self.endpoint(&["repos", owner, repo, "rules", "branches", base_ref])?;
+        rules_url.query_pairs_mut().append_pair("per_page", "100");
+        let rules = self.get_optional(rules_url)?;
         let Some(rules) = rules else {
             return Ok(Policy::Unavailable);
         };
