@@ -299,6 +299,8 @@ pub struct TaskSnapshot {
     #[serde(default)]
     pub action_history: Vec<PriorAction>,
     #[serde(default)]
+    pub workspace_fact_hash: Option<String>,
+    #[serde(default)]
     pub budget_usage: BudgetUsage,
     pub max_attempts: Option<u32>,
     #[serde(default)]
@@ -548,11 +550,14 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
                 .collect();
             failure_identity.sort();
             let cause = digest(&format!(
-                "{}:{}:{:?}:{}",
+                "{}:{}:{:?}:{}:{}",
                 x.pr_head_sha.as_deref().unwrap_or(""),
                 sha,
                 x.evaluation_kind,
-                failure_identity.join("|")
+                failure_identity.join("|"),
+                s.workspace_fact_hash
+                    .as_deref()
+                    .unwrap_or("unknown-workspace")
             ));
             let continuation_count = s
                 .budget_usage
@@ -1986,6 +1991,7 @@ mod tests {
             runtime_failure_fingerprint: None,
             max_runtime_recoveries: Some(2),
             action_history: vec![],
+            workspace_fact_hash: None,
             budget_usage: BudgetUsage::default(),
             max_attempts: Some(4),
             max_continuations_by_reason: Default::default(),
@@ -2302,13 +2308,18 @@ mod tests {
             state: ActionState::Succeeded,
         });
         assert_eq!(reconcile(&s, LogicalTime(1)).rule_id, "no_progress");
+        s.workspace_fact_hash = Some("workspace-changed".into());
+        assert_eq!(
+            reconcile(&s, LogicalTime(2)).rule_id,
+            "required_checks_failing"
+        );
         let delivery = s.delivery.as_mut().unwrap();
         delivery.evaluation_sha = Some("new-evaluation".into());
         for check in &mut delivery.required_checks {
             check.evaluation_sha = "new-evaluation".into();
         }
         assert_eq!(
-            reconcile(&s, LogicalTime(2)).rule_id,
+            reconcile(&s, LogicalTime(3)).rule_id,
             "required_checks_failing"
         );
     }

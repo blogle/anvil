@@ -257,6 +257,7 @@ mod tests {
             runtime_failure_fingerprint: None,
             max_runtime_recoveries: Some(2),
             action_history: vec![],
+            workspace_fact_hash: None,
             budget_usage: BudgetUsage {
                 attempts: 1,
                 ..Default::default()

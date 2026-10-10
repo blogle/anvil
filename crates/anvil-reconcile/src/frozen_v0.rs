@@ -83,6 +83,7 @@ pub fn decode_snapshot(source: &Value) -> Result<(TaskSnapshot, LogicalTime), St
     let merge_wait_due_at_ms = source.get("merge_wait_due_at_ms").and_then(Value::as_i64);
     let runtime = decode_runtime_health(source);
     let completion_evidence = decode_evidence(source);
+    let workspace_fact_hash = decode_workspace_fact_hash(source);
     let snapshot = TaskSnapshot {
         schema_version,
         task_id,
@@ -120,6 +121,7 @@ pub fn decode_snapshot(source: &Value) -> Result<(TaskSnapshot, LogicalTime), St
             .and_then(Value::as_u64)
             .map(|n| n as u32),
         action_history,
+        workspace_fact_hash,
         budget_usage,
         max_attempts,
         max_continuations_by_reason,
@@ -129,6 +131,26 @@ pub fn decode_snapshot(source: &Value) -> Result<(TaskSnapshot, LogicalTime), St
         merge_wait_due_at_ms,
     };
     Ok((snapshot, LogicalTime(logical_time)))
+}
+
+fn decode_workspace_fact_hash(source: &Value) -> Option<String> {
+    source
+        .get("observations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|observation| {
+            matches!(
+                string(observation.get("kind")).as_deref(),
+                Some("workspace" | "workspace_git")
+            ) && (bool_value(observation.get("fresh"))
+                || string(observation.get("freshness")).as_deref() == Some("fresh"))
+        })
+        .and_then(|observation| {
+            string(observation.get("fact_hash"))
+                .or_else(|| string(observation.get("semantic_hash")))
+        })
 }
 
 fn decode_delivery(source: &Value) -> Result<Option<Delivery>, String> {
