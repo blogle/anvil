@@ -1414,10 +1414,11 @@ pub mod github {
             .map(|required| {
                 let mut states = Vec::new();
                 if required.source == "check_run" {
-                    if let Some(run)=runs
+                    if let Some(run) = runs
                         .iter()
                         .filter(|r| r.name == required.context && r.sha == evaluation)
-                        .max_by_key(|run|(run.updated_at.as_deref().unwrap_or(""),run.run_id)) {
+                        .max_by_key(|run| (run.updated_at.as_deref().unwrap_or(""), run.run_id))
+                    {
                         states.push(match (run.status.as_str(), run.conclusion.as_deref()) {
                             ("completed", Some("success" | "neutral" | "skipped")) => {
                                 CheckState::Passing
@@ -1429,10 +1430,11 @@ pub mod github {
                     }
                 }
                 if required.source == "status" {
-                    if let Some(st)=statuses
+                    if let Some(st) = statuses
                         .iter()
                         .filter(|s| s.context == required.context && s.sha == evaluation)
-                        .max_by_key(|status|status.updated_at.as_deref().unwrap_or("")) {
+                        .max_by_key(|status| status.updated_at.as_deref().unwrap_or(""))
+                    {
                         states.push(match st.state.as_str() {
                             "success" => CheckState::Passing,
                             "failure" | "error" => CheckState::Failing,
@@ -1486,21 +1488,21 @@ pub mod github {
             ]);
             let runs = [
                 CheckRun {
-                    run_id:1,
+                    run_id: 1,
                     name: "ci".into(),
                     sha: "head".into(),
                     conclusion: Some("failure".into()),
                     status: "completed".into(),
-                    updated_at:None,
+                    updated_at: None,
                     details_fingerprint: None,
                 },
                 CheckRun {
-                    run_id:2,
+                    run_id: 2,
                     name: "ci".into(),
                     sha: "merge".into(),
                     conclusion: Some("neutral".into()),
                     status: "completed".into(),
-                    updated_at:None,
+                    updated_at: None,
                     details_fingerprint: None,
                 },
             ];
@@ -1508,7 +1510,7 @@ pub mod github {
                 context: "legacy".into(),
                 sha: "merge".into(),
                 state: "success".into(),
-                updated_at:None,
+                updated_at: None,
             }];
             let e = evaluate(p, "head", "merge", EvaluationKind::TestMerge, &runs, &sts);
             assert_eq!(e.pr_head_sha, "head");
@@ -1527,6 +1529,65 @@ pub mod github {
             );
             assert!(!e.policy_known);
             assert!(e.checks.is_empty());
+        }
+        #[test]
+        fn newest_exact_sha_status_and_check_rerun_win_over_older_failure() {
+            let policy = Policy::Known(vec![
+                RequiredContext {
+                    context: "CI".into(),
+                    source: "check_run".into(),
+                },
+                RequiredContext {
+                    context: "legacy".into(),
+                    source: "status".into(),
+                },
+            ]);
+            let runs = vec![
+                CheckRun {
+                    run_id: 1,
+                    name: "CI".into(),
+                    sha: "eval".into(),
+                    conclusion: Some("failure".into()),
+                    status: "completed".into(),
+                    updated_at: Some("2026-01-01T00:00:00Z".into()),
+                    details_fingerprint: None,
+                },
+                CheckRun {
+                    run_id: 2,
+                    name: "CI".into(),
+                    sha: "eval".into(),
+                    conclusion: Some("success".into()),
+                    status: "completed".into(),
+                    updated_at: Some("2026-01-01T01:00:00Z".into()),
+                    details_fingerprint: None,
+                },
+            ];
+            let statuses = vec![
+                CommitStatus {
+                    context: "legacy".into(),
+                    sha: "eval".into(),
+                    state: "failure".into(),
+                    updated_at: Some("2026-01-01T00:00:00Z".into()),
+                },
+                CommitStatus {
+                    context: "legacy".into(),
+                    sha: "eval".into(),
+                    state: "success".into(),
+                    updated_at: Some("2026-01-01T01:00:00Z".into()),
+                },
+            ];
+            let evaluated = evaluate(
+                policy,
+                "head",
+                "eval",
+                EvaluationKind::TestMerge,
+                &runs,
+                &statuses,
+            );
+            assert!(evaluated
+                .checks
+                .iter()
+                .all(|check| check.state == CheckState::Passing));
         }
     }
     #[cfg(test)]
@@ -1593,12 +1654,12 @@ pub mod github {
                     source: "check_run".into(),
                 }])),
                 runs: Ok(vec![CheckRun {
-                    run_id:1,
+                    run_id: 1,
                     name: "CI".into(),
                     sha: "merge".into(),
                     conclusion: Some("success".into()),
                     status: "completed".into(),
-                    updated_at:None,
+                    updated_at: None,
                     details_fingerprint: None,
                 }]),
                 statuses: Ok(vec![]),
