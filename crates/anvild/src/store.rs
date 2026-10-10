@@ -1645,6 +1645,12 @@ impl ControllerStore {
             .as_deref()
             .map(serde_json::from_str::<Value>)
             .transpose()?;
+        let retry_cause = attempts.iter().find_map(|attempt| {
+            attempt["failure"]["code"]
+                .as_str()
+                .or_else(|| attempt["failure_reason"].as_str())
+                .map(str::to_owned)
+        });
         let execution_target = control
             .8
             .as_deref()
@@ -1712,7 +1718,7 @@ impl ControllerStore {
             "execution_ms": execution_ms,
             "grants": grant_entries,
         });
-        snapshot["retry_schedule"]["cause"] = Value::Null;
+        snapshot["retry_schedule"]["cause"] = retry_cause.map(Value::String).unwrap_or(Value::Null);
         snapshot["merge_wait_due_at_ms"] = Value::Null;
         tx.commit()?;
         Ok(Some(snapshot))
@@ -3687,6 +3693,38 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(snapshot["budget_usage"]["execution_ms"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn snapshot_retry_schedule_surfaces_persisted_attempt_failure_cause() {
+        let (_dir, store) = store();
+        let spec = serde_json::json!({"outcome":"retryable work"});
+        store
+            .accept_task("retry-cause-key", "test", &spec, "retry-cause-task", &spec)
+            .unwrap();
+        store
+            .create_attempt(
+                "retry-cause-task",
+                "retry-cause-attempt",
+                "retry-cause-attempt-key",
+            )
+            .unwrap();
+        store
+            .record_attempt_failure(
+                "retry-cause-attempt",
+                crate::store::scheduler::FailureClass::Infrastructure,
+                "sandbox disappeared",
+                1_000,
+                3,
+                10_000,
+            )
+            .unwrap();
+        let snapshot = store
+            .task_snapshot("retry-cause-task", 1_000)
+            .unwrap()
+            .unwrap();
+        assert!(snapshot["retry_schedule"]["due_at_ms"].as_i64().is_some());
+        assert_eq!(snapshot["retry_schedule"]["cause"], "legacy_infrastructure");
     }
 
     #[test]

@@ -210,6 +210,12 @@ async fn responses(
     } else if let Some(text) = input.as_str() {
         prompt.push_str(text);
     }
+    if std::env::var("ANVIL_TEST_MODEL_DEBUG").as_deref() == Ok("1") {
+        eprintln!(
+            "test-model classification: title={is_title_generation} wait_gate={} tools={tool_count} prompt={prompt:?}",
+            prompt.contains("ANVIL-E2E:wait-for-release")
+        );
+    }
     if let Some(confirmation) = continuity_response(&request) {
         let value = response_text(confirmation, &request);
         return if stream {
