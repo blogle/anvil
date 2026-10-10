@@ -109,7 +109,7 @@ fn sandbox_manifest(
     workspace_init: Value,
     env: Vec<Value>,
 ) -> Value {
-    let container = json!({"name":"sandbox","image":config.image,"ports":[{"name":"opencode","containerPort":config.opencode_port}],"env":env,"volumeMounts":[{"name":"workspace","mountPath":"/home/anvil"},{"name":"shared-profile","mountPath":"/anvil/profile"},shared_nix_store_mount(),shared_nix_socket_mount()]});
+    let container = json!({"name":"sandbox","image":config.image,"ports":[{"name":"opencode","containerPort":config.opencode_port},{"name":"git-diff","containerPort":4097}],"env":env,"volumeMounts":[{"name":"workspace","mountPath":"/home/anvil"},{"name":"shared-profile","mountPath":"/anvil/profile"},shared_nix_store_mount(),shared_nix_socket_mount()]});
     json!({"apiVersion":"agents.x-k8s.io/v1beta1","kind":"Sandbox","metadata":{"name":name,"namespace":config.namespace,"labels":labels,"annotations":annotations},"spec":{"service":true,"podTemplate":{"spec":{"initContainers":[workspace_init],"containers":[container],"volumes":[{"name":"shared-profile","persistentVolumeClaim":{"claimName":config.profile_pvc}},shared_nix_volume(&config.nix_pvc)]}},"volumeClaimTemplates":[{"metadata":{"name":"workspace"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":config.workspace_size}}}}]}})
 }
 
@@ -8269,6 +8269,10 @@ mod tests {
             .values()
             .all(Value::is_string));
         let spec = &manifest["spec"]["podTemplate"]["spec"];
+        assert!(spec["containers"][0]["ports"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"name":"git-diff","containerPort":4097})));
         assert_eq!(spec["volumes"][1], shared_nix_volume("configured-nix-pvc"));
         assert!(spec
             .get("securityContext")
