@@ -2794,6 +2794,51 @@ mod tests {
             .unwrap();
         assert_eq!(version, 12);
     }
+
+    #[test]
+    fn migration_mapping_fixtures_match_the_explicit_historical_tables() {
+        let (_dir, store) = store();
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/task-migration-mappings-v1.json"
+        ))
+        .unwrap();
+        let connection = store.connection.lock().unwrap();
+        let attempts: Vec<Value> = {
+            let mut statement = connection
+                .prepare("SELECT legacy_state,lifecycle,exit_reason FROM attempt_state_migration_map ORDER BY legacy_state")
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok(serde_json::json!({
+                        "legacy_state":row.get::<_,String>(0)?,
+                        "lifecycle":row.get::<_,String>(1)?,
+                        "exit_reason":row.get::<_,Option<String>>(2)?
+                    }))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let failures: Vec<Value> = {
+            let mut statement = connection
+                .prepare("SELECT legacy_failure,canonical_domain,canonical_code FROM task_failure_migration_map ORDER BY legacy_failure")
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok(serde_json::json!({
+                        "legacy_failure":row.get::<_,String>(0)?,
+                        "canonical_domain":row.get::<_,String>(1)?,
+                        "canonical_code":row.get::<_,String>(2)?
+                    }))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(serde_json::json!(attempts), fixture["attempt_states"]);
+        assert_eq!(serde_json::json!(failures), fixture["failures"]);
+    }
+
     #[test]
     fn migration_is_repeatable_and_indexed() {
         let (dir, _) = store();
