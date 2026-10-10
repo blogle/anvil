@@ -345,9 +345,10 @@ directory_source_path="$(agent_exec "$api_b_pod" /bin/bash -lc '
 ')"
 agent_exec "$api_b_pod" /bin/bash -c 'test "$(cat "$1/fixture.txt")" = "directory source passed through the shared Nix daemon"' -- "$directory_source_path"
 fresh_sandbox_build() {
-  local pod="$1" name="$2" bash_path command_literal output
+  local pod="$1" name="$2" bash_path build_path command_literal output
   bash_path="$(agent_exec "$pod" readlink -f /bin/bash)"
-  command_literal="$(jq -Rn --arg value 'mkdir -p source; printf fresh-build > source/input; chmod 0700 source; chmod 0755 source; cp source/input "$out"' '$value')"
+  build_path="$(agent_exec "$pod" printenv PATH)"
+  command_literal="$(jq -Rn --arg path "$build_path" --arg value 'mkdir -p source; printf fresh-build > source/input; chmod 0700 source; chmod 0755 source; cp source/input "$out"' '"export PATH=\($path); \($value)"')"
   output="$(agent_exec "$pod" nix build --no-link --print-out-paths --impure --expr "derivation { name = \"$name\"; system = builtins.currentSystem; builder = \"$bash_path\"; args = [ \"-c\" $command_literal ]; }")"
   [[ "$output" = /nix/store/* ]]
   agent_exec "$pod" /bin/bash -c 'test "$(cat "$1")" = fresh-build' -- "$output"
