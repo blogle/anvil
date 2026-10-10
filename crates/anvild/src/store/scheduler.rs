@@ -2,7 +2,7 @@
 //! records. Queue order is durable task insertion order (`tasks.rowid`), which is
 //! the acceptance order within a batch and is stable across controller restarts.
 use super::{ControllerStore, StoreError};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -75,24 +75,45 @@ impl ControllerStore {
         }
         drop(batches_stmt);
 
-        let mut stmt = tx.prepare("SELECT t.task_id,t.batch_id,t.payload_json,b.payload_json,t.state FROM tasks t JOIN batches b USING(batch_id) WHERE t.state IN ('queued','retry_wait','provisioning') ORDER BY t.rowid")?;
+        let mut stmt = tx.prepare("SELECT t.task_id,t.batch_id,t.payload_json,b.payload_json,t.state,COALESCE(d.operator_hold,0),COALESCE(d.controller_mode,'legacy') FROM tasks t LEFT JOIN batches b USING(batch_id) LEFT JOIN task_durable_state d USING(task_id) WHERE t.state IN ('queued','retry_wait','provisioning') ORDER BY t.rowid")?;
         let candidates = stmt
             .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, bool>(5)?,
+                    r.get::<_, String>(6)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
         let mut claims = Vec::new();
-        for (task_id, batch_id, task_json, batch_json, task_state) in candidates {
+        for (
+            task_id,
+            batch_id,
+            task_json,
+            batch_json,
+            task_state,
+            operator_hold,
+            controller_mode,
+        ) in candidates
+        {
+            if operator_hold || controller_mode != "legacy" {
+                continue;
+            }
+            let batch_id = batch_id.unwrap_or_default();
             let task: Value = serde_json::from_str(&task_json)?;
-            let batch: Value = serde_json::from_str(&batch_json)?;
-            let ceiling = batch["requested_concurrency"].as_u64().unwrap_or(1) as u32;
+            let batch: Value = batch_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?
+                .unwrap_or(Value::Null);
+            let ceiling = batch["requested_concurrency"]
+                .as_u64()
+                .unwrap_or(global_limit as u64) as u32;
             let previous: Option<(i64, String, Option<String>)> = tx.query_row("SELECT ordinal,payload_json,session_id FROM attempts WHERE task_id=?1 ORDER BY ordinal DESC LIMIT 1", [&task_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
             let previous_payload = previous
                 .as_ref()
@@ -107,7 +128,10 @@ impl ControllerStore {
             if !resume && active_global >= global_limit {
                 break;
             }
-            if !resume && active_batches.get(&batch_id).copied().unwrap_or(0) >= ceiling {
+            if !resume
+                && !batch_id.is_empty()
+                && active_batches.get(&batch_id).copied().unwrap_or(0) >= ceiling
+            {
                 continue;
             }
             if !dependencies_satisfied(&tx, &task)? {
@@ -399,7 +423,14 @@ fn set_task_state(tx: &Transaction<'_>, task_id: &str, state: &str) -> Result<()
         |r| r.get(0),
     )?;
     let mut payload: Value = serde_json::from_str(&raw)?;
+    let retry_due: Option<i64> = if state == "retry_wait" {
+        tx.query_row("SELECT json_extract(payload_json,'$.retry_at_ms') FROM attempts WHERE task_id=?1 ORDER BY ordinal DESC LIMIT 1",[task_id],|r|r.get(0))?
+    } else {
+        None
+    };
+    let version:i64=tx.query_row("UPDATE task_durable_state SET version=version+1,retry_due_ms=?2,updated_at=?3 WHERE task_id=?1 RETURNING version",params![task_id,retry_due,chrono::Utc::now().to_rfc3339()],|r|r.get(0))?;
     payload["state"] = Value::String(state.to_owned());
+    payload["version"] = serde_json::json!(version);
     let encoded = serde_json::to_string(&payload)?;
     tx.execute(
         "UPDATE tasks SET state=?2,payload_json=?3 WHERE task_id=?1",
@@ -414,13 +445,54 @@ fn persist_attempt(
     attempt_id: &str,
     attempt: &Value,
 ) -> Result<(), StoreError> {
-    let encoded = serde_json::to_string(attempt)?;
-    tx.execute(
-        "UPDATE attempts SET payload_json=?2 WHERE attempt_id=?1",
-        params![attempt_id, encoded],
+    let current: i64 = tx.query_row(
+        "SELECT version FROM attempts WHERE attempt_id=?1",
+        [attempt_id],
+        |row| row.get(0),
     )?;
+    let next = current + 1;
+    let mut attempt = attempt.clone();
+    let state = attempt["state"].as_str().unwrap_or_default();
+    let (lifecycle, exit_reason) = match state {
+        "queued" => ("queued", Value::Null),
+        "provisioning" => ("provisioning", Value::Null),
+        "running" => ("running", Value::Null),
+        "completed" | "succeeded" => ("ended", serde_json::json!("completed_turn")),
+        "canceled" | "cancelled" => ("ended", serde_json::json!("canceled")),
+        "abandoned" => ("ended", serde_json::json!("abandoned")),
+        "orphaned" => ("ended", serde_json::json!("orphaned")),
+        "replaced" => ("ended", serde_json::json!("replaced")),
+        "failed" | "retry_wait" | "exhausted" => ("ended", serde_json::json!("failed")),
+        "suspended" => ("running", Value::Null),
+        _ => ("ended", serde_json::json!("failed")),
+    };
+    attempt["lifecycle"] = Value::String(lifecycle.into());
+    attempt["exit_reason"] = exit_reason;
+    if attempt["failure_class"].is_string() {
+        let domain = match attempt["failure_class"].as_str().unwrap_or_default() {
+            "infrastructure" => "platform",
+            "execution" => "work",
+            _ => "unknown",
+        };
+        let summary: String = attempt["failure_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .chars()
+            .take(512)
+            .collect();
+        attempt["failure"] = serde_json::json!({"domain":domain,"code":format!("legacy_{}",attempt["failure_class"].as_str().unwrap_or("unknown")),"summary":summary,"artifact_refs":[]});
+    }
+    attempt["version"] = serde_json::json!(next);
+    let encoded = serde_json::to_string(&attempt)?;
+    let updated = tx.execute(
+        "UPDATE attempts SET payload_json=?2,version=?3 WHERE attempt_id=?1 AND version=?4",
+        params![attempt_id, encoded, next, current],
+    )?;
+    if updated != 1 {
+        return Err(StoreError::Conflict);
+    }
     tx.execute("UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='attempt' AND resource_id=?1", params![attempt_id,encoded,chrono::Utc::now().to_rfc3339()])?;
-    super::append_resource_change(tx, "attempt", attempt_id, attempt)?;
+    super::append_resource_change(tx, "attempt", attempt_id, &attempt)?;
     Ok(())
 }
 fn task_is_runnable(
@@ -466,8 +538,12 @@ fn count_runnable(
     max_attempts: u32,
 ) -> Result<u32, StoreError> {
     let sql = match batch_id {
-        Some(_) => "SELECT task_id,state,payload_json FROM tasks WHERE batch_id=?1 AND state IN ('queued','retry_wait') ORDER BY rowid",
-        None => "SELECT task_id,state,payload_json FROM tasks WHERE state IN ('queued','retry_wait') ORDER BY rowid",
+        Some(_) => {
+            "SELECT t.task_id,t.state,t.payload_json FROM tasks t JOIN task_durable_state d USING(task_id) WHERE t.batch_id=?1 AND t.state IN ('queued','retry_wait') AND d.operator_hold=0 AND d.controller_mode='legacy' ORDER BY t.rowid"
+        }
+        None => {
+            "SELECT t.task_id,t.state,t.payload_json FROM tasks t JOIN task_durable_state d USING(task_id) WHERE t.state IN ('queued','retry_wait') AND d.operator_hold=0 AND d.controller_mode='legacy' ORDER BY t.rowid"
+        }
     };
     let mut statement = c.prepare(sql)?;
     let mut count = 0;
@@ -550,9 +626,11 @@ mod tests {
         let other = ControllerStore::open(_dir.path().join("controller.sqlite3")).unwrap();
         let recovered = other.claim_runnable(8, 100, 3, 0).unwrap();
         assert_eq!(recovered.len(), 4);
-        assert!(recovered.iter().all(|attempt| first
-            .iter()
-            .any(|claimed| { claimed.attempt["attempt_id"] == attempt.attempt["attempt_id"] })));
+        assert!(recovered.iter().all(|attempt| {
+            first
+                .iter()
+                .any(|claimed| claimed.attempt["attempt_id"] == attempt.attempt["attempt_id"])
+        }));
         assert_eq!(other.capacity(8, 100, 3, 0, 0).unwrap().provisioning, 4);
     }
 

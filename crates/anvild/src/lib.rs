@@ -7,13 +7,14 @@ pub mod store;
 pub use local::LocalSandboxApi;
 
 use anvil_core::{
-    branch_name, preview_hostname, GitRef, LifecycleEvent, LoginFlow, OpenCodeMessageId,
-    OperationTelemetry, Port, Project, Prompt, ProviderAuthMethod, ProviderListResponse,
-    ProviderStatus, ProviderSummary, Repository, Run, RunId, RunState, Session, SessionActivity,
-    SessionId, SessionRequest, SessionTelemetry,
+    GitRef, LifecycleEvent, LoginFlow, OpenCodeMessageId, OperationTelemetry, Port, Project,
+    Prompt, ProviderAuthMethod, ProviderListResponse, ProviderStatus, ProviderSummary, Repository,
+    Run, RunId, RunState, Session, SessionActivity, SessionId, SessionRequest, SessionTelemetry,
+    branch_name, preview_hostname,
 };
 use async_trait::async_trait;
 use axum::{
+    Json, Router,
     body::Body,
     extract::{Extension, Path, Query, State},
     http::StatusCode,
@@ -21,33 +22,32 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use chrono::{DateTime, Utc};
 use kube::{
+    Client, ResourceExt,
     api::{
         Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams, PostParams,
     },
-    Client, ResourceExt,
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     env,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{
     io::AsyncWriteExt,
-    sync::{watch, Mutex as AsyncMutex},
+    sync::{Mutex as AsyncMutex, watch},
 };
 use tracing::{info, warn};
 
@@ -156,7 +156,7 @@ impl Config {
             value => {
                 return Err(ServiceError::Config(format!(
                     "unsupported ANVIL_SANDBOX_BACKEND={value}; expected kubernetes or local"
-                )))
+                )));
             }
         };
         let production = sandbox_backend == SandboxBackend::Kubernetes;
@@ -2190,6 +2190,17 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
         .route("/v1/batches/:id", get(get_batch))
         .route("/v1/batches/:id/digest", get(get_batch_digest))
         .route("/v1/capacity", get(get_capacity))
+        .route("/v1/tasks", post(create_task).get(list_tasks))
+        .route("/v1/tasks/graph", post(create_task_graph))
+        .route("/v1/tasks/:id/complete", post(complete_task))
+        .route("/v1/tasks/:id/cancel", post(cancel_task))
+        .route("/v1/tasks/:id/obviate", post(obviate_task))
+        .route(
+            "/v1/tasks/:id/controller-mode",
+            post(set_task_controller_mode),
+        )
+        .route("/v1/tasks/:id/budget-grants", post(grant_task_budget))
+        .route("/v1/tasks/:id/snapshot", get(get_task_snapshot))
         .route("/v1/tasks/:id", get(get_task))
         .route(
             "/v1/tasks/:id/attempts",
@@ -3078,13 +3089,443 @@ async fn get_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ServiceError> {
+    let store = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?;
+    let mut task = store
+        .get_resource("task", &id)
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+        .ok_or(ServiceError::NotFound)?;
+    if let Some(control) = store
+        .task_control(&id)
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+    {
+        task["version"] = control["version"].clone();
+        task["operator_hold"] = control["operator_hold"].clone();
+        task["controller_mode"] = control["controller_mode"].clone();
+        task["reconcile_generation"] = control["reconcile_generation"].clone();
+        task["completion_policy"] =
+            serde_json::from_str(control["completion_policy"].as_str().unwrap_or("null"))
+                .unwrap_or(Value::Null);
+        task["verification_spec"] =
+            serde_json::from_str(control["verification_spec"].as_str().unwrap_or("null"))
+                .unwrap_or(Value::Null);
+        task["budget"] = serde_json::from_str(control["budget"].as_str().unwrap_or("null"))
+            .unwrap_or(Value::Null);
+        task["execution_target"] = control["execution_target"]
+            .as_str()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or(Value::Null);
+        task["work_branch"] = control["work_branch"].clone();
+        task["pull_request_binding"] = control["pull_request_binding"]
+            .as_str()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or(Value::Null);
+        task["base_revision"] = control["base_revision"].clone();
+        task["terminal"] = control["terminal"]
+            .as_str()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or(Value::Null);
+    }
+    Ok(Json(task))
+}
+
+async fn create_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(specification): Json<Value>,
+) -> Result<(StatusCode, Json<Value>), ServiceError> {
+    let outcome = specification["outcome"].as_str().unwrap_or_default();
+    if outcome.trim().is_empty() {
+        return Err(ServiceError::Invalid("outcome must not be empty".into()));
+    }
+    validate_durable_task_spec(&specification)?;
+    let completion_policy = specification
+        .get("completion_policy")
+        .cloned()
+        .unwrap_or_else(|| {
+            if specification["execution_target"].is_null() {
+                json!({"kind":"all_children_completed"})
+            } else {
+                json!({"kind":"evidence","required_kinds":["delivery_complete"]})
+            }
+        });
+    serde_json::from_value::<anvil_core::CompletionPolicy>(completion_policy.clone())
+        .map_err(|error| ServiceError::Invalid(format!("invalid completion_policy: {error}")))?;
+    let request = json!({"specification":specification,"completion_policy":completion_policy});
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let mut accepted_spec = specification;
+    accepted_spec["completion_policy"] = completion_policy;
+    let result = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .accept_task(&key, "api", &request, &task_id, &accepted_spec)
+        .map_err(|error| match error {
+            store::StoreError::Conflict => {
+                ServiceError::Conflict("task idempotency key conflict".into())
+            }
+            other => ServiceError::Store(other.to_string()),
+        })?;
+    Ok((
+        if result.created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(result.task),
+    ))
+}
+
+fn validate_durable_task_spec(specification: &Value) -> Result<(), ServiceError> {
+    if let Some(criteria) = specification.get("acceptance_criteria") {
+        let criteria = criteria
+            .as_array()
+            .ok_or_else(|| ServiceError::Invalid("acceptance_criteria must be an array".into()))?;
+        if criteria
+            .iter()
+            .any(|item| item.as_str().is_none_or(|text| text.trim().is_empty()))
+        {
+            return Err(ServiceError::Invalid(
+                "acceptance_criteria must contain non-empty strings".into(),
+            ));
+        }
+    }
+    if let Some(target) = specification
+        .get("execution_target")
+        .filter(|value| !value.is_null())
+    {
+        if target["kind"] != "git_repository" {
+            return Err(ServiceError::Invalid(
+                "execution_target.kind must be git_repository".into(),
+            ));
+        }
+        Project::new(target["project"].as_str().unwrap_or_default())
+            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        Repository::new(target["repository"].as_str().unwrap_or_default())
+            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        GitRef::new(target["base_ref"].as_str().unwrap_or_default())
+            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        if !matches!(
+            target["delivery"]["kind"].as_str(),
+            Some("pull_request" | "local_branch")
+        ) {
+            return Err(ServiceError::Invalid(
+                "execution_target.delivery.kind must be pull_request or local_branch".into(),
+            ));
+        }
+    }
+    if let Some(value) = specification.get("budget") {
+        let budget: anvil_core::TaskBudget = serde_json::from_value(value.clone())
+            .map_err(|error| ServiceError::Invalid(format!("invalid budget: {error}")))?;
+        if budget.max_attempts == 0 || budget.max_execution_seconds == 0 {
+            return Err(ServiceError::Invalid(
+                "budget attempt and execution limits must be positive".into(),
+            ));
+        }
+    }
+    if let Some(value) = specification.get("verification_spec") {
+        if !value["holdout_scenarios"].is_array() {
+            return Err(ServiceError::Invalid(
+                "verification_spec.holdout_scenarios must be an array".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct TaskListQuery {
+    after: Option<String>,
+    limit: Option<usize>,
+    lifecycle: Option<String>,
+    parent: Option<String>,
+}
+
+async fn list_tasks(
+    State(state): State<AppState>,
+    Query(query): Query<TaskListQuery>,
+) -> Result<Json<Value>, ServiceError> {
+    let after = query
+        .after
+        .as_deref()
+        .and_then(|value| value.strip_prefix("task1."))
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let (mut tasks, next) = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .task_page(after, query.limit.unwrap_or(50))
+        .map_err(|error| ServiceError::Store(error.to_string()))?;
+    if let Some(lifecycle) = query.lifecycle {
+        tasks.retain(|task| task["state"] == lifecycle);
+    }
+    if let Some(parent) = query.parent {
+        tasks.retain(|task| task["parent_task_id"] == parent);
+    }
+    Ok(Json(
+        json!({"tasks":tasks,"next_cursor":next.map(|sequence|format!("task1.{sequence}"))}),
+    ))
+}
+
+async fn get_task_snapshot(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ServiceError> {
     state
         .store()
         .map_err(|error| ServiceError::Store(error.into()))?
-        .get_resource("task", &id)
+        .task_snapshot(&id, Utc::now().timestamp_millis())
         .map_err(|error| ServiceError::Store(error.to_string()))?
         .map(Json)
         .ok_or(ServiceError::NotFound)
+}
+
+async fn create_task_graph(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Result<(StatusCode, Json<Value>), ServiceError> {
+    let raw_nodes = request["nodes"]
+        .as_array()
+        .ok_or_else(|| ServiceError::Invalid("nodes must be an array".into()))?;
+    let raw_edges = request["dependencies"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if raw_nodes.is_empty() || raw_nodes.len() > 256 || raw_edges.len() > 2048 {
+        return Err(ServiceError::Invalid("graph size exceeds limits".into()));
+    }
+    let mut nodes = Vec::with_capacity(raw_nodes.len());
+    for node in raw_nodes {
+        let key = node["key"]
+            .as_str()
+            .filter(|key| !key.trim().is_empty())
+            .ok_or_else(|| ServiceError::Invalid("each graph node requires a key".into()))?
+            .to_owned();
+        let spec = node.get("task").cloned().unwrap_or(Value::Null);
+        if spec["outcome"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            return Err(ServiceError::Invalid(format!(
+                "node {key} requires outcome"
+            )));
+        }
+        validate_durable_task_spec(&spec)?;
+        let completion = spec.get("completion_policy").cloned().unwrap_or_else(|| {
+            if spec["execution_target"].is_null() {
+                json!({"kind":"all_children_completed"})
+            } else {
+                json!({"kind":"evidence","required_kinds":["delivery_complete"]})
+            }
+        });
+        serde_json::from_value::<anvil_core::CompletionPolicy>(completion).map_err(|error| {
+            ServiceError::Invalid(format!("node {key}: invalid completion policy: {error}"))
+        })?;
+        nodes.push((key, uuid::Uuid::new_v4().to_string(), spec));
+    }
+    let mut edges = Vec::new();
+    for edge in raw_edges {
+        let predecessor = edge["predecessor"]
+            .as_str()
+            .ok_or_else(|| ServiceError::Invalid("dependency requires predecessor".into()))?
+            .to_owned();
+        let successor = edge["successor"]
+            .as_str()
+            .ok_or_else(|| ServiceError::Invalid("dependency requires successor".into()))?
+            .to_owned();
+        edges.push((predecessor, successor));
+    }
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let result = state
+        .store()
+        .map_err(|e| ServiceError::Store(e.into()))?
+        .accept_task_graph(&key, "api", &request, &nodes, &edges)
+        .map_err(|error| match error {
+            store::StoreError::Conflict => {
+                ServiceError::Conflict("task graph idempotency conflict".into())
+            }
+            store::StoreError::InvalidState(message) => ServiceError::Invalid(message),
+            other => ServiceError::Store(other.to_string()),
+        })?;
+    Ok((
+        if result.created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(result.task),
+    ))
+}
+
+#[derive(Deserialize)]
+struct CompleteTaskRequest {
+    expected_version: u64,
+    evidence_ids: Vec<String>,
+}
+
+async fn complete_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<CompleteTaskRequest>,
+) -> Result<Json<Value>, ServiceError> {
+    state
+        .store()
+        .map_err(|e| ServiceError::Store(e.into()))?
+        .complete_task(&id, request.expected_version, &request.evidence_ids)
+        .map(Json)
+        .map_err(|error| match error {
+            store::StoreError::NotFound => ServiceError::NotFound,
+            store::StoreError::Conflict => ServiceError::Conflict("task version changed".into()),
+            store::StoreError::InvalidState(message) => ServiceError::Invalid(message),
+            other => ServiceError::Store(other.to_string()),
+        })
+}
+
+#[derive(Deserialize)]
+struct TerminalMutation {
+    expected_version: u64,
+    reason: String,
+    actor: Option<String>,
+}
+
+async fn cancel_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<TerminalMutation>,
+) -> Result<Json<Value>, ServiceError> {
+    if body.reason.trim().is_empty() {
+        return Err(ServiceError::Invalid("reason must not be empty".into()));
+    }
+    state
+        .store()
+        .map_err(|e| ServiceError::Store(e.into()))?
+        .terminate_task(
+            &id,
+            body.expected_version,
+            anvil_core::TaskTerminal::Canceled {
+                actor: body.actor.unwrap_or_else(|| "operator".into()),
+                reason: body.reason,
+            },
+        )
+        .map(Json)
+        .map_err(map_task_terminal_error)
+}
+
+async fn obviate_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<TerminalMutation>,
+) -> Result<Json<Value>, ServiceError> {
+    if body.reason.trim().is_empty() {
+        return Err(ServiceError::Invalid("reason must not be empty".into()));
+    }
+    state
+        .store()
+        .map_err(|e| ServiceError::Store(e.into()))?
+        .terminate_task(
+            &id,
+            body.expected_version,
+            anvil_core::TaskTerminal::Obviated {
+                reason: body.reason,
+            },
+        )
+        .map(Json)
+        .map_err(map_task_terminal_error)
+}
+
+#[derive(Deserialize)]
+struct ControllerModeMutation {
+    expected_version: u64,
+    operator_hold: bool,
+    controller_mode: anvil_core::ControllerMode,
+}
+
+async fn set_task_controller_mode(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ControllerModeMutation>,
+) -> Result<Json<Value>, ServiceError> {
+    let mode = match request.controller_mode {
+        anvil_core::ControllerMode::Legacy => "legacy",
+        anvil_core::ControllerMode::Shadow => "shadow",
+        anvil_core::ControllerMode::Reconciler => "reconciler",
+    };
+    let store = state.store().map_err(|e| ServiceError::Store(e.into()))?;
+    let version = store
+        .set_task_control(&id, request.expected_version, request.operator_hold, mode)
+        .map_err(map_task_terminal_error)?;
+    store
+        .get_resource("task", &id)
+        .map_err(|e| ServiceError::Store(e.to_string()))?
+        .map(|mut task| {
+            task["version"] = json!(version);
+            task["operator_hold"] = json!(request.operator_hold);
+            task["controller_mode"] = json!(mode);
+            Json(task)
+        })
+        .ok_or(ServiceError::NotFound)
+}
+
+#[derive(Deserialize)]
+struct BudgetGrantMutation {
+    expected_version: u64,
+    actor: String,
+    reason: String,
+    additional_attempts: u32,
+    additional_continuations: u32,
+    additional_ci_retries: u32,
+    additional_execution_seconds: u64,
+}
+
+async fn grant_task_budget(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<BudgetGrantMutation>,
+) -> Result<Json<Value>, ServiceError> {
+    let store = state.store().map_err(|e| ServiceError::Store(e.into()))?;
+    let version = store
+        .grant_task_budget(
+            &id,
+            request.expected_version,
+            &request.actor,
+            &request.reason,
+            request.additional_attempts,
+            request.additional_continuations,
+            request.additional_ci_retries,
+            request.additional_execution_seconds,
+        )
+        .map_err(map_task_terminal_error)?;
+    store
+        .get_resource("task", &id)
+        .map_err(|e| ServiceError::Store(e.to_string()))?
+        .map(|mut task| {
+            task["version"] = json!(version);
+            Json(task)
+        })
+        .ok_or(ServiceError::NotFound)
+}
+
+fn map_task_terminal_error(error: store::StoreError) -> ServiceError {
+    match error {
+        store::StoreError::NotFound => ServiceError::NotFound,
+        store::StoreError::Conflict => ServiceError::Conflict("task version changed".into()),
+        store::StoreError::InvalidState(message) => ServiceError::Invalid(message),
+        other => ServiceError::Store(other.to_string()),
+    }
 }
 
 async fn list_attempts(
@@ -3189,6 +3630,8 @@ async fn idempotency_middleware(
         || method == axum::http::Method::DELETE;
     if key.is_none()
         || path == "/v1/batches"
+        || (method == axum::http::Method::POST
+            && matches!(path.as_str(), "/v1/tasks" | "/v1/tasks/graph"))
         || (path.starts_with("/v1/tasks/") && path.ends_with("/attempts"))
         || path.ends_with("/credentials/github")
         || !is_mutation
@@ -3204,7 +3647,7 @@ async fn idempotency_middleware(
         Ok(bytes) => bytes,
         Err(error) => {
             return ServiceError::Invalid(format!("unable to read request body: {error}"))
-                .into_response()
+                .into_response();
         }
     };
     let semantic = serde_json::from_slice::<Value>(&bytes)
@@ -3253,7 +3696,7 @@ async fn idempotency_middleware(
             return ServiceError::Conflict(
                 "Idempotency-Key was already used for a different operation or request".into(),
             )
-            .into_response()
+            .into_response();
         }
         Err(error) => return ServiceError::Store(error).into_response(),
     };
@@ -3294,7 +3737,7 @@ async fn idempotency_middleware(
         Ok(bytes) => bytes,
         Err(error) => {
             return ServiceError::Store(format!("unable to persist HTTP result: {error}"))
-                .into_response()
+                .into_response();
         }
     };
     let body_value = serde_json::from_slice::<Value>(&bytes)
@@ -7246,10 +7689,12 @@ mod tests {
             .await
             .1;
         assert!(human["text"].as_str().unwrap().contains("Batch digest-100"));
-        assert!(human["text"]
-            .as_str()
-            .unwrap()
-            .contains("dependency failed"));
+        assert!(
+            human["text"]
+                .as_str()
+                .unwrap()
+                .contains("dependency failed")
+        );
         assert!(human["text"].as_str().unwrap().contains("1.5s"));
 
         // Prove the row's Task ID and Attempt IDs resolve through existing detail routes.
@@ -7550,10 +7995,12 @@ mod tests {
         let attempts = store.attempts_for_task("logical-task").unwrap();
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0]["failure_class"], "infrastructure");
-        assert!(attempts[0]["failure_reason"]
-            .as_str()
-            .unwrap()
-            .contains("gone-session"));
+        assert!(
+            attempts[0]["failure_reason"]
+                .as_str()
+                .unwrap()
+                .contains("gone-session")
+        );
         assert_eq!(attempts[1]["ordinal"], 2);
         assert_eq!(attempts[1]["task_id"], attempts[0]["task_id"]);
         assert_eq!(
@@ -7788,11 +8235,12 @@ mod tests {
     #[async_trait]
     impl SandboxApi for LifecycleSandbox {
         async fn list(&self) -> Result<Vec<SandboxRecord>, ServiceError> {
-            Ok(vec![self
-                .record
-                .lock()
-                .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?
-                .clone()])
+            Ok(vec![
+                self.record
+                    .lock()
+                    .map_err(|_| ServiceError::Kubernetes("test lock poisoned".into()))?
+                    .clone(),
+            ])
         }
 
         async fn create(
@@ -8263,11 +8711,13 @@ mod tests {
             vec![],
         );
         let _: DynamicObject = serde_json::from_value(manifest.clone()).unwrap();
-        assert!(manifest["metadata"]["annotations"]
-            .as_object()
-            .unwrap()
-            .values()
-            .all(Value::is_string));
+        assert!(
+            manifest["metadata"]["annotations"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(Value::is_string)
+        );
         let spec = &manifest["spec"]["podTemplate"]["spec"];
         assert_eq!(spec["volumes"][1], shared_nix_volume("configured-nix-pvc"));
         assert!(spec
@@ -8277,31 +8727,39 @@ mod tests {
         let mounts = spec["containers"][0]["volumeMounts"].as_array().unwrap();
         assert!(mounts.contains(&shared_nix_store_mount()));
         assert!(mounts.contains(&shared_nix_socket_mount()));
-        assert!(mounts
-            .iter()
-            .filter(|m| m["name"] == "shared-nix")
-            .all(|m| m["readOnly"] == true));
+        assert!(
+            mounts
+                .iter()
+                .filter(|m| m["name"] == "shared-nix")
+                .all(|m| m["readOnly"] == true)
+        );
         assert!(spec["initContainers"][0].get("volumeMounts").is_none());
-        assert!(spec["volumes"][1]["persistentVolumeClaim"]
-            .get("readOnly")
-            .is_none());
+        assert!(
+            spec["volumes"][1]["persistentVolumeClaim"]
+                .get("readOnly")
+                .is_none()
+        );
     }
 
     #[test]
     fn sandbox_committer_env_and_real_git_metadata_preserve_author() {
         let mut configured = config("http://profile".into());
         configured.git_committer_email = "anvil@noreply.thejeffer.net".into();
-        assert!(!configured
-            .git_committer_email
-            .contains("@users.noreply.github.com"));
+        assert!(
+            !configured
+                .git_committer_email
+                .contains("@users.noreply.github.com")
+        );
         assert!(!DEFAULT_GIT_COMMITTER_EMAIL.contains("@users.noreply.github.com"));
         assert!(!DEFAULT_GIT_COMMITTER_EMAIL.contains("thejeffer.net"));
         assert_eq!(DEFAULT_GIT_COMMITTER_NAME, "Anvil");
         let defaults = config("http://profile".into());
         assert_eq!(defaults.git_committer_email, "anvil@anvil.local");
-        assert!(!defaults
-            .git_committer_email
-            .contains("@users.noreply.github.com"));
+        assert!(
+            !defaults
+                .git_committer_email
+                .contains("@users.noreply.github.com")
+        );
         let mut env: Vec<Value> = git_committer_environment(&configured)
             .into_iter()
             .map(|(name, value)| json!({"name":name,"value":value}))
@@ -8367,11 +8825,13 @@ mod tests {
 
         let default_repo = tempfile::tempdir().unwrap();
         std::fs::write(default_repo.path().join("file"), "content").unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["init", default_repo.path().to_str().unwrap()])
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", default_repo.path().to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success()
+        );
         let default_home = tempfile::tempdir().unwrap();
         let default_commit = std::process::Command::new("bash")
             .arg("-c")
@@ -8582,10 +9042,12 @@ mod tests {
         let completed = legacy_run_record(&completed.to_string()).unwrap();
         assert!(completed.current.is_none());
         assert_eq!(completed.last_run().unwrap().state, RunState::Completed);
-        assert!(serde_json::to_value(completed)
-            .unwrap()
-            .get("state")
-            .is_none());
+        assert!(
+            serde_json::to_value(completed)
+                .unwrap()
+                .get("state")
+                .is_none()
+        );
     }
 
     #[test]
@@ -8727,14 +9189,18 @@ mod tests {
         assert!(
             matches!(lifecycle_event(&permission_replied).unwrap(), (_, LifecycleObservation::Telemetry(NormalizedTelemetryEvent { fact: TelemetryFact::Wait(ref wait), .. })) if wait["id"] == "per-1" && wait["state"] == "replied")
         );
-        assert!(lifecycle_event(
-            &json!({"type":"question.asked","properties":{"sessionID":"ses_demo"}})
-        )
-        .is_none());
-        assert!(lifecycle_event(
-            &json!({"type":"permission.asked","properties":{"sessionID":"ses_demo"}})
-        )
-        .is_none());
+        assert!(
+            lifecycle_event(
+                &json!({"type":"question.asked","properties":{"sessionID":"ses_demo"}})
+            )
+            .is_none()
+        );
+        assert!(
+            lifecycle_event(
+                &json!({"type":"permission.asked","properties":{"sessionID":"ses_demo"}})
+            )
+            .is_none()
+        );
         let message_update = json!({
             "type":"message.updated",
             "properties":{
@@ -9147,9 +9613,11 @@ mod tests {
         let index_body = axum::body::to_bytes(index.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert!(std::str::from_utf8(&index_body)
-            .unwrap()
-            .contains("/assets/app-abc.js"));
+        assert!(
+            std::str::from_utf8(&index_body)
+                .unwrap()
+                .contains("/assets/app-abc.js")
+        );
 
         let javascript = static_app
             .clone()
@@ -9186,9 +9654,11 @@ mod tests {
         let session_body = axum::body::to_bytes(session_route.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert!(std::str::from_utf8(&session_body)
-            .unwrap()
-            .contains("/assets/app-abc.js"));
+        assert!(
+            std::str::from_utf8(&session_body)
+                .unwrap()
+                .contains("/assets/app-abc.js")
+        );
         let missing_api = static_app
             .oneshot(Request::get("/v1/missing").body(Body::empty()).unwrap())
             .await
@@ -9216,14 +9686,16 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::OK, "asset {path}");
-                assert!(response.headers()["content-type"]
-                    .to_str()
-                    .unwrap()
-                    .starts_with(if path.ends_with(".css") {
-                        "text/css"
-                    } else {
-                        "text/javascript"
-                    }));
+                assert!(
+                    response.headers()["content-type"]
+                        .to_str()
+                        .unwrap()
+                        .starts_with(if path.ends_with(".css") {
+                            "text/css"
+                        } else {
+                            "text/javascript"
+                        })
+                );
             }
         }
     }
@@ -9664,10 +10136,12 @@ mod tests {
         assert_eq!(activity.requests[0].state, "completed");
         assert_eq!(activity.requests[0].duration_ms, Some(6_000));
         assert_eq!(activity.requests[0].provider.as_deref(), Some("openai"));
-        assert!(activity
-            .lifecycle
-            .iter()
-            .any(|event| event.kind == "request_completed"));
+        assert!(
+            activity
+                .lifecycle
+                .iter()
+                .any(|event| event.kind == "request_completed")
+        );
     }
 
     #[test]
@@ -9761,17 +10235,23 @@ mod tests {
             run.started_at.clone(),
         );
         let annotations = run_record_annotations(&config("http://profile.test".into()), &record);
-        assert!(annotations
-            .values()
-            .all(|value| value.is_string() || value.is_null()));
-        assert!(annotations
-            .get("anvil.example/run-record")
-            .and_then(Value::as_str)
-            .and_then(|value| serde_json::from_str::<RunRecord>(value).ok())
-            .is_some());
-        assert!(annotations
-            .iter()
-            .all(|(key, value)| value.is_null() || !key.contains("work-state")));
+        assert!(
+            annotations
+                .values()
+                .all(|value| value.is_string() || value.is_null())
+        );
+        assert!(
+            annotations
+                .get("anvil.example/run-record")
+                .and_then(Value::as_str)
+                .and_then(|value| serde_json::from_str::<RunRecord>(value).ok())
+                .is_some()
+        );
+        assert!(
+            annotations
+                .iter()
+                .all(|(key, value)| value.is_null() || !key.contains("work-state"))
+        );
         assert_eq!(
             annotations
                 .get("anvil.example/run-current")
@@ -10243,10 +10723,12 @@ mod tests {
             expected,
         );
         assert_eq!(result["status"], "unavailable");
-        assert!(result["message"]
-            .as_str()
-            .unwrap()
-            .contains("does not match"));
+        assert!(
+            result["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not match")
+        );
         assert_eq!(
             validate_worker_diff_base(
                 json!({"status":"ready","diff":{"base_revision":expected,"files":[]}}),
