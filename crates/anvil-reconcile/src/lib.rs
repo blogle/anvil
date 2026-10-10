@@ -77,6 +77,8 @@ pub struct RequiredCheck {
     pub source: String,
     pub state: CheckState,
     pub evaluation_sha: String,
+    #[serde(default)]
+    pub failure_fingerprint: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Delivery {
@@ -86,6 +88,8 @@ pub struct Delivery {
     pub evaluation_sha: Option<String>,
     pub evaluation_kind: Option<EvaluationKind>,
     pub pr_state: Option<String>,
+    #[serde(default)]
+    pub check_policy_known: bool,
     #[serde(default)]
     pub pr_merged: bool,
     #[serde(default)]
@@ -291,6 +295,11 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
         return d;
     }
     if let Some(x) = delivery {
+        if !x.check_policy_known {
+            d.rule_id = "required_check_policy_unknown".into();
+            d.attention.push("required_check_policy_unknown".into());
+            return d;
+        }
         let sha = x.evaluation_sha.as_deref().unwrap_or("");
         let failing: Vec<_> = x
             .required_checks
@@ -304,10 +313,24 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
                 d.attention.push("integration_checks_failing".into());
                 return d;
             }
+            let mut failure_identity: Vec<_> = x
+                .required_checks
+                .iter()
+                .filter(|check| check.evaluation_sha == sha && check.state == CheckState::Failing)
+                .map(|check| {
+                    format!(
+                        "{}:{}:{}",
+                        check.source,
+                        check.context,
+                        check.failure_fingerprint.as_deref().unwrap_or("failure")
+                    )
+                })
+                .collect();
+            failure_identity.sort();
             let cause = digest(&format!(
                 "{}:{}",
                 x.pr_head_sha.as_deref().unwrap_or(""),
-                failing.join(",")
+                failure_identity.join("|")
             ));
             let continuation_count = s
                 .budget_usage
@@ -906,6 +929,7 @@ pub mod github {
                     source: required.source,
                     state,
                     evaluation_sha: evaluation.into(),
+                    failure_fingerprint: None,
                 }
             })
             .collect();
@@ -1022,12 +1046,14 @@ mod tests {
             evaluation_sha: Some("old".into()),
             evaluation_kind: Some(EvaluationKind::Head),
             pr_state: Some("open".into()),
+            check_policy_known: true,
             pr_merged: true,
             required_checks: vec![RequiredCheck {
                 context: "ci".into(),
                 source: "check_run".into(),
                 state: CheckState::Failing,
                 evaluation_sha: "old".into(),
+                failure_fingerprint: None,
             }],
         });
         assert_eq!(
@@ -1061,12 +1087,14 @@ mod tests {
             evaluation_sha: Some("head".into()),
             evaluation_kind: Some(EvaluationKind::Head),
             pr_state: Some("open".into()),
+            check_policy_known: true,
             pr_merged: false,
             required_checks: vec![RequiredCheck {
                 context: "CI".into(),
                 source: "check_run".into(),
                 state: CheckState::Failing,
                 evaluation_sha: "head".into(),
+                failure_fingerprint: Some("lint:E123".into()),
             }],
         });
         s.attempts.push(Attempt {
@@ -1101,18 +1129,40 @@ mod tests {
             evaluation_sha: Some("group".into()),
             evaluation_kind: Some(EvaluationKind::MergeGroup),
             pr_state: Some("open".into()),
+            check_policy_known: true,
             pr_merged: false,
             required_checks: vec![RequiredCheck {
                 context: "CI".into(),
                 source: "check_run".into(),
                 state: CheckState::Failing,
                 evaluation_sha: "group".into(),
+                failure_fingerprint: None,
             }],
         });
         let decision = reconcile(&s, LogicalTime(0));
         assert_eq!(decision.rule_id, "merge_group_checks_failing");
         assert!(decision.desired_actions.is_empty());
         assert_eq!(decision.attention, ["integration_checks_failing"]);
+    }
+
+    #[test]
+    fn inaccessible_required_check_policy_is_not_green() {
+        let mut s = snap();
+        s.delivery = Some(Delivery {
+            work_branch: Some("task/demo".into()),
+            base_revision: None,
+            pr_head_sha: Some("head".into()),
+            evaluation_sha: Some("head".into()),
+            evaluation_kind: Some(EvaluationKind::Head),
+            pr_state: Some("open".into()),
+            check_policy_known: false,
+            pr_merged: false,
+            required_checks: vec![],
+        });
+        let decision = reconcile(&s, LogicalTime(0));
+        assert_eq!(decision.rule_id, "required_check_policy_unknown");
+        assert!(decision.desired_actions.is_empty());
+        assert_eq!(decision.attention, ["required_check_policy_unknown"]);
     }
     #[test]
     fn canonical_hash_ignores_poll_churn() {
