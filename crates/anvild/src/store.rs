@@ -3573,6 +3573,34 @@ mod tests {
     }
 
     #[test]
+    fn shadow_and_reconciler_modes_fence_legacy_capacity_claims() {
+        let (_dir, store) = store();
+        let spec = serde_json::json!({
+            "outcome":"owned execution",
+            "execution_target":{"kind":"git_repository","project":"demo","repository":"https://example.test/repo","base_ref":"main","delivery":"local_branch"}
+        });
+        store
+            .accept_task("mode-key", "test", &spec, "mode-task", &spec)
+            .unwrap();
+        store
+            .create_attempt("mode-task", "mode-attempt", "mode-attempt-key")
+            .unwrap();
+        store.set_attempt_state("mode-attempt", "running").unwrap();
+        store
+            .set_task_control("mode-task", 2, false, "shadow")
+            .unwrap();
+        assert!(store.claim_runnable(4, 0, 3, 0).unwrap().is_empty());
+        let attempts = store.attempts_for_task("mode-task").unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0]["attempt_id"], "mode-attempt");
+        store
+            .set_task_control("mode-task", 3, false, "reconciler")
+            .unwrap();
+        assert!(store.claim_runnable(4, 0, 3, 0).unwrap().is_empty());
+        assert_eq!(store.attempts_for_task("mode-task").unwrap().len(), 1);
+    }
+
+    #[test]
     fn budget_grants_are_audited_append_only_and_visible_in_snapshot() {
         let (_dir, store) = store();
         let spec = serde_json::json!({"outcome":"bounded work"});
@@ -4172,6 +4200,48 @@ mod tests {
             store.complete_legacy_scheduler_attempt("legacy-task", "legacy-attempt", 2),
             Err(StoreError::InvalidState(_))
         ));
+
+        let shadow_spec = serde_json::json!({
+            "outcome":"shadow-owned work",
+            "completion_policy":{"kind":"evidence","required_kinds":["legacy_scheduler_exit"]}
+        });
+        store
+            .accept_task(
+                "shadow-legacy-key",
+                "test",
+                &shadow_spec,
+                "shadow-legacy-task",
+                &shadow_spec,
+            )
+            .unwrap();
+        store
+            .create_attempt(
+                "shadow-legacy-task",
+                "shadow-legacy-attempt",
+                "shadow-legacy-attempt-key",
+            )
+            .unwrap();
+        store
+            .set_attempt_state("shadow-legacy-attempt", "completed")
+            .unwrap();
+        store
+            .set_task_control("shadow-legacy-task", 2, false, "shadow")
+            .unwrap();
+        assert!(matches!(
+            store.complete_legacy_scheduler_attempt(
+                "shadow-legacy-task",
+                "shadow-legacy-attempt",
+                3
+            ),
+            Err(StoreError::InvalidState(_))
+        ));
+        assert_eq!(
+            store
+                .get_resource("task", "shadow-legacy-task")
+                .unwrap()
+                .unwrap()["state"],
+            "open"
+        );
     }
 
     #[test]
