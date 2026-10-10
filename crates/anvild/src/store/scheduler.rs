@@ -273,6 +273,35 @@ impl ControllerStore {
         Ok(())
     }
 
+    pub fn compare_and_set_attempt_state(
+        &self,
+        attempt_id: &str,
+        expected_version: u64,
+        state: &str,
+    ) -> Result<u64, StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (version, raw_attempt): (i64, String) = tx
+            .query_row(
+                "SELECT version,payload_json FROM attempts WHERE attempt_id=?1",
+                [attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        if version as u64 != expected_version {
+            return Err(StoreError::Conflict);
+        }
+        let mut attempt: Value = serde_json::from_str(&raw_attempt)?;
+        attempt["state"] = Value::String(state.to_owned());
+        persist_attempt(&tx, attempt_id, &attempt)?;
+        tx.commit()?;
+        Ok(expected_version + 1)
+    }
+
     pub fn set_attempt_and_task_state(
         &self,
         attempt_id: &str,

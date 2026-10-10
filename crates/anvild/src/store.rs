@@ -4341,6 +4341,38 @@ mod tests {
     }
 
     #[test]
+    fn attempt_state_compare_and_set_is_version_fenced() {
+        let (_dir, store) = store();
+        let spec = serde_json::json!({"outcome":"attempt CAS"});
+        store
+            .accept_task("attempt-cas-key", "test", &spec, "attempt-cas-task", &spec)
+            .unwrap();
+        store
+            .create_attempt(
+                "attempt-cas-task",
+                "attempt-cas-id",
+                "attempt-cas-submission",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .compare_and_set_attempt_state("attempt-cas-id", 1, "running")
+                .unwrap(),
+            2
+        );
+        assert!(matches!(
+            store.compare_and_set_attempt_state("attempt-cas-id", 1, "ended"),
+            Err(StoreError::Conflict)
+        ));
+        let attempt = store
+            .get_resource("attempt", "attempt-cas-id")
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt["version"], 2);
+        assert_eq!(attempt["lifecycle"], "running");
+    }
+
+    #[test]
     fn active_logical_collision_suppresses_by_default_and_override_allows_competition() {
         let (_dir, store) = store();
         let base_a = "0123456789abcdef0123456789abcdef01234567";
