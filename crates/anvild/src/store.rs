@@ -3820,6 +3820,51 @@ mod tests {
             store.set_task_control("mode-task", 4, false, "shadow"),
             Err(StoreError::InvalidState(_))
         ));
+
+        let retry_spec = serde_json::json!({
+            "outcome":"pending legacy retry",
+            "execution_target":{"kind":"git_repository","project":"demo","repository":"https://example.test/repo","base_ref":"main","delivery":"local_branch"}
+        });
+        store
+            .accept_task(
+                "retry-mode-key",
+                "test",
+                &retry_spec,
+                "retry-mode-task",
+                &retry_spec,
+            )
+            .unwrap();
+        store
+            .create_attempt(
+                "retry-mode-task",
+                "retry-mode-attempt",
+                "retry-mode-attempt-key",
+            )
+            .unwrap();
+        store
+            .record_attempt_failure(
+                "retry-mode-attempt",
+                scheduler::FailureClass::Infrastructure,
+                "pending infrastructure retry",
+                1_000,
+                3,
+                10_000,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get_resource("task", "retry-mode-task")
+                .unwrap()
+                .unwrap()["state"],
+            "retry_wait"
+        );
+        let version = store.task_control("retry-mode-task").unwrap().unwrap()["version"]
+            .as_u64()
+            .unwrap();
+        store
+            .set_task_control("retry-mode-task", version, false, "shadow")
+            .unwrap();
+        assert!(store.claim_runnable(4, i64::MAX, 3, 0).unwrap().is_empty());
     }
 
     #[test]
