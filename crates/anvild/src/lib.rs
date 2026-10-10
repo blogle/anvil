@@ -3273,12 +3273,14 @@ async fn list_tasks(
     State(state): State<AppState>,
     Query(query): Query<TaskListQuery>,
 ) -> Result<Json<Value>, ServiceError> {
-    let after = query
-        .after
-        .as_deref()
-        .and_then(|value| value.strip_prefix("task1."))
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(0);
+    let after = match query.after.as_deref() {
+        None => 0,
+        Some(cursor) => cursor
+            .strip_prefix("task1.")
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value >= 0)
+            .ok_or_else(|| ServiceError::Invalid("invalid Task cursor".into()))?,
+    };
     let filters = store::TaskListFilters {
         lifecycle: query.lifecycle,
         parent: query.parent,

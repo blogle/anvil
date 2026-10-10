@@ -254,6 +254,7 @@ async fn responses(
     }
     if tool_count == 0 {
         let value = response_text("I will inspect and update the fixture file.", &request);
+        eprintln!("deterministic title/text response: {}", value);
         return if stream {
             response_sse(&value)
         } else {

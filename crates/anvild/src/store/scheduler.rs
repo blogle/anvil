@@ -410,7 +410,7 @@ fn dependencies_satisfied(tx: &Connection, task: &Value) -> Result<bool, StoreEr
                 r.get(0)
             })
             .optional()?;
-        if !matches!(state.as_deref(), Some("completed" | "succeeded")) {
+        if state.as_deref() != Some("completed") {
             return Ok(false);
         }
     }

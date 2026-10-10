@@ -1546,9 +1546,7 @@ impl ControllerStore {
             _ => "legacy",
         };
         let has_execution_target = control.8.is_some();
-        let dependencies_unresolved = dependencies
-            .iter()
-            .any(|item| item["state"] != "completed" && item["state"] != "succeeded");
+        let dependencies_unresolved = dependencies.iter().any(|item| item["state"] != "completed");
         let phase = anvil_core::derive_task_phase(
             task["state"].as_str().unwrap_or("open"),
             blocker.is_some() || dependencies_unresolved,
@@ -1571,9 +1569,17 @@ impl ControllerStore {
             .as_deref()
             .map(serde_json::from_str::<Value>)
             .transpose()?;
+        let lifecycle = if matches!(
+            task["state"].as_str(),
+            Some("completed" | "canceled" | "obviated" | "superseded" | "failed_exhausted")
+        ) {
+            serde_json::json!({"state":"terminal","terminal":task["terminal"]})
+        } else {
+            serde_json::json!({"state":"open"})
+        };
         let mut snapshot = serde_json::json!({
             "schema_version":1,"task_id":task_id,"task_version":control.0,"logical_time_ms":logical_time,
-            "lifecycle":{"state":if matches!(task["state"].as_str(),Some("completed"|"canceled"|"obviated"|"superseded"|"failed_exhausted")) {"terminal"} else {"open"},"terminal":task["terminal"]},"completion_policy":serde_json::from_str::<Value>(&control.4)?,
+            "lifecycle":lifecycle,"completion_policy":serde_json::from_str::<Value>(&control.4)?,
             "operator_hold":control.1,"controller_mode":controller_mode,"reconcile_generation":control.3,
             "execution_target":control.8.as_deref().map(serde_json::from_str::<Value>).transpose()? ,"delivery":{"work_branch":control.9,"pull_request":pull_request.clone(),"base_revision":control.11,"pr_head_sha":pr_head_sha,"evaluation_sha":checks.and_then(|value|value["evaluation_sha"].as_str()),"evaluation_kind":checks.and_then(|value|value["evaluation_kind"].as_str()),"pr_state":pull_request.as_ref().and_then(|value|value["state"].as_str()),"required_checks":checks.and_then(|value|value["required_checks"].as_array()).cloned().unwrap_or_default()},
             "dependencies":{"all_completed":!dependencies_unresolved,"predecessors":dependencies},"children":{"total":children.len(),"completed":children.iter().filter(|c|c["state"]=="completed").count(),"terminal_noncompleted":children.iter().filter(|c|c["state"]!="completed"&&matches!(c["state"].as_str(),Some("canceled"|"obviated"|"superseded"|"failed_exhausted"))).count()},
@@ -3149,6 +3155,7 @@ mod tests {
         assert_eq!(replay.task, first.task);
         let snapshot = store.task_snapshot("task-detached", 123).unwrap().unwrap();
         assert_eq!(snapshot["task_id"], "task-detached");
+        assert_eq!(snapshot["lifecycle"], serde_json::json!({"state":"open"}));
         assert_eq!(snapshot["logical_time_ms"], 123);
         assert!(snapshot.get("dependencies").is_some());
         assert!(snapshot.get("children").is_some());
