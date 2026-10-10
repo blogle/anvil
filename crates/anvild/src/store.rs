@@ -1741,6 +1741,7 @@ impl ControllerStore {
             "retry_schedule":{"due_at_ms":control.7},"verification_spec":serde_json::from_str::<Value>(&control.6)?,"phase":phase
         });
         snapshot["action_history"] = serde_json::json!({
+            "availability": "unavailable",
             "relevant": [],
             "continuation_fingerprints_sent": [],
             "last_consumed_evidence": null
@@ -4394,6 +4395,7 @@ mod tests {
         assert!(snapshot.get("attempts").is_some());
         assert!(snapshot.get("observations").is_some());
         assert!(snapshot.get("action_history").is_some());
+        assert_eq!(snapshot["action_history"]["availability"], "unavailable");
         assert_eq!(snapshot["phase"], "runnable");
         serde_json::from_value::<anvil_core::TaskSnapshot>(snapshot.clone())
             .expect("stored snapshot must deserialize as the shared v0 DTO");

@@ -116,6 +116,8 @@ pub enum ControllerMode {
     Reconciler,
 }
 
+/// Whether the returned action list is authoritative. Missing metadata (`None`)
+/// and `Unavailable` must never be treated as a known-empty action ledger.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptRole {
@@ -290,10 +292,27 @@ pub struct TaskChildSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionHistorySummary {
+    #[serde(default)]
+    pub availability: Option<ActionHistoryAvailability>,
     pub relevant: Vec<ActionHistoryEntry>,
     pub continuation_fingerprints_sent: Vec<String>,
     #[serde(default)]
     pub last_consumed_evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionHistoryAvailability {
+    #[default]
+    Unavailable,
+    Authoritative,
+}
+
+/// Shared read boundary for action history owned by the reconciler/outbox lane.
+/// Implementations should return `Unavailable` when their authoritative ledger
+/// cannot be read; they must not convert read failure into an authoritative empty set.
+pub trait TaskActionHistoryReadPort {
+    fn read_action_history(&self, task_id: &str, limit: usize) -> ActionHistorySummary;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +323,8 @@ pub struct ActionHistoryEntry {
     pub idempotency_key: String,
     pub state: ActionState,
     pub turn_id: Option<String>,
+    #[serde(default)]
+    pub generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,6 +458,24 @@ pub struct TaskSnapshot {
     pub retry_schedule: RetrySchedule,
     pub phase: TaskPhase,
     pub merge_wait_due_at_ms: Option<i64>,
+}
+
+impl TaskSnapshot {
+    /// Project the ANVIL-56-owned action read port into this canonical snapshot.
+    /// The unavailable state is preserved when that port is not yet wired.
+    pub fn with_action_history(
+        mut self,
+        reader: &impl TaskActionHistoryReadPort,
+        limit: usize,
+    ) -> Self {
+        let limit = limit.clamp(1, 128);
+        self.action_history = reader.read_action_history(&self.task_id, limit);
+        self.action_history.relevant.truncate(limit);
+        self.action_history
+            .continuation_fingerprints_sent
+            .truncate(limit);
+        self
+    }
 }
 
 /// Coarse snapshot phase. This function deliberately performs no I/O.
@@ -1137,6 +1176,112 @@ mod tests {
             let decoded: TaskSnapshot = serde_json::from_value(encoded).unwrap();
             assert_eq!(decoded, snapshot);
         }
+    }
+
+    #[test]
+    fn action_history_read_port_projects_exact_history_and_fails_closed_when_unavailable() {
+        struct FakeActionHistory {
+            summary: ActionHistorySummary,
+        }
+        impl TaskActionHistoryReadPort for FakeActionHistory {
+            fn read_action_history(&self, task_id: &str, _limit: usize) -> ActionHistorySummary {
+                assert_eq!(task_id, "task_demo");
+                self.summary.clone()
+            }
+        }
+        struct UnavailableActionHistory;
+        impl TaskActionHistoryReadPort for UnavailableActionHistory {
+            fn read_action_history(&self, _task_id: &str, _limit: usize) -> ActionHistorySummary {
+                ActionHistorySummary {
+                    availability: Some(ActionHistoryAvailability::Unavailable),
+                    relevant: Vec::new(),
+                    continuation_fingerprints_sent: Vec::new(),
+                    last_consumed_evidence: None,
+                }
+            }
+        }
+
+        let fixture = include_str!("../tests/fixtures/task-snapshot-v1/fresh-open-executable.json");
+        let snapshot: TaskSnapshot = serde_json::from_str(fixture).unwrap();
+        assert_eq!(
+            snapshot.action_history.availability, None,
+            "missing provider metadata must not masquerade as an authoritative empty ledger"
+        );
+        assert_eq!(snapshot.controller_mode, ControllerMode::Reconciler);
+        let unavailable = snapshot
+            .clone()
+            .with_action_history(&UnavailableActionHistory, 10);
+        assert_eq!(
+            unavailable.action_history.availability,
+            Some(ActionHistoryAvailability::Unavailable)
+        );
+        assert!(unavailable.action_history.relevant.is_empty());
+
+        let first_entry = ActionHistoryEntry {
+            action_kind: "send_turn".into(),
+            attempt_id: Some("attempt_1".into()),
+            cause_fingerprint: "checks-failed:abc".into(),
+            idempotency_key: "send-turn-key".into(),
+            state: ActionState::UnknownOutcome,
+            turn_id: Some("turn_1".into()),
+            generation: Some(7),
+        };
+        let provider = FakeActionHistory {
+            summary: ActionHistorySummary {
+                availability: Some(ActionHistoryAvailability::Authoritative),
+                relevant: vec![
+                    first_entry,
+                    ActionHistoryEntry {
+                        action_kind: "send_turn".into(),
+                        attempt_id: Some("attempt_1".into()),
+                        cause_fingerprint: "checks-failed:def".into(),
+                        idempotency_key: "send-turn-key-2".into(),
+                        state: ActionState::Succeeded,
+                        turn_id: Some("turn_2".into()),
+                        generation: Some(8),
+                    },
+                ],
+                continuation_fingerprints_sent: vec![
+                    "checks-failed:abc".into(),
+                    "checks-failed:def".into(),
+                ],
+                last_consumed_evidence: Some("observation_9".into()),
+            },
+        };
+        let projected = snapshot.with_action_history(&provider, 1);
+        assert_eq!(
+            projected.action_history.availability,
+            Some(ActionHistoryAvailability::Authoritative)
+        );
+        assert_eq!(
+            projected.action_history.relevant[0].cause_fingerprint,
+            "checks-failed:abc"
+        );
+        assert_eq!(
+            projected.action_history.relevant[0].idempotency_key,
+            "send-turn-key"
+        );
+        assert_eq!(
+            projected.action_history.relevant[0].turn_id.as_deref(),
+            Some("turn_1")
+        );
+        assert_eq!(projected.action_history.relevant[0].generation, Some(7));
+        assert_eq!(projected.action_history.relevant.len(), 1);
+        assert_eq!(
+            projected
+                .action_history
+                .continuation_fingerprints_sent
+                .len(),
+            1
+        );
+        assert_eq!(
+            projected.action_history.relevant[0].state,
+            ActionState::UnknownOutcome
+        );
+        assert_eq!(
+            projected.action_history.last_consumed_evidence.as_deref(),
+            Some("observation_9")
+        );
     }
 
     #[test]
