@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+pub mod frozen_v0;
+
 pub const RECONCILER_VERSION: &str = "anvil-reconcile-v1";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -23,12 +25,43 @@ pub enum Lifecycle {
     Terminal,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CompletionPolicy {
+    Evidence { required_kinds: Vec<String> },
+    AllChildrenCompleted,
+    Manual,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationProvenance {
+    Runtime,
+    Platform,
+    External,
+    Agent,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletionEvidence {
+    pub kind: String,
+    pub provenance: ObservationProvenance,
+    pub fresh: bool,
+    pub trusted: bool,
+    #[serde(default)]
+    pub subject_sha: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptLifecycle {
     Queued,
     Provisioning,
     Running,
     Ended,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeHealth {
+    Healthy,
+    Failed,
+    Unknown,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -56,9 +89,27 @@ pub enum ActionClass {
 #[serde(rename_all = "snake_case")]
 pub enum ActionKind {
     CreateAttempt,
+    RecoverRuntime,
     ChecksFailed,
     MergeConflict,
     ObserveDelivery,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryStrategy {
+    RetryIdempotently,
+    ObserveBeforeRetry,
+    NeverReplay,
+}
+impl ActionKind {
+    pub fn recovery_strategy(&self) -> RecoveryStrategy {
+        match self {
+            Self::CreateAttempt | Self::ObserveDelivery => RecoveryStrategy::RetryIdempotently,
+            Self::RecoverRuntime | Self::ChecksFailed | Self::MergeConflict => {
+                RecoveryStrategy::ObserveBeforeRetry
+            }
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -91,6 +142,12 @@ pub struct Delivery {
     #[serde(default)]
     pub check_policy_known: bool,
     #[serde(default)]
+    pub unexpected_force_push: bool,
+    #[serde(default)]
+    pub changes_requested: bool,
+    #[serde(default)]
+    pub merge_conflict: bool,
+    #[serde(default)]
     pub pr_merged: bool,
     #[serde(default)]
     pub required_checks: Vec<RequiredCheck>,
@@ -122,6 +179,8 @@ pub struct BudgetUsage {
     pub ci_retries: u32,
     pub verifier_cycles: u32,
     pub execution_ms: u64,
+    #[serde(default)]
+    pub runtime_recoveries: u32,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskSnapshot {
@@ -133,7 +192,9 @@ pub struct TaskSnapshot {
     pub operator_hold: bool,
     pub lifecycle: Lifecycle,
     #[serde(default)]
-    pub completion_satisfied: bool,
+    pub completion_policy: Option<CompletionPolicy>,
+    #[serde(default)]
+    pub completion_evidence: Vec<CompletionEvidence>,
     pub phase: Option<String>,
     #[serde(default)]
     pub dependencies_all_completed: bool,
@@ -148,6 +209,12 @@ pub struct TaskSnapshot {
     pub attempts: Vec<Attempt>,
     #[serde(default)]
     pub unresolved_blocker: bool,
+    #[serde(default)]
+    pub runtime_health: Option<RuntimeHealth>,
+    #[serde(default)]
+    pub runtime_failure_fingerprint: Option<String>,
+    #[serde(default)]
+    pub max_runtime_recoveries: Option<u32>,
     #[serde(default)]
     pub action_history: Vec<PriorAction>,
     #[serde(default)]
@@ -170,6 +237,7 @@ pub struct ProposedAction {
     pub cause_fingerprint: String,
     pub idempotency_key: String,
     pub class: ActionClass,
+    pub recovery_strategy: RecoveryStrategy,
     pub payload: Value,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -200,13 +268,21 @@ fn make_action(
             attempt.unwrap_or("-").to_owned()
         )
     };
+    let class = match &kind {
+        ActionKind::CreateAttempt | ActionKind::ObserveDelivery => ActionClass::Idempotent,
+        ActionKind::RecoverRuntime | ActionKind::ChecksFailed | ActionKind::MergeConflict => {
+            ActionClass::Observable
+        }
+    };
+    let recovery_strategy = kind.recovery_strategy();
     ProposedAction {
         kind,
         task_id: task.to_owned(),
         attempt_id: attempt.map(str::to_owned),
         cause_fingerprint: cause,
         idempotency_key: digest(&key_material),
-        class: ActionClass::Observable,
+        class,
+        recovery_strategy,
         payload,
     }
 }
@@ -233,12 +309,15 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
         d.rule_id = "already_terminal".into();
         return d;
     }
-    if s.completion_satisfied
-        || (s.child_count > 0
-            && s.children_completed == s.child_count
-            && s.children_terminal_noncompleted == 0)
-    {
+    if completion_satisfied(s) {
         d.rule_id = "completion_satisfied".into();
+        return d;
+    }
+    if s.delivery
+        .as_ref()
+        .is_some_and(|delivery| delivery.pr_merged)
+    {
+        d.rule_id = "delivery_merged_observed".into();
         return d;
     }
     if s.controller_mode != ControllerMode::Reconciler {
@@ -282,9 +361,55 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
         d.rule_id = "retry_backoff".into();
         return d;
     }
+    if s.runtime_health == Some(RuntimeHealth::Failed) {
+        let attempt = s
+            .attempts
+            .iter()
+            .rev()
+            .find(|attempt| attempt.session_id.is_some());
+        let Some(attempt) = attempt else {
+            d.rule_id = "runtime_failure".into();
+            d.attention.push("runtime_failure".into());
+            return d;
+        };
+        if s.max_runtime_recoveries
+            .is_some_and(|max| s.budget_usage.runtime_recoveries >= max)
+        {
+            d.rule_id = "runtime_recovery_exhausted".into();
+            d.attention.push("runtime_failure".into());
+            return d;
+        }
+        let cause = s
+            .runtime_failure_fingerprint
+            .clone()
+            .unwrap_or_else(|| "runtime_failed".into());
+        if has_action(
+            s,
+            ActionKind::RecoverRuntime,
+            Some(&attempt.attempt_id),
+            &cause,
+        ) {
+            d.rule_id = "no_progress".into();
+            d.attention.push("no_progress".into());
+        } else {
+            d.rule_id = "runtime_failure".into();
+            d.desired_actions.push(make_action(&s.task_id,Some(&attempt.attempt_id),ActionKind::RecoverRuntime,cause,json!({"session_id":attempt.session_id,"failure_fingerprint":s.runtime_failure_fingerprint})));
+        }
+        return d;
+    }
     if delivery.is_some_and(|x| x.work_branch.is_none()) {
         d.rule_id = "branch_missing".into();
         d.attention.push("branch_deleted".into());
+        return d;
+    }
+    if delivery.is_some_and(|x| x.unexpected_force_push) {
+        d.rule_id = "unexpected_head_change".into();
+        d.attention.push("ambiguous_delivery".into());
+        return d;
+    }
+    if delivery.is_some_and(|x| x.changes_requested) {
+        d.rule_id = "changes_requested_review".into();
+        d.attention.push("changed_requested_review".into());
         return d;
     }
     if s.attempts.iter().any(|a| {
@@ -295,6 +420,10 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
         return d;
     }
     if let Some(x) = delivery {
+        if x.pr_state.is_none() {
+            d.rule_id = "waiting_for_pr_discovery".into();
+            return d;
+        }
         if !x.check_policy_known {
             d.rule_id = "required_check_policy_unknown".into();
             d.attention.push("required_check_policy_unknown".into());
@@ -328,8 +457,10 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
                 .collect();
             failure_identity.sort();
             let cause = digest(&format!(
-                "{}:{}",
+                "{}:{}:{:?}:{}",
                 x.pr_head_sha.as_deref().unwrap_or(""),
+                sha,
+                x.evaluation_kind,
                 failure_identity.join("|")
             ));
             let continuation_count = s
@@ -366,13 +497,56 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
                 return d;
             }
         }
+        if x.merge_conflict {
+            let count = s
+                .budget_usage
+                .continuations_by_reason
+                .get("merge_conflict")
+                .copied()
+                .unwrap_or(0);
+            if s.max_continuations_by_reason
+                .get("merge_conflict")
+                .is_some_and(|max| count >= *max)
+            {
+                d.rule_id = "budget_exhausted".into();
+                d.attention.push("needs_budget".into());
+                return d;
+            }
+            if let Some(a) = s
+                .attempts
+                .iter()
+                .find(|a| a.session_healthy && a.session_id.is_some())
+            {
+                let cause = digest(&format!(
+                    "{}:{}:{}",
+                    x.pr_head_sha.as_deref().unwrap_or(""),
+                    x.base_revision.as_deref().unwrap_or(""),
+                    "merge_conflict"
+                ));
+                if has_action(s, ActionKind::MergeConflict, Some(&a.attempt_id), &cause) {
+                    d.rule_id = "no_progress".into();
+                    d.attention.push("no_progress".into());
+                } else {
+                    d.rule_id = "merge_conflict".into();
+                    d.desired_actions.push(make_action(
+                        &s.task_id,
+                        Some(&a.attempt_id),
+                        ActionKind::MergeConflict,
+                        cause,
+                        json!({"head_sha":x.pr_head_sha,"base_revision":x.base_revision}),
+                    ));
+                }
+                return d;
+            }
+        }
         if x.pr_merged {
             d.rule_id = "delivery_observed".into();
             return d;
         }
         if x.required_checks.iter().any(|c| {
-            c.evaluation_sha == sha && c.state == CheckState::Unknown
-                || c.evaluation_sha == sha && c.state == CheckState::Pending
+            c.evaluation_sha != sha
+                || c.state == CheckState::Unknown
+                || c.state == CheckState::Pending
         }) {
             d.rule_id = "required_checks_pending".into();
             return d;
@@ -380,6 +554,10 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
         if s.merge_wait_due_at_ms.is_some_and(|due| now.0 >= due) {
             d.rule_id = "waiting_for_merge_too_long".into();
             d.attention.push("waiting_for_merge_too_long".into());
+            return d;
+        }
+        if x.pr_state.as_deref() == Some("open") {
+            d.rule_id = "waiting_for_merge".into();
             return d;
         }
     }
@@ -410,6 +588,47 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
         json!({"role":"implementation","ordinal":ordinal}),
     ));
     d
+}
+
+fn completion_satisfied(s: &TaskSnapshot) -> bool {
+    match &s.completion_policy {
+        Some(CompletionPolicy::Evidence { required_kinds }) => required_kinds.iter().all(|kind| {
+            s.completion_evidence.iter().any(|evidence| {
+                evidence.kind == *kind
+                    && evidence.fresh
+                    && evidence.trusted
+                    && evidence.provenance != ObservationProvenance::Agent
+                    && completion_evidence_matches_binding(s, evidence)
+            })
+        }),
+        Some(CompletionPolicy::AllChildrenCompleted) => {
+            s.child_count > 0
+                && s.children_completed == s.child_count
+                && s.children_terminal_noncompleted == 0
+        }
+        Some(CompletionPolicy::Manual) => s.completion_evidence.iter().any(|evidence| {
+            evidence.kind == "manual_completion"
+                && evidence.fresh
+                && evidence.trusted
+                && evidence.provenance != ObservationProvenance::Agent
+                && completion_evidence_matches_binding(s, evidence)
+        }),
+        None => false,
+    }
+}
+
+fn completion_evidence_matches_binding(
+    snapshot: &TaskSnapshot,
+    evidence: &CompletionEvidence,
+) -> bool {
+    match snapshot
+        .delivery
+        .as_ref()
+        .and_then(|delivery| delivery.pr_head_sha.as_deref())
+    {
+        Some(expected_head) => evidence.subject_sha.as_deref() == Some(expected_head),
+        None => true,
+    }
 }
 
 /// Canonical JSON for a snapshot, excluding polling time and collection churn.
@@ -467,6 +686,8 @@ pub struct DecisionRecord {
     pub reconciler_version: String,
     pub task_id: String,
     pub task_version: u64,
+    pub snapshot_reconcile_generation: u64,
+    pub decision_sequence: u64,
     pub generation: u64,
     pub logical_time_ms: i64,
     pub snapshot_hash: String,
@@ -484,7 +705,9 @@ impl DecisionRecord {
             reconciler_version: RECONCILER_VERSION.into(),
             task_id: s.task_id.clone(),
             task_version: s.task_version,
-            generation: s.reconcile_generation,
+            snapshot_reconcile_generation: s.reconcile_generation,
+            decision_sequence: 0,
+            generation: 0,
             logical_time_ms: now.0,
             snapshot_hash: snapshot_hash(source),
             actions_hash: actions_hash(&d.desired_actions),
@@ -514,6 +737,39 @@ pub fn replay(
 pub mod outbox {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+    #[cfg(test)]
+    pub mod failpoints {
+        use std::cell::Cell;
+        thread_local! { static ARMED: Cell<Option<&'static str>> = const { Cell::new(None) }; }
+        pub const ALL: &[&str] = &[
+            "reconcile.before_decision_commit",
+            "reconcile.after_decision_commit",
+            "outbox.before_claim",
+            "outbox.after_claim_before_dispatch",
+            "outbox.after_side_effect_before_result_commit",
+            "observer.after_observation_commit_before_wake",
+            "task.before_terminal_commit",
+            "gc.after_schedule_before_cleanup",
+        ];
+        pub const INTEGRATION_GATED: &[&str] = &[
+            "task.before_terminal_commit",
+            "gc.after_schedule_before_cleanup",
+        ];
+        pub fn arm(name: &'static str) {
+            assert!(ALL.contains(&name));
+            ARMED.with(|armed| armed.set(Some(name)));
+        }
+        pub fn hit(name: &str) -> bool {
+            ARMED.with(|armed| {
+                if armed.get() == Some(name) {
+                    armed.set(None);
+                    true
+                } else {
+                    false
+                }
+            })
+        }
+    }
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct ActionRecord {
         pub action: ProposedAction,
@@ -574,6 +830,9 @@ pub mod outbox {
             }
             self.keys = next;
             self.generation = generation;
+            let mut decision = decision;
+            decision.generation = generation;
+            decision.decision_sequence = self.decisions.len() as u64 + 1;
             self.decisions.push(decision);
             CommitResult::Applied {
                 generation,
@@ -739,8 +998,19 @@ pub mod outbox {
                 [task_id],
                 |r| r.get(0),
             )?;
-            tx.execute("INSERT INTO reconcile_decisions(task_id,sequence,generation,record_json) VALUES(?1,?2,?3,?4)", params![task_id,sequence,generation,serde_json::to_string(decision).expect("decision serializes")])?;
+            let mut committed_decision = decision.clone();
+            committed_decision.generation = generation;
+            committed_decision.decision_sequence = sequence;
+            tx.execute("INSERT INTO reconcile_decisions(task_id,sequence,generation,record_json) VALUES(?1,?2,?3,?4)", params![task_id,sequence,generation,serde_json::to_string(&committed_decision).expect("decision serializes")])?;
+            #[cfg(test)]
+            if failpoints::hit("reconcile.before_decision_commit") {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
             tx.commit()?;
+            #[cfg(test)]
+            if failpoints::hit("reconcile.after_decision_commit") {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
             Ok(CommitResult::Applied {
                 generation,
                 inserted,
@@ -755,6 +1025,10 @@ pub mod outbox {
             held: bool,
         ) -> rusqlite::Result<bool> {
             use rusqlite::{params, OptionalExtension, TransactionBehavior};
+            #[cfg(test)]
+            if failpoints::hit("outbox.before_claim") {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
             if mode != ControllerMode::Reconciler || held {
                 return Ok(false);
             }
@@ -774,6 +1048,33 @@ pub mod outbox {
                 return Ok(false);
             }
             let changed=tx.execute("UPDATE reconcile_actions SET state='executing' WHERE task_id=?1 AND idempotency_key=?2 AND state='pending'",params![task_id,key])?;
+            tx.commit()?;
+            #[cfg(test)]
+            if changed == 1 && failpoints::hit("outbox.after_claim_before_dispatch") {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            Ok(changed == 1)
+        }
+        pub fn record_result_after_side_effect(
+            &mut self,
+            task_id: &str,
+            key: &str,
+            state: ActionState,
+        ) -> rusqlite::Result<bool> {
+            use rusqlite::{params, TransactionBehavior};
+            let state = serde_json::to_value(state)
+                .expect("state serializes")
+                .as_str()
+                .expect("snake case state")
+                .to_owned();
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed=tx.execute("UPDATE reconcile_actions SET state=?3 WHERE task_id=?1 AND idempotency_key=?2 AND state='executing'",params![task_id,key,state])?;
+            #[cfg(test)]
+            if changed == 1 && failpoints::hit("outbox.after_side_effect_before_result_commit") {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
             tx.commit()?;
             Ok(changed == 1)
         }
@@ -832,6 +1133,29 @@ pub mod outbox {
                 |r| r.get(0),
             )
         }
+        pub fn decision_record(
+            &self,
+            task_id: &str,
+            sequence: u64,
+        ) -> rusqlite::Result<Option<DecisionRecord>> {
+            use rusqlite::OptionalExtension;
+            self.connection
+                .query_row(
+                    "SELECT record_json FROM reconcile_decisions WHERE task_id=?1 AND sequence=?2",
+                    rusqlite::params![task_id, sequence],
+                    |row| {
+                        let raw: String = row.get(0)?;
+                        serde_json::from_str(&raw).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    },
+                )
+                .optional()
+        }
     }
 }
 
@@ -849,6 +1173,7 @@ pub mod github {
         pub sha: String,
         pub conclusion: Option<String>,
         pub status: String,
+        pub details_fingerprint: Option<String>,
     }
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct CommitStatus {
@@ -868,6 +1193,195 @@ pub mod github {
         pub evaluation_kind: EvaluationKind,
         pub checks: Vec<RequiredCheck>,
         pub policy_known: bool,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct PullRequestFacts {
+        pub number: u64,
+        pub head_sha: String,
+        pub evaluation_sha: String,
+        pub evaluation_kind: EvaluationKind,
+        pub state: String,
+        pub merged: bool,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ProviderError {
+        Unavailable,
+        RateLimited,
+        PermissionDenied,
+        InvalidResponse,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ObservationRequest {
+        pub repository: String,
+        pub base_ref: String,
+        pub work_branch: String,
+        pub bound_pr_number: Option<u64>,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct DeliveryObservation {
+        pub repository: String,
+        pub work_branch: String,
+        pub branch_exists: bool,
+        pub pull_request: Option<PullRequestFacts>,
+        pub required_checks: Vec<RequiredCheck>,
+        pub required_policy_known: bool,
+    }
+    impl DeliveryObservation {
+        pub fn into_reducer_delivery(&self, base_revision: Option<String>) -> Delivery {
+            let pr = self.pull_request.as_ref();
+            Delivery {
+                work_branch: self.branch_exists.then(|| self.work_branch.clone()),
+                base_revision,
+                pr_head_sha: pr.map(|facts| facts.head_sha.clone()),
+                evaluation_sha: pr.map(|facts| facts.evaluation_sha.clone()),
+                evaluation_kind: pr.map(|facts| facts.evaluation_kind.clone()),
+                pr_state: pr.map(|facts| facts.state.clone()),
+                check_policy_known: self.required_policy_known,
+                unexpected_force_push: false,
+                changes_requested: false,
+                merge_conflict: false,
+                pr_merged: pr.is_some_and(|facts| facts.merged),
+                required_checks: self.required_checks.clone(),
+            }
+        }
+    }
+    /// Read-only provider boundary. Implementations must query the Task's known branch/PR only.
+    pub trait GitHubReadPort {
+        fn branch_exists(&self, repository: &str, branch: &str) -> Result<bool, ProviderError>;
+        fn pull_request(
+            &self,
+            repository: &str,
+            branch: &str,
+            bound_number: Option<u64>,
+        ) -> Result<Option<PullRequestFacts>, ProviderError>;
+        fn required_policy(
+            &self,
+            repository: &str,
+            base_ref: &str,
+        ) -> Result<Policy, ProviderError>;
+        fn check_runs(
+            &self,
+            repository: &str,
+            evaluation_sha: &str,
+        ) -> Result<Vec<CheckRun>, ProviderError>;
+        fn commit_statuses(
+            &self,
+            repository: &str,
+            evaluation_sha: &str,
+        ) -> Result<Vec<CommitStatus>, ProviderError>;
+    }
+    pub struct GitHubCodeHost<P> {
+        port: P,
+    }
+    impl<P: GitHubReadPort> GitHubCodeHost<P> {
+        pub fn new(port: P) -> Self {
+            Self { port }
+        }
+        pub fn observe(
+            &self,
+            request: &ObservationRequest,
+        ) -> Result<DeliveryObservation, ProviderError> {
+            let branch_exists = self
+                .port
+                .branch_exists(&request.repository, &request.work_branch)?;
+            if !branch_exists {
+                return Ok(DeliveryObservation {
+                    repository: request.repository.clone(),
+                    work_branch: request.work_branch.clone(),
+                    branch_exists: false,
+                    pull_request: None,
+                    required_checks: vec![],
+                    required_policy_known: false,
+                });
+            }
+            let pr = self.port.pull_request(
+                &request.repository,
+                &request.work_branch,
+                request.bound_pr_number,
+            )?;
+            let Some(pr) = pr else {
+                return Ok(DeliveryObservation {
+                    repository: request.repository.clone(),
+                    work_branch: request.work_branch.clone(),
+                    branch_exists: true,
+                    pull_request: None,
+                    required_checks: vec![],
+                    required_policy_known: true,
+                });
+            };
+            let policy = self
+                .port
+                .required_policy(&request.repository, &request.base_ref)
+                .unwrap_or(Policy::Unavailable);
+            let policy_known = matches!(&policy, Policy::Known(_));
+            let runs = self
+                .port
+                .check_runs(&request.repository, &pr.evaluation_sha);
+            let statuses = self
+                .port
+                .commit_statuses(&request.repository, &pr.evaluation_sha);
+            let mut evaluation = evaluate(
+                policy,
+                &pr.head_sha,
+                &pr.evaluation_sha,
+                pr.evaluation_kind.clone(),
+                runs.as_ref().map(Vec::as_slice).unwrap_or(&[]),
+                statuses.as_ref().map(Vec::as_slice).unwrap_or(&[]),
+            );
+            if runs.is_err() || statuses.is_err() {
+                for check in &mut evaluation.checks {
+                    let failed_api = if check.source == "check_run" {
+                        runs.is_err()
+                    } else {
+                        statuses.is_err()
+                    };
+                    if failed_api {
+                        check.state = CheckState::Unknown;
+                    }
+                }
+            }
+            for check in &mut evaluation.checks {
+                if check.state == CheckState::Failing {
+                    let mut identities: Vec<_> = runs
+                        .as_ref()
+                        .ok()
+                        .into_iter()
+                        .flatten()
+                        .filter(|run| run.sha == pr.evaluation_sha && run.name == check.context)
+                        .map(|run| {
+                            format!(
+                                "{}:{}:{}",
+                                run.status,
+                                run.conclusion.as_deref().unwrap_or("unknown"),
+                                run.details_fingerprint.as_deref().unwrap_or("")
+                            )
+                        })
+                        .collect();
+                    identities.extend(
+                        statuses
+                            .as_ref()
+                            .ok()
+                            .into_iter()
+                            .flatten()
+                            .filter(|status| {
+                                status.sha == pr.evaluation_sha && status.context == check.context
+                            })
+                            .map(|status| status.state.clone()),
+                    );
+                    identities.sort();
+                    check.failure_fingerprint = Some(digest(&identities.join("|")));
+                }
+            }
+            // An inaccessible ruleset must not erase other observed PR facts or claim green.
+            Ok(DeliveryObservation {
+                repository: request.repository.clone(),
+                work_branch: request.work_branch.clone(),
+                branch_exists: true,
+                pull_request: Some(pr),
+                required_checks: evaluation.checks,
+                required_policy_known: policy_known,
+            })
+        }
     }
     pub fn evaluate(
         policy: Policy,
@@ -962,12 +1476,14 @@ pub mod github {
                     sha: "head".into(),
                     conclusion: Some("failure".into()),
                     status: "completed".into(),
+                    details_fingerprint: None,
                 },
                 CheckRun {
                     name: "ci".into(),
                     sha: "merge".into(),
                     conclusion: Some("neutral".into()),
                     status: "completed".into(),
+                    details_fingerprint: None,
                 },
             ];
             let sts = [CommitStatus {
@@ -994,6 +1510,263 @@ pub mod github {
             assert!(e.checks.is_empty());
         }
     }
+    #[cfg(test)]
+    mod adapter_tests {
+        use super::*;
+        #[derive(Clone)]
+        struct FakePort {
+            branch: Result<bool, ProviderError>,
+            pr: Result<Option<PullRequestFacts>, ProviderError>,
+            policy: Result<Policy, ProviderError>,
+            runs: Result<Vec<CheckRun>, ProviderError>,
+            statuses: Result<Vec<CommitStatus>, ProviderError>,
+        }
+        impl GitHubReadPort for FakePort {
+            fn branch_exists(&self, _: &str, _: &str) -> Result<bool, ProviderError> {
+                self.branch.clone()
+            }
+            fn pull_request(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<u64>,
+            ) -> Result<Option<PullRequestFacts>, ProviderError> {
+                self.pr.clone()
+            }
+            fn required_policy(&self, _: &str, _: &str) -> Result<Policy, ProviderError> {
+                self.policy.clone()
+            }
+            fn check_runs(&self, _: &str, _: &str) -> Result<Vec<CheckRun>, ProviderError> {
+                self.runs.clone()
+            }
+            fn commit_statuses(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<Vec<CommitStatus>, ProviderError> {
+                self.statuses.clone()
+            }
+        }
+        fn request() -> ObservationRequest {
+            ObservationRequest {
+                repository: "org/repo".into(),
+                base_ref: "main".into(),
+                work_branch: "anvil/task_x".into(),
+                bound_pr_number: None,
+            }
+        }
+        fn pull() -> PullRequestFacts {
+            PullRequestFacts {
+                number: 42,
+                head_sha: "head".into(),
+                evaluation_sha: "merge".into(),
+                evaluation_kind: EvaluationKind::TestMerge,
+                state: "open".into(),
+                merged: false,
+            }
+        }
+        fn port() -> FakePort {
+            FakePort {
+                branch: Ok(true),
+                pr: Ok(Some(pull())),
+                policy: Ok(Policy::Known(vec![RequiredContext {
+                    context: "CI".into(),
+                    source: "check_run".into(),
+                }])),
+                runs: Ok(vec![CheckRun {
+                    name: "CI".into(),
+                    sha: "merge".into(),
+                    conclusion: Some("success".into()),
+                    status: "completed".into(),
+                    details_fingerprint: None,
+                }]),
+                statuses: Ok(vec![]),
+            }
+        }
+        #[test]
+        fn observer_discovers_branch_pr_and_preserves_head_evaluation_identity() {
+            let observation = GitHubCodeHost::new(port()).observe(&request()).unwrap();
+            let pr = observation.pull_request.unwrap();
+            assert_eq!(pr.number, 42);
+            assert_eq!(pr.head_sha, "head");
+            assert_eq!(pr.evaluation_sha, "merge");
+            assert_eq!(pr.evaluation_kind, EvaluationKind::TestMerge);
+            assert!(observation.required_policy_known);
+            assert_eq!(observation.required_checks[0].state, CheckState::Passing);
+        }
+        #[test]
+        fn provider_errors_cannot_become_passing_checks_or_clear_delivery_facts() {
+            let mut unavailable = port();
+            unavailable.policy = Err(ProviderError::PermissionDenied);
+            let unknown = GitHubCodeHost::new(unavailable)
+                .observe(&request())
+                .unwrap();
+            assert!(!unknown.required_policy_known);
+            let mut checks_down = port();
+            checks_down.runs = Err(ProviderError::Unavailable);
+            let observed = GitHubCodeHost::new(checks_down)
+                .observe(&request())
+                .unwrap();
+            assert_eq!(observed.required_checks[0].state, CheckState::Unknown);
+            let mut pr_down = port();
+            pr_down.pr = Err(ProviderError::Unavailable);
+            assert_eq!(
+                GitHubCodeHost::new(pr_down).observe(&request()),
+                Err(ProviderError::Unavailable)
+            );
+        }
+        #[test]
+        fn missing_task_branch_is_observed_without_global_pr_search() {
+            let mut absent = port();
+            absent.branch = Ok(false);
+            let observed = GitHubCodeHost::new(absent).observe(&request()).unwrap();
+            assert!(!observed.branch_exists);
+            assert!(observed.pull_request.is_none());
+            assert!(observed.required_checks.is_empty());
+        }
+    }
+}
+
+/// Durable poll scheduling contract. A collection sequence and next due time are reserved
+/// before the provider call; finishing a stale reservation cannot replace newer facts.
+pub mod observer {
+    use rusqlite::{params, OptionalExtension, TransactionBehavior};
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct PollReservation {
+        pub task_id: String,
+        pub collection_sequence: u64,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct PollState {
+        pub collection_sequence: u64,
+        pub next_due_at_ms: i64,
+        pub consecutive_failures: u32,
+        pub last_success_at_ms: Option<i64>,
+        pub last_error_class: Option<String>,
+    }
+    pub struct SqliteObserverSchedule {
+        connection: rusqlite::Connection,
+    }
+    impl SqliteObserverSchedule {
+        pub fn open(path: impl AsRef<std::path::Path>) -> rusqlite::Result<Self> {
+            let connection = rusqlite::Connection::open(path)?;
+            connection.execute_batch("CREATE TABLE IF NOT EXISTS reconcile_observer_schedule(task_id TEXT PRIMARY KEY, collection_sequence INTEGER NOT NULL, next_due_at_ms INTEGER NOT NULL, consecutive_failures INTEGER NOT NULL, last_success_at_ms INTEGER, last_error_class TEXT)")?;
+            Ok(Self { connection })
+        }
+        pub fn reserve(
+            &mut self,
+            task_id: &str,
+            now_ms: i64,
+            base_interval_ms: i64,
+        ) -> rusqlite::Result<Option<PollReservation>> {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute("INSERT OR IGNORE INTO reconcile_observer_schedule(task_id,collection_sequence,next_due_at_ms,consecutive_failures) VALUES(?1,0,0,0)",[task_id])?;
+            let (sequence,due):(u64,i64)=tx.query_row("SELECT collection_sequence,next_due_at_ms FROM reconcile_observer_schedule WHERE task_id=?1",[task_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            if now_ms < due {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let next = sequence + 1;
+            tx.execute("UPDATE reconcile_observer_schedule SET collection_sequence=?2,next_due_at_ms=?3 WHERE task_id=?1",params![task_id,next,now_ms.saturating_add(base_interval_ms.max(0))])?;
+            tx.commit()?;
+            Ok(Some(PollReservation {
+                task_id: task_id.into(),
+                collection_sequence: next,
+            }))
+        }
+        pub fn finish(
+            &mut self,
+            reservation: &PollReservation,
+            now_ms: i64,
+            base_interval_ms: i64,
+            max_backoff_ms: i64,
+            result: Result<(), &str>,
+        ) -> rusqlite::Result<bool> {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current:Option<(u64,u32)>=tx.query_row("SELECT collection_sequence,consecutive_failures FROM reconcile_observer_schedule WHERE task_id=?1",[&reservation.task_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let Some((sequence, failures)) = current else {
+                tx.rollback()?;
+                return Ok(false);
+            };
+            if sequence != reservation.collection_sequence {
+                tx.rollback()?;
+                return Ok(false);
+            }
+            let (next_due, next_failures, last_success, error_class) = match result {
+                Ok(()) => (
+                    now_ms.saturating_add(base_interval_ms.max(0)),
+                    0,
+                    Some(now_ms),
+                    None,
+                ),
+                Err(class) => {
+                    let next_failures = failures.saturating_add(1);
+                    let factor = 1_i64
+                        .checked_shl(next_failures.saturating_sub(1).min(62))
+                        .unwrap_or(i64::MAX);
+                    let delay = base_interval_ms
+                        .max(0)
+                        .saturating_mul(factor)
+                        .min(max_backoff_ms.max(0));
+                    (
+                        now_ms.saturating_add(delay),
+                        next_failures,
+                        None,
+                        Some(class),
+                    )
+                }
+            };
+            tx.execute("UPDATE reconcile_observer_schedule SET next_due_at_ms=?2,consecutive_failures=?3,last_success_at_ms=COALESCE(?4,last_success_at_ms),last_error_class=?5 WHERE task_id=?1",params![reservation.task_id,next_due,next_failures,last_success,error_class])?;
+            tx.commit()?;
+            #[cfg(test)]
+            if super::outbox::failpoints::hit("observer.after_observation_commit_before_wake") {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            Ok(true)
+        }
+        pub fn state(&self, task_id: &str) -> rusqlite::Result<Option<PollState>> {
+            self.connection.query_row("SELECT collection_sequence,next_due_at_ms,consecutive_failures,last_success_at_ms,last_error_class FROM reconcile_observer_schedule WHERE task_id=?1",[task_id],|r|Ok(PollState{collection_sequence:r.get(0)?,next_due_at_ms:r.get(1)?,consecutive_failures:r.get(2)?,last_success_at_ms:r.get(3)?,last_error_class:r.get(4)?})).optional()
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn reservation_sequence_backoff_and_stale_finish_are_durable() {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let mut store = SqliteObserverSchedule::open(file.path()).unwrap();
+            let first = store.reserve("t", 100, 10).unwrap().unwrap();
+            assert_eq!(store.reserve("t", 105, 10).unwrap(), None);
+            assert!(store
+                .finish(&first, 110, 10, 100, Err("rate_limited"))
+                .unwrap());
+            assert_eq!(store.reserve("t", 119, 10).unwrap(), None);
+            let second = store.reserve("t", 120, 10).unwrap().unwrap();
+            assert_eq!(second.collection_sequence, 2);
+            assert!(!store.finish(&first, 121, 10, 100, Ok(())).unwrap());
+            assert!(store.finish(&second, 122, 10, 100, Ok(())).unwrap());
+            let state = store.state("t").unwrap().unwrap();
+            assert_eq!(state.collection_sequence, 2);
+            assert_eq!(state.last_success_at_ms, Some(122));
+            assert_eq!(state.consecutive_failures, 0);
+        }
+        #[test]
+        fn post_observation_crash_keeps_committed_sequence_and_facts() {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let mut store = SqliteObserverSchedule::open(file.path()).unwrap();
+            let reservation = store.reserve("t", 0, 10).unwrap().unwrap();
+            super::super::outbox::failpoints::arm("observer.after_observation_commit_before_wake");
+            assert!(store.finish(&reservation, 1, 10, 100, Ok(())).is_err());
+            assert_eq!(
+                store.state("t").unwrap().unwrap().last_success_at_ms,
+                Some(1)
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1008,7 +1781,10 @@ mod tests {
             controller_mode: ControllerMode::Reconciler,
             operator_hold: false,
             lifecycle: Lifecycle::Open,
-            completion_satisfied: false,
+            completion_policy: Some(CompletionPolicy::Evidence {
+                required_kinds: vec!["delivery_complete".into()],
+            }),
+            completion_evidence: vec![],
             phase: Some("runnable".into()),
             dependencies_all_completed: true,
             child_count: 0,
@@ -1017,6 +1793,9 @@ mod tests {
             delivery: None,
             attempts: vec![],
             unresolved_blocker: false,
+            runtime_health: None,
+            runtime_failure_fingerprint: None,
+            max_runtime_recoveries: Some(2),
             action_history: vec![],
             budget_usage: BudgetUsage::default(),
             max_attempts: Some(4),
@@ -1038,7 +1817,13 @@ mod tests {
     fn completion_precedes_hold_and_stale_red_checks() {
         let mut s = snap();
         s.operator_hold = true;
-        s.completion_satisfied = true;
+        s.completion_evidence.push(CompletionEvidence {
+            kind: "delivery_complete".into(),
+            provenance: ObservationProvenance::External,
+            fresh: true,
+            trusted: true,
+            subject_sha: Some("head".into()),
+        });
         s.delivery = Some(Delivery {
             work_branch: Some("b".into()),
             base_revision: None,
@@ -1047,6 +1832,9 @@ mod tests {
             evaluation_kind: Some(EvaluationKind::Head),
             pr_state: Some("open".into()),
             check_policy_known: true,
+            unexpected_force_push: false,
+            changes_requested: false,
+            merge_conflict: false,
             pr_merged: true,
             required_checks: vec![RequiredCheck {
                 context: "ci".into(),
@@ -1071,6 +1859,76 @@ mod tests {
         assert!(reconcile(&s, LogicalTime(0)).desired_actions.is_empty());
     }
     #[test]
+    fn agent_claims_and_stale_evidence_never_complete() {
+        let mut s = snap();
+        s.completion_evidence = vec![CompletionEvidence {
+            kind: "delivery_complete".into(),
+            provenance: ObservationProvenance::Agent,
+            fresh: true,
+            trusted: true,
+            subject_sha: None,
+        }];
+        assert_ne!(
+            reconcile(&s, LogicalTime(0)).rule_id,
+            "completion_satisfied"
+        );
+        s.completion_evidence[0].provenance = ObservationProvenance::Platform;
+        s.completion_evidence[0].fresh = false;
+        assert_ne!(
+            reconcile(&s, LogicalTime(0)).rule_id,
+            "completion_satisfied"
+        );
+    }
+    #[test]
+    fn delivery_evidence_is_invalidated_when_submitted_head_changes() {
+        let mut s = snap();
+        s.delivery = Some(Delivery {
+            work_branch: Some("anvil/task_demo".into()),
+            base_revision: Some("base".into()),
+            pr_head_sha: Some("head-1".into()),
+            evaluation_sha: Some("head-1".into()),
+            evaluation_kind: Some(EvaluationKind::Head),
+            pr_state: Some("closed".into()),
+            check_policy_known: true,
+            unexpected_force_push: false,
+            changes_requested: false,
+            merge_conflict: false,
+            pr_merged: true,
+            required_checks: vec![],
+        });
+        s.completion_evidence.push(CompletionEvidence {
+            kind: "delivery_complete".into(),
+            provenance: ObservationProvenance::External,
+            fresh: true,
+            trusted: true,
+            subject_sha: Some("head-1".into()),
+        });
+        assert_eq!(
+            reconcile(&s, LogicalTime(0)).rule_id,
+            "completion_satisfied"
+        );
+        s.delivery.as_mut().unwrap().pr_head_sha = Some("head-2".into());
+        assert_ne!(
+            reconcile(&s, LogicalTime(1)).rule_id,
+            "completion_satisfied"
+        );
+    }
+    #[test]
+    fn empty_aggregate_is_not_vacuously_complete() {
+        let mut s = snap();
+        s.completion_policy = Some(CompletionPolicy::AllChildrenCompleted);
+        assert_ne!(
+            reconcile(&s, LogicalTime(0)).rule_id,
+            "completion_satisfied"
+        );
+        s.child_count = 2;
+        s.children_completed = 2;
+        assert_eq!(
+            reconcile(&s, LogicalTime(0)).rule_id,
+            "completion_satisfied"
+        );
+    }
+    #[test]
     fn retry_deadline_uses_logical_time() {
         let mut s = snap();
         s.retry_due_at_ms = Some(10);
@@ -1088,6 +1946,9 @@ mod tests {
             evaluation_kind: Some(EvaluationKind::Head),
             pr_state: Some("open".into()),
             check_policy_known: true,
+            unexpected_force_push: false,
+            changes_requested: false,
+            merge_conflict: false,
             pr_merged: false,
             required_checks: vec![RequiredCheck {
                 context: "CI".into(),
@@ -1118,6 +1979,88 @@ mod tests {
         assert_eq!(exhausted.rule_id, "budget_exhausted");
         assert!(exhausted.desired_actions.is_empty());
     }
+    #[test]
+    fn runtime_failure_is_recovered_only_from_factual_health_and_is_bounded() {
+        let mut s = snap();
+        s.runtime_health = Some(RuntimeHealth::Failed);
+        s.runtime_failure_fingerprint = Some("sandbox_exit:137".into());
+        s.attempts.push(Attempt {
+            attempt_id: "attempt_1".into(),
+            ordinal: 1,
+            role: "implementation".into(),
+            lifecycle: AttemptLifecycle::Running,
+            turn_state: Some("running".into()),
+            session_id: Some("session".into()),
+            session_healthy: false,
+        });
+        let recovery = reconcile(&s, LogicalTime(0));
+        assert_eq!(recovery.rule_id, "runtime_failure");
+        assert_eq!(recovery.desired_actions[0].kind, ActionKind::RecoverRuntime);
+        assert_eq!(
+            recovery.desired_actions[0].attempt_id.as_deref(),
+            Some("attempt_1")
+        );
+        s.budget_usage.runtime_recoveries = 2;
+        assert_eq!(
+            reconcile(&s, LogicalTime(1)).rule_id,
+            "runtime_recovery_exhausted"
+        );
+        s.runtime_health = Some(RuntimeHealth::Unknown);
+        s.budget_usage.runtime_recoveries = 0;
+        assert_ne!(reconcile(&s, LogicalTime(2)).rule_id, "runtime_failure");
+    }
+    #[test]
+    fn repeated_checks_failure_is_suppressed_but_new_sha_is_new_cause() {
+        let mut s = snap();
+        s.delivery = Some(Delivery {
+            work_branch: Some("task/demo".into()),
+            base_revision: Some("base".into()),
+            pr_head_sha: Some("head".into()),
+            evaluation_sha: Some("head".into()),
+            evaluation_kind: Some(EvaluationKind::Head),
+            pr_state: Some("open".into()),
+            check_policy_known: true,
+            unexpected_force_push: false,
+            changes_requested: false,
+            merge_conflict: false,
+            pr_merged: false,
+            required_checks: vec![RequiredCheck {
+                context: "CI".into(),
+                source: "check_run".into(),
+                state: CheckState::Failing,
+                evaluation_sha: "head".into(),
+                failure_fingerprint: Some("lint:E1".into()),
+            }],
+        });
+        s.attempts.push(Attempt {
+            attempt_id: "a1".into(),
+            ordinal: 1,
+            role: "implementation".into(),
+            lifecycle: AttemptLifecycle::Ended,
+            turn_state: Some("completed".into()),
+            session_id: Some("ses1".into()),
+            session_healthy: true,
+        });
+        let first = reconcile(&s, LogicalTime(0));
+        let action = &first.desired_actions[0];
+        s.action_history.push(PriorAction {
+            action_kind: ActionKind::ChecksFailed,
+            attempt_id: action.attempt_id.clone(),
+            cause_fingerprint: action.cause_fingerprint.clone(),
+            idempotency_key: action.idempotency_key.clone(),
+            state: ActionState::Succeeded,
+        });
+        assert_eq!(reconcile(&s, LogicalTime(1)).rule_id, "no_progress");
+        let delivery = s.delivery.as_mut().unwrap();
+        delivery.evaluation_sha = Some("new-evaluation".into());
+        for check in &mut delivery.required_checks {
+            check.evaluation_sha = "new-evaluation".into();
+        }
+        assert_eq!(
+            reconcile(&s, LogicalTime(2)).rule_id,
+            "required_checks_failing"
+        );
+    }
 
     #[test]
     fn merge_group_only_regression_does_not_prompt_worker() {
@@ -1130,6 +2073,9 @@ mod tests {
             evaluation_kind: Some(EvaluationKind::MergeGroup),
             pr_state: Some("open".into()),
             check_policy_known: true,
+            unexpected_force_push: false,
+            changes_requested: false,
+            merge_conflict: false,
             pr_merged: false,
             required_checks: vec![RequiredCheck {
                 context: "CI".into(),
@@ -1156,6 +2102,9 @@ mod tests {
             evaluation_kind: Some(EvaluationKind::Head),
             pr_state: Some("open".into()),
             check_policy_known: false,
+            unexpected_force_push: false,
+            changes_requested: false,
+            merge_conflict: false,
             pr_merged: false,
             required_checks: vec![],
         });
@@ -1178,6 +2127,17 @@ mod tests {
         let expected = reconcile(&fixture, LogicalTime(1_791_600_000_000));
         assert_eq!(expected.rule_id, "task_runnable");
         assert_eq!(expected.desired_actions.len(), 1);
+        let golden: Value =
+            serde_json::from_str(include_str!("../fixtures/fresh-runnable.expected.json")).unwrap();
+        assert_eq!(
+            serde_json::to_value(&expected.desired_actions).unwrap(),
+            golden["actions"]
+        );
+        assert_eq!(expected.rule_id, golden["rule_id"]);
+        assert_eq!(
+            serde_json::to_value(&expected.attention).unwrap(),
+            golden["attention"]
+        );
         let replayed =
             replay(&fixture, LogicalTime(1_791_600_000_000), RECONCILER_VERSION).unwrap();
         assert_eq!(replayed, expected);
@@ -1185,6 +2145,61 @@ mod tests {
             replay(&fixture, LogicalTime(0), "unknown-version"),
             Err(ReplayError::UnsupportedVersion("unknown-version".into()))
         );
+    }
+    #[test]
+    fn frozen_v0_wire_snapshot_decodes_and_matches_golden_action_intent() {
+        let source: Value =
+            serde_json::from_str(include_str!("../fixtures/frozen-v0-fresh-runnable.json"))
+                .unwrap();
+        let (snapshot, now) = frozen_v0::decode_snapshot(&source).unwrap();
+        assert_eq!(now, LogicalTime(1_791_600_000_000));
+        let decision = reconcile(&snapshot, now);
+        let golden: Value =
+            serde_json::from_str(include_str!("../fixtures/fresh-runnable.expected.json")).unwrap();
+        assert_eq!(decision.rule_id, golden["rule_id"]);
+        assert_eq!(
+            serde_json::to_value(decision.desired_actions).unwrap(),
+            golden["actions"]
+        );
+    }
+
+    #[test]
+    fn frozen_rule_fixture_matrix_matches_ordered_rules() {
+        fn overlay(base: &mut Value, patch: Value) {
+            match (base, patch) {
+                (Value::Object(base), Value::Object(patch)) => {
+                    for (key, value) in patch {
+                        overlay(base.entry(key).or_insert(Value::Null), value);
+                    }
+                }
+                (base, patch) => *base = patch,
+            }
+        }
+        let base: Value =
+            serde_json::from_str(include_str!("../fixtures/fresh-runnable.json")).unwrap();
+        let cases: Vec<Value> =
+            serde_json::from_str(include_str!("../fixtures/rule-cases.json")).unwrap();
+        assert!(cases.len() >= 20);
+        for case in cases {
+            let mut input = base.clone();
+            overlay(&mut input, case["changes"].clone());
+            let snapshot: TaskSnapshot = serde_json::from_value(input)
+                .unwrap_or_else(|error| panic!("fixture {} invalid: {error}", case["name"]));
+            let decision = reconcile(&snapshot, LogicalTime(case["now"].as_i64().unwrap()));
+            assert_eq!(
+                decision.rule_id,
+                case["rule"].as_str().unwrap(),
+                "fixture {}",
+                case["name"]
+            );
+            let replayed = replay(
+                &snapshot,
+                LogicalTime(case["now"].as_i64().unwrap()),
+                RECONCILER_VERSION,
+            )
+            .unwrap();
+            assert_eq!(decision, replayed, "fixture {} replay", case["name"]);
+        }
     }
 
     #[test]
@@ -1209,6 +2224,7 @@ mod outbox_tests {
             cause_fingerprint: "cause".into(),
             idempotency_key: key.into(),
             class: ActionClass::Observable,
+            recovery_strategy: RecoveryStrategy::ObserveBeforeRetry,
             payload: json!({}),
         }
     }
@@ -1218,6 +2234,8 @@ mod outbox_tests {
             reconciler_version: RECONCILER_VERSION.into(),
             task_id: "t".into(),
             task_version: 1,
+            snapshot_reconcile_generation: 1,
+            decision_sequence: 0,
             generation: 1,
             logical_time_ms: 0,
             snapshot_hash: "s".into(),
@@ -1292,6 +2310,9 @@ mod outbox_tests {
             CommitResult::Unchanged { generation: 1 }
         );
         assert_eq!(store.decision_count("t").unwrap(), 1);
+        let decision = store.decision_record("t", 1).unwrap().unwrap();
+        assert_eq!(decision.decision_sequence, 1);
+        assert_eq!(decision.generation, 1);
         assert_eq!(store.generation("t").unwrap(), Some(1));
         assert!(store
             .observe_unknown("t", "durable-key", Some(true))
@@ -1299,6 +2320,115 @@ mod outbox_tests {
         assert_eq!(
             store.action_state("t", "durable-key").unwrap(),
             Some(ActionState::Succeeded)
+        );
+    }
+
+    #[test]
+    fn sqlite_failpoints_cover_decision_claim_and_result_crash_boundaries() {
+        use super::outbox::failpoints;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let action = desired("crash-key");
+        let mut store = SqliteDecisionStore::open(file.path()).unwrap();
+        failpoints::arm("reconcile.before_decision_commit");
+        assert!(store
+            .commit("t", 0, &record(), std::slice::from_ref(&action))
+            .is_err());
+        assert_eq!(store.generation("t").unwrap(), None);
+        failpoints::arm("reconcile.after_decision_commit");
+        assert!(store
+            .commit("t", 0, &record(), std::slice::from_ref(&action))
+            .is_err());
+        assert_eq!(store.generation("t").unwrap(), Some(1));
+        assert_eq!(store.decision_count("t").unwrap(), 1);
+        failpoints::arm("outbox.before_claim");
+        assert!(store
+            .claim("t", "crash-key", 1, ControllerMode::Reconciler, false)
+            .is_err());
+        assert_eq!(
+            store.action_state("t", "crash-key").unwrap(),
+            Some(ActionState::Pending)
+        );
+        failpoints::arm("outbox.after_claim_before_dispatch");
+        assert!(store
+            .claim("t", "crash-key", 1, ControllerMode::Reconciler, false)
+            .is_err());
+        assert_eq!(
+            store.action_state("t", "crash-key").unwrap(),
+            Some(ActionState::Executing)
+        );
+        failpoints::arm("outbox.after_side_effect_before_result_commit");
+        assert!(store
+            .record_result_after_side_effect("t", "crash-key", ActionState::Succeeded)
+            .is_err());
+        assert_eq!(
+            store.action_state("t", "crash-key").unwrap(),
+            Some(ActionState::Executing)
+        );
+        assert!(store
+            .record_result_after_side_effect("t", "crash-key", ActionState::Succeeded)
+            .unwrap());
+        assert_eq!(
+            store.action_state("t", "crash-key").unwrap(),
+            Some(ActionState::Succeeded)
+        );
+        assert_eq!(failpoints::ALL.len(), 8);
+        assert_eq!(failpoints::INTEGRATION_GATED.len(), 2);
+    }
+
+    #[test]
+    fn stale_cas_conflicts_and_only_pending_undesired_rows_are_superseded() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut store = SqliteDecisionStore::open(file.path()).unwrap();
+        let executing = desired("executing");
+        let pending = desired("pending");
+        let replacement = desired("replacement");
+        assert_eq!(
+            store
+                .commit("t", 0, &record(), &[executing.clone(), pending.clone()])
+                .unwrap(),
+            CommitResult::Applied {
+                generation: 1,
+                inserted: 2
+            }
+        );
+        assert!(store
+            .claim("t", "executing", 1, ControllerMode::Reconciler, false)
+            .unwrap());
+        assert_eq!(
+            store
+                .commit("t", 0, &record(), std::slice::from_ref(&replacement))
+                .unwrap(),
+            CommitResult::Conflict {
+                actual_generation: 1
+            }
+        );
+        assert_eq!(
+            store.action_state("t", "pending").unwrap(),
+            Some(ActionState::Pending)
+        );
+        assert_eq!(
+            store
+                .commit("t", 1, &record(), std::slice::from_ref(&replacement))
+                .unwrap(),
+            CommitResult::Applied {
+                generation: 2,
+                inserted: 1
+            }
+        );
+        assert_eq!(
+            store.action_state("t", "pending").unwrap(),
+            Some(ActionState::Superseded)
+        );
+        assert_eq!(
+            store.action_state("t", "executing").unwrap(),
+            Some(ActionState::Executing)
+        );
+        assert!(!store
+            .claim("t", "executing", 2, ControllerMode::Reconciler, false)
+            .unwrap());
+        assert_eq!(
+            store.action_state("t", "executing").unwrap(),
+            Some(ActionState::Executing)
         );
     }
 }

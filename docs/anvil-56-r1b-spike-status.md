@@ -2,9 +2,27 @@
 
 ## OpenCode v1.18.30 SendTurn ambiguity
 
-Status: **unproven; executable spike not run**. Repository integration research and pinned source inspection state that caller-assigned `messageID` persists the user message before asynchronous dispatch, with no duplicate-ID idempotency gate evident in the `prompt` path. Therefore this implementation treats an uncertain SendTurn as observation-only and does not equate equal message IDs with idempotence.
+Command: `nix develop -c node crates/anvil-reconcile/tests/opencode_v11830_ambiguity.mjs`
 
-Required runtime experiments remain outstanding: duplicate while idle; duplicate while busy; timeout after request acceptance; server restart; and persisted user message with no assistant reply. Until those tests run against exactly v1.18.30, none of those cases is claimed proven.
+Observed exact runtime: `1.18.30+3104c14`, from the pinned dev-shell package. The test used an isolated temporary HOME/XDG profile, a loopback OpenCode server, and `anvil-test-model`; it did not connect to a live Anvil session or external model.
+
+Observed result:
+
+| Experiment | Observation |
+|---|---|
+| Same caller `messageID` resubmitted while first turn was busy | First and duplicate `prompt_async` both returned HTTP 204; one assistant parent observed; the gated model was released and completed. |
+| Same `messageID` resubmitted after idle | HTTP 204; still one assistant parent for that user-message ID. |
+| Client socket closed 250 ms after dispatch | User message was observed persisted and its assistant parent later appeared. |
+| OpenCode server restarted with same temporary profile | Both tested user messages and assistant correlation remained queryable. |
+| Tool side effects | None requested by these prompts; the probe did not establish tool-call idempotence. |
+
+Across the probe the local model logged two requests for the two distinct message IDs, with no additional request observed for either duplicate. This is **bounded experimental evidence for the tested cases**, not a general exactly-once/idempotency contract. Production recovery therefore remains observation-first: correlate user/assistant by `messageID`/`parentID`; never blindly resend `UnknownOutcome`.
+
+Still unproven: duplicate behavior where a tool side effect is in progress; the exact crash window after user-message persistence but before `ensureRunning`; and a restart with user present but no assistant. The pinned binary exposes no test-only crash hook at that internal boundary, so the script explicitly reports that scenario unproven rather than manufacturing it through a different API. A user-only result remains ambiguous and must stay `unknown_outcome`/attention absent stronger evidence.
+
+## Legacy/Shadow/Reconciler cutover
+
+Status: **unproven**. No service authority switch or live Attempt adoption was tested. Production dispatch/cutover remains gated until ANVIL-55 Task ownership/store integration is merged and a separate restart/fencing test can exercise an already-live Attempt.
 
 ## Scope boundary
 
