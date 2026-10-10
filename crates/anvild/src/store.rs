@@ -16,6 +16,39 @@ use thiserror::Error;
 pub mod scheduler;
 
 const CANONICALIZATION_VERSION: i64 = 1;
+#[cfg(test)]
+std::thread_local! {
+    static TASK_STORE_FAILPOINT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn arm_task_store_failpoint(name: &'static str) {
+    TASK_STORE_FAILPOINT.with(|failpoint| failpoint.set(Some(name)));
+}
+
+#[cfg(test)]
+fn hit_task_store_failpoint(name: &'static str) -> Result<(), StoreError> {
+    let should_fail = TASK_STORE_FAILPOINT.with(|failpoint| {
+        if failpoint.get() == Some(name) {
+            failpoint.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if should_fail {
+        Err(StoreError::InvalidState(format!("test failpoint: {name}")))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn hit_task_store_failpoint(_name: &'static str) -> Result<(), StoreError> {
+    Ok(())
+}
+
 type TaskControlRow = (
     i64,
     bool,
@@ -805,6 +838,7 @@ impl ControllerStore {
         tx.execute("INSERT INTO orchestration_resources(resource_type,resource_id,batch_id,task_id,attempt_id,payload_json,created_at,updated_at) VALUES('task',?1,NULL,?1,NULL,?2,?3,?3)", params![task_id,serde_json::to_string(&task)?,now])?;
         append_resource_change(&tx, "task", task_id, &task)?;
         tx.execute("INSERT INTO idempotency_records(idempotency_key,operation_kind,scope,request_hash,canonicalization_version,result_reference,result_json,state,created_at,updated_at) VALUES(?1,'create_task',?2,?3,?4,?5,?6,'accepted',?7,?7)",params![key,scope,hash,CANONICALIZATION_VERSION,task_id,serde_json::to_string(&task)?,now])?;
+        hit_task_store_failpoint("task.create.before_commit")?;
         tx.commit()?;
         Ok(TaskAcceptance {
             task,
@@ -945,6 +979,7 @@ impl ControllerStore {
         }
         let result = json!({"tasks":nodes.iter().map(|(client,id,_)|json!({"node_key":client,"task_id":id})).collect::<Vec<_>>()});
         tx.execute("INSERT INTO idempotency_records(idempotency_key,operation_kind,scope,request_hash,canonicalization_version,result_reference,result_json,state,created_at,updated_at) VALUES(?1,'create_task_graph',?2,?3,?4,?5,?6,'accepted',?7,?7)",params![key,scope,hash,CANONICALIZATION_VERSION,key,serde_json::to_string(&result)?,now])?;
+        hit_task_store_failpoint("task.graph.before_commit")?;
         tx.commit()?;
         Ok(TaskAcceptance {
             task: result,
@@ -1254,6 +1289,7 @@ impl ControllerStore {
         )?;
         tx.execute("UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='task' AND resource_id=?1",params![task_id,encoded,now])?;
         append_resource_change(&tx, "task", task_id, &task)?;
+        hit_task_store_failpoint("task.terminal.before_commit")?;
         tx.commit()?;
         Ok(task)
     }
@@ -1713,6 +1749,7 @@ impl ControllerStore {
             .expect("controller store lock poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let acceptance = create_attempt_tx(&tx, task_id, attempt_id, idempotency_key)?;
+        hit_task_store_failpoint("attempt.create.before_commit")?;
         tx.commit()?;
         Ok(acceptance)
     }
@@ -1823,6 +1860,7 @@ impl ControllerStore {
             params![task_id, created_at, expected_task_version as i64],
         )?;
         sync_task_payload_version(&tx, &task_id, expected_task_version + 1, &created_at)?;
+        hit_task_store_failpoint("blocker.create.before_commit")?;
         tx.commit()?;
         Ok(
             serde_json::json!({"id":blocker_id,"task_id":task_id,"attempt_id":attempt_id,"version":1,"question":question,"context":context,"created_at":created_at}),
@@ -1873,6 +1911,7 @@ impl ControllerStore {
             params![task_id, now, expected_task_version as i64],
         )?;
         sync_task_payload_version(&tx, task_id, expected_task_version + 1, &now)?;
+        hit_task_store_failpoint("blocker.resolve.before_commit")?;
         tx.commit()?;
         Ok(
             serde_json::json!({"id":blocker_id,"task_id":task_id,"version":expected_task_version+1,"resolution":resolution_record}),
@@ -2837,6 +2876,173 @@ mod tests {
         };
         assert_eq!(serde_json::json!(attempts), fixture["attempt_states"]);
         assert_eq!(serde_json::json!(failures), fixture["failures"]);
+    }
+
+    #[test]
+    fn named_task_persistence_failpoints_recover_after_database_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("controller.sqlite3");
+        let store = ControllerStore::open(&path).unwrap();
+
+        let spec = serde_json::json!({"outcome":"fault task"});
+        arm_task_store_failpoint("task.create.before_commit");
+        assert!(store
+            .accept_task("fp-create", "test", &spec, "fp-task", &spec)
+            .is_err());
+        drop(store);
+        let store = ControllerStore::open(&path).unwrap();
+        assert!(store.get_resource("task", "fp-task").unwrap().is_none());
+
+        let graph_nodes = vec![
+            (
+                "a".into(),
+                "fp-graph-a".into(),
+                serde_json::json!({"outcome":"a"}),
+            ),
+            (
+                "b".into(),
+                "fp-graph-b".into(),
+                serde_json::json!({"outcome":"b"}),
+            ),
+        ];
+        arm_task_store_failpoint("task.graph.before_commit");
+        assert!(store
+            .accept_task_graph(
+                "fp-graph",
+                "test",
+                &serde_json::json!({"nodes":2}),
+                &graph_nodes,
+                &[("a".into(), "b".into())],
+            )
+            .is_err());
+        drop(store);
+        let store = ControllerStore::open(&path).unwrap();
+        assert!(store.get_resource("task", "fp-graph-a").unwrap().is_none());
+        assert!(store.get_resource("task", "fp-graph-b").unwrap().is_none());
+
+        store
+            .accept_task("fp-attempt-task", "test", &spec, "fp-attempt-task", &spec)
+            .unwrap();
+        arm_task_store_failpoint("attempt.create.before_commit");
+        assert!(store
+            .create_attempt("fp-attempt-task", "fp-attempt", "fp-attempt-key")
+            .is_err());
+        drop(store);
+        let store = ControllerStore::open(&path).unwrap();
+        assert!(store
+            .get_resource("attempt", "fp-attempt")
+            .unwrap()
+            .is_none());
+        store
+            .create_attempt("fp-attempt-task", "fp-attempt", "fp-attempt-key")
+            .unwrap();
+
+        let terminal_spec = serde_json::json!({
+            "outcome":"trusted terminal",
+            "completion_policy":{"kind":"evidence","required_kinds":["delivery_complete"]}
+        });
+        store
+            .accept_task(
+                "fp-terminal",
+                "test",
+                &terminal_spec,
+                "fp-terminal-task",
+                &terminal_spec,
+            )
+            .unwrap();
+        let sequence = store
+            .reserve_observation_sequence("fp-terminal-task", "evidence.delivery_complete")
+            .unwrap();
+        store
+            .record_observation(
+                "fp-terminal-evidence",
+                "fp-terminal-task",
+                "evidence.delivery_complete",
+                &serde_json::json!({"ok":true}),
+                "external",
+                sequence,
+                None,
+            )
+            .unwrap();
+        arm_task_store_failpoint("task.terminal.before_commit");
+        assert!(store
+            .complete_task("fp-terminal-task", 1, &["fp-terminal-evidence".into()])
+            .is_err());
+        drop(store);
+        let store = ControllerStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .get_resource("task", "fp-terminal-task")
+                .unwrap()
+                .unwrap()["state"],
+            "open"
+        );
+        assert_eq!(
+            store
+                .complete_task("fp-terminal-task", 1, &["fp-terminal-evidence".into()])
+                .unwrap()["state"],
+            "completed"
+        );
+
+        let blocker_spec = serde_json::json!({"outcome":"blocker work"});
+        store
+            .accept_task(
+                "fp-blocker",
+                "test",
+                &blocker_spec,
+                "fp-blocker-task",
+                &blocker_spec,
+            )
+            .unwrap();
+        store
+            .create_attempt(
+                "fp-blocker-task",
+                "fp-blocker-attempt",
+                "fp-blocker-attempt-key",
+            )
+            .unwrap();
+        store
+            .bind_attempt_session("fp-blocker-attempt", "fp-blocker-session")
+            .unwrap();
+        arm_task_store_failpoint("blocker.create.before_commit");
+        assert!(store
+            .create_attempt_blocker("fp-blocker-attempt", "fp-blocker-session", 2, "q", "c")
+            .is_err());
+        drop(store);
+        let store = ControllerStore::open(&path).unwrap();
+        assert_eq!(
+            store.task_snapshot("fp-blocker-task", 0).unwrap().unwrap()["blocker"],
+            Value::Null
+        );
+        let blocker = store
+            .create_attempt_blocker("fp-blocker-attempt", "fp-blocker-session", 2, "q", "c")
+            .unwrap();
+        arm_task_store_failpoint("blocker.resolve.before_commit");
+        assert!(store
+            .resolve_task_blocker(
+                "fp-blocker-task",
+                blocker["id"].as_str().unwrap(),
+                3,
+                "op",
+                "answer"
+            )
+            .is_err());
+        drop(store);
+        let store = ControllerStore::open(&path).unwrap();
+        assert!(store.task_snapshot("fp-blocker-task", 0).unwrap().unwrap()["blocker"].is_object());
+        store
+            .resolve_task_blocker(
+                "fp-blocker-task",
+                blocker["id"].as_str().unwrap(),
+                3,
+                "op",
+                "answer",
+            )
+            .unwrap();
+        assert_eq!(
+            store.task_snapshot("fp-blocker-task", 0).unwrap().unwrap()["blocker"],
+            Value::Null
+        );
     }
 
     #[test]

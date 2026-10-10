@@ -255,6 +255,9 @@ async fn responses(
     if tool_count == 0 {
         let value = response_text("I will inspect and update the fixture file.", &request);
         eprintln!("deterministic title/text response: {}", value);
+        if is_title_generation {
+            return Json(value).into_response();
+        }
         return if stream {
             response_sse(&value)
         } else {
@@ -398,12 +401,16 @@ mod tests {
                 {"role":"user","content":"ANVIL-E2E:edit-file ANVIL-E2E:wait-for-release inspect fixture"}
             ]
         });
-        tokio::time::timeout(
+        let response = tokio::time::timeout(
             std::time::Duration::from_millis(100),
             responses(State(state), Json(title_request)),
         )
         .await
         .expect("title completion must not block the E2E worker turn");
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "application/json"
+        );
     }
 
     #[tokio::test]
