@@ -2473,6 +2473,10 @@ fn append_resource_change(
 }
 
 fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
+    migrate_until(connection, i64::MAX)
+}
+
+fn migrate_until(connection: &Connection, target_version: i64) -> Result<(), rusqlite::Error> {
     connection.execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);")?;
     // SQLite only permits changing foreign-key enforcement outside a transaction.
     // Migration 10 rebuilds tasks to make Batch membership genuinely optional;
@@ -2484,7 +2488,7 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
         [],
         |row| row.get(0),
     )?;
-    if version < 1 {
+    if version < 1 && target_version >= 1 {
         tx.execute_batch("CREATE TABLE idempotency_records (idempotency_key TEXT PRIMARY KEY, operation_kind TEXT NOT NULL, scope TEXT NOT NULL, request_hash TEXT NOT NULL, canonicalization_version INTEGER NOT NULL, result_reference TEXT NOT NULL, result_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('accepted')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE INDEX idempotency_by_scope ON idempotency_records(scope, operation_kind);
         -- Reserved indexed identity slots for future Batch/Task/Attempt records.
@@ -2498,7 +2502,7 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
         )?;
         version = 1;
     }
-    if version < 2 {
+    if version < 2 && target_version >= 2 {
         // v1 allowed only accepted records. Rebuild transactionally to expand the state contract.
         tx.execute_batch("CREATE TABLE idempotency_records_v2 (idempotency_key TEXT PRIMARY KEY, operation_kind TEXT NOT NULL, scope TEXT NOT NULL, request_hash TEXT NOT NULL, canonicalization_version INTEGER NOT NULL, result_reference TEXT NOT NULL, result_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('accepted','completed')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         INSERT INTO idempotency_records_v2 SELECT idempotency_key, operation_kind, scope, request_hash, canonicalization_version, result_reference, result_json, state, created_at, updated_at FROM idempotency_records;
@@ -2511,7 +2515,7 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
         )?;
         version = 2;
     }
-    if version < 3 {
+    if version < 3 && target_version >= 3 {
         tx.execute_batch("CREATE TABLE attempts (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, ordinal INTEGER NOT NULL, session_id TEXT UNIQUE, payload_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(task_id, ordinal)); CREATE INDEX attempts_by_task ON attempts(task_id);")?;
         tx.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?1)",
@@ -2519,7 +2523,7 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
         )?;
         version = 3;
     }
-    if version < 4 {
+    if version < 4 && target_version >= 4 {
         tx.execute_batch("CREATE TABLE batches (batch_id TEXT PRIMARY KEY, project TEXT NOT NULL, repository TEXT NOT NULL, requested_revision TEXT NOT NULL, base_commit TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE tasks (task_id TEXT PRIMARY KEY, batch_id TEXT NOT NULL REFERENCES batches(batch_id), client_task_id TEXT NOT NULL, project TEXT NOT NULL, repository TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL); CREATE INDEX tasks_by_batch ON tasks(batch_id); CREATE INDEX active_logical_tasks ON tasks(project,repository,prompt,state); CREATE TABLE attempts_v4 (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), ordinal INTEGER NOT NULL, session_id TEXT UNIQUE, payload_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(task_id,ordinal)); INSERT INTO attempts_v4 SELECT attempt_id,task_id,ordinal,session_id,payload_json,created_at FROM attempts; DROP TABLE attempts; ALTER TABLE attempts_v4 RENAME TO attempts; CREATE INDEX attempts_by_task ON attempts(task_id);")?;
         tx.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?1)",
@@ -2527,7 +2531,7 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
         )?;
         version = 4;
     }
-    if version < 5 {
+    if version < 5 && target_version >= 5 {
         tx.execute_batch("CREATE TABLE attempt_submissions (idempotency_key TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(attempt_id));")?;
         tx.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?1)",
@@ -2535,7 +2539,7 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
         )?;
         version = 5;
     }
-    if version < 6 {
+    if version < 6 && target_version >= 6 {
         tx.execute_batch("CREATE TABLE orchestration_changes (sequence INTEGER PRIMARY KEY AUTOINCREMENT, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, payload_json TEXT NOT NULL);
             CREATE INDEX orchestration_changes_by_resource ON orchestration_changes(resource_type, resource_id, sequence);")?;
         tx.execute(
@@ -2544,14 +2548,14 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
         )?;
         version = 6;
     }
-    if version < 7 {
+    if version < 7 && target_version >= 7 {
         tx.execute_batch("CREATE TABLE orchestration_materializations (resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, payload_json TEXT, last_sequence INTEGER NOT NULL, PRIMARY KEY(resource_type,resource_id));")?;
         tx.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?1)",
             [chrono::Utc::now().to_rfc3339()],
         )?;
     }
-    if version < 8 {
+    if version < 8 && target_version >= 8 {
         // Scheduler queries are served from canonical task/attempt payload state.
         // Expression indexes preserve that single source of truth while keeping
         // capacity snapshots and atomic claims efficient as history grows.
@@ -2563,7 +2567,7 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
             [chrono::Utc::now().to_rfc3339()],
         )?;
     }
-    if version < 9 {
+    if version < 9 && target_version >= 9 {
         // Extend the existing canonical Task/Attempt store. Batch membership remains
         // an optional grouping concern in the durable metadata, while old rows and
         // their IDs/session/idempotency bindings are preserved verbatim.
@@ -2684,7 +2688,7 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
         )?;
         version = 9;
     }
-    if version < 10 {
+    if version < 10 && target_version >= 10 {
         tx.execute_batch(
             "CREATE TABLE tasks_v10 (
                 task_id TEXT PRIMARY KEY,
@@ -2710,7 +2714,7 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
         [],
         |row| row.get(0),
     )?;
-    if latest < 11 {
+    if latest < 11 && target_version >= 11 {
         tx.execute_batch("ALTER TABLE attempts ADD COLUMN version INTEGER NOT NULL DEFAULT 1; UPDATE attempts SET payload_json=json_set(payload_json,'$.version',1) WHERE json_type(payload_json,'$.version') IS NULL; INSERT INTO schema_migrations(version,applied_at) VALUES(11,datetime('now'));")?;
     }
     let latest: i64 = tx.query_row(
@@ -2718,7 +2722,7 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
         [],
         |row| row.get(0),
     )?;
-    if latest < 12 {
+    if latest < 12 && target_version >= 12 {
         tx.execute_batch("CREATE TABLE attempt_state_migration_map(legacy_state TEXT PRIMARY KEY,lifecycle TEXT NOT NULL,exit_reason TEXT); INSERT INTO attempt_state_migration_map VALUES ('queued','queued',NULL),('provisioning','provisioning',NULL),('running','running',NULL),('completed','ended','completed_turn'),('succeeded','ended','completed_turn'),('failed','ended','failed'),('retry_wait','ended','failed'),('exhausted','ended','failed'),('canceled','ended','canceled'),('cancelled','ended','canceled'),('abandoned','ended','abandoned'),('orphaned','ended','orphaned'),('replaced','ended','replaced'); UPDATE attempts SET payload_json=json_set(payload_json,'$.lifecycle',CASE WHEN json_extract(payload_json,'$.state') IN ('queued','provisioning','running') THEN json_extract(payload_json,'$.state') ELSE 'ended' END,'$.exit_reason',CASE json_extract(payload_json,'$.state') WHEN 'completed' THEN 'completed_turn' WHEN 'succeeded' THEN 'completed_turn' WHEN 'failed' THEN 'failed' WHEN 'retry_wait' THEN 'failed' WHEN 'exhausted' THEN 'failed' WHEN 'canceled' THEN 'canceled' WHEN 'cancelled' THEN 'canceled' WHEN 'abandoned' THEN 'abandoned' WHEN 'orphaned' THEN 'orphaned' WHEN 'replaced' THEN 'replaced' ELSE NULL END) WHERE json_type(payload_json,'$.lifecycle') IS NULL; UPDATE attempts SET payload_json=json_set(payload_json,'$.failure',json_object('domain',CASE json_extract(payload_json,'$.failure_class') WHEN 'infrastructure' THEN 'platform' WHEN 'execution' THEN 'work' ELSE 'unknown' END,'code','legacy_'||COALESCE(json_extract(payload_json,'$.failure_class'),'unclassified'),'summary',substr(COALESCE(json_extract(payload_json,'$.failure_reason'),''),1,512),'artifact_refs',json('[]'))) WHERE json_type(payload_json,'$.failure_class') IS NOT NULL; INSERT INTO schema_migrations(version,applied_at) VALUES(12,datetime('now'));")?;
     }
     tx.commit()?;
@@ -3078,6 +3082,34 @@ mod tests {
         };
         assert_eq!(serde_json::json!(attempts), fixture["attempt_states"]);
         assert_eq!(serde_json::json!(failures), fixture["failures"]);
+    }
+
+    #[test]
+    fn every_historical_schema_migration_target_can_restart_and_continue() {
+        for target in 1..=12 {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("historical.sqlite3");
+            let connection = Connection::open(&path).unwrap();
+            migrate_until(&connection, target).unwrap();
+            let reached: i64 = connection
+                .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(reached, target, "migration target {target}");
+            drop(connection);
+
+            let reopened = Connection::open(&path).unwrap();
+            // A restored controller database at any supported version must keep
+            // migrating forward to the current schema on startup.
+            migrate(&reopened).unwrap();
+            let latest: i64 = reopened
+                .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(latest, 12, "restored schema version {target}");
+        }
     }
 
     #[test]
