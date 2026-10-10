@@ -4468,6 +4468,19 @@ mod tests {
         assert_eq!(completed["state"], "completed");
         assert_eq!(completed["terminal"]["kind"], "completed");
         assert_eq!(completed["terminal"]["evidence"][0]["id"], "trusted-proof");
+        let completed_snapshot = store.task_snapshot("complete-me", 0).unwrap().unwrap();
+        let typed_snapshot: anvil_core::TaskSnapshot =
+            serde_json::from_value(completed_snapshot.clone()).unwrap();
+        assert!(matches!(
+            typed_snapshot.lifecycle,
+            anvil_core::TaskLifecycle::Terminal {
+                terminal: anvil_core::TaskTerminal::Completed { .. }
+            }
+        ));
+        assert_eq!(
+            completed_snapshot["lifecycle"]["terminal"]["evidence"][0]["id"],
+            "trusted-proof"
+        );
         assert!(matches!(
             store.terminate_task(
                 "complete-me",
