@@ -1336,6 +1336,20 @@ impl ControllerStore {
             [task_id],
             |row| row.get(0),
         )?;
+        let grant_entries: Vec<Value> = {
+            let mut stmt = tx.prepare("SELECT grant_id,actor_json,reason,additional_attempts,additional_continuations,additional_ci_retries,additional_execution_seconds,recorded_at FROM task_budget_grants WHERE task_id=?1 ORDER BY recorded_at,grant_id LIMIT 64")?;
+            let rows = stmt.query_map([task_id], |row| Ok(serde_json::json!({
+                "grant_id": row.get::<_, String>(0)?,
+                "actor": serde_json::from_str::<Value>(&row.get::<_, String>(1)?).unwrap_or(Value::Null),
+                "reason": row.get::<_, String>(2)?,
+                "additional_attempts": row.get::<_, u32>(3)?,
+                "additional_continuations": row.get::<_, u32>(4)?,
+                "additional_ci_retries": row.get::<_, u32>(5)?,
+                "additional_execution_seconds": row.get::<_, u64>(6)?,
+                "recorded_at": row.get::<_, String>(7)?
+            })))?.collect::<Result<_, _>>()?;
+            rows
+        };
         let grants: String=tx.query_row("SELECT json_object('attempts',COALESCE(SUM(additional_attempts),0),'continuations',COALESCE(SUM(additional_continuations),0),'ci_retries',COALESCE(SUM(additional_ci_retries),0),'execution_seconds',COALESCE(SUM(additional_execution_seconds),0)) FROM task_budget_grants WHERE task_id=?1",[task_id],|row|row.get(0))?;
         let mode = control.2;
         let controller_mode = match mode.as_str() {
@@ -1353,7 +1367,7 @@ impl ControllerStore {
             !active.is_empty(),
             has_execution_target,
         );
-        let snapshot = serde_json::json!({
+        let mut snapshot = serde_json::json!({
             "schema_version":1,"task_id":task_id,"task_version":control.0,"logical_time_ms":logical_time,
             "lifecycle":{"state":if matches!(task["state"].as_str(),Some("completed"|"canceled"|"obviated"|"superseded"|"failed_exhausted")) {"terminal"} else {"open"},"terminal":task["terminal"]},"completion_policy":serde_json::from_str::<Value>(&control.4)?,
             "operator_hold":control.1,"controller_mode":controller_mode,"reconcile_generation":control.3,
@@ -1363,6 +1377,17 @@ impl ControllerStore {
             "action_history":{"recent":[]},"budget_usage":{"attempt_count":attempt_count,"grants":serde_json::from_str::<Value>(&grants)?,"spec":serde_json::from_str::<Value>(&control.5)?},
             "retry_schedule":{"due_at_ms":control.7},"verification_spec":serde_json::from_str::<Value>(&control.6)?,"phase":phase
         });
+        snapshot["action_history"] = serde_json::json!({"relevant": [], "continuation_fingerprints_sent": []});
+        snapshot["budget_usage"] = serde_json::json!({
+            "attempts": attempt_count,
+            "continuations_by_reason": {},
+            "ci_retries": 0,
+            "verifier_cycles": 0,
+            "execution_ms": 0,
+            "grants": grant_entries,
+        });
+        snapshot["retry_schedule"]["cause"] = Value::Null;
+        snapshot["merge_wait_due_at_ms"] = Value::Null;
         tx.commit()?;
         Ok(Some(snapshot))
     }
@@ -2413,10 +2438,11 @@ mod tests {
             Err(StoreError::Conflict)
         ));
         let snapshot = store.task_snapshot("grant-me", 42).unwrap().unwrap();
-        assert_eq!(snapshot["budget_usage"]["grants"]["attempts"], 2);
-        assert_eq!(snapshot["budget_usage"]["grants"]["continuations"], 1);
-        assert_eq!(snapshot["budget_usage"]["grants"]["ci_retries"], 3);
-        assert_eq!(snapshot["budget_usage"]["grants"]["execution_seconds"], 900);
+        assert_eq!(snapshot["budget_usage"]["grants"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["budget_usage"]["grants"][0]["additional_attempts"], 2);
+        assert_eq!(snapshot["budget_usage"]["grants"][0]["additional_continuations"], 1);
+        assert_eq!(snapshot["budget_usage"]["grants"][0]["additional_ci_retries"], 3);
+        assert_eq!(snapshot["budget_usage"]["grants"][0]["additional_execution_seconds"], 900);
     }
 
     #[test]
@@ -2444,6 +2470,8 @@ mod tests {
         assert!(snapshot.get("observations").is_some());
         assert!(snapshot.get("action_history").is_some());
         assert_eq!(snapshot["phase"], "runnable");
+        serde_json::from_value::<anvil_core::TaskSnapshot>(snapshot.clone())
+            .expect("stored snapshot must deserialize as the shared v0 DTO");
         drop(store);
         let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
         assert_eq!(

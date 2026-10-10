@@ -191,27 +191,95 @@ pub struct TaskBudget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum TaskLifecycle {
+    Open,
+    Terminal { terminal: TaskTerminal },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPhase {
+    Terminal,
+    Blocked,
+    Running,
+    Runnable,
+    Waiting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskDependencySummary {
+    pub all_completed: bool,
+    pub predecessors: Vec<TaskDependencyRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskDependencyRef {
+    pub task_id: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskChildSummary {
+    pub total: u32,
+    pub completed: u32,
+    pub terminal_noncompleted: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionHistorySummary {
+    pub relevant: Vec<ActionHistoryEntry>,
+    pub continuation_fingerprints_sent: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionHistoryEntry {
+    pub action_kind: String,
+    pub attempt_id: Option<String>,
+    pub cause_fingerprint: String,
+    pub idempotency_key: String,
+    pub state: String,
+    pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetUsage {
+    pub attempts: u32,
+    pub continuations_by_reason: std::collections::BTreeMap<String, u32>,
+    pub ci_retries: u32,
+    pub verifier_cycles: u32,
+    pub execution_ms: u64,
+    pub grants: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrySchedule {
+    pub due_at_ms: Option<i64>,
+    pub cause: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSnapshot {
     pub schema_version: u32,
     pub task_id: String,
     pub task_version: u64,
     pub logical_time_ms: i64,
-    pub lifecycle: serde_json::Value,
+    pub lifecycle: TaskLifecycle,
     pub completion_policy: CompletionPolicy,
     pub operator_hold: bool,
     pub controller_mode: ControllerMode,
     pub reconcile_generation: u64,
     pub execution_target: Option<serde_json::Value>,
     pub delivery: Option<serde_json::Value>,
-    pub dependencies: serde_json::Value,
-    pub children: serde_json::Value,
+    pub dependencies: TaskDependencySummary,
+    pub children: TaskChildSummary,
     pub attempts: Vec<serde_json::Value>,
     pub blocker: Option<serde_json::Value>,
     pub observations: Vec<serde_json::Value>,
-    pub action_history: serde_json::Value,
-    pub budget_usage: serde_json::Value,
-    pub retry_schedule: serde_json::Value,
-    pub phase: String,
+    pub action_history: ActionHistorySummary,
+    pub budget_usage: BudgetUsage,
+    pub retry_schedule: RetrySchedule,
+    pub phase: TaskPhase,
     pub merge_wait_due_at_ms: Option<i64>,
 }
 
@@ -872,6 +940,33 @@ mod tests {
             &[],
             &[TaskTerminal::Completed { evidence: vec![] }]
         ));
+    }
+
+    #[test]
+    fn task_snapshot_v0_fixture_deserializes_and_round_trips() {
+        let fixture = include_str!("../tests/fixtures/task-snapshot-v1/fresh-open-executable.json");
+        let snapshot: TaskSnapshot = serde_json::from_str(fixture).unwrap();
+        assert_eq!(snapshot.schema_version, 1);
+        assert_eq!(snapshot.logical_time_ms, 1_791_600_000_000);
+        assert_eq!(snapshot.lifecycle, TaskLifecycle::Open);
+        assert_eq!(snapshot.phase, TaskPhase::Runnable);
+        let encoded = serde_json::to_value(snapshot).unwrap();
+        for required in [
+            "logical_time_ms",
+            "lifecycle",
+            "dependencies",
+            "children",
+            "attempts",
+            "observations",
+            "action_history",
+            "budget_usage",
+            "retry_schedule",
+            "delivery",
+            "merge_wait_due_at_ms",
+        ] {
+            assert!(encoded.get(required).is_some(), "missing {required}");
+        }
+        assert_eq!(encoded["lifecycle"], serde_json::json!({"state":"open"}));
     }
 
     #[test]
