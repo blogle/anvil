@@ -8,18 +8,32 @@ use reqwest::blocking::Client;
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::time::Duration;
 use url::Url;
 
-fn next_link(header: &str) -> Option<Url> {
-    header.split(',').find_map(|link| {
-        if !(link.contains("rel=\"next\"") || link.contains("rel=next")) {
-            return None;
-        }
-        let start = link.find('<')? + 1;
-        let end = link[start..].find('>')? + start;
-        Url::parse(&link[start..end]).ok()
-    })
+fn next_link(header: &str, api_base: &Url) -> Result<Option<Url>, ProviderError> {
+    let Some(link) = header
+        .split(',')
+        .find(|link| link.contains("rel=\"next\"") || link.contains("rel=next"))
+    else {
+        return Ok(None);
+    };
+    let start = link.find('<').ok_or(ProviderError::InvalidResponse)? + 1;
+    let end = link[start..]
+        .find('>')
+        .ok_or(ProviderError::InvalidResponse)?
+        + start;
+    let url = Url::parse(&link[start..end]).map_err(|_| ProviderError::InvalidResponse)?;
+    if url.scheme() != api_base.scheme()
+        || url.host_str() != api_base.host_str()
+        || url.port_or_known_default() != api_base.port_or_known_default()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(ProviderError::InvalidResponse);
+    }
+    Ok(Some(url))
 }
 
 /// GitHub REST port with an explicit least-privilege token and API base URL.
@@ -104,7 +118,9 @@ impl GitHubRestPort {
             .headers()
             .get(reqwest::header::LINK)
             .and_then(|value| value.to_str().ok())
-            .and_then(next_link);
+            .map(|header| next_link(header, &self.api_base))
+            .transpose()?
+            .flatten();
         let value = response
             .json::<Value>()
             .map_err(|_| ProviderError::InvalidResponse)?;
@@ -201,6 +217,40 @@ impl GitHubRestPort {
                 .to_owned(),
         ))
     }
+
+    fn pull_request_review_state(&self, owner: &str, repo: &str, number: u64) -> (bool, bool) {
+        let result = (|| {
+            let mut url = self.endpoint(&[
+                "repos",
+                owner,
+                repo,
+                "pulls",
+                &number.to_string(),
+                "reviews",
+            ])?;
+            url.query_pairs_mut()
+                .append_pair("per_page", "100")
+                .append_pair("page", "1");
+            let reviews = self.get_all_pages(url, None)?;
+            let mut latest = BTreeMap::new();
+            for review in reviews {
+                let login = review
+                    .pointer("/user/login")
+                    .and_then(Value::as_str)
+                    .ok_or(ProviderError::InvalidResponse)?;
+                let state = review
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .ok_or(ProviderError::InvalidResponse)?;
+                latest.insert(login.to_owned(), state.to_owned());
+            }
+            Ok::<_, ProviderError>(latest.values().any(|state| state == "CHANGES_REQUESTED"))
+        })();
+        match result {
+            Ok(changes_requested) => (changes_requested, true),
+            Err(_) => (false, false),
+        }
+    }
 }
 
 impl GitHubReadPort for GitHubRestPort {
@@ -274,12 +324,16 @@ impl GitHubReadPort for GitHubRestPort {
                         .ok_or(ProviderError::InvalidResponse)?
                 }
                 .to_owned();
+                let (changes_requested, review_state_known) =
+                    self.pull_request_review_state(owner, repo, number);
                 Ok(PullRequestFacts {
                     number,
                     head_sha,
                     evaluation_sha,
                     evaluation_kind,
                     evaluation_identity_known,
+                    changes_requested,
+                    review_state_known,
                     state,
                     merged,
                 })
@@ -345,9 +399,6 @@ impl GitHubReadPort for GitHubRestPort {
             ) => return Ok(Policy::Unavailable),
             Err(error) => return Err(error),
         };
-        if rules.is_empty() {
-            return Ok(Policy::Unavailable);
-        }
         for rule in rules.iter().filter(|rule| {
             rule.get("type").and_then(Value::as_str) == Some("required_status_checks")
         }) {
@@ -493,6 +544,22 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn pagination_never_forwards_auth_to_a_foreign_link_origin() {
+        let base = Url::parse("https://api.github.com/").unwrap();
+        assert!(next_link("<https://attacker.invalid/page2>; rel=\"next\"", &base).is_err());
+        assert_eq!(
+            next_link(
+                "<https://api.github.com/repos/org/repo?page=2>; rel=\"next\"",
+                &base
+            )
+            .unwrap()
+            .unwrap()
+            .host_str(),
+            Some("api.github.com")
+        );
+    }
+
+    #[test]
     fn observes_exact_branch_pr_test_merge_policy_checks_and_statuses_read_only() {
         let server = MockServer::start();
         let branch = server.mock(|when, then| {
@@ -509,6 +576,14 @@ mod tests {
             when.method(POST).path("/graphql");
             then.status(200)
                 .json_body(json!({"data":{"repository":{"pullRequest":{"mergeQueueEntry":null}}}}));
+        });
+        let reviews = server.mock(|when, then| {
+            when.method(GET).path("/repos/org/repo/pulls/42/reviews");
+            then.status(200).json_body(json!([
+                {"user":{"login":"reviewer"},"state":"CHANGES_REQUESTED"},
+                {"user":{"login":"reviewer"},"state":"COMMENTED"},
+                {"user":{"login":"reviewer-two"},"state":"CHANGES_REQUESTED"}
+            ]));
         });
         let protection = server.mock(|when, then| {
             when.method(GET)
@@ -558,6 +633,8 @@ mod tests {
             observed.pull_request.as_ref().unwrap().evaluation_kind,
             EvaluationKind::TestMerge
         );
+        assert!(observed.pull_request.as_ref().unwrap().review_state_known);
+        assert!(observed.pull_request.as_ref().unwrap().changes_requested);
         assert_eq!(
             observed
                 .required_checks
@@ -574,6 +651,7 @@ mod tests {
             branch,
             pulls,
             queue,
+            reviews,
             protection,
             rules,
             rules_second_page,
@@ -631,6 +709,10 @@ mod tests {
         server.mock(|when,then|{when.method(GET).path("/repos/org/repo/pulls").query_param("head","org:anvil/task");then.status(200).json_body(json!([{"number":42,"state":"open","head":{"ref":"anvil/task","sha":"pr-head"},"base":{"ref":"main","repo":{"full_name":"org/repo"}},"merge_commit_sha":"test-merge"}]));});
         server.mock(|when,then|{when.method(POST).path("/graphql");then.status(200).json_body(json!({"data":{"repository":{"pullRequest":{"mergeQueueEntry":{"headCommit":{"oid":"merge-group-sha"}}}}}}));});
         server.mock(|when, then| {
+            when.method(GET).path("/repos/org/repo/pulls/42/reviews");
+            then.status(200).json_body(json!([]));
+        });
+        server.mock(|when, then| {
             when.method(GET)
                 .path("/repos/org/repo/branches/main/protection/required_status_checks");
             then.status(404);
@@ -663,5 +745,41 @@ mod tests {
             observed.required_checks[0].state,
             anvil_reconcile::CheckState::Failing
         );
+        assert!(pr.review_state_known);
+    }
+
+    #[test]
+    fn inaccessible_review_state_is_explicitly_unknown() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/org/repo/branches/anvil%2Ftask");
+            then.status(200).json_body(json!({"name":"anvil/task"}));
+        });
+        server.mock(|when,then|{when.method(GET).path("/repos/org/repo/pulls");then.status(200).json_body(json!([{"number":42,"state":"open","head":{"ref":"anvil/task","sha":"h"},"base":{"ref":"main","repo":{"full_name":"org/repo"}}}]));});
+        server.mock(|when, then| {
+            when.method(POST).path("/graphql");
+            then.status(200)
+                .json_body(json!({"data":{"repository":{"pullRequest":{"mergeQueueEntry":null}}}}));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/org/repo/pulls/42/reviews");
+            then.status(403);
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/org/repo/branches/main/protection/required_status_checks");
+            then.status(404);
+        });
+        server.mock(|when,then|{when.method(GET).path("/repos/org/repo/rules/branches/main").query_param("page","1");then.status(200).json_body(json!([{"type":"required_status_checks","parameters":{"required_status_checks":[]}}]));});
+        let observed = GitHubCodeHost::new(GitHubRestPort::new(&server.url("/"), "token").unwrap())
+            .observe(&ObservationRequest {
+                repository: "org/repo".into(),
+                base_ref: "main".into(),
+                work_branch: "anvil/task".into(),
+                bound_pr_number: None,
+            })
+            .unwrap();
+        assert!(!observed.pull_request.unwrap().review_state_known);
     }
 }

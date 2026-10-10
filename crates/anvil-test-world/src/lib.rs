@@ -20,6 +20,8 @@ pub struct PullRequest {
     pub merged: bool,
     pub open: bool,
     pub evaluation_kind: EvaluationKind,
+    pub changes_requested: bool,
+    pub review_state_known: bool,
 }
 #[derive(Clone, Debug, Default)]
 pub struct TestWorld {
@@ -64,6 +66,8 @@ impl GitHubReadPort for TestWorld {
                 evaluation_sha: pr.evaluation_sha.clone(),
                 evaluation_kind: pr.evaluation_kind.clone(),
                 evaluation_identity_known: true,
+                changes_requested: pr.changes_requested,
+                review_state_known: pr.review_state_known,
                 state: if pr.open { "open" } else { "closed" }.into(),
                 merged: pr.merged,
             }))
@@ -158,6 +162,8 @@ mod tests {
                 merged: false,
                 open: true,
                 evaluation_kind: EvaluationKind::Head,
+                changes_requested: false,
+                review_state_known: true,
             }],
             branches: vec![("org/repo".into(), "anvil/task_7".into())],
             ..Default::default()
@@ -183,6 +189,8 @@ mod tests {
                 merged: false,
                 open: true,
                 evaluation_kind: EvaluationKind::Head,
+                changes_requested: false,
+                review_state_known: true,
             }],
             required_contexts: Some(vec![RequiredContext {
                 context: "CI".into(),

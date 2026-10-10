@@ -225,6 +225,8 @@ pub struct Delivery {
     #[serde(default)]
     pub changes_requested: bool,
     #[serde(default)]
+    pub review_state_known: bool,
+    #[serde(default)]
     pub merge_conflict: bool,
     #[serde(default)]
     pub pr_merged: bool,
@@ -310,6 +312,7 @@ pub struct TaskSnapshot {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProposedAction {
+    pub schema_version: u32,
     pub kind: ActionKind,
     pub task_id: String,
     pub attempt_id: Option<String>,
@@ -317,6 +320,7 @@ pub struct ProposedAction {
     pub idempotency_key: String,
     pub class: ActionClass,
     pub recovery_strategy: RecoveryStrategy,
+    pub rule_id: String,
     pub payload: Value,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -335,6 +339,7 @@ fn make_action(
     kind: ActionKind,
     cause: String,
     payload: Value,
+    rule_id: &str,
 ) -> ProposedAction {
     let key_material = if kind == ActionKind::CreateAttempt {
         format!(
@@ -355,6 +360,7 @@ fn make_action(
     };
     let recovery_strategy = kind.recovery_strategy();
     ProposedAction {
+        schema_version: 1,
         kind,
         task_id: task.to_owned(),
         attempt_id: attempt.map(str::to_owned),
@@ -362,6 +368,7 @@ fn make_action(
         idempotency_key: digest(&key_material),
         class,
         recovery_strategy,
+        rule_id: rule_id.into(),
         payload,
     }
 }
@@ -472,7 +479,7 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
             d.attention.push("no_progress".into());
         } else {
             d.rule_id = "runtime_failure".into();
-            d.desired_actions.push(make_action(&s.task_id,Some(&attempt.attempt_id),ActionKind::RecoverRuntime,cause,json!({"session_id":attempt.session_id,"failure_fingerprint":s.runtime_failure_fingerprint})));
+            d.desired_actions.push(make_action(&s.task_id,Some(&attempt.attempt_id),ActionKind::RecoverRuntime,cause,json!({"session_id":attempt.session_id,"failure_fingerprint":s.runtime_failure_fingerprint}),"runtime_failure"));
         }
         return d;
     }
@@ -489,6 +496,11 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
     if delivery.is_some_and(|x| x.changes_requested) {
         d.rule_id = "changes_requested_review".into();
         d.attention.push("changed_requested_review".into());
+        return d;
+    }
+    if delivery.is_some_and(|x| x.pr_state.as_deref() == Some("open") && !x.review_state_known) {
+        d.rule_id = "review_state_unknown".into();
+        d.attention.push("review_state_unknown".into());
         return d;
     }
     if s.attempts.iter().any(|a| {
@@ -571,7 +583,7 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
                     d.attention.push("no_progress".into());
                 } else {
                     d.rule_id = "required_checks_failing".into();
-                    d.desired_actions.push(make_action(&s.task_id, Some(&a.attempt_id), ActionKind::ChecksFailed, cause, json!({"checks": failing, "head_sha": x.pr_head_sha, "evaluation_sha": sha})));
+                    d.desired_actions.push(make_action(&s.task_id, Some(&a.attempt_id), ActionKind::ChecksFailed, cause, json!({"checks": failing, "head_sha": x.pr_head_sha, "evaluation_sha": sha}),"required_checks_failing"));
                 }
                 return d;
             }
@@ -613,6 +625,7 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
                         ActionKind::MergeConflict,
                         cause,
                         json!({"head_sha":x.pr_head_sha,"base_revision":x.base_revision}),
+                        "merge_conflict",
                     ));
                 }
                 return d;
@@ -665,6 +678,7 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
         ActionKind::CreateAttempt,
         format!("implementation:{ordinal}"),
         json!({"role":"implementation","ordinal":ordinal}),
+        "task_runnable",
     ));
     d
 }
@@ -1300,6 +1314,8 @@ pub mod github {
         pub evaluation_sha: String,
         pub evaluation_kind: EvaluationKind,
         pub evaluation_identity_known: bool,
+        pub changes_requested: bool,
+        pub review_state_known: bool,
         pub state: String,
         pub merged: bool,
     }
@@ -1338,7 +1354,8 @@ pub mod github {
                 pr_state: pr.map(|facts| facts.state.clone()),
                 check_policy_known: self.required_policy_known,
                 unexpected_force_push: false,
-                changes_requested: false,
+                changes_requested: pr.is_some_and(|facts| facts.changes_requested),
+                review_state_known: pr.is_some_and(|facts| facts.review_state_known),
                 merge_conflict: false,
                 pr_merged: pr.is_some_and(|facts| facts.merged),
                 required_checks: self.required_checks.clone(),
@@ -1729,6 +1746,8 @@ pub mod github {
                 evaluation_sha: "merge".into(),
                 evaluation_kind: EvaluationKind::TestMerge,
                 evaluation_identity_known: true,
+                changes_requested: false,
+                review_state_known: true,
                 state: "open".into(),
                 merged: false,
             }
@@ -2004,6 +2023,7 @@ mod tests {
             check_policy_known: true,
             unexpected_force_push: false,
             changes_requested: false,
+            review_state_known: true,
             merge_conflict: false,
             pr_merged: true,
             required_checks: vec![RequiredCheck {
@@ -2062,6 +2082,7 @@ mod tests {
             check_policy_known: true,
             unexpected_force_push: false,
             changes_requested: false,
+            review_state_known: true,
             merge_conflict: false,
             pr_merged: true,
             required_checks: vec![],
@@ -2096,6 +2117,7 @@ mod tests {
             check_policy_known: true,
             unexpected_force_push: false,
             changes_requested: false,
+            review_state_known: true,
             merge_conflict: false,
             pr_merged: false,
             required_checks: vec![],
@@ -2163,6 +2185,7 @@ mod tests {
             check_policy_known: true,
             unexpected_force_push: false,
             changes_requested: false,
+            review_state_known: true,
             merge_conflict: false,
             pr_merged: false,
             required_checks: vec![RequiredCheck {
@@ -2249,6 +2272,7 @@ mod tests {
             check_policy_known: true,
             unexpected_force_push: false,
             changes_requested: false,
+            review_state_known: true,
             merge_conflict: false,
             pr_merged: false,
             required_checks: vec![RequiredCheck {
@@ -2302,6 +2326,7 @@ mod tests {
             check_policy_known: true,
             unexpected_force_push: false,
             changes_requested: false,
+            review_state_known: true,
             merge_conflict: false,
             pr_merged: false,
             required_checks: vec![RequiredCheck {
@@ -2331,6 +2356,7 @@ mod tests {
             check_policy_known: false,
             unexpected_force_push: false,
             changes_requested: false,
+            review_state_known: true,
             merge_conflict: false,
             pr_merged: false,
             required_checks: vec![],
@@ -2445,6 +2471,7 @@ mod outbox_tests {
 
     fn desired(key: &str) -> ProposedAction {
         ProposedAction {
+            schema_version: 1,
             kind: ActionKind::ChecksFailed,
             task_id: "t".into(),
             attempt_id: Some("a".into()),
@@ -2452,6 +2479,7 @@ mod outbox_tests {
             idempotency_key: key.into(),
             class: ActionClass::Observable,
             recovery_strategy: RecoveryStrategy::ObserveBeforeRetry,
+            rule_id: "required_checks_failing".into(),
             payload: json!({}),
         }
     }

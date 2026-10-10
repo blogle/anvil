@@ -3,6 +3,7 @@
   "attention": [],
   "actions": [
     {
+      "schema_version": 1,
       "kind": "create_attempt",
       "task_id": "task_demo",
       "attempt_id": null,
@@ -10,6 +11,7 @@
       "idempotency_key": "74ebc49bc84b0bd2d4c1b180201436ef48f1adc18b85b2606ef5de8b2a3d0ea2",
       "class": "idempotent",
       "recovery_strategy": "retry_idempotently",
+      "rule_id": "task_runnable",
       "payload": {"ordinal": 1, "role": "implementation"}
     }
   ]

@@ -156,9 +156,34 @@ fn decode_delivery(source: &Value) -> Result<Option<Delivery>, String> {
         check_policy_known,
         unexpected_force_push: bool_value(raw.get("unexpected_force_push")),
         changes_requested: bool_value(raw.get("changes_requested")),
+        review_state_known: decode_review_state(source, raw).0,
         merge_conflict: bool_value(raw.get("merge_conflict")),
         required_checks,
     }))
+}
+
+fn decode_review_state(source: &Value, delivery: &Value) -> (bool, bool) {
+    if let Some(known) = delivery.get("review_state_known").and_then(Value::as_bool) {
+        return (bool_value(delivery.get("changes_requested")), known);
+    }
+    let review = source
+        .get("observations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|observation| {
+            string(observation.get("kind")).as_deref() == Some("review_state")
+                && (bool_value(observation.get("fresh"))
+                    || string(observation.get("freshness")).as_deref() == Some("fresh"))
+        });
+    review.map_or((false, false), |observation| {
+        let state = string(observation.get("state"));
+        (
+            state.as_deref() == Some("changes_requested"),
+            state.is_some(),
+        )
+    })
 }
 
 fn decode_attempts(source: &Value) -> Result<Vec<Attempt>, String> {
@@ -182,6 +207,8 @@ fn decode_attempts(source: &Value) -> Result<Vec<Attempt>, String> {
                 .collect();
             let session_healthy = attempt_observations.iter().any(|observation| {
                 string(observation.get("runtime_health")).as_deref() == Some("healthy")
+                    && (bool_value(observation.get("fresh"))
+                        || string(observation.get("freshness")).as_deref() == Some("fresh"))
             });
             let turn_state = string(raw.pointer("/turn/state"));
             Ok(Attempt {
@@ -234,10 +261,11 @@ fn decode_runtime_health(source: &Value) -> (Option<RuntimeHealth>, Option<Strin
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let latest = observations
-        .iter()
-        .rev()
-        .find(|observation| string(observation.get("kind")).as_deref() == Some("runtime_health"));
+    let latest = observations.iter().rev().find(|observation| {
+        string(observation.get("kind")).as_deref() == Some("runtime_health")
+            && (bool_value(observation.get("fresh"))
+                || string(observation.get("freshness")).as_deref() == Some("fresh"))
+    });
     latest.map_or((None, None), |observation| {
         (
             decode(observation.get("state")),
