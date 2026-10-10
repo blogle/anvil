@@ -141,6 +141,7 @@ async function main() {
     await api(`http://127.0.0.1:${modelPort}/__test/release`,"POST",{});
     await delay(1000);
     const idleAssistants=assistantIds(await messageRows(sessionId),busyId);
+    const modelRequestsAfterIdle=modelRequests.filter((request)=>request.text.includes("busy duplicate probe")).length;
 
     const timeoutId="msg_anvil_spike_timeout_after_dispatch_02";
     await api(`http://127.0.0.1:${modelPort}/__test/hold`,"POST",{});
@@ -174,10 +175,12 @@ async function main() {
       busy_first_http_status:busyFirst.status,
       busy_duplicate_http_status:duplicateBusy.status,
       busy_model_calls_while_held:busyRequestsWhileHeld,
+      busy_duplicate_model_requests_after_release:modelCountBeforeIdle-1,
       busy_user_message_records_for_message_id:busyUserRecords,
       busy_assistant_turns_for_message_id:busyAssistants.length,
       idle_duplicate_http_status:idleDuplicate.status,
       idle_duplicate_model_calls_while_held:idleModelCallsWhileHeld,
+      idle_duplicate_total_model_requests:modelRequestsAfterIdle-modelCountBeforeIdle,
       idle_user_message_records_for_message_id:(await messageRows(sessionId)).filter((row)=>info(row).id===busyId&&info(row).role==="user").length,
       extra_idle_duplicate_assistant_turns:idleAssistants.length-busyAssistants.length,
       total_loopback_model_requests:modelSequence,
