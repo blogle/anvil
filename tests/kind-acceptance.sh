@@ -194,7 +194,7 @@ jq -n \
             name:"sandbox",
             image:$image,
             imagePullPolicy:"IfNotPresent",
-            ports:[{name:"opencode",containerPort:4096}],
+            ports:[{name:"opencode",containerPort:4096},{name:"git-diff",containerPort:4097}],
             env:[
               {name:"ANVIL_PROJECT",value:"anvil"},
               {name:"ANVIL_REPOSITORY",value:$repository},
@@ -239,6 +239,7 @@ kubectl --kubeconfig "$kubeconfig" -n "$namespace" wait --for=jsonpath='{.status
 service_fqdn="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get sandbox "$sandbox_name" -o json | jq -r '.status.serviceFQDN // empty')"
 test -n "$service_fqdn"
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" get service "$sandbox_name" -o json | jq -e '.spec.ports[] | select(.port == 4096)' >/dev/null
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" get service "$sandbox_name" -o json | jq -e '.spec.ports[] | select(.port == 4097)' >/dev/null
 
 deadline=$((SECONDS + 120))
 while (( SECONDS < deadline )); do
@@ -250,6 +251,7 @@ test -n "$pod_name"
 mount_output="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- mount)"
 [[ "$mount_output" == *"/home/anvil"* ]]
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- curl -fsS "http://$service_fqdn:4096/global/health" >/dev/null
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- curl -fsS "http://$service_fqdn:4097/v1/base" >/dev/null
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" port-forward service/anvild 18080:8080 >"$tmp/anvild-port-forward.log" 2>&1 & api_forward_pid=$!
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" port-forward service/anvil-router 18082:8082 >"$tmp/router-port-forward.log" 2>&1 & router_forward_pid=$!
 poll http://127.0.0.1:18080/readyz
