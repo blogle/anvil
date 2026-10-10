@@ -2687,3 +2687,132 @@ mod outbox_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod lifecycle_failpoint_tests {
+    use crate::outbox::failpoints;
+    use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+
+    /// Test-only SQLite lifecycle double. Its tables are not part of production migrations
+    /// and prove only transaction/crash ordering for the 55-owned service integration points.
+    struct LifecycleHarness {
+        connection: Connection,
+    }
+    impl LifecycleHarness {
+        fn open(path: &std::path::Path) -> rusqlite::Result<Self> {
+            let connection = Connection::open(path)?;
+            connection.execute_batch("CREATE TABLE IF NOT EXISTS test_task_lifecycle(task_id TEXT PRIMARY KEY,state TEXT NOT NULL);CREATE TABLE IF NOT EXISTS test_runtime(runtime_id TEXT PRIMARY KEY,present INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS test_gc(task_id TEXT NOT NULL,runtime_id TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(task_id,runtime_id));")?;
+            Ok(Self { connection })
+        }
+        fn seed(&self, task: &str, runtime: &str) -> rusqlite::Result<()> {
+            self.connection.execute(
+                "INSERT OR IGNORE INTO test_task_lifecycle(task_id,state) VALUES(?1,'open')",
+                [task],
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO test_runtime(runtime_id,present) VALUES(?1,1)",
+                [runtime],
+            )?;
+            Ok(())
+        }
+        fn commit_terminal(&mut self, task: &str) -> rusqlite::Result<()> {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "UPDATE test_task_lifecycle SET state='completed' WHERE task_id=?1",
+                [task],
+            )?;
+            if failpoints::hit("task.before_terminal_commit") {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            tx.commit()
+        }
+        fn schedule_gc(&mut self, task: &str, runtime: &str) -> rusqlite::Result<()> {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO test_gc(task_id,runtime_id,state) VALUES(?1,?2,'scheduled')",
+                params![task, runtime],
+            )?;
+            tx.commit()?;
+            if failpoints::hit("gc.after_schedule_before_cleanup") {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            Ok(())
+        }
+        fn cleanup(&self, task: &str, runtime: &str) -> rusqlite::Result<()> {
+            let tx = self.connection.unchecked_transaction()?;
+            tx.execute("DELETE FROM test_runtime WHERE runtime_id=?1", [runtime])?;
+            tx.execute(
+                "UPDATE test_gc SET state='cleaned' WHERE task_id=?1 AND runtime_id=?2",
+                params![task, runtime],
+            )?;
+            tx.commit()
+        }
+        fn state(&self, table: &str, key: &str) -> rusqlite::Result<Option<String>> {
+            let query = match table {
+                "task" => "SELECT state FROM test_task_lifecycle WHERE task_id=?1",
+                "runtime" => "SELECT CAST(present AS TEXT) FROM test_runtime WHERE runtime_id=?1",
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            };
+            self.connection
+                .query_row(query, [key], |row| row.get(0))
+                .optional()
+        }
+        fn gc_state(&self, task: &str, runtime: &str) -> rusqlite::Result<Option<String>> {
+            self.connection
+                .query_row(
+                    "SELECT state FROM test_gc WHERE task_id=?1 AND runtime_id=?2",
+                    params![task, runtime],
+                    |row| row.get(0),
+                )
+                .optional()
+        }
+    }
+
+    #[test]
+    fn terminal_and_gc_failpoints_recover_from_same_test_database_after_restart() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut store = LifecycleHarness::open(file.path()).unwrap();
+            store.seed("task", "runtime").unwrap();
+            failpoints::arm("task.before_terminal_commit");
+            assert!(store.commit_terminal("task").is_err());
+        }
+        {
+            let mut store = LifecycleHarness::open(file.path()).unwrap();
+            assert_eq!(
+                store.state("task", "task").unwrap().as_deref(),
+                Some("open")
+            );
+            assert_eq!(
+                store.state("runtime", "runtime").unwrap().as_deref(),
+                Some("1")
+            );
+            store.commit_terminal("task").unwrap();
+            failpoints::arm("gc.after_schedule_before_cleanup");
+            assert!(store.schedule_gc("task", "runtime").is_err());
+        }
+        let store = LifecycleHarness::open(file.path()).unwrap();
+        assert_eq!(
+            store.state("task", "task").unwrap().as_deref(),
+            Some("completed")
+        );
+        assert_eq!(
+            store.state("runtime", "runtime").unwrap().as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            store.gc_state("task", "runtime").unwrap().as_deref(),
+            Some("scheduled")
+        );
+        store.cleanup("task", "runtime").unwrap();
+        assert_eq!(store.state("runtime", "runtime").unwrap(), None);
+        assert_eq!(
+            store.gc_state("task", "runtime").unwrap().as_deref(),
+            Some("cleaned")
+        );
+    }
+}
