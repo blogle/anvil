@@ -37,6 +37,9 @@ fn hit_task_store_failpoint(name: &'static str) -> Result<(), StoreError> {
         }
     });
     if should_fail {
+        if std::env::var("ANVIL_TASK_CRASH_POINT").as_deref() == Ok(name) {
+            std::process::exit(86);
+        }
         Err(StoreError::InvalidState(format!("test failpoint: {name}")))
     } else {
         Ok(())
@@ -3043,6 +3046,229 @@ mod tests {
             store.task_snapshot("fp-blocker-task", 0).unwrap().unwrap()["blocker"],
             Value::Null
         );
+    }
+
+    #[test]
+    fn process_crash_child_for_task_persistence_failpoints() {
+        let Ok(point) = std::env::var("ANVIL_TASK_CRASH_POINT") else {
+            return;
+        };
+        let point_name = match point.as_str() {
+            "task.create.before_commit" => "task.create.before_commit",
+            "task.graph.before_commit" => "task.graph.before_commit",
+            "attempt.create.before_commit" => "attempt.create.before_commit",
+            "task.terminal.before_commit" => "task.terminal.before_commit",
+            "blocker.create.before_commit" => "blocker.create.before_commit",
+            "blocker.resolve.before_commit" => "blocker.resolve.before_commit",
+            _ => panic!("unknown crash point: {point}"),
+        };
+        let path = std::env::var("ANVIL_TASK_CRASH_DB").unwrap();
+        let store = ControllerStore::open(path).unwrap();
+        arm_task_store_failpoint(point_name);
+        match point.as_str() {
+            "task.create.before_commit" => {
+                let spec = serde_json::json!({"outcome":"crash create"});
+                let _ = store.accept_task("crash-create", "test", &spec, "crash-create", &spec);
+            }
+            "task.graph.before_commit" => {
+                let nodes = vec![(
+                    "node".into(),
+                    "crash-graph".into(),
+                    serde_json::json!({"outcome":"graph"}),
+                )];
+                let _ = store.accept_task_graph(
+                    "crash-graph-key",
+                    "test",
+                    &serde_json::json!({"graph":true}),
+                    &nodes,
+                    &[],
+                );
+            }
+            "attempt.create.before_commit" => {
+                let _ = store.create_attempt(
+                    "crash-attempt-task",
+                    "crash-attempt",
+                    "crash-attempt-key",
+                );
+            }
+            "task.terminal.before_commit" => {
+                let _ =
+                    store.complete_task("crash-terminal-task", 1, &["crash-terminal-proof".into()]);
+            }
+            "blocker.create.before_commit" => {
+                let _ = store.create_attempt_blocker(
+                    "crash-blocker-task-attempt",
+                    "crash-blocker-task-session",
+                    2,
+                    "q",
+                    "c",
+                );
+            }
+            "blocker.resolve.before_commit" => {
+                let blocker_id = std::env::var("ANVIL_TASK_CRASH_BLOCKER_ID").unwrap();
+                let _ = store.resolve_task_blocker(
+                    "crash-resolve-task",
+                    &blocker_id,
+                    3,
+                    "operator",
+                    "answer",
+                );
+            }
+            _ => unreachable!(),
+        }
+        panic!("configured crash failpoint was not reached: {point}");
+    }
+
+    #[test]
+    fn process_crashes_at_task_boundaries_reopen_to_consistent_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("crash-controller.sqlite3");
+        let store = ControllerStore::open(&path).unwrap();
+        let attempt_spec = serde_json::json!({"outcome":"attempt task"});
+        store
+            .accept_task(
+                "seed-attempt",
+                "test",
+                &attempt_spec,
+                "crash-attempt-task",
+                &attempt_spec,
+            )
+            .unwrap();
+        let terminal_spec = serde_json::json!({"outcome":"terminal task","completion_policy":{"kind":"evidence","required_kinds":["delivery_complete"]}});
+        store
+            .accept_task(
+                "seed-terminal",
+                "test",
+                &terminal_spec,
+                "crash-terminal-task",
+                &terminal_spec,
+            )
+            .unwrap();
+        let sequence = store
+            .reserve_observation_sequence("crash-terminal-task", "evidence.delivery_complete")
+            .unwrap();
+        store
+            .record_observation(
+                "crash-terminal-proof",
+                "crash-terminal-task",
+                "evidence.delivery_complete",
+                &serde_json::json!({"merged":true}),
+                "external",
+                sequence,
+                None,
+            )
+            .unwrap();
+        let blocker_spec = serde_json::json!({"outcome":"blocker task"});
+        store
+            .accept_task(
+                "seed-blocker",
+                "test",
+                &blocker_spec,
+                "crash-blocker-task",
+                &blocker_spec,
+            )
+            .unwrap();
+        store
+            .create_attempt(
+                "crash-blocker-task",
+                "crash-blocker-task-attempt",
+                "seed-blocker-attempt",
+            )
+            .unwrap();
+        store
+            .bind_attempt_session("crash-blocker-task-attempt", "crash-blocker-task-session")
+            .unwrap();
+        let resolve_spec = serde_json::json!({"outcome":"resolve task"});
+        store
+            .accept_task(
+                "seed-resolve",
+                "test",
+                &resolve_spec,
+                "crash-resolve-task",
+                &resolve_spec,
+            )
+            .unwrap();
+        store
+            .create_attempt(
+                "crash-resolve-task",
+                "crash-resolve-attempt",
+                "seed-resolve-attempt",
+            )
+            .unwrap();
+        store
+            .bind_attempt_session("crash-resolve-attempt", "crash-resolve-session")
+            .unwrap();
+        let blocker = store
+            .create_attempt_blocker(
+                "crash-resolve-attempt",
+                "crash-resolve-session",
+                2,
+                "q",
+                "c",
+            )
+            .unwrap();
+        drop(store);
+
+        for point in [
+            "task.create.before_commit",
+            "task.graph.before_commit",
+            "attempt.create.before_commit",
+            "task.terminal.before_commit",
+            "blocker.create.before_commit",
+            "blocker.resolve.before_commit",
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "store::tests::process_crash_child_for_task_persistence_failpoints",
+                ])
+                .env("ANVIL_TASK_CRASH_POINT", point)
+                .env("ANVIL_TASK_CRASH_DB", &path);
+            if point == "blocker.resolve.before_commit" {
+                command.env(
+                    "ANVIL_TASK_CRASH_BLOCKER_ID",
+                    blocker["id"].as_str().unwrap(),
+                );
+            }
+            let status = command.status().unwrap();
+            assert_eq!(status.code(), Some(86), "crash boundary {point}");
+            let reopened = ControllerStore::open(&path).unwrap();
+            match point {
+                "task.create.before_commit" => assert!(reopened
+                    .get_resource("task", "crash-create")
+                    .unwrap()
+                    .is_none()),
+                "task.graph.before_commit" => assert!(reopened
+                    .get_resource("task", "crash-graph")
+                    .unwrap()
+                    .is_none()),
+                "attempt.create.before_commit" => assert!(reopened
+                    .get_resource("attempt", "crash-attempt")
+                    .unwrap()
+                    .is_none()),
+                "task.terminal.before_commit" => assert_eq!(
+                    reopened
+                        .get_resource("task", "crash-terminal-task")
+                        .unwrap()
+                        .unwrap()["state"],
+                    "open"
+                ),
+                "blocker.create.before_commit" => assert_eq!(
+                    reopened
+                        .task_snapshot("crash-blocker-task", 0)
+                        .unwrap()
+                        .unwrap()["blocker"],
+                    Value::Null
+                ),
+                "blocker.resolve.before_commit" => assert!(reopened
+                    .task_snapshot("crash-resolve-task", 0)
+                    .unwrap()
+                    .unwrap()["blocker"]
+                    .is_object()),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]
