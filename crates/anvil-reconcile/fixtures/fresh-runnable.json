@@ -6,6 +6,8 @@
   "controller_mode": "reconciler",
   "operator_hold": false,
   "lifecycle": "open",
+  "completion_policy": {"kind":"evidence","required_kinds":["delivery_complete"]},
+  "completion_evidence": [],
   "phase": "runnable",
   "dependencies_all_completed": true,
   "child_count": 0,
