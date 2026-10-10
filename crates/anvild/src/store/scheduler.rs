@@ -327,6 +327,7 @@ impl ControllerStore {
         attempt["state"] = Value::String(attempt_state.to_owned());
         persist_attempt(&tx, attempt_id, &attempt)?;
         set_task_state(&tx, &task_id, task_state)?;
+        super::hit_task_store_failpoint("attempt.start.before_commit")?;
         tx.commit()?;
         Ok(())
     }

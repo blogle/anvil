@@ -3442,6 +3442,7 @@ mod tests {
             "task.graph.after_commit" => "task.graph.after_commit",
             "attempt.create.before_commit" => "attempt.create.before_commit",
             "attempt.create.after_commit" => "attempt.create.after_commit",
+            "attempt.start.before_commit" => "attempt.start.before_commit",
             "task.terminal.before_commit" => "task.terminal.before_commit",
             "task.terminal.after_commit" => "task.terminal.after_commit",
             "blocker.create.before_commit" => "blocker.create.before_commit",
@@ -3481,6 +3482,9 @@ mod tests {
                     "crash-attempt",
                     "crash-attempt-key",
                 );
+            }
+            "attempt.start.before_commit" => {
+                let _ = store.set_attempt_and_task_state("crash-attempt", "running", "running");
             }
             "task.terminal.before_commit" | "task.terminal.after_commit" => {
                 let _ =
@@ -3634,6 +3638,7 @@ mod tests {
             "task.graph.after_commit",
             "attempt.create.before_commit",
             "attempt.create.after_commit",
+            "attempt.start.before_commit",
             "task.terminal.before_commit",
             "task.terminal.after_commit",
             "blocker.create.before_commit",
@@ -3693,6 +3698,22 @@ mod tests {
                         .unwrap()["ordinal"],
                     1
                 ),
+                "attempt.start.before_commit" => {
+                    assert_eq!(
+                        reopened
+                            .get_resource("attempt", "crash-attempt")
+                            .unwrap()
+                            .unwrap()["state"],
+                        "queued"
+                    );
+                    assert_eq!(
+                        reopened
+                            .get_resource("task", "crash-attempt-task")
+                            .unwrap()
+                            .unwrap()["state"],
+                        "open"
+                    );
+                }
                 "task.terminal.before_commit" => assert_eq!(
                     reopened
                         .get_resource("task", "crash-terminal-task")
