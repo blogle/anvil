@@ -8,6 +8,8 @@ members = [
   "crates/anvil-mcp",
   "crates/anvil-router",
   "crates/anvilctl",
+  "crates/anvil-reconcile",
+  "crates/anvil-test-world",
 ]
 
 [workspace.package]
