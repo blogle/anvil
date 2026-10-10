@@ -65,6 +65,7 @@ type TaskControlRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 #[derive(Debug, Error)]
@@ -1542,8 +1543,8 @@ impl ControllerStore {
         };
         let task: Value = serde_json::from_str(&task_json)?;
         let control: TaskControlRow = tx.query_row(
-            "SELECT version,operator_hold,controller_mode,reconcile_generation,completion_policy_json,budget_json,verification_spec_json,retry_due_ms,execution_target_json,work_branch,pull_request_binding_json,base_revision FROM task_durable_state WHERE task_id=?1",
-            [task_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?)),
+            "SELECT version,operator_hold,controller_mode,reconcile_generation,completion_policy_json,budget_json,verification_spec_json,retry_due_ms,execution_target_json,work_branch,pull_request_binding_json,base_revision,terminal_json FROM task_durable_state WHERE task_id=?1",
+            [task_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?)),
         )?;
         let dependencies: Vec<Value> = {
             let mut stmt=tx.prepare("SELECT predecessor_task_id,t.state FROM task_dependencies d JOIN tasks t ON t.task_id=d.predecessor_task_id WHERE d.successor_task_id=?1 ORDER BY d.predecessor_task_id")?;
@@ -1708,11 +1709,21 @@ impl ControllerStore {
         let evaluation_kind = checks
             .and_then(|value| value["evaluation_kind"].as_str())
             .and_then(|kind| matches!(kind, "head" | "test_merge" | "merge_group").then_some(kind));
+        let terminal = control
+            .12
+            .as_deref()
+            .map(serde_json::from_str::<Value>)
+            .transpose()?
+            .or_else(|| {
+                task.get("terminal")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+            });
         let lifecycle = if matches!(
             task["state"].as_str(),
             Some("completed" | "canceled" | "obviated" | "superseded" | "failed_exhausted")
         ) {
-            serde_json::json!({"state":"terminal","terminal":task["terminal"]})
+            serde_json::json!({"state":"terminal","terminal":terminal})
         } else {
             serde_json::json!({"state":"open"})
         };
@@ -3079,6 +3090,99 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, 12);
+    }
+
+    #[test]
+    fn sanitized_v8_controller_fixture_preserves_batch_task_attempt_session_and_edges() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("controller-v8.sqlite3");
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/controller-v8-sanitized.json"
+        ))
+        .unwrap();
+        let connection = Connection::open(&path).unwrap();
+        migrate_until(&connection, 8).unwrap();
+        let batch = &fixture["batch"];
+        connection.execute(
+            "INSERT INTO batches(batch_id,project,repository,requested_revision,base_commit,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![batch["batch_id"].as_str().unwrap(),batch["project"].as_str().unwrap(),batch["repository"].as_str().unwrap(),batch["requested_revision"].as_str().unwrap(),batch["base_commit"].as_str().unwrap(),batch["payload"].to_string(),batch["created_at"].as_str().unwrap()],
+        ).unwrap();
+        for task in fixture["tasks"].as_array().unwrap() {
+            let payload = serde_json::json!({
+                "task_id":task["task_id"],"batch_id":batch["batch_id"],"project":batch["project"],
+                "repository":batch["repository"],"requested_revision":batch["requested_revision"],
+                "base_commit":batch["base_commit"],"prompt":task["prompt"],"dependencies":task["dependencies"],
+                "state":task["state"],"requested_task_id":task["client_task_id"]
+            });
+            connection.execute(
+                "INSERT INTO tasks(task_id,batch_id,client_task_id,project,repository,prompt,state,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![task["task_id"].as_str().unwrap(),batch["batch_id"].as_str().unwrap(),task["client_task_id"].as_str().unwrap(),batch["project"].as_str().unwrap(),batch["repository"].as_str().unwrap(),task["prompt"].as_str().unwrap(),task["state"].as_str().unwrap(),payload.to_string(),task["created_at"].as_str().unwrap()],
+            ).unwrap();
+        }
+        for attempt in fixture["attempts"].as_array().unwrap() {
+            let payload = serde_json::json!({
+                "attempt_id":attempt["attempt_id"],"task_id":attempt["task_id"],"ordinal":attempt["ordinal"],
+                "session_id":attempt["session_id"],"state":attempt["state"],"role":"implementation",
+                "created_at":attempt["created_at"]
+            });
+            connection.execute(
+                "INSERT INTO attempts(attempt_id,task_id,ordinal,session_id,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![attempt["attempt_id"].as_str().unwrap(),attempt["task_id"].as_str().unwrap(),attempt["ordinal"].as_u64().unwrap(),attempt["session_id"].as_str().unwrap(),payload.to_string(),attempt["created_at"].as_str().unwrap()],
+            ).unwrap();
+            let submission_key = format!("submission-{}", attempt["attempt_id"].as_str().unwrap());
+            connection.execute(
+                "INSERT INTO attempt_submissions(idempotency_key,task_id,attempt_id) VALUES(?1,?2,?3)",
+                params![submission_key,attempt["task_id"].as_str().unwrap(),attempt["attempt_id"].as_str().unwrap()],
+            ).unwrap();
+        }
+        let idempotency = &fixture["idempotency"];
+        connection.execute(
+            "INSERT INTO idempotency_records(idempotency_key,operation_kind,scope,request_hash,canonicalization_version,result_reference,result_json,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![idempotency["idempotency_key"].as_str().unwrap(),idempotency["operation_kind"].as_str().unwrap(),idempotency["scope"].as_str().unwrap(),idempotency["request_hash"].as_str().unwrap(),idempotency["canonicalization_version"].as_i64().unwrap(),idempotency["result_reference"].as_str().unwrap(),idempotency["result"].to_string(),idempotency["state"].as_str().unwrap(),idempotency["created_at"].as_str().unwrap(),idempotency["updated_at"].as_str().unwrap()],
+        ).unwrap();
+        drop(connection);
+
+        let store = ControllerStore::open(&path).unwrap();
+        let batch_id: String = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT batch_id FROM tasks WHERE task_id='task_legacy_done'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(batch_id, "batch_legacy_01");
+        let attempt: (String, i64, String) = store.connection.lock().unwrap().query_row(
+            "SELECT attempt_id,ordinal,session_id FROM attempts WHERE attempt_id='attempt_legacy_next'", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))
+        ).unwrap();
+        assert_eq!(
+            attempt,
+            (
+                "attempt_legacy_next".into(),
+                1,
+                "session_legacy_next".into()
+            )
+        );
+        assert!(store.connection.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_dependencies WHERE predecessor_task_id='task_legacy_done' AND successor_task_id='task_legacy_next')", [], |row| row.get::<_,bool>(0)
+        ).unwrap());
+        assert_eq!(
+            store
+                .get("legacy-batch-key")
+                .unwrap()
+                .unwrap()
+                .result_reference,
+            "batch_legacy_01"
+        );
+        let completed_snapshot = store.task_snapshot("task_legacy_done", 0).unwrap().unwrap();
+        assert_eq!(completed_snapshot["lifecycle"]["state"], "terminal");
+        assert_eq!(
+            completed_snapshot["lifecycle"]["terminal"]["evidence"][0]["kind"],
+            "legacy_scheduler_exit"
+        );
     }
 
     #[test]
