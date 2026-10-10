@@ -844,6 +844,7 @@ impl ControllerStore {
         tx.execute("INSERT INTO idempotency_records(idempotency_key,operation_kind,scope,request_hash,canonicalization_version,result_reference,result_json,state,created_at,updated_at) VALUES(?1,'create_task',?2,?3,?4,?5,?6,'accepted',?7,?7)",params![key,scope,hash,CANONICALIZATION_VERSION,task_id,serde_json::to_string(&task)?,now])?;
         hit_task_store_failpoint("task.create.before_commit")?;
         tx.commit()?;
+        hit_task_store_failpoint("task.create.after_commit")?;
         Ok(TaskAcceptance {
             task,
             created: true,
@@ -985,6 +986,7 @@ impl ControllerStore {
         tx.execute("INSERT INTO idempotency_records(idempotency_key,operation_kind,scope,request_hash,canonicalization_version,result_reference,result_json,state,created_at,updated_at) VALUES(?1,'create_task_graph',?2,?3,?4,?5,?6,'accepted',?7,?7)",params![key,scope,hash,CANONICALIZATION_VERSION,key,serde_json::to_string(&result)?,now])?;
         hit_task_store_failpoint("task.graph.before_commit")?;
         tx.commit()?;
+        hit_task_store_failpoint("task.graph.after_commit")?;
         Ok(TaskAcceptance {
             task: result,
             created: true,
@@ -1295,6 +1297,7 @@ impl ControllerStore {
         append_resource_change(&tx, "task", task_id, &task)?;
         hit_task_store_failpoint("task.terminal.before_commit")?;
         tx.commit()?;
+        hit_task_store_failpoint("task.terminal.after_commit")?;
         Ok(task)
     }
 
@@ -1978,6 +1981,7 @@ impl ControllerStore {
         let acceptance = create_attempt_tx(&tx, task_id, attempt_id, idempotency_key)?;
         hit_task_store_failpoint("attempt.create.before_commit")?;
         tx.commit()?;
+        hit_task_store_failpoint("attempt.create.after_commit")?;
         Ok(acceptance)
     }
 
@@ -2116,6 +2120,7 @@ impl ControllerStore {
         sync_task_payload_version(&tx, &task_id, expected_task_version + 1, &created_at)?;
         hit_task_store_failpoint("blocker.create.before_commit")?;
         tx.commit()?;
+        hit_task_store_failpoint("blocker.create.after_commit")?;
         Ok(
             serde_json::json!({"id":blocker_id,"task_id":task_id,"attempt_id":attempt_id,"version":1,"question":question,"context":context,"created_at":created_at}),
         )
@@ -2167,6 +2172,7 @@ impl ControllerStore {
         sync_task_payload_version(&tx, task_id, expected_task_version + 1, &now)?;
         hit_task_store_failpoint("blocker.resolve.before_commit")?;
         tx.commit()?;
+        hit_task_store_failpoint("blocker.resolve.after_commit")?;
         Ok(
             serde_json::json!({"id":blocker_id,"task_id":task_id,"version":expected_task_version+1,"resolution":resolution_record}),
         )
@@ -3431,11 +3437,17 @@ mod tests {
         };
         let point_name = match point.as_str() {
             "task.create.before_commit" => "task.create.before_commit",
+            "task.create.after_commit" => "task.create.after_commit",
             "task.graph.before_commit" => "task.graph.before_commit",
+            "task.graph.after_commit" => "task.graph.after_commit",
             "attempt.create.before_commit" => "attempt.create.before_commit",
+            "attempt.create.after_commit" => "attempt.create.after_commit",
             "task.terminal.before_commit" => "task.terminal.before_commit",
+            "task.terminal.after_commit" => "task.terminal.after_commit",
             "blocker.create.before_commit" => "blocker.create.before_commit",
+            "blocker.create.after_commit" => "blocker.create.after_commit",
             "blocker.resolve.before_commit" => "blocker.resolve.before_commit",
+            "blocker.resolve.after_commit" => "blocker.resolve.after_commit",
             "legacy_scheduler.after_evidence_before_terminal" => {
                 "legacy_scheduler.after_evidence_before_terminal"
             }
@@ -3445,11 +3457,11 @@ mod tests {
         let store = ControllerStore::open(path).unwrap();
         arm_task_store_failpoint(point_name);
         match point.as_str() {
-            "task.create.before_commit" => {
+            "task.create.before_commit" | "task.create.after_commit" => {
                 let spec = serde_json::json!({"outcome":"crash create"});
                 let _ = store.accept_task("crash-create", "test", &spec, "crash-create", &spec);
             }
-            "task.graph.before_commit" => {
+            "task.graph.before_commit" | "task.graph.after_commit" => {
                 let nodes = vec![(
                     "node".into(),
                     "crash-graph".into(),
@@ -3463,18 +3475,18 @@ mod tests {
                     &[],
                 );
             }
-            "attempt.create.before_commit" => {
+            "attempt.create.before_commit" | "attempt.create.after_commit" => {
                 let _ = store.create_attempt(
                     "crash-attempt-task",
                     "crash-attempt",
                     "crash-attempt-key",
                 );
             }
-            "task.terminal.before_commit" => {
+            "task.terminal.before_commit" | "task.terminal.after_commit" => {
                 let _ =
                     store.complete_task("crash-terminal-task", 1, &["crash-terminal-proof".into()]);
             }
-            "blocker.create.before_commit" => {
+            "blocker.create.before_commit" | "blocker.create.after_commit" => {
                 let _ = store.create_attempt_blocker(
                     "crash-blocker-task-attempt",
                     "crash-blocker-task-session",
@@ -3483,7 +3495,7 @@ mod tests {
                     "c",
                 );
             }
-            "blocker.resolve.before_commit" => {
+            "blocker.resolve.before_commit" | "blocker.resolve.after_commit" => {
                 let blocker_id = std::env::var("ANVIL_TASK_CRASH_BLOCKER_ID").unwrap();
                 let _ = store.resolve_task_blocker(
                     "crash-resolve-task",
@@ -3617,11 +3629,17 @@ mod tests {
 
         for point in [
             "task.create.before_commit",
+            "task.create.after_commit",
             "task.graph.before_commit",
+            "task.graph.after_commit",
             "attempt.create.before_commit",
+            "attempt.create.after_commit",
             "task.terminal.before_commit",
+            "task.terminal.after_commit",
             "blocker.create.before_commit",
+            "blocker.create.after_commit",
             "blocker.resolve.before_commit",
+            "blocker.resolve.after_commit",
             "legacy_scheduler.after_evidence_before_terminal",
         ] {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
@@ -3632,7 +3650,10 @@ mod tests {
                 ])
                 .env("ANVIL_TASK_CRASH_POINT", point)
                 .env("ANVIL_TASK_CRASH_DB", &path);
-            if point == "blocker.resolve.before_commit" {
+            if matches!(
+                point,
+                "blocker.resolve.before_commit" | "blocker.resolve.after_commit"
+            ) {
                 command.env(
                     "ANVIL_TASK_CRASH_BLOCKER_ID",
                     blocker["id"].as_str().unwrap(),
@@ -3646,20 +3667,45 @@ mod tests {
                     .get_resource("task", "crash-create")
                     .unwrap()
                     .is_none()),
+                "task.create.after_commit" => assert_eq!(
+                    reopened
+                        .get_resource("task", "crash-create")
+                        .unwrap()
+                        .unwrap()["state"],
+                    "open"
+                ),
                 "task.graph.before_commit" => assert!(reopened
                     .get_resource("task", "crash-graph")
                     .unwrap()
                     .is_none()),
+                "task.graph.after_commit" => assert!(reopened
+                    .get_resource("task", "crash-graph")
+                    .unwrap()
+                    .is_some()),
                 "attempt.create.before_commit" => assert!(reopened
                     .get_resource("attempt", "crash-attempt")
                     .unwrap()
                     .is_none()),
+                "attempt.create.after_commit" => assert_eq!(
+                    reopened
+                        .get_resource("attempt", "crash-attempt")
+                        .unwrap()
+                        .unwrap()["ordinal"],
+                    1
+                ),
                 "task.terminal.before_commit" => assert_eq!(
                     reopened
                         .get_resource("task", "crash-terminal-task")
                         .unwrap()
                         .unwrap()["state"],
                     "open"
+                ),
+                "task.terminal.after_commit" => assert_eq!(
+                    reopened
+                        .get_resource("task", "crash-terminal-task")
+                        .unwrap()
+                        .unwrap()["state"],
+                    "completed"
                 ),
                 "blocker.create.before_commit" => assert_eq!(
                     reopened
@@ -3668,11 +3714,23 @@ mod tests {
                         .unwrap()["blocker"],
                     Value::Null
                 ),
+                "blocker.create.after_commit" => assert!(reopened
+                    .task_snapshot("crash-blocker-task", 0)
+                    .unwrap()
+                    .unwrap()["blocker"]
+                    .is_object()),
                 "blocker.resolve.before_commit" => assert!(reopened
                     .task_snapshot("crash-resolve-task", 0)
                     .unwrap()
                     .unwrap()["blocker"]
                     .is_object()),
+                "blocker.resolve.after_commit" => assert_eq!(
+                    reopened
+                        .task_snapshot("crash-resolve-task", 0)
+                        .unwrap()
+                        .unwrap()["blocker"],
+                    Value::Null
+                ),
                 "legacy_scheduler.after_evidence_before_terminal" => {
                     assert_eq!(
                         reopened
