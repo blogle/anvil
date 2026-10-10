@@ -6957,8 +6957,39 @@ pub struct OpenCode {
     client: reqwest::Client,
     base: Url,
 }
+
+#[cfg(test)]
+thread_local! {
+    static FORBID_OPENCODE_CLIENT_CONSTRUCTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+struct OpenCodeConstructionGuard;
+
+#[cfg(test)]
+impl OpenCodeConstructionGuard {
+    fn forbidden() -> Self {
+        FORBID_OPENCODE_CLIENT_CONSTRUCTION.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for OpenCodeConstructionGuard {
+    fn drop(&mut self) {
+        FORBID_OPENCODE_CLIENT_CONSTRUCTION.with(|flag| flag.set(false));
+    }
+}
+
 impl OpenCode {
     pub fn new(base: String, t: Duration) -> Self {
+        #[cfg(test)]
+        FORBID_OPENCODE_CLIENT_CONSTRUCTION.with(|flag| {
+            assert!(
+                !flag.get(),
+                "OpenCode client constructed during durable Task recovery"
+            );
+        });
         Self {
             client: reqwest::Client::builder().timeout(t).build().unwrap(),
             base: Url::parse(&base).unwrap(),
@@ -7205,6 +7236,32 @@ mod tests {
             .unwrap();
         let value = serde_json::from_slice(&body).unwrap();
         (status, value)
+    }
+
+    #[tokio::test]
+    async fn durable_task_recovery_never_constructs_an_opencode_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        let task_spec = json!({"outcome":"recover from SQLite"});
+        {
+            let store = store::ControllerStore::open(&config.store_path).unwrap();
+            store
+                .accept_task(
+                    "recover-key",
+                    "test",
+                    &task_spec,
+                    "recover-task",
+                    &task_spec,
+                )
+                .unwrap();
+        }
+        let app = router(AppState::new(config, FakeSandbox));
+        let _guard = OpenCodeConstructionGuard::forbidden();
+        let (status, snapshot) = get_json(&app, "/v1/tasks/recover-task/snapshot").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(snapshot["task_id"], "recover-task");
+        assert_eq!(snapshot["lifecycle"], json!({"state":"open"}));
     }
 
     #[tokio::test]
