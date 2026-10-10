@@ -1645,6 +1645,45 @@ impl ControllerStore {
             .as_deref()
             .map(serde_json::from_str::<Value>)
             .transpose()?;
+        let execution_target = control
+            .8
+            .as_deref()
+            .map(serde_json::from_str::<Value>)
+            .transpose()?
+            .map(|mut target: Value| {
+                let kind = target["delivery"]["kind"]
+                    .as_str()
+                    .or_else(|| target["delivery"].as_str())
+                    .unwrap_or("pull_request");
+                target["delivery"] = serde_json::json!(kind);
+                target
+            });
+        let evaluation_sha = checks.and_then(|value| value["evaluation_sha"].as_str());
+        let required_checks = checks
+            .and_then(|value| value["required_checks"].as_array())
+            .map(|checks| {
+                checks
+                    .iter()
+                    .map(|check| {
+                        let state = match check["state"].as_str().unwrap_or_default() {
+                            "passing" | "success" | "neutral" | "skipped" => "passing",
+                            "failing" | "failure" | "error" => "failing",
+                            "pending" => "pending",
+                            _ => "unknown",
+                        };
+                        serde_json::json!({
+                            "context": check["context"].as_str().or_else(||check["name"].as_str()).unwrap_or_default(),
+                            "source": check["source"].as_str().unwrap_or("check_run"),
+                            "state": state,
+                            "evaluation_sha": check["evaluation_sha"].as_str().or(evaluation_sha).unwrap_or_default(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let evaluation_kind = checks
+            .and_then(|value| value["evaluation_kind"].as_str())
+            .and_then(|kind| matches!(kind, "head" | "test_merge" | "merge_group").then_some(kind));
         let lifecycle = if matches!(
             task["state"].as_str(),
             Some("completed" | "canceled" | "obviated" | "superseded" | "failed_exhausted")
@@ -1657,7 +1696,7 @@ impl ControllerStore {
             "schema_version":1,"task_id":task_id,"task_version":control.0,"logical_time_ms":logical_time,
             "lifecycle":lifecycle,"completion_policy":serde_json::from_str::<Value>(&control.4)?,
             "operator_hold":control.1,"controller_mode":controller_mode,"reconcile_generation":control.3,
-            "execution_target":control.8.as_deref().map(serde_json::from_str::<Value>).transpose()? ,"delivery":{"work_branch":control.9,"pull_request":pull_request.clone(),"base_revision":control.11,"pr_head_sha":pr_head_sha,"evaluation_sha":checks.and_then(|value|value["evaluation_sha"].as_str()),"evaluation_kind":checks.and_then(|value|value["evaluation_kind"].as_str()),"pr_state":pull_request.as_ref().and_then(|value|value["state"].as_str()),"required_checks":checks.and_then(|value|value["required_checks"].as_array()).cloned().unwrap_or_default()},
+            "execution_target":execution_target,"delivery":{"work_branch":control.9,"pull_request":pull_request.clone(),"base_revision":control.11,"pr_head_sha":pr_head_sha,"evaluation_sha":evaluation_sha,"evaluation_kind":evaluation_kind,"pr_state":pull_request.as_ref().and_then(|value|value["state"].as_str()),"required_checks":required_checks},
             "dependencies":{"all_completed":!dependencies_unresolved,"predecessors":dependencies},"children":{"total":children.len(),"completed":children.iter().filter(|c|c["state"]=="completed").count(),"terminal_noncompleted":children.iter().filter(|c|c["state"]!="completed"&&matches!(c["state"].as_str(),Some("canceled"|"obviated"|"superseded"|"failed_exhausted"))).count()},
             "attempts":attempts,"blocker":blocker,"observations":observations,
             "action_history":{"recent":[]},"budget_usage":{"attempt_count":attempt_count,"grants":serde_json::from_str::<Value>(&grants)?,"spec":serde_json::from_str::<Value>(&control.5)?},
@@ -1716,6 +1755,96 @@ impl ControllerStore {
         task["controller_mode"] = serde_json::json!(controller_mode);
         let encoded = serde_json::to_string(&task)?;
         let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE tasks SET payload_json=?2 WHERE task_id=?1",
+            params![task_id, encoded],
+        )?;
+        tx.execute("UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='task' AND resource_id=?1", params![task_id, encoded, now])?;
+        append_resource_change(&tx, "task", task_id, &task)?;
+        tx.commit()?;
+        Ok(expected_version + 1)
+    }
+
+    pub fn bind_task_delivery(
+        &self,
+        task_id: &str,
+        expected_version: u64,
+        base_revision: Option<&str>,
+        pull_request: Option<&Value>,
+    ) -> Result<u64, StoreError> {
+        if base_revision.is_some_and(|revision| revision.trim().is_empty()) {
+            return Err(StoreError::InvalidState(
+                "base revision cannot be empty".into(),
+            ));
+        }
+        if let Some(binding) = pull_request {
+            if binding["provider"].as_str().is_none_or(str::is_empty)
+                || binding["repository"].as_str().is_none_or(str::is_empty)
+                || binding["number"].as_u64().is_none_or(|number| number == 0)
+            {
+                return Err(StoreError::InvalidState(
+                    "pull request binding requires provider, repository, and positive number"
+                        .into(),
+                ));
+            }
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (version, existing_base, existing_pr): (i64, Option<String>, Option<String>) = tx
+            .query_row(
+                "SELECT version,base_revision,pull_request_binding_json FROM task_durable_state WHERE task_id=?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        if version as u64 != expected_version {
+            return Err(StoreError::Conflict);
+        }
+        if base_revision.is_some_and(|revision| {
+            existing_base
+                .as_deref()
+                .is_some_and(|stored| stored != revision)
+        }) {
+            return Err(StoreError::Conflict);
+        }
+        if let Some(binding) = pull_request {
+            if let Some(existing) = existing_pr.as_deref() {
+                if serde_json::from_str::<Value>(existing)? != *binding {
+                    return Err(StoreError::Conflict);
+                }
+            }
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed = tx.execute(
+            "UPDATE task_durable_state SET version=version+1,base_revision=COALESCE(base_revision,?3),pull_request_binding_json=COALESCE(pull_request_binding_json,?4),updated_at=?5 WHERE task_id=?1 AND version=?2",
+            params![task_id, expected_version as i64, base_revision, pull_request.map(Value::to_string), now],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        let payload: String = tx.query_row(
+            "SELECT payload_json FROM tasks WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        let mut task: Value = serde_json::from_str(&payload)?;
+        task["version"] = serde_json::json!(expected_version + 1);
+        if let Some(revision) = existing_base.as_deref().or(base_revision) {
+            task["base_revision"] = serde_json::json!(revision);
+        }
+        if let Some(binding) = existing_pr
+            .as_deref()
+            .map(serde_json::from_str::<Value>)
+            .transpose()?
+            .or_else(|| pull_request.cloned())
+        {
+            task["pull_request_binding"] = binding;
+        }
+        let encoded = serde_json::to_string(&task)?;
         tx.execute(
             "UPDATE tasks SET payload_json=?2 WHERE task_id=?1",
             params![task_id, encoded],
@@ -3503,6 +3632,54 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(snapshot["budget_usage"]["execution_ms"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn delivery_binding_is_task_owned_immutable_and_snapshot_typed() {
+        let (_dir, store) = store();
+        let spec = serde_json::json!({
+            "outcome":"deliver a branch",
+            "execution_target":{"kind":"git_repository","project":"demo","repository":"https://example.test/repo","base_ref":"main","delivery":{"kind":"pull_request"}}
+        });
+        store
+            .accept_task("delivery-key", "test", &spec, "delivery-task", &spec)
+            .unwrap();
+        let binding =
+            serde_json::json!({"provider":"github","repository":"example/repo","number":42});
+        assert_eq!(
+            store
+                .bind_task_delivery(
+                    "delivery-task",
+                    1,
+                    Some("1111111111111111111111111111111111111111"),
+                    Some(&binding),
+                )
+                .unwrap(),
+            2
+        );
+        assert!(matches!(
+            store.bind_task_delivery(
+                "delivery-task",
+                2,
+                Some("2222222222222222222222222222222222222222"),
+                None
+            ),
+            Err(StoreError::Conflict)
+        ));
+        let snapshot = store.task_snapshot("delivery-task", 100).unwrap().unwrap();
+        assert_eq!(
+            snapshot["delivery"]["base_revision"],
+            "1111111111111111111111111111111111111111"
+        );
+        assert_eq!(snapshot["delivery"]["pull_request"], binding);
+        let typed: anvil_core::TaskSnapshot = serde_json::from_value(snapshot).unwrap();
+        assert!(matches!(
+            typed.execution_target,
+            Some(anvil_core::TaskExecutionTarget::GitRepository {
+                delivery: anvil_core::DeliveryKind::PullRequest,
+                ..
+            })
+        ));
     }
 
     #[test]

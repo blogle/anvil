@@ -306,6 +306,77 @@ pub struct RetrySchedule {
     pub cause: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryKind {
+    PullRequest,
+    LocalBranch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TaskExecutionTarget {
+    GitRepository {
+        #[serde(default)]
+        project: Option<String>,
+        repository: String,
+        base_ref: String,
+        delivery: DeliveryKind,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckEvaluationKind {
+    Head,
+    TestMerge,
+    MergeGroup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckState {
+    Pending,
+    Passing,
+    Failing,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskPullRequestBinding {
+    pub provider: String,
+    pub repository: String,
+    pub number: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRequiredCheck {
+    pub context: String,
+    pub source: String,
+    pub state: CheckState,
+    pub evaluation_sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskDeliverySummary {
+    #[serde(default)]
+    pub work_branch: Option<String>,
+    #[serde(default)]
+    pub base_revision: Option<String>,
+    #[serde(default)]
+    pub pull_request: Option<TaskPullRequestBinding>,
+    #[serde(default)]
+    pub pr_head_sha: Option<String>,
+    #[serde(default)]
+    pub evaluation_sha: Option<String>,
+    #[serde(default)]
+    pub evaluation_kind: Option<CheckEvaluationKind>,
+    #[serde(default)]
+    pub pr_state: Option<String>,
+    #[serde(default)]
+    pub required_checks: Vec<TaskRequiredCheck>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSnapshot {
     pub schema_version: u32,
@@ -317,8 +388,8 @@ pub struct TaskSnapshot {
     pub operator_hold: bool,
     pub controller_mode: ControllerMode,
     pub reconcile_generation: u64,
-    pub execution_target: Option<serde_json::Value>,
-    pub delivery: Option<serde_json::Value>,
+    pub execution_target: Option<TaskExecutionTarget>,
+    pub delivery: Option<TaskDeliverySummary>,
     pub dependencies: TaskDependencySummary,
     pub children: TaskChildSummary,
     pub attempts: Vec<TaskAttemptSummary>,
