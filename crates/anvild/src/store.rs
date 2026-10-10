@@ -1953,6 +1953,33 @@ impl ControllerStore {
             .collect()
     }
 
+    pub fn attempt_page(
+        &self,
+        task_id: &str,
+        after_ordinal: u32,
+        limit: usize,
+    ) -> Result<(Vec<Value>, Option<u32>), StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let mut statement = connection.prepare(
+            "SELECT ordinal,payload_json FROM attempts WHERE task_id=?1 AND ordinal>?2 ORDER BY ordinal LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![task_id, after_ordinal, limit.clamp(1, 100) as i64],
+            |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let mut attempts = Vec::new();
+        let mut next = None;
+        for row in rows {
+            let (ordinal, payload) = row?;
+            next = Some(ordinal);
+            attempts.push(serde_json::from_str(&payload)?);
+        }
+        Ok((attempts, next))
+    }
+
     pub fn create_attempt_blocker(
         &self,
         attempt_id: &str,
@@ -4440,6 +4467,39 @@ mod tests {
             .unwrap();
         assert_eq!(attempt["version"], 2);
         assert_eq!(attempt["lifecycle"], "running");
+    }
+
+    #[test]
+    fn attempt_history_cursor_pages_are_exclusive_and_stable() {
+        let (_dir, store) = store();
+        let spec = serde_json::json!({"outcome":"paged attempt history"});
+        store
+            .accept_task(
+                "attempt-page-key",
+                "test",
+                &spec,
+                "attempt-page-task",
+                &spec,
+            )
+            .unwrap();
+        store
+            .create_attempt("attempt-page-task", "attempt-page-1", "attempt-page-key-1")
+            .unwrap();
+        store.set_attempt_state("attempt-page-1", "ended").unwrap();
+        store
+            .create_attempt("attempt-page-task", "attempt-page-2", "attempt-page-key-2")
+            .unwrap();
+        let (first, cursor) = store.attempt_page("attempt-page-task", 0, 1).unwrap();
+        assert_eq!(first[0]["attempt_id"], "attempt-page-1");
+        assert_eq!(cursor, Some(1));
+        let (second, cursor) = store
+            .attempt_page("attempt-page-task", cursor.unwrap(), 1)
+            .unwrap();
+        assert_eq!(second[0]["attempt_id"], "attempt-page-2");
+        assert_eq!(cursor, Some(2));
+        let (empty, cursor) = store.attempt_page("attempt-page-task", 2, 1).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(cursor, None);
     }
 
     #[test]

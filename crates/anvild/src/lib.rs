@@ -3589,16 +3589,32 @@ fn map_task_terminal_error(error: store::StoreError) -> ServiceError {
     }
 }
 
+#[derive(Deserialize, Default)]
+struct AttemptListQuery {
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
 async fn list_attempts(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<AttemptListQuery>,
 ) -> Result<Json<Value>, ServiceError> {
-    let attempts = state
+    let after = match query.after.as_deref() {
+        None => 0,
+        Some(cursor) => cursor
+            .strip_prefix("attempt1.")
+            .and_then(|ordinal| ordinal.parse::<u32>().ok())
+            .ok_or_else(|| ServiceError::Invalid("invalid Attempt cursor".into()))?,
+    };
+    let (attempts, next) = state
         .store()
         .map_err(|error| ServiceError::Store(error.into()))?
-        .attempts_for_task(&id)
+        .attempt_page(&id, after, query.limit.unwrap_or(50))
         .map_err(|error| ServiceError::Store(error.to_string()))?;
-    Ok(Json(json!({"task_id":id,"attempts":attempts})))
+    Ok(Json(
+        json!({"task_id":id,"attempts":attempts,"next_cursor":next.map(|ordinal|format!("attempt1.{ordinal}"))}),
+    ))
 }
 
 async fn create_attempt(
