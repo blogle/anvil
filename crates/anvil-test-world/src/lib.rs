@@ -188,10 +188,12 @@ mod tests {
                 source: "check_run".into(),
             }]),
             check_runs: vec![CheckRun {
+                run_id:1,
                 name: "CI".into(),
                 sha: "head-1".into(),
                 conclusion: Some("failure".into()),
                 status: "completed".into(),
+                updated_at:None,
                 details_fingerprint: Some("lint:E1".into()),
             }],
             ..Default::default()
@@ -275,10 +277,12 @@ mod tests {
 
         world.advance_head(42, "head-2", "head-2");
         world.check_runs = vec![CheckRun {
+            run_id:2,
             name: "CI".into(),
             sha: "head-2".into(),
             conclusion: Some("success".into()),
             status: "completed".into(),
+            updated_at:None,
             details_fingerprint: None,
         }];
         let green = observe(&world);

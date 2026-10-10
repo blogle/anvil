@@ -1180,10 +1180,12 @@ pub mod github {
     }
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct CheckRun {
+        pub run_id: u64,
         pub name: String,
         pub sha: String,
         pub conclusion: Option<String>,
         pub status: String,
+        pub updated_at: Option<String>,
         pub details_fingerprint: Option<String>,
     }
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1191,6 +1193,7 @@ pub mod github {
         pub context: String,
         pub sha: String,
         pub state: String,
+        pub updated_at: Option<String>,
     }
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum Policy {
@@ -1411,10 +1414,10 @@ pub mod github {
             .map(|required| {
                 let mut states = Vec::new();
                 if required.source == "check_run" {
-                    for run in runs
+                    if let Some(run)=runs
                         .iter()
                         .filter(|r| r.name == required.context && r.sha == evaluation)
-                    {
+                        .max_by_key(|run|(run.updated_at.as_deref().unwrap_or(""),run.run_id)) {
                         states.push(match (run.status.as_str(), run.conclusion.as_deref()) {
                             ("completed", Some("success" | "neutral" | "skipped")) => {
                                 CheckState::Passing
@@ -1426,10 +1429,10 @@ pub mod github {
                     }
                 }
                 if required.source == "status" {
-                    for st in statuses
+                    if let Some(st)=statuses
                         .iter()
                         .filter(|s| s.context == required.context && s.sha == evaluation)
-                    {
+                        .max_by_key(|status|status.updated_at.as_deref().unwrap_or("")) {
                         states.push(match st.state.as_str() {
                             "success" => CheckState::Passing,
                             "failure" | "error" => CheckState::Failing,
@@ -1483,17 +1486,21 @@ pub mod github {
             ]);
             let runs = [
                 CheckRun {
+                    run_id:1,
                     name: "ci".into(),
                     sha: "head".into(),
                     conclusion: Some("failure".into()),
                     status: "completed".into(),
+                    updated_at:None,
                     details_fingerprint: None,
                 },
                 CheckRun {
+                    run_id:2,
                     name: "ci".into(),
                     sha: "merge".into(),
                     conclusion: Some("neutral".into()),
                     status: "completed".into(),
+                    updated_at:None,
                     details_fingerprint: None,
                 },
             ];
@@ -1501,6 +1508,7 @@ pub mod github {
                 context: "legacy".into(),
                 sha: "merge".into(),
                 state: "success".into(),
+                updated_at:None,
             }];
             let e = evaluate(p, "head", "merge", EvaluationKind::TestMerge, &runs, &sts);
             assert_eq!(e.pr_head_sha, "head");
@@ -1585,10 +1593,12 @@ pub mod github {
                     source: "check_run".into(),
                 }])),
                 runs: Ok(vec![CheckRun {
+                    run_id:1,
                     name: "CI".into(),
                     sha: "merge".into(),
                     conclusion: Some("success".into()),
                     status: "completed".into(),
+                    updated_at:None,
                     details_fingerprint: None,
                 }]),
                 statuses: Ok(vec![]),
