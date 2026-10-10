@@ -1741,6 +1741,25 @@ impl ControllerStore {
             .lock()
             .expect("controller store lock poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_mode: String = tx
+            .query_row(
+                "SELECT controller_mode FROM task_durable_state WHERE task_id=?1 AND version=?2",
+                params![task_id, expected_version as i64],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::Conflict)?;
+        let rank = |mode: &str| match mode {
+            "legacy" => 0,
+            "shadow" => 1,
+            "reconciler" => 2,
+            _ => -1,
+        };
+        if rank(controller_mode) < rank(&current_mode) {
+            return Err(StoreError::InvalidState(
+                "controller ownership cannot be downgraded through the Task API".into(),
+            ));
+        }
         let changed = tx.execute(
             "UPDATE task_durable_state SET version=version+1,operator_hold=?3,controller_mode=?4,
                  reconcile_generation=reconcile_generation+CASE WHEN controller_mode<>?4 THEN 1 ELSE 0 END,
@@ -3634,6 +3653,10 @@ mod tests {
         assert_eq!(after["controller_mode"], "shadow");
         assert_eq!(after["reconcile_generation"], 1);
         assert_eq!(after["operator_hold"], true);
+        assert!(matches!(
+            store.set_task_control("control-task", 2, false, "legacy"),
+            Err(StoreError::InvalidState(_))
+        ));
         assert!(store.claim_runnable(2, 0, 3, 0).unwrap().is_empty());
     }
 
@@ -3663,6 +3686,10 @@ mod tests {
             .unwrap();
         assert!(store.claim_runnable(4, 0, 3, 0).unwrap().is_empty());
         assert_eq!(store.attempts_for_task("mode-task").unwrap().len(), 1);
+        assert!(matches!(
+            store.set_task_control("mode-task", 4, false, "shadow"),
+            Err(StoreError::InvalidState(_))
+        ));
     }
 
     #[test]
