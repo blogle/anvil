@@ -189,7 +189,21 @@ pub struct TaskBudget {
     pub max_verifier_cycles: u32,
     pub max_ci_retries: u32,
     pub max_execution_seconds: u64,
+    #[serde(default)]
     pub max_model_cost: Option<String>,
+}
+
+impl Default for TaskBudget {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            max_continuations_per_reason: 2,
+            max_verifier_cycles: 0,
+            max_ci_retries: 2,
+            max_execution_seconds: 14_400,
+            max_model_cost: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,6 +292,8 @@ pub struct TaskChildSummary {
 pub struct ActionHistorySummary {
     pub relevant: Vec<ActionHistoryEntry>,
     pub continuation_fingerprints_sent: Vec<String>,
+    #[serde(default)]
+    pub last_consumed_evidence: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +308,8 @@ pub struct ActionHistoryEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BudgetUsage {
+    #[serde(default)]
+    pub limits: TaskBudget,
     pub attempts: u32,
     pub continuations_by_reason: std::collections::BTreeMap<String, u32>,
     pub ci_retries: u32,

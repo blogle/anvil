@@ -1615,6 +1615,24 @@ impl ControllerStore {
             rows
         };
         let grants: String=tx.query_row("SELECT json_object('attempts',COALESCE(SUM(additional_attempts),0),'continuations',COALESCE(SUM(additional_continuations),0),'ci_retries',COALESCE(SUM(additional_ci_retries),0),'execution_seconds',COALESCE(SUM(additional_execution_seconds),0)) FROM task_budget_grants WHERE task_id=?1",[task_id],|row|row.get(0))?;
+        let grant_totals: Value = serde_json::from_str(&grants)?;
+        let mut effective_budget: anvil_core::TaskBudget =
+            serde_json::from_str(&control.5).unwrap_or_default();
+        effective_budget.max_attempts = effective_budget
+            .max_attempts
+            .saturating_add(grant_totals["attempts"].as_u64().unwrap_or_default() as u32);
+        effective_budget.max_continuations_per_reason = effective_budget
+            .max_continuations_per_reason
+            .saturating_add(grant_totals["continuations"].as_u64().unwrap_or_default() as u32);
+        effective_budget.max_ci_retries = effective_budget
+            .max_ci_retries
+            .saturating_add(grant_totals["ci_retries"].as_u64().unwrap_or_default() as u32);
+        effective_budget.max_execution_seconds =
+            effective_budget.max_execution_seconds.saturating_add(
+                grant_totals["execution_seconds"]
+                    .as_u64()
+                    .unwrap_or_default(),
+            );
         let mode = control.2;
         let controller_mode = match mode.as_str() {
             "shadow" => "shadow",
@@ -1708,9 +1726,13 @@ impl ControllerStore {
             "action_history":{"recent":[]},"budget_usage":{"attempt_count":attempt_count,"grants":serde_json::from_str::<Value>(&grants)?,"spec":serde_json::from_str::<Value>(&control.5)?},
             "retry_schedule":{"due_at_ms":control.7},"verification_spec":serde_json::from_str::<Value>(&control.6)?,"phase":phase
         });
-        snapshot["action_history"] =
-            serde_json::json!({"relevant": [], "continuation_fingerprints_sent": []});
+        snapshot["action_history"] = serde_json::json!({
+            "relevant": [],
+            "continuation_fingerprints_sent": [],
+            "last_consumed_evidence": null
+        });
         snapshot["budget_usage"] = serde_json::json!({
+            "limits": effective_budget,
             "attempts": attempt_count,
             "continuations_by_reason": {},
             "ci_retries": 0,
@@ -3710,6 +3732,16 @@ mod tests {
             Err(StoreError::Conflict)
         ));
         let snapshot = store.task_snapshot("grant-me", 42).unwrap().unwrap();
+        assert_eq!(snapshot["budget_usage"]["limits"]["max_attempts"], 5);
+        assert_eq!(
+            snapshot["budget_usage"]["limits"]["max_continuations_per_reason"],
+            3
+        );
+        assert_eq!(snapshot["budget_usage"]["limits"]["max_ci_retries"], 5);
+        assert_eq!(
+            snapshot["budget_usage"]["limits"]["max_execution_seconds"],
+            15_300
+        );
         assert_eq!(
             snapshot["budget_usage"]["grants"].as_array().unwrap().len(),
             1
