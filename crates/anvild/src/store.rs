@@ -3695,6 +3695,9 @@ mod tests {
         store
             .create_attempt("mode-task", "mode-attempt", "mode-attempt-key")
             .unwrap();
+        store
+            .bind_attempt_session("mode-attempt", "mode-session")
+            .unwrap();
         store.set_attempt_state("mode-attempt", "running").unwrap();
         store
             .set_task_control("mode-task", 2, false, "shadow")
@@ -3703,6 +3706,7 @@ mod tests {
         let attempts = store.attempts_for_task("mode-task").unwrap();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0]["attempt_id"], "mode-attempt");
+        assert_eq!(attempts[0]["session_id"], "mode-session");
         store
             .set_task_control("mode-task", 3, false, "reconciler")
             .unwrap();
