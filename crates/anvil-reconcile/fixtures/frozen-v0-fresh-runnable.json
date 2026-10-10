@@ -10,7 +10,7 @@
   "phase": "runnable",
   "completion_policy": {"kind": "evidence", "required_kinds": ["delivery_complete"]},
   "execution_target": {"kind": "git_repository", "repository": "https://example.test/repo", "base_ref": "main", "delivery": "pull_request"},
-  "delivery": null,
+  "delivery": {"work_branch":"anvil/task_demo","base_revision":"1111111111111111111111111111111111111111","pull_request":null,"pr_head_sha":null,"evaluation_sha":null,"evaluation_kind":null,"pr_state":null,"required_checks":[]},
   "dependencies": {"all_completed": true, "predecessors": []},
   "children": {"total": 0, "completed": 0, "terminal_noncompleted": 0},
   "attempts": [],

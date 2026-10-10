@@ -499,11 +499,11 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
         return d;
     }
     if let Some(x) = delivery {
-        if x.pr_state.is_none() {
+        if x.pr_state.is_none() && !s.attempts.is_empty() {
             d.rule_id = "waiting_for_pr_discovery".into();
             return d;
         }
-        if !x.check_policy_known {
+        if x.pr_state.is_some() && !x.check_policy_known {
             d.rule_id = "required_check_policy_unknown".into();
             d.attention.push("required_check_policy_unknown".into());
             return d;
