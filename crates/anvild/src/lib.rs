@@ -8269,9 +8269,10 @@ mod tests {
             .values()
             .all(Value::is_string));
         let spec = &manifest["spec"]["podTemplate"]["spec"];
-        assert!(spec["containers"][0]["ports"].as_array().unwrap().contains(
-            &json!({"name":"git-diff","containerPort":4097})
-        ));
+        assert!(spec["containers"][0]["ports"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"name":"git-diff","containerPort":4097})));
         assert_eq!(spec["volumes"][1], shared_nix_volume("configured-nix-pvc"));
         assert!(spec
             .get("securityContext")
