@@ -2205,6 +2205,10 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
             "/v1/tasks/:id/attempts",
             get(list_attempts).post(create_attempt),
         )
+        .route(
+            "/v1/tasks/:id/external-refs",
+            get(list_task_external_refs).post(attach_task_external_ref),
+        )
         .route("/v1/attempts/:id/blockers", post(create_attempt_blocker))
         .route(
             "/v1/tasks/:id/blockers/:blocker_id/resolve",
@@ -3615,6 +3619,52 @@ async fn list_attempts(
     Ok(Json(
         json!({"task_id":id,"attempts":attempts,"next_cursor":next.map(|ordinal|format!("attempt1.{ordinal}"))}),
     ))
+}
+
+#[derive(Deserialize)]
+struct AttachExternalRefRequest {
+    provider: String,
+    external_id: String,
+    source_hash: String,
+    url: Option<String>,
+}
+
+async fn attach_task_external_ref(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    Json(request): Json<AttachExternalRefRequest>,
+) -> Result<(StatusCode, Json<Value>), ServiceError> {
+    let reference = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .attach_task_external_ref(
+            &task_id,
+            &request.provider,
+            &request.external_id,
+            &request.source_hash,
+            request.url.as_deref(),
+        )
+        .map_err(|error| match error {
+            store::StoreError::NotFound => ServiceError::NotFound,
+            store::StoreError::Conflict => {
+                ServiceError::Conflict("external reference is already bound to active work".into())
+            }
+            store::StoreError::InvalidState(reason) => ServiceError::Invalid(reason),
+            other => ServiceError::Store(other.to_string()),
+        })?;
+    Ok((StatusCode::OK, Json(reference)))
+}
+
+async fn list_task_external_refs(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<Json<Value>, ServiceError> {
+    let references = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .external_refs_for_task(&task_id)
+        .map_err(|error| ServiceError::Store(error.to_string()))?;
+    Ok(Json(json!({"task_id":task_id,"external_refs":references})))
 }
 
 async fn create_attempt(
@@ -7368,6 +7418,62 @@ mod tests {
                 .unwrap()["blocker"],
             Value::Null
         );
+    }
+
+    #[tokio::test]
+    async fn task_external_reference_http_routes_are_idempotent_and_readable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        let store = store::ControllerStore::open(&config.store_path).unwrap();
+        let specification = json!({"outcome":"imported work"});
+        store
+            .accept_task(
+                "external-api-key",
+                "test",
+                &specification,
+                "external-api-task",
+                &specification,
+            )
+            .unwrap();
+        let app = router(AppState::new(config, FakeSandbox));
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks/external-api-task/external-refs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "provider":"lific",
+                        "external_id":"ANVIL-55",
+                        "source_hash":"sha256:fixture",
+                        "url":"https://lific.test/ANVIL-55"
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first: Value = serde_json::from_slice(
+            &axum::body::to_bytes(first.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let second = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second: Value = serde_json::from_slice(
+            &axum::body::to_bytes(second.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["id"], second["id"]);
+        let (status, listing) = get_json(&app, "/v1/tasks/external-api-task/external-refs").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listing["external_refs"].as_array().unwrap().len(), 1);
+        assert_eq!(listing["external_refs"][0]["source_hash"], "sha256:fixture");
     }
 
     #[tokio::test]
