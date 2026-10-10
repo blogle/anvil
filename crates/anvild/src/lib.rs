@@ -2206,6 +2206,11 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
             "/v1/tasks/:id/attempts",
             get(list_attempts).post(create_attempt),
         )
+        .route("/v1/attempts/:id/blockers", post(create_attempt_blocker))
+        .route(
+            "/v1/tasks/:id/blockers/:blocker_id/resolve",
+            post(resolve_task_blocker),
+        )
         .route(
             "/v1/attempts/:id",
             get(get_attempt).post(bind_attempt_session),
@@ -3245,6 +3250,9 @@ struct TaskListQuery {
     limit: Option<usize>,
     lifecycle: Option<String>,
     parent: Option<String>,
+    runnable: Option<bool>,
+    external_provider: Option<String>,
+    external_id: Option<String>,
 }
 
 async fn list_tasks(
@@ -3257,17 +3265,18 @@ async fn list_tasks(
         .and_then(|value| value.strip_prefix("task1."))
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(0);
-    let (mut tasks, next) = state
+    let filters = store::TaskListFilters {
+        lifecycle: query.lifecycle,
+        parent: query.parent,
+        runnable: query.runnable,
+        external_provider: query.external_provider,
+        external_id: query.external_id,
+    };
+    let (tasks, next) = state
         .store()
         .map_err(|error| ServiceError::Store(error.into()))?
-        .task_page(after, query.limit.unwrap_or(50))
+        .task_page_filtered(after, query.limit.unwrap_or(50), &filters)
         .map_err(|error| ServiceError::Store(error.to_string()))?;
-    if let Some(lifecycle) = query.lifecycle {
-        tasks.retain(|task| task["state"] == lifecycle);
-    }
-    if let Some(parent) = query.parent {
-        tasks.retain(|task| task["parent_task_id"] == parent);
-    }
     Ok(Json(
         json!({"tasks":tasks,"next_cursor":next.map(|sequence|format!("task1.{sequence}"))}),
     ))
@@ -3569,6 +3578,86 @@ async fn create_attempt(
         StatusCode::OK
     };
     Ok((status, Json(acceptance.attempt)))
+}
+
+#[derive(Deserialize)]
+struct CreateBlockerRequest {
+    expected_task_version: u64,
+    question: String,
+    context: String,
+}
+
+async fn create_attempt_blocker(
+    State(state): State<AppState>,
+    Path(attempt_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<CreateBlockerRequest>,
+) -> Result<(StatusCode, Json<Value>), ServiceError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or(ServiceError::Unauthorized)?;
+    let signer = state
+        .capability_signer
+        .as_ref()
+        .ok_or(ServiceError::Unauthorized)?;
+    let claims = signer
+        .verify_for_refresh(token)
+        .map_err(|_| ServiceError::Unauthorized)?;
+    if claims.expires_at <= Utc::now().timestamp() {
+        return Err(ServiceError::Unauthorized);
+    }
+    let blocker = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .create_attempt_blocker(
+            &attempt_id,
+            &claims.session_id,
+            request.expected_task_version,
+            &request.question,
+            &request.context,
+        )
+        .map_err(|error| match error {
+            store::StoreError::NotFound => ServiceError::NotFound,
+            store::StoreError::Conflict => {
+                ServiceError::Conflict("blocker CAS or session binding conflict".into())
+            }
+            store::StoreError::InvalidState(reason) => ServiceError::Invalid(reason),
+            other => ServiceError::Store(other.to_string()),
+        })?;
+    Ok((StatusCode::CREATED, Json(blocker)))
+}
+
+#[derive(Deserialize)]
+struct ResolveBlockerRequest {
+    expected_task_version: u64,
+    actor: String,
+    resolution: String,
+}
+
+async fn resolve_task_blocker(
+    State(state): State<AppState>,
+    Path((task_id, blocker_id)): Path<(String, String)>,
+    Json(request): Json<ResolveBlockerRequest>,
+) -> Result<Json<Value>, ServiceError> {
+    state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .resolve_task_blocker(
+            &task_id,
+            &blocker_id,
+            request.expected_task_version,
+            &request.actor,
+            &request.resolution,
+        )
+        .map(Json)
+        .map_err(|error| match error {
+            store::StoreError::NotFound => ServiceError::NotFound,
+            store::StoreError::Conflict => ServiceError::Conflict("blocker CAS conflict".into()),
+            store::StoreError::InvalidState(reason) => ServiceError::Invalid(reason),
+            other => ServiceError::Store(other.to_string()),
+        })
 }
 
 #[derive(Deserialize)]
@@ -7064,6 +7153,96 @@ mod tests {
             .unwrap();
         let value = serde_json::from_slice(&body).unwrap();
         (status, value)
+    }
+
+    #[tokio::test]
+    async fn blocker_http_routes_enforce_attempt_capability_and_task_cas() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        config.session_signing_secret = Some("b".repeat(32));
+        let store = store::ControllerStore::open(config.store_path.clone()).unwrap();
+        let state = AppState::new(config.clone(), FakeSandbox);
+        let spec = json!({"outcome":"wait for operator"});
+        store
+            .accept_task(
+                "blocker-http-task",
+                "test",
+                &spec,
+                "blocker-http-task",
+                &spec,
+            )
+            .unwrap();
+        store
+            .create_attempt(
+                "blocker-http-task",
+                "blocker-http-attempt",
+                "blocker-http-attempt-key",
+            )
+            .unwrap();
+        store
+            .bind_attempt_session("blocker-http-attempt", "ses-blocker")
+            .unwrap();
+        let signer =
+            github::CapabilitySigner::new("b".repeat(32), Duration::from_secs(60)).unwrap();
+        let capability = signer.mint("ses-blocker", "example/repo").unwrap();
+        let app = router(state);
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/attempts/blocker-http-attempt/blockers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"expected_task_version":2,"question":"q","context":"c"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/attempts/blocker-http-attempt/blockers")
+                    .header("authorization", format!("Bearer {capability}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"expected_task_version":2,"question":"q","context":"c"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let blocker: Value = serde_json::from_slice(
+            &axum::body::to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let resolved = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/tasks/blocker-http-task/blockers/{}/resolve", blocker["id"].as_str().unwrap()))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"expected_task_version":3,"actor":"operator","resolution":"answered"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.status(), StatusCode::OK);
+        assert_eq!(
+            store
+                .task_snapshot("blocker-http-task", 0)
+                .unwrap()
+                .unwrap()["blocker"],
+            Value::Null
+        );
     }
 
     #[tokio::test]

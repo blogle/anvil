@@ -91,6 +91,15 @@ pub struct AttemptAcceptance {
     pub created: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TaskListFilters {
+    pub lifecycle: Option<String>,
+    pub parent: Option<String>,
+    pub runnable: Option<bool>,
+    pub external_provider: Option<String>,
+    pub external_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskAcceptance {
     pub task: Value,
@@ -973,16 +982,45 @@ impl ControllerStore {
         after: i64,
         limit: usize,
     ) -> Result<(Vec<Value>, Option<i64>), StoreError> {
+        self.task_page_filtered(after, limit, &TaskListFilters::default())
+    }
+
+    pub fn task_page_filtered(
+        &self,
+        after: i64,
+        limit: usize,
+        filters: &TaskListFilters,
+    ) -> Result<(Vec<Value>, Option<i64>), StoreError> {
         let connection = self
             .connection
             .lock()
             .expect("controller store lock poisoned");
         let mut statement = connection.prepare(
-            "SELECT rowid,payload_json FROM tasks WHERE rowid>?1 ORDER BY rowid LIMIT ?2",
+            "SELECT t.rowid,t.payload_json FROM tasks t
+             LEFT JOIN task_durable_state d USING(task_id)
+             WHERE t.rowid>?1
+               AND (?2 IS NULL OR (?2='open' AND t.state NOT IN ('completed','canceled','obviated','superseded','failed_exhausted')) OR (?2='terminal' AND t.state IN ('completed','canceled','obviated','superseded','failed_exhausted')) OR t.state=?2)
+               AND (?3 IS NULL OR d.parent_task_id=?3)
+               AND (?4 IS NULL OR ?4 = CASE WHEN t.state IN ('queued','retry_wait','open') AND d.execution_target_json IS NOT NULL AND NOT EXISTS(SELECT 1 FROM task_blockers b WHERE b.task_id=t.task_id AND b.resolution_json IS NULL) AND NOT EXISTS(SELECT 1 FROM task_dependencies dep JOIN tasks predecessor ON predecessor.task_id=dep.predecessor_task_id WHERE dep.successor_task_id=t.task_id AND predecessor.state<>'completed') THEN 1 ELSE 0 END)
+               AND (?5 IS NULL OR EXISTS(SELECT 1 FROM task_external_refs x WHERE x.task_id=t.task_id AND x.provider=?5 AND (?6 IS NULL OR x.external_id=?6)))
+               AND (?6 IS NULL OR EXISTS(SELECT 1 FROM task_external_refs x WHERE x.task_id=t.task_id AND (?5 IS NULL OR x.provider=?5) AND x.external_id=?6))
+             ORDER BY t.rowid LIMIT ?7",
         )?;
-        let rows = statement.query_map(params![after, limit.clamp(1, 100) as i64], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
+        let runnable = filters
+            .runnable
+            .map(|value| if value { 1_i64 } else { 0_i64 });
+        let rows = statement.query_map(
+            params![
+                after,
+                filters.lifecycle,
+                filters.parent,
+                runnable,
+                filters.external_provider,
+                filters.external_id,
+                limit.clamp(1, 100) as i64
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?;
         let mut values = Vec::new();
         let mut cursor = None;
         for row in rows {
@@ -1209,6 +1247,10 @@ impl ControllerStore {
             "UPDATE tasks SET state='completed',payload_json=?2 WHERE task_id=?1",
             params![task_id, encoded],
         )?;
+        tx.execute(
+            "UPDATE task_external_refs SET task_open=0 WHERE task_id=?1",
+            [task_id],
+        )?;
         tx.execute("UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='task' AND resource_id=?1",params![task_id,encoded,now])?;
         append_resource_change(&tx, "task", task_id, &task)?;
         tx.commit()?;
@@ -1265,6 +1307,10 @@ impl ControllerStore {
         tx.execute(
             "UPDATE tasks SET state=?2,payload_json=?3 WHERE task_id=?1",
             params![task_id, state, encoded],
+        )?;
+        tx.execute(
+            "UPDATE task_external_refs SET task_open=0 WHERE task_id=?1",
+            [task_id],
         )?;
         tx.execute("UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='task' AND resource_id=?1",params![task_id,encoded,now])?;
         append_resource_change(&tx, "task", task_id, &task)?;
@@ -1548,6 +1594,225 @@ impl ControllerStore {
         values
             .map(|value| Ok(serde_json::from_str(&value?)?))
             .collect()
+    }
+
+    pub fn create_attempt_blocker(
+        &self,
+        attempt_id: &str,
+        capability_session_id: &str,
+        expected_task_version: u64,
+        question: &str,
+        context: &str,
+    ) -> Result<Value, StoreError> {
+        if question.trim().is_empty() || context.trim().is_empty() {
+            return Err(StoreError::InvalidState(
+                "blocker question and context are required".into(),
+            ));
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt: Option<(String, Option<String>, String)> = tx
+            .query_row(
+                "SELECT task_id,session_id,payload_json FROM attempts WHERE attempt_id=?1",
+                [attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((task_id, session_id, payload)) = attempt else {
+            return Err(StoreError::NotFound);
+        };
+        if session_id.as_deref() != Some(capability_session_id) {
+            return Err(StoreError::Conflict);
+        }
+        let attempt_payload: Value = serde_json::from_str(&payload)?;
+        if attempt_payload["lifecycle"] == "ended"
+            || matches!(
+                attempt_payload["state"].as_str(),
+                Some(
+                    "ended"
+                        | "completed"
+                        | "failed"
+                        | "canceled"
+                        | "abandoned"
+                        | "orphaned"
+                        | "replaced"
+                        | "exhausted"
+                )
+            )
+        {
+            return Err(StoreError::InvalidState("Attempt has ended".into()));
+        }
+        let version: i64 = tx.query_row(
+            "SELECT version FROM task_durable_state WHERE task_id=?1",
+            [&task_id],
+            |row| row.get(0),
+        )?;
+        if version as u64 != expected_task_version {
+            return Err(StoreError::Conflict);
+        }
+        let unresolved: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_blockers WHERE task_id=?1 AND resolution_json IS NULL)",
+            [&task_id],
+            |row| row.get(0),
+        )?;
+        if unresolved {
+            return Err(StoreError::Conflict);
+        }
+        let blocker_id = uuid::Uuid::new_v4().to_string();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO task_blockers(blocker_id,task_id,attempt_id,version,question,context,created_at,resolution_json) VALUES(?1,?2,?3,1,?4,?5,?6,NULL)",
+            params![blocker_id, task_id, attempt_id, question, context, created_at],
+        )?;
+        tx.execute(
+            "UPDATE task_durable_state SET version=version+1,updated_at=?2 WHERE task_id=?1 AND version=?3",
+            params![task_id, created_at, expected_task_version as i64],
+        )?;
+        sync_task_payload_version(&tx, &task_id, expected_task_version + 1, &created_at)?;
+        tx.commit()?;
+        Ok(
+            serde_json::json!({"id":blocker_id,"task_id":task_id,"attempt_id":attempt_id,"version":1,"question":question,"context":context,"created_at":created_at}),
+        )
+    }
+
+    pub fn resolve_task_blocker(
+        &self,
+        task_id: &str,
+        blocker_id: &str,
+        expected_task_version: u64,
+        actor: &str,
+        resolution: &str,
+    ) -> Result<Value, StoreError> {
+        if actor.trim().is_empty() || resolution.trim().is_empty() {
+            return Err(StoreError::InvalidState(
+                "blocker resolution requires actor and resolution".into(),
+            ));
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 = tx
+            .query_row(
+                "SELECT version FROM task_durable_state WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        if version as u64 != expected_task_version {
+            return Err(StoreError::Conflict);
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let resolution_record =
+            serde_json::json!({"actor":actor,"resolution":resolution,"resolved_at":now});
+        let changed = tx.execute(
+            "UPDATE task_blockers SET version=version+1,resolution_json=?3 WHERE task_id=?1 AND blocker_id=?2 AND resolution_json IS NULL",
+            params![task_id, blocker_id, resolution_record.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        tx.execute(
+            "UPDATE task_durable_state SET version=version+1,updated_at=?2 WHERE task_id=?1 AND version=?3",
+            params![task_id, now, expected_task_version as i64],
+        )?;
+        sync_task_payload_version(&tx, task_id, expected_task_version + 1, &now)?;
+        tx.commit()?;
+        Ok(
+            serde_json::json!({"id":blocker_id,"task_id":task_id,"version":expected_task_version+1,"resolution":resolution_record}),
+        )
+    }
+
+    pub fn attach_task_external_ref(
+        &self,
+        task_id: &str,
+        provider: &str,
+        external_id: &str,
+        source_hash: &str,
+        url: Option<&str>,
+    ) -> Result<Value, StoreError> {
+        if [provider, external_id, source_hash]
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            return Err(StoreError::InvalidState(
+                "external reference provider, id, and source hash are required".into(),
+            ));
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state: String = tx
+            .query_row(
+                "SELECT state FROM tasks WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        let task_open = !matches!(
+            state.as_str(),
+            "completed" | "canceled" | "obviated" | "superseded" | "failed_exhausted"
+        );
+        let existing: Option<(String, String)> = tx
+            .query_row(
+                "SELECT id,task_id FROM task_external_refs WHERE provider=?1 AND external_id=?2 AND task_open=1 LIMIT 1",
+                params![provider, external_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let reference_id = match existing {
+            Some((id, existing_task_id)) if existing_task_id == task_id => {
+                tx.execute(
+                    "UPDATE task_external_refs SET source_hash=?2,url=?3,task_open=?4 WHERE id=?1",
+                    params![id, source_hash, url, task_open],
+                )?;
+                id
+            }
+            Some((_, _)) if task_open => return Err(StoreError::Conflict),
+            _ => {
+                let id = uuid::Uuid::new_v4().to_string();
+                tx.execute(
+                    "INSERT INTO task_external_refs(id,task_id,provider,external_id,source_hash,url,task_open) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![id, task_id, provider, external_id, source_hash, url, task_open],
+                )?;
+                id
+            }
+        };
+        tx.commit()?;
+        Ok(
+            serde_json::json!({"id":reference_id,"task_id":task_id,"provider":provider,"external_id":external_id,"source_hash":source_hash,"url":url,"task_open":task_open}),
+        )
+    }
+
+    pub fn external_refs_for_task(&self, task_id: &str) -> Result<Vec<Value>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id,provider,external_id,source_hash,url,task_open FROM task_external_refs WHERE task_id=?1 ORDER BY provider,external_id,id",
+        )?;
+        let rows = statement
+            .query_map([task_id], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "provider": row.get::<_, String>(1)?,
+                    "external_id": row.get::<_, String>(2)?,
+                    "source_hash": row.get::<_, String>(3)?,
+                    "url": row.get::<_, Option<String>>(4)?,
+                    "task_open": row.get::<_, bool>(5)?
+                }))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     pub fn tasks_for_session(&self, session_id: &str) -> Result<Vec<(String, String)>, StoreError> {
@@ -2073,6 +2338,32 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+fn sync_task_payload_version(
+    tx: &Transaction<'_>,
+    task_id: &str,
+    version: u64,
+    updated_at: &str,
+) -> Result<(), StoreError> {
+    let payload: String = tx.query_row(
+        "SELECT payload_json FROM tasks WHERE task_id=?1",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    let mut task: Value = serde_json::from_str(&payload)?;
+    task["version"] = serde_json::json!(version);
+    let encoded = serde_json::to_string(&task)?;
+    tx.execute(
+        "UPDATE tasks SET payload_json=?2 WHERE task_id=?1",
+        params![task_id, encoded],
+    )?;
+    tx.execute(
+        "UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='task' AND resource_id=?1",
+        params![task_id, encoded, updated_at],
+    )?;
+    append_resource_change(tx, "task", task_id, &task)?;
+    Ok(())
+}
+
 fn encode_cursor(sequence: i64) -> String {
     format!("anv1.{sequence}")
 }
@@ -2473,6 +2764,148 @@ mod tests {
             snapshot["budget_usage"]["grants"][0]["additional_execution_seconds"],
             900
         );
+    }
+
+    #[test]
+    fn blockers_are_attempt_bound_unique_and_cas_resolved() {
+        let (_dir, store) = store();
+        let spec = serde_json::json!({"outcome":"wait for input"});
+        store
+            .accept_task("blocker-task", "test", &spec, "blocked-task", &spec)
+            .unwrap();
+        store
+            .create_attempt("blocked-task", "blocker-attempt", "blocker-attempt-key")
+            .unwrap();
+        store
+            .bind_attempt_session("blocker-attempt", "session-bound")
+            .unwrap();
+        assert!(matches!(
+            store.create_attempt_blocker(
+                "blocker-attempt",
+                "different-session",
+                2,
+                "question",
+                "context"
+            ),
+            Err(StoreError::Conflict)
+        ));
+        let blocker = store
+            .create_attempt_blocker("blocker-attempt", "session-bound", 2, "question", "context")
+            .unwrap();
+        assert_eq!(blocker["attempt_id"], "blocker-attempt");
+        assert!(matches!(
+            store.create_attempt_blocker(
+                "blocker-attempt",
+                "session-bound",
+                3,
+                "second question",
+                "context"
+            ),
+            Err(StoreError::Conflict)
+        ));
+        let blocker_id = blocker["id"].as_str().unwrap();
+        assert!(matches!(
+            store.resolve_task_blocker("blocked-task", blocker_id, 2, "operator", "answer"),
+            Err(StoreError::Conflict)
+        ));
+        let resolved = store
+            .resolve_task_blocker("blocked-task", blocker_id, 3, "operator", "answer")
+            .unwrap();
+        assert_eq!(resolved["resolution"]["actor"], "operator");
+        assert_eq!(
+            store.task_snapshot("blocked-task", 0).unwrap().unwrap()["blocker"],
+            Value::Null
+        );
+        assert_eq!(
+            store.task_control("blocked-task").unwrap().unwrap()["version"],
+            4
+        );
+    }
+
+    #[test]
+    fn external_reference_identity_is_unique_for_open_tasks_and_retained_at_terminal() {
+        let (_dir, store) = store();
+        for task_id in ["external-a", "external-b"] {
+            let spec = serde_json::json!({"outcome":task_id});
+            store
+                .accept_task(&format!("key-{task_id}"), "test", &spec, task_id, &spec)
+                .unwrap();
+        }
+        let first = store
+            .attach_task_external_ref("external-a", "lific", "ANVIL-1", "hash-a", None)
+            .unwrap();
+        let replay = store
+            .attach_task_external_ref(
+                "external-a",
+                "lific",
+                "ANVIL-1",
+                "hash-b",
+                Some("https://lific.test/ANVIL-1"),
+            )
+            .unwrap();
+        assert_eq!(first["id"], replay["id"]);
+        assert_eq!(replay["source_hash"], "hash-b");
+        assert!(matches!(
+            store.attach_task_external_ref("external-b", "lific", "ANVIL-1", "hash-c", None),
+            Err(StoreError::Conflict)
+        ));
+        store
+            .terminate_task(
+                "external-a",
+                1,
+                anvil_core::TaskTerminal::Canceled {
+                    actor: "operator".into(),
+                    reason: "done".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(store.external_refs_for_task("external-a").unwrap().len(), 1);
+        let reassigned = store
+            .attach_task_external_ref("external-b", "lific", "ANVIL-1", "hash-c", None)
+            .unwrap();
+        assert_eq!(reassigned["task_id"], "external-b");
+    }
+
+    #[test]
+    fn task_page_applies_lifecycle_runnable_and_external_filters_before_pagination() {
+        let (_dir, store) = store();
+        let leaf = serde_json::json!({"outcome":"leaf","execution_target":{"kind":"git_repository","project":"demo","repository":"https://example.test/repo","base_ref":"main","delivery":"local_branch"}});
+        let aggregate = serde_json::json!({"outcome":"root"});
+        store
+            .accept_task("leaf-key", "test", &leaf, "leaf-task", &leaf)
+            .unwrap();
+        store
+            .accept_task("root-key", "test", &aggregate, "root-task", &aggregate)
+            .unwrap();
+        store
+            .attach_task_external_ref("root-task", "lific", "issue-7", "source-hash", None)
+            .unwrap();
+        let (runnable, _) = store
+            .task_page_filtered(
+                0,
+                1,
+                &TaskListFilters {
+                    lifecycle: Some("open".into()),
+                    runnable: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(runnable.len(), 1);
+        assert_eq!(runnable[0]["task_id"], "leaf-task");
+        let (external, _) = store
+            .task_page_filtered(
+                0,
+                1,
+                &TaskListFilters {
+                    external_provider: Some("lific".into()),
+                    external_id: Some("issue-7".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(external.len(), 1);
+        assert_eq!(external[0]["task_id"], "root-task");
     }
 
     #[test]

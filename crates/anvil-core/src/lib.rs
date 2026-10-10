@@ -942,29 +942,45 @@ mod tests {
 
     #[test]
     fn task_snapshot_v0_fixture_deserializes_and_round_trips() {
-        let fixture = include_str!("../tests/fixtures/task-snapshot-v1/fresh-open-executable.json");
-        let snapshot: TaskSnapshot = serde_json::from_str(fixture).unwrap();
-        assert_eq!(snapshot.schema_version, 1);
-        assert_eq!(snapshot.logical_time_ms, 1_791_600_000_000);
-        assert_eq!(snapshot.lifecycle, TaskLifecycle::Open);
-        assert_eq!(snapshot.phase, TaskPhase::Runnable);
-        let encoded = serde_json::to_value(snapshot).unwrap();
-        for required in [
-            "logical_time_ms",
-            "lifecycle",
-            "dependencies",
-            "children",
-            "attempts",
-            "observations",
-            "action_history",
-            "budget_usage",
-            "retry_schedule",
-            "delivery",
-            "merge_wait_due_at_ms",
-        ] {
-            assert!(encoded.get(required).is_some(), "missing {required}");
+        let fixtures = [
+            include_str!("../tests/fixtures/task-snapshot-v1/fresh-open-executable.json"),
+            include_str!(
+                "../tests/fixtures/task-snapshot-v1/failed-checks-prior-continuation.json"
+            ),
+            include_str!("../tests/fixtures/task-snapshot-v1/merged-pr-stale-red-checks.json"),
+            include_str!("../tests/fixtures/task-snapshot-v1/operator-hold.json"),
+            include_str!("../tests/fixtures/task-snapshot-v1/unresolved-blocker.json"),
+            include_str!("../tests/fixtures/task-snapshot-v1/budget-exhaustion.json"),
+            include_str!(
+                "../tests/fixtures/task-snapshot-v1/dependency-terminal-noncompleted.json"
+            ),
+            include_str!("../tests/fixtures/task-snapshot-v1/missing-pr-branch.json"),
+            include_str!("../tests/fixtures/task-snapshot-v1/shadow-inflight-attempt.json"),
+            include_str!("../tests/fixtures/task-snapshot-v1/empty-aggregate-root.json"),
+            include_str!("../tests/fixtures/task-snapshot-v1/merge-group-sha-mismatch.json"),
+        ];
+        for fixture in fixtures {
+            let snapshot: TaskSnapshot = serde_json::from_str(fixture).unwrap();
+            assert_eq!(snapshot.schema_version, 1);
+            let encoded = serde_json::to_value(&snapshot).unwrap();
+            for required in [
+                "logical_time_ms",
+                "lifecycle",
+                "dependencies",
+                "children",
+                "attempts",
+                "observations",
+                "action_history",
+                "budget_usage",
+                "retry_schedule",
+                "delivery",
+                "merge_wait_due_at_ms",
+            ] {
+                assert!(encoded.get(required).is_some(), "missing {required}");
+            }
+            let decoded: TaskSnapshot = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, snapshot);
         }
-        assert_eq!(encoded["lifecycle"], serde_json::json!({"state":"open"}));
     }
 
     #[test]
