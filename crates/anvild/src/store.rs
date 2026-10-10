@@ -4,7 +4,7 @@
 //! use SQLite WAL for reader/writer concurrency and SQLite's writer lock for arbitration.
 //! FULL synchronous commits make accepted results durable before provisioning begins.
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -1114,7 +1114,7 @@ impl ControllerStore {
             if provenance == "agent"
                 || expires_at
                     .as_deref()
-                    .is_some_and(|deadline| deadline <= now)
+                    .is_some_and(|deadline| deadline <= now.as_str())
             {
                 continue;
             }
@@ -1289,19 +1289,22 @@ impl ControllerStore {
         )?;
         let dependencies: Vec<Value> = {
             let mut stmt=tx.prepare("SELECT predecessor_task_id,t.state FROM task_dependencies d JOIN tasks t ON t.task_id=d.predecessor_task_id WHERE d.successor_task_id=?1 ORDER BY d.predecessor_task_id")?;
-            stmt.query_map([task_id],|row|Ok(serde_json::json!({"task_id":row.get::<_,String>(0)?,"state":row.get::<_,String>(1)?})))?.collect::<Result<_,_>>()?
+            let rows = stmt.query_map([task_id],|row|Ok(serde_json::json!({"task_id":row.get::<_,String>(0)?,"state":row.get::<_,String>(1)?})))?.collect::<Result<_,_>>()?;
+            rows
         };
         let children: Vec<Value> = {
             let mut stmt=tx.prepare("SELECT task_id,state FROM tasks WHERE json_extract(payload_json,'$.parent_task_id')=?1 ORDER BY task_id LIMIT 256")?;
-            stmt.query_map([task_id],|row|Ok(serde_json::json!({"task_id":row.get::<_,String>(0)?,"state":row.get::<_,String>(1)?})))?.collect::<Result<_,_>>()?
+            let rows = stmt.query_map([task_id],|row|Ok(serde_json::json!({"task_id":row.get::<_,String>(0)?,"state":row.get::<_,String>(1)?})))?.collect::<Result<_,_>>()?;
+            rows
         };
         let attempts: Vec<Value> = {
             let mut stmt = tx.prepare(
                 "SELECT payload_json FROM attempts WHERE task_id=?1 ORDER BY ordinal DESC LIMIT 16",
             )?;
-            stmt.query_map([task_id], |row| row.get::<_, String>(0))?
+            let rows = stmt.query_map([task_id], |row| row.get::<_, String>(0))?
                 .map(|r| Ok(serde_json::from_str(&r?)?))
-                .collect::<Result<_, StoreError>>()?
+                .collect::<Result<_, StoreError>>()?;
+            rows
         };
         let active: Vec<Value> = attempts
             .iter()
@@ -1325,14 +1328,15 @@ impl ControllerStore {
         let blocker: Option<Value> = tx.query_row("SELECT json_object('id',blocker_id,'attempt_id',attempt_id,'question',question,'context',context,'version',version) FROM task_blockers WHERE task_id=?1 AND resolution_json IS NULL",[task_id],|row|row.get::<_,String>(0)).optional()?.map(|v|serde_json::from_str(&v)).transpose()?;
         let observations: Vec<Value> = {
             let mut stmt=tx.prepare("SELECT o.id,o.key,o.value_json,o.provenance,o.observed_at,o.recorded_at,o.version,o.collection_seq,o.expires_at FROM task_observation_current c JOIN task_observations o ON o.id=c.observation_id WHERE c.task_id=?1 ORDER BY o.key LIMIT 128")?;
-            stmt.query_map([task_id],|row|Ok(serde_json::json!({"id":row.get::<_,String>(0)?,"key":row.get::<_,String>(1)?,"value":serde_json::from_str::<Value>(&row.get::<_,String>(2)?).unwrap_or(Value::Null),"provenance":row.get::<_,String>(3)?,"observed_at":row.get::<_,String>(4)?,"recorded_at":row.get::<_,String>(5)?,"version":row.get::<_,i64>(6)?,"collection_seq":row.get::<_,i64>(7)?,"expires_at":row.get::<_,Option<String>>(8)?})))?.collect::<Result<_,_>>()?
+            let rows = stmt.query_map([task_id],|row|Ok(serde_json::json!({"id":row.get::<_,String>(0)?,"key":row.get::<_,String>(1)?,"value":serde_json::from_str::<Value>(&row.get::<_,String>(2)?).unwrap_or(Value::Null),"provenance":row.get::<_,String>(3)?,"observed_at":row.get::<_,String>(4)?,"recorded_at":row.get::<_,String>(5)?,"version":row.get::<_,i64>(6)?,"collection_seq":row.get::<_,i64>(7)?,"expires_at":row.get::<_,Option<String>>(8)?})))?.collect::<Result<_,_>>()?;
+            rows
         };
         let attempt_count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM attempts WHERE task_id=?1",
             [task_id],
             |row| row.get(0),
         )?;
-        let grants: Value=tx.query_row("SELECT json_object('attempts',COALESCE(SUM(additional_attempts),0),'continuations',COALESCE(SUM(additional_continuations),0),'ci_retries',COALESCE(SUM(additional_ci_retries),0),'execution_seconds',COALESCE(SUM(additional_execution_seconds),0)) FROM task_budget_grants WHERE task_id=?1",[task_id],|row|row.get::<_,String>(0))?;
+        let grants: String=tx.query_row("SELECT json_object('attempts',COALESCE(SUM(additional_attempts),0),'continuations',COALESCE(SUM(additional_continuations),0),'ci_retries',COALESCE(SUM(additional_ci_retries),0),'execution_seconds',COALESCE(SUM(additional_execution_seconds),0)) FROM task_budget_grants WHERE task_id=?1",[task_id],|row|row.get(0))?;
         let mode = control.2;
         let controller_mode = match mode.as_str() {
             "shadow" => "shadow",
@@ -1350,12 +1354,12 @@ impl ControllerStore {
             has_execution_target,
         );
         let snapshot = serde_json::json!({
-            "schema_version":1,"task_id":task_id,"task_version":control.0,"logical_time":logical_time,
-            "lifecycle":task["state"],"completion_policy":serde_json::from_str::<Value>(&control.4)?,
+            "schema_version":1,"task_id":task_id,"task_version":control.0,"logical_time_ms":logical_time,
+            "lifecycle":{"state":if matches!(task["state"].as_str(),Some("completed"|"canceled"|"obviated"|"superseded"|"failed_exhausted")) {"terminal"} else {"open"},"terminal":task["terminal"]},"completion_policy":serde_json::from_str::<Value>(&control.4)?,
             "operator_hold":control.1,"controller_mode":controller_mode,"reconcile_generation":control.3,
-            "execution_target":control.8.as_deref().map(serde_json::from_str::<Value>).transpose()? ,"delivery":{"branch":control.9,"pull_request":control.10,"head_sha":null},
-            "dependency_summary":{"predecessors":dependencies},"child_summary":{"children":children},
-            "active_attempts":active,"blocker":blocker,"current_observations":observations,
+            "execution_target":control.8.as_deref().map(serde_json::from_str::<Value>).transpose()? ,"delivery":{"work_branch":control.9,"pull_request":control.10,"base_revision":null,"pr_head_sha":null,"evaluation_sha":null,"evaluation_kind":null,"pr_state":null,"required_checks":[]},
+            "dependencies":{"all_completed":!dependencies_unresolved,"predecessors":dependencies},"children":{"total":children.len(),"completed":children.iter().filter(|c|c["state"]=="completed").count(),"terminal_noncompleted":children.iter().filter(|c|c["state"]!="completed"&&matches!(c["state"].as_str(),Some("canceled"|"obviated"|"superseded"|"failed_exhausted"))).count()},
+            "attempts":attempts,"blocker":blocker,"observations":observations,
             "action_history":{"recent":[]},"budget_usage":{"attempt_count":attempt_count,"grants":serde_json::from_str::<Value>(&grants)?,"spec":serde_json::from_str::<Value>(&control.5)?},
             "retry_schedule":{"due_at_ms":control.7},"verification_spec":serde_json::from_str::<Value>(&control.6)?,"phase":phase
         });
@@ -2433,7 +2437,12 @@ mod tests {
         assert_eq!(replay.task, first.task);
         let snapshot = store.task_snapshot("task-detached", 123).unwrap().unwrap();
         assert_eq!(snapshot["task_id"], "task-detached");
-        assert_eq!(snapshot["logical_time"], 123);
+        assert_eq!(snapshot["logical_time_ms"], 123);
+        assert!(snapshot.get("dependencies").is_some());
+        assert!(snapshot.get("children").is_some());
+        assert!(snapshot.get("attempts").is_some());
+        assert!(snapshot.get("observations").is_some());
+        assert!(snapshot.get("action_history").is_some());
         assert_eq!(snapshot["phase"], "runnable");
         drop(store);
         let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();

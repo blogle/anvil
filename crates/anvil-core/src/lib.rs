@@ -74,9 +74,12 @@ pub fn completion_policy_satisfied(
                 .iter()
                 .any(|trusted| trusted.observation().kind == *required)
         }),
-        CompletionPolicy::AllChildrenCompleted => children
-            .iter()
-            .all(|child| matches!(child, TaskTerminal::Completed { .. })),
+        CompletionPolicy::AllChildrenCompleted => {
+            !children.is_empty()
+                && children
+                    .iter()
+                    .all(|child| matches!(child, TaskTerminal::Completed { .. }))
+        }
         CompletionPolicy::Manual => evidence
             .iter()
             .any(|trusted| trusted.observation().kind == EvidenceKind::ManualCompletion),
@@ -192,23 +195,24 @@ pub struct TaskSnapshot {
     pub schema_version: u32,
     pub task_id: String,
     pub task_version: u64,
-    pub logical_time: i64,
-    pub lifecycle: String,
+    pub logical_time_ms: i64,
+    pub lifecycle: serde_json::Value,
     pub completion_policy: CompletionPolicy,
     pub operator_hold: bool,
     pub controller_mode: ControllerMode,
     pub reconcile_generation: u64,
     pub execution_target: Option<serde_json::Value>,
     pub delivery: Option<serde_json::Value>,
-    pub dependency_summary: serde_json::Value,
-    pub child_summary: serde_json::Value,
-    pub active_attempts: Vec<serde_json::Value>,
+    pub dependencies: serde_json::Value,
+    pub children: serde_json::Value,
+    pub attempts: Vec<serde_json::Value>,
     pub blocker: Option<serde_json::Value>,
-    pub current_observations: Vec<serde_json::Value>,
+    pub observations: Vec<serde_json::Value>,
     pub action_history: serde_json::Value,
     pub budget_usage: serde_json::Value,
     pub retry_schedule: serde_json::Value,
     pub phase: String,
+    pub merge_wait_due_at_ms: Option<i64>,
 }
 
 /// Coarse snapshot phase. This function deliberately performs no I/O.
@@ -850,6 +854,25 @@ pub fn parse_preview_hostname(hostname: &str, base_domain: &str) -> Option<(Sess
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregate_completion_requires_declared_children_and_all_completed() {
+        let policy = CompletionPolicy::AllChildrenCompleted;
+        assert!(!completion_policy_satisfied(&policy, &[], &[]));
+        assert!(!completion_policy_satisfied(
+            &policy,
+            &[],
+            &[TaskTerminal::Canceled {
+                actor: "operator".into(),
+                reason: "not complete".into(),
+            }]
+        ));
+        assert!(completion_policy_satisfied(
+            &policy,
+            &[],
+            &[TaskTerminal::Completed { evidence: vec![] }]
+        ));
+    }
 
     #[test]
     fn agent_observations_cannot_become_trusted_completion_evidence() {
