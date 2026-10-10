@@ -129,7 +129,7 @@ kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-dae
   case "$config" in *"build-users-group = nixbld"*) ;; *) exit 1 ;; esac
   case "$config" in *filter-syscalls*false*) exit 1 ;; esac
   nix store info >/dev/null
-  for path in /nix/var /nix/var/nix /nix/var/nix/builds; do
+  for path in /nix /nix/var /nix/var/nix /nix/var/nix/builds; do
     printf "%s: " "$path"
     stat -c "%u:%g:%a" "$path"
     test "$(stat -c "%u:%g:%a" "$path")" = 0:0:755
@@ -181,7 +181,6 @@ jq -n \
       podTemplate:{
         metadata:{labels:{"app.kubernetes.io/managed-by":"anvil","app.kubernetes.io/name":"sandbox"}},
         spec:{
-          securityContext:{fsGroup:1000},
           initContainers:[{
             name:"prepare-workspace",
             image:$image,
@@ -271,12 +270,24 @@ api_b_name="anvil-$api_b_id"
 for name in "$api_a_name" "$api_b_name"; do
   kubectl --kubeconfig "$kubeconfig" -n "$namespace" get sandbox "$name" -o json | jq -e '
     .spec.podTemplate.spec as $pod |
+    ($pod.securityContext.fsGroup == null) and
     any($pod.volumes[]; .name == "shared-nix" and .persistentVolumeClaim.claimName == "anvil-nix-shared" and (.persistentVolumeClaim | has("readOnly") | not)) and
     ([$pod.containers[] | select(.name == "sandbox") | .volumeMounts[] | select(.name == "shared-nix")] | length == 2 and
       all(.[]; .readOnly == true and ((.mountPath == "/nix/store" and .subPath == "store") or (.mountPath == "/nix/var/nix/daemon-socket" and .subPath == "var/nix/daemon-socket"))))' >/dev/null
 done
 api_a_pod="$(wait_for_sandbox_pod "$api_a_name")"
 api_b_pod="$(wait_for_sandbox_pod "$api_b_name")"
+assert_nix_metadata() {
+  kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c '
+    for path in /nix /nix/var /nix/var/nix /nix/var/nix/builds; do
+      test "$(stat -c "%u:%g:%a" "$path")" = 0:0:755 || {
+        printf "protected Nix metadata changed: %s is %s\\n" "$path" "$(stat -c "%u:%g:%a" "$path")" >&2
+        exit 1
+      }
+    done
+  '
+}
+assert_nix_metadata
 agent_exec() {
   local pod="$1"
   shift
@@ -285,6 +296,9 @@ agent_exec() {
 }
 agent_exec "$api_a_pod" /bin/bash -c '
   test "$(id -u):$(id -g)" = 1000:1000
+  test -w /home/anvil/workspace/anvil
+  test -r /anvil/profile/config/opencode.jsonc
+  test -w /anvil/profile/auth
   ! touch /nix/store/anvil-must-not-write
   ! pgrep -x nix-daemon
   nix store info >/dev/null
@@ -299,6 +313,15 @@ directory_source_path="$(agent_exec "$api_b_pod" /bin/bash -lc '
   nix build --no-link --print-out-paths .#shared-nix-directory-source-smoke
 ')"
 agent_exec "$api_b_pod" /bin/bash -c 'test "$(cat "$1/fixture.txt")" = "directory source passed through the shared Nix daemon"' -- "$directory_source_path"
+fresh_sandbox_build() {
+  local pod="$1" name="$2" bash_path command_literal output
+  bash_path="$(agent_exec "$pod" readlink -f /bin/bash)"
+  command_literal="$(jq -Rn --arg value 'mkdir -p source; printf fresh-build > source/input; chmod 0700 source; chmod 0755 source; cp source/input "$out"' '$value')"
+  output="$(agent_exec "$pod" nix build --no-link --print-out-paths --impure --expr "derivation { name = \"$name\"; system = builtins.currentSystem; builder = \"$bash_path\"; args = [ \"-c\" $command_literal ]; }")"
+  [[ "$output" = /nix/store/* ]]
+  agent_exec "$pod" /bin/bash -c 'test "$(cat "$1")" = fresh-build' -- "$output"
+}
+fresh_sandbox_build "$api_b_pod" "anvil-lifecycle-before-remove-${cluster}"
 if agent_exec "$api_b_pod" nix path-info "$upgrade_canary" >/dev/null 2>&1; then
   printf 'upgrade canary was unexpectedly present in the original baseline\n' >&2
   exit 1
@@ -307,6 +330,8 @@ curl -fsS -X DELETE "http://127.0.0.1:18080/v1/sessions/$api_a_id" >/dev/null
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" wait --for=delete "sandbox/$api_a_name" --timeout=120s
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" wait --for=delete "pod/$api_a_pod" --timeout=120s
 agent_exec "$api_b_pod" nix path-info "$shared_path" >/dev/null
+assert_nix_metadata
+fresh_sandbox_build "$api_b_pod" "anvil-lifecycle-after-remove-${cluster}"
 opencode_session="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- \
   curl -fsS -X POST http://127.0.0.1:4096/session -H 'content-type: application/json' -d '{}' | jq -r .id)"
 test -n "$opencode_session"
@@ -355,22 +380,19 @@ while (( SECONDS < deadline )); do
 done
 test -n "$pod_name"
 
-# Recreate the old persistent-PVC state before restarting the daemon. The init
-# container must remove setgid rather than relying on a fresh volume.
-kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c '
-  chmod 2775 /nix/var /nix/var/nix /nix/var/nix/builds
-  test "$(stat -c "%u:%g:%a" /nix/var/nix/builds)" = 0:0:2775
-'
+# Sandbox lifecycle above must leave the daemon's protected metadata alone.
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout restart deployment/anvil-nix-daemon
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-nix-daemon --timeout=300s
+assert_nix_metadata
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c '
-  for path in /nix/var /nix/var/nix /nix/var/nix/builds; do
+  for path in /nix /nix/var /nix/var/nix /nix/var/nix/builds; do
     printf "%s: " "$path"
     stat -c "%u:%g:%a" "$path"
     test "$(stat -c "%u:%g:%a" "$path")" = 0:0:755
   done
 '
 agent_exec "$api_b_pod" /bin/bash -c 'nix store info >/dev/null && test "$(cat "$1")" = kind-shared && nix path-info "$1" >/dev/null' -- "$shared_path"
+fresh_sandbox_build "$api_b_pod" "anvil-lifecycle-after-daemon-restart-${cluster}"
 
 # Upgrade the baseline on the populated PVC; registration must merge into the
 # existing DB without losing the derivation previously built by sandbox A.
@@ -391,6 +413,7 @@ api_c_name="anvil-$api_c_id"
 api_c_pod="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get endpoints "$api_c_name" -o json | jq -r '[.subsets[]?.addresses[]?.targetRef.name][0] // empty')"
 test -n "$api_c_pod"
 agent_exec "$api_c_pod" /bin/bash -c 'nix store info >/dev/null && nix path-info "$1" >/dev/null && nix path-info "$2" >/dev/null' -- "$shared_path" "$upgrade_canary"
+fresh_sandbox_build "$api_c_pod" "anvil-lifecycle-new-sandbox-${cluster}"
 # Rust checks are owned by the parallel local-first lane. Keep this narrowly
 # scoped smoke because it proves the sandbox can enter a Nix shell through the
 # shared daemon without reseeding the full Cargo development environment.

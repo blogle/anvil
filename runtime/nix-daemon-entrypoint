@@ -2,22 +2,32 @@
 set -euo pipefail
 
 if [ "${1:-}" = --bootstrap ]; then
-  # Kind's local-path provisioner creates volume roots world-writable; Nix
-  # refuses to execute builds unless every component of /nix is secure.
-  chmod 0755 /shared-nix
   # The image's initialized DB and complete sandbox closure live in /nix;
   # mounting the PVC at /shared-nix leaves this baseline visible for import.
   state=/shared-nix/var/nix
   complete="$state/.anvil-bootstrap-complete"
   cold_attempt="$state/.anvil-cold-in-progress"
   staging_dir=/shared-nix/.anvil-import
-  normalize_build_state() {
-    mkdir -p /shared-nix/var "$state/builds"
-    chown root:root /shared-nix/var "$state" "$state/builds"
-    chmod 0755 /shared-nix/var "$state" "$state/builds"
-    chmod u-s,g-s /shared-nix/var "$state" "$state/builds"
+  require_secure_build_state() {
+    local path actual
+    for path in /shared-nix /shared-nix/var "$state" "$state/builds"; do
+      actual="$(stat -c '%u:%g:%a' "$path")"
+      if [ "$actual" != 0:0:755 ]; then
+        printf 'Nix PVC has unsafe build metadata: %s is %s (expected 0:0:755); run the documented one-time recovery before starting the daemon\n' \
+          "$path" "$actual" >&2
+        return 1
+      fi
+    done
   }
-  mkdir -p /shared-nix/store "$state"
+  umask 022
+  mkdir -p /shared-nix/store /shared-nix/var "$state/builds"
+  # Kind's local-path provisioner can create a world-writable volume root.
+  # Secure only a truly uninitialized PVC; populated PVC metadata is checked,
+  # never repaired as a side effect of an application restart.
+  if [ ! -e "$complete" ] && [ ! -s "$state/db/db.sqlite" ]; then
+    chmod 0755 /shared-nix
+  fi
+  require_secure_build_state
   # A previous init may have been interrupted while copying a store path.
   # This private staging area never contains authoritative store paths.
   rm -rf "$staging_dir"
@@ -68,7 +78,6 @@ if [ "${1:-}" = --bootstrap ]; then
       rm "$pending"
     fi
   fi
-  normalize_build_state
   # Keep all baseline image paths alive, including the tools needed to start
   # future containers, even if other sandboxes run nix store gc.
   mkdir -p "$state/gcroots/anvil-baseline"
@@ -84,10 +93,21 @@ if [ "${1:-}" = --bootstrap ]; then
   exit 0
 fi
 
+require_secure_build_state() {
+  local path actual
+  for path in /nix /nix/var /nix/var/nix /nix/var/nix/builds; do
+    actual="$(stat -c '%u:%g:%a' "$path")"
+    if [ "$actual" != 0:0:755 ]; then
+      printf 'Nix PVC has unsafe build metadata: %s is %s (expected 0:0:755); refusing to repair shared state at daemon startup\n' \
+        "$path" "$actual" >&2
+      return 1
+    fi
+  done
+}
+
+umask 022
 mkdir -p /nix/var /nix/var/nix /nix/var/nix/builds /nix/var/nix/daemon-socket
-chown root:root /nix/var /nix/var/nix /nix/var/nix/builds
-chmod 0755 /nix/var /nix/var/nix /nix/var/nix/builds
-chmod u-s,g-s /nix/var /nix/var/nix /nix/var/nix/builds
+require_secure_build_state
 rm -f /nix/var/nix/daemon-socket/socket
 nix_daemon_pid=''
 forward_signal() {
@@ -107,7 +127,5 @@ for _ in {1..100}; do
   fi
   sleep 0.1
 done
-chown root:root /nix/var /nix/var/nix /nix/var/nix/builds
-chmod 0755 /nix/var /nix/var/nix /nix/var/nix/builds
-chmod u-s,g-s /nix/var /nix/var/nix /nix/var/nix/builds
+require_secure_build_state
 wait "$nix_daemon_pid"

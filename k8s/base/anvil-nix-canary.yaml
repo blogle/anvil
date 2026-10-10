@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: anvil-nix-canary
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 180
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          restartPolicy: Never
+          containers:
+            - name: builder-canary
+              image: ghcr.io/blogle/anvil-nix-daemon:main
+              imagePullPolicy: Always
+              command: [/bin/anvil-nix-deployment-canary]
+              env:
+                - name: NIX_REMOTE
+                  value: daemon
+              volumeMounts:
+                - name: nix
+                  mountPath: /nix
+                  # The daemon mounts this RWO ext4 ZVOL read-write. Keep CSI
+                  # publication writable and make only this container mount RO.
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+          volumes:
+            - name: nix
+              persistentVolumeClaim:
+                claimName: anvil-nix-shared

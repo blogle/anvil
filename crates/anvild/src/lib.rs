@@ -87,6 +87,9 @@ const LOGIN_TTL: Duration = Duration::from_secs(10 * 60);
 const RUNTIME_LAYOUT: &str = "v2";
 
 fn shared_nix_volume(pvc: &str) -> Value {
+    // Keep the PVC publish writable so OpenEBS can share its ext4 ZVOL with the
+    // daemon. Only the sandbox's subPath mounts are read-only. Omitting fsGroup
+    // prevents kubelet from recursively changing ownership on the shared PVC.
     json!({"name":"shared-nix","persistentVolumeClaim":{"claimName":pvc}})
 }
 
@@ -107,7 +110,7 @@ fn sandbox_manifest(
     env: Vec<Value>,
 ) -> Value {
     let container = json!({"name":"sandbox","image":config.image,"ports":[{"name":"opencode","containerPort":config.opencode_port}],"env":env,"volumeMounts":[{"name":"workspace","mountPath":"/home/anvil"},{"name":"shared-profile","mountPath":"/anvil/profile"},shared_nix_store_mount(),shared_nix_socket_mount()]});
-    json!({"apiVersion":"agents.x-k8s.io/v1beta1","kind":"Sandbox","metadata":{"name":name,"namespace":config.namespace,"labels":labels,"annotations":annotations},"spec":{"service":true,"podTemplate":{"spec":{"securityContext":{"fsGroup":1000},"initContainers":[workspace_init],"containers":[container],"volumes":[{"name":"shared-profile","persistentVolumeClaim":{"claimName":config.profile_pvc}},shared_nix_volume(&config.nix_pvc)]}},"volumeClaimTemplates":[{"metadata":{"name":"workspace"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":config.workspace_size}}}}]}})
+    json!({"apiVersion":"agents.x-k8s.io/v1beta1","kind":"Sandbox","metadata":{"name":name,"namespace":config.namespace,"labels":labels,"annotations":annotations},"spec":{"service":true,"podTemplate":{"spec":{"initContainers":[workspace_init],"containers":[container],"volumes":[{"name":"shared-profile","persistentVolumeClaim":{"claimName":config.profile_pvc}},shared_nix_volume(&config.nix_pvc)]}},"volumeClaimTemplates":[{"metadata":{"name":"workspace"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":config.workspace_size}}}}]}})
 }
 
 #[derive(Debug, Clone)]
@@ -8241,7 +8244,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_sandbox_publishes_shared_nix_rw_with_read_only_mounts() {
+    fn generated_sandbox_publishes_shared_nix_read_only_without_fs_group() {
         let mut config = config("http://profile".into());
         config.nix_pvc = "configured-nix-pvc".into();
         let state = RunRecord::submitted(
@@ -8267,6 +8270,10 @@ mod tests {
             .all(Value::is_string));
         let spec = &manifest["spec"]["podTemplate"]["spec"];
         assert_eq!(spec["volumes"][1], shared_nix_volume("configured-nix-pvc"));
+        assert!(spec
+            .get("securityContext")
+            .and_then(|context| context.get("fsGroup"))
+            .is_none());
         let mounts = spec["containers"][0]["volumeMounts"].as_array().unwrap();
         assert!(mounts.contains(&shared_nix_store_mount()));
         assert!(mounts.contains(&shared_nix_socket_mount()));
