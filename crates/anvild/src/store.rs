@@ -1358,7 +1358,34 @@ impl ControllerStore {
                 None,
             )?;
         }
+        hit_task_store_failpoint("legacy_scheduler.after_evidence_before_terminal")?;
         self.complete_task(task_id, expected_version, &[observation_id])
+    }
+
+    pub fn legacy_completion_candidates(&self) -> Result<Vec<(String, String, u64)>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let mut statement = connection.prepare(
+            "SELECT t.task_id,a.attempt_id,d.version
+             FROM tasks t
+             JOIN task_durable_state d USING(task_id)
+             JOIN attempts a ON a.task_id=t.task_id
+             WHERE d.controller_mode='legacy' AND t.state NOT IN ('completed','canceled','obviated','superseded','failed_exhausted')
+               AND json_extract(a.payload_json,'$.state')='completed'
+               AND json_extract(d.completion_policy_json,'$.kind')='evidence'
+               AND EXISTS(SELECT 1 FROM json_each(d.completion_policy_json,'$.required_kinds') e WHERE e.value='legacy_scheduler_exit')
+             ORDER BY t.task_id,a.ordinal",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+            ))
+        })?;
+        rows.collect::<Result<_, _>>().map_err(StoreError::from)
     }
 
     /// Persist a typed non-success terminal before any best-effort runtime shutdown.
@@ -3060,6 +3087,9 @@ mod tests {
             "task.terminal.before_commit" => "task.terminal.before_commit",
             "blocker.create.before_commit" => "blocker.create.before_commit",
             "blocker.resolve.before_commit" => "blocker.resolve.before_commit",
+            "legacy_scheduler.after_evidence_before_terminal" => {
+                "legacy_scheduler.after_evidence_before_terminal"
+            }
             _ => panic!("unknown crash point: {point}"),
         };
         let path = std::env::var("ANVIL_TASK_CRASH_DB").unwrap();
@@ -3112,6 +3142,13 @@ mod tests {
                     3,
                     "operator",
                     "answer",
+                );
+            }
+            "legacy_scheduler.after_evidence_before_terminal" => {
+                let _ = store.complete_legacy_scheduler_attempt(
+                    "crash-legacy-task",
+                    "crash-legacy-attempt",
+                    2,
                 );
             }
             _ => unreachable!(),
@@ -3207,6 +3244,26 @@ mod tests {
                 "c",
             )
             .unwrap();
+        let legacy_spec = serde_json::json!({"outcome":"legacy recovery","completion_policy":{"kind":"evidence","required_kinds":["legacy_scheduler_exit"]}});
+        store
+            .accept_task(
+                "seed-legacy",
+                "test",
+                &legacy_spec,
+                "crash-legacy-task",
+                &legacy_spec,
+            )
+            .unwrap();
+        store
+            .create_attempt(
+                "crash-legacy-task",
+                "crash-legacy-attempt",
+                "seed-legacy-attempt",
+            )
+            .unwrap();
+        store
+            .set_attempt_state("crash-legacy-attempt", "completed")
+            .unwrap();
         drop(store);
 
         for point in [
@@ -3216,6 +3273,7 @@ mod tests {
             "task.terminal.before_commit",
             "blocker.create.before_commit",
             "blocker.resolve.before_commit",
+            "legacy_scheduler.after_evidence_before_terminal",
         ] {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
@@ -3266,6 +3324,27 @@ mod tests {
                     .unwrap()
                     .unwrap()["blocker"]
                     .is_object()),
+                "legacy_scheduler.after_evidence_before_terminal" => {
+                    assert_eq!(
+                        reopened
+                            .get_resource("task", "crash-legacy-task")
+                            .unwrap()
+                            .unwrap()["state"],
+                        "open"
+                    );
+                    let (task_id, attempt_id, version) = reopened
+                        .legacy_completion_candidates()
+                        .unwrap()
+                        .into_iter()
+                        .find(|(task_id, _, _)| task_id == "crash-legacy-task")
+                        .unwrap();
+                    assert_eq!(
+                        reopened
+                            .complete_legacy_scheduler_attempt(&task_id, &attempt_id, version)
+                            .unwrap()["state"],
+                        "completed"
+                    );
+                }
                 _ => unreachable!(),
             }
         }
@@ -3470,6 +3549,74 @@ mod tests {
             store.task_control("blocked-task").unwrap().unwrap()["version"],
             4
         );
+    }
+
+    #[test]
+    fn concurrent_attempt_and_blocker_claims_are_database_arbitrated() {
+        let (directory, store) = store();
+        let task = serde_json::json!({"outcome":"concurrent claims"});
+        store
+            .accept_task("concurrent-key", "test", &task, "concurrent-task", &task)
+            .unwrap();
+        let left = ControllerStore::open(directory.path().join("controller.sqlite3")).unwrap();
+        let right = ControllerStore::open(directory.path().join("controller.sqlite3")).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let left_barrier = barrier.clone();
+        let left_claim = std::thread::spawn(move || {
+            left_barrier.wait();
+            left.create_attempt("concurrent-task", "attempt-left", "attempt-left-key")
+        });
+        let right_barrier = barrier.clone();
+        let right_claim = std::thread::spawn(move || {
+            right_barrier.wait();
+            right.create_attempt("concurrent-task", "attempt-right", "attempt-right-key")
+        });
+        let attempt_results = [left_claim.join().unwrap(), right_claim.join().unwrap()];
+        assert_eq!(
+            attempt_results
+                .iter()
+                .filter(|result| result.is_ok())
+                .count(),
+            1
+        );
+        assert_eq!(store.attempts_for_task("concurrent-task").unwrap().len(), 1);
+
+        let active = store
+            .attempts_for_task("concurrent-task")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let attempt_id = active["attempt_id"].as_str().unwrap().to_owned();
+        store
+            .bind_attempt_session(&attempt_id, "concurrent-session")
+            .unwrap();
+        let version = store.task_control("concurrent-task").unwrap().unwrap()["version"]
+            .as_u64()
+            .unwrap();
+        let left = ControllerStore::open(directory.path().join("controller.sqlite3")).unwrap();
+        let right = ControllerStore::open(directory.path().join("controller.sqlite3")).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let left_barrier = barrier.clone();
+        let left_id = attempt_id.clone();
+        let left_claim = std::thread::spawn(move || {
+            left_barrier.wait();
+            left.create_attempt_blocker(&left_id, "concurrent-session", version, "q1", "c1")
+        });
+        let right_barrier = barrier.clone();
+        let right_id = attempt_id.clone();
+        let right_claim = std::thread::spawn(move || {
+            right_barrier.wait();
+            right.create_attempt_blocker(&right_id, "concurrent-session", version, "q2", "c2")
+        });
+        let blocker_results = [left_claim.join().unwrap(), right_claim.join().unwrap()];
+        assert_eq!(
+            blocker_results
+                .iter()
+                .filter(|result| result.is_ok())
+                .count(),
+            1
+        );
+        assert!(store.task_snapshot("concurrent-task", 0).unwrap().unwrap()["blocker"].is_object());
     }
 
     #[test]

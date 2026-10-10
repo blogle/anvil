@@ -2918,6 +2918,16 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
     let store = state
         .store()
         .map_err(|error| ServiceError::Store(error.into()))?;
+    // Recover a crash after the Legacy scheduler observed a completed turn and
+    // persisted its bridge evidence but before the Task terminal CAS committed.
+    for (task_id, attempt_id, version) in store
+        .legacy_completion_candidates()
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+    {
+        store
+            .complete_legacy_scheduler_attempt(&task_id, &attempt_id, version)
+            .map_err(|error| ServiceError::Store(error.to_string()))?;
+    }
     // Observe authoritative backend lifecycle state before claiming dependent work.
     for active in store
         .active_attempts()

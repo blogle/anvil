@@ -254,10 +254,6 @@ async fn responses(
     }
     if tool_count == 0 {
         let value = response_text("I will inspect and update the fixture file.", &request);
-        eprintln!("deterministic title/text response: {}", value);
-        if is_title_generation {
-            return Json(value).into_response();
-        }
         return if stream {
             response_sse(&value)
         } else {
@@ -409,7 +405,7 @@ mod tests {
         .expect("title completion must not block the E2E worker turn");
         assert_eq!(
             response.headers()[axum::http::header::CONTENT_TYPE],
-            "application/json"
+            "text/event-stream"
         );
     }
 
