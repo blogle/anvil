@@ -592,15 +592,18 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
 
 fn completion_satisfied(s: &TaskSnapshot) -> bool {
     match &s.completion_policy {
-        Some(CompletionPolicy::Evidence { required_kinds }) => required_kinds.iter().all(|kind| {
-            s.completion_evidence.iter().any(|evidence| {
-                evidence.kind == *kind
-                    && evidence.fresh
-                    && evidence.trusted
-                    && evidence.provenance != ObservationProvenance::Agent
-                    && completion_evidence_matches_binding(s, evidence)
-            })
-        }),
+        Some(CompletionPolicy::Evidence { required_kinds }) => {
+            !required_kinds.is_empty()
+                && required_kinds.iter().all(|kind| {
+                    s.completion_evidence.iter().any(|evidence| {
+                        evidence.kind == *kind
+                            && evidence.fresh
+                            && evidence.trusted
+                            && evidence.provenance != ObservationProvenance::Agent
+                            && completion_evidence_matches_binding(s, evidence)
+                    })
+                })
+        }
         Some(CompletionPolicy::AllChildrenCompleted) => {
             s.child_count > 0
                 && s.children_completed == s.child_count
@@ -621,6 +624,14 @@ fn completion_evidence_matches_binding(
     snapshot: &TaskSnapshot,
     evidence: &CompletionEvidence,
 ) -> bool {
+    if evidence.kind == "delivery_complete"
+        && snapshot
+            .delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.pr_state.is_some() && !delivery.pr_merged)
+    {
+        return false;
+    }
     match snapshot
         .delivery
         .as_ref()
@@ -1910,6 +1921,35 @@ mod tests {
         s.delivery.as_mut().unwrap().pr_head_sha = Some("head-2".into());
         assert_ne!(
             reconcile(&s, LogicalTime(1)).rule_id,
+            "completion_satisfied"
+        );
+    }
+    #[test]
+    fn unmerged_pull_request_cannot_satisfy_delivery_complete() {
+        let mut s = snap();
+        s.delivery = Some(Delivery {
+            work_branch: Some("anvil/task_demo".into()),
+            base_revision: Some("base".into()),
+            pr_head_sha: Some("head".into()),
+            evaluation_sha: Some("head".into()),
+            evaluation_kind: Some(EvaluationKind::Head),
+            pr_state: Some("open".into()),
+            check_policy_known: true,
+            unexpected_force_push: false,
+            changes_requested: false,
+            merge_conflict: false,
+            pr_merged: false,
+            required_checks: vec![],
+        });
+        s.completion_evidence.push(CompletionEvidence {
+            kind: "delivery_complete".into(),
+            provenance: ObservationProvenance::External,
+            fresh: true,
+            trusted: true,
+            subject_sha: Some("head".into()),
+        });
+        assert_ne!(
+            reconcile(&s, LogicalTime(0)).rule_id,
             "completion_satisfied"
         );
     }
