@@ -94,6 +94,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "anvil-github-observer"
+version = "0.1.0"
+dependencies = [
+ "anvil-reconcile",
+ "httpmock",
+ "reqwest",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "anvil-mcp"
 version = "0.1.0"
 dependencies = [
