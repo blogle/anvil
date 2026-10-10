@@ -1,6 +1,9 @@
 { pkgs, craneLib, opencode, nix2containerPkgs, repoRoot }:
 
 let
+  browserFontsConf = pkgs.makeFontsConf {
+    fontDirectories = [ pkgs.dejavu_fonts ];
+  };
   # Keep the Cargo source filter here so the root flake only wires modules
   # together.  The web application is part of the Rust build input.
   src = pkgs.lib.cleanSourceWith {
@@ -122,9 +125,12 @@ let
       pkgs.gh pkgs.curl pkgs.jq pkgs.kubectl pkgs.kustomize pkgs.nix pkgs.nodejs
       pkgs.process-compose pkgs.watchexec nix2containerPkgs.skopeo-nix2container pkgs.umoci pkgs.crun pkgs.kind pkgs.util-linux
       opencode.packages.${pkgs.system}.default
-    ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.chromium ];
+    ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+      pkgs.chromium pkgs.fontconfig pkgs.dejavu_fonts
+    ];
     shellHook = ''
       export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$PWD/target}"
+      export FONTCONFIG_FILE="${browserFontsConf}"
       if [ -z "''${CARGO_HOME:-}" ]; then
         export CARGO_HOME="$CARGO_TARGET_DIR/.cargo-home"
         mkdir -p "$CARGO_HOME"

@@ -301,8 +301,6 @@ pub fn derive_task_phase(
         "running"
     } else if lifecycle == "queued" || (lifecycle == "open" && has_execution_target) {
         "runnable"
-    } else if lifecycle == "open" {
-        "waiting"
     } else {
         "waiting"
     }

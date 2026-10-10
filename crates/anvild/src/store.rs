@@ -3,8 +3,8 @@
 //! A store handle serializes its own operations with a mutex; separate handles/processes
 //! use SQLite WAL for reader/writer concurrency and SQLite's writer lock for arbitration.
 //! FULL synchronous commits make accepted results durable before provisioning begins.
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use serde_json::{Value, json};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -16,6 +16,19 @@ use thiserror::Error;
 pub mod scheduler;
 
 const CANONICALIZATION_VERSION: i64 = 1;
+type TaskControlRow = (
+    i64,
+    bool,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -538,12 +551,10 @@ impl ControllerStore {
             .collect();
         if !suppressed.is_empty() {
             accepted_batch["queued_count"] = serde_json::json!(new_tasks.len());
-            accepted_batch["runnable_count"] = serde_json::json!(
-                new_tasks
-                    .iter()
-                    .filter(|(_, task)| task["dependencies"].as_array().is_none_or(Vec::is_empty))
-                    .count()
-            );
+            accepted_batch["runnable_count"] = serde_json::json!(new_tasks
+                .iter()
+                .filter(|(_, task)| task["dependencies"].as_array().is_none_or(Vec::is_empty))
+                .count());
             if let Some(ids) = accepted_batch
                 .get_mut("accepted_task_ids")
                 .and_then(Value::as_array_mut)
@@ -1005,6 +1016,7 @@ impl ControllerStore {
 
     /// Persist a collected fact. Arrival order cannot let an older in-flight
     /// collection replace the current value; same-sequence disagreement is invalid.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_observation(
         &self,
         observation_id: &str,
@@ -1283,7 +1295,7 @@ impl ControllerStore {
             return Ok(None);
         };
         let task: Value = serde_json::from_str(&task_json)?;
-        let control: (i64,bool,String,i64,String,String,String,Option<i64>,Option<String>,Option<String>,Option<String>) = tx.query_row(
+        let control: TaskControlRow = tx.query_row(
             "SELECT version,operator_hold,controller_mode,reconcile_generation,completion_policy_json,budget_json,verification_spec_json,retry_due_ms,execution_target_json,work_branch,pull_request_binding_json FROM task_durable_state WHERE task_id=?1",
             [task_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?)),
         )?;
@@ -1301,7 +1313,8 @@ impl ControllerStore {
             let mut stmt = tx.prepare(
                 "SELECT payload_json FROM attempts WHERE task_id=?1 ORDER BY ordinal DESC LIMIT 16",
             )?;
-            let rows = stmt.query_map([task_id], |row| row.get::<_, String>(0))?
+            let rows = stmt
+                .query_map([task_id], |row| row.get::<_, String>(0))?
                 .map(|r| Ok(serde_json::from_str(&r?)?))
                 .collect::<Result<_, StoreError>>()?;
             rows
@@ -1377,7 +1390,8 @@ impl ControllerStore {
             "action_history":{"recent":[]},"budget_usage":{"attempt_count":attempt_count,"grants":serde_json::from_str::<Value>(&grants)?,"spec":serde_json::from_str::<Value>(&control.5)?},
             "retry_schedule":{"due_at_ms":control.7},"verification_spec":serde_json::from_str::<Value>(&control.6)?,"phase":phase
         });
-        snapshot["action_history"] = serde_json::json!({"relevant": [], "continuation_fingerprints_sent": []});
+        snapshot["action_history"] =
+            serde_json::json!({"relevant": [], "continuation_fingerprints_sent": []});
         snapshot["budget_usage"] = serde_json::json!({
             "attempts": attempt_count,
             "continuations_by_reason": {},
@@ -1439,6 +1453,7 @@ impl ControllerStore {
         Ok(expected_version + 1)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn grant_task_budget(
         &self,
         task_id: &str,
@@ -2438,11 +2453,26 @@ mod tests {
             Err(StoreError::Conflict)
         ));
         let snapshot = store.task_snapshot("grant-me", 42).unwrap().unwrap();
-        assert_eq!(snapshot["budget_usage"]["grants"].as_array().unwrap().len(), 1);
-        assert_eq!(snapshot["budget_usage"]["grants"][0]["additional_attempts"], 2);
-        assert_eq!(snapshot["budget_usage"]["grants"][0]["additional_continuations"], 1);
-        assert_eq!(snapshot["budget_usage"]["grants"][0]["additional_ci_retries"], 3);
-        assert_eq!(snapshot["budget_usage"]["grants"][0]["additional_execution_seconds"], 900);
+        assert_eq!(
+            snapshot["budget_usage"]["grants"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            snapshot["budget_usage"]["grants"][0]["additional_attempts"],
+            2
+        );
+        assert_eq!(
+            snapshot["budget_usage"]["grants"][0]["additional_continuations"],
+            1
+        );
+        assert_eq!(
+            snapshot["budget_usage"]["grants"][0]["additional_ci_retries"],
+            3
+        );
+        assert_eq!(
+            snapshot["budget_usage"]["grants"][0]["additional_execution_seconds"],
+            900
+        );
     }
 
     #[test]
@@ -2556,7 +2586,7 @@ mod tests {
             )
             .unwrap();
         let snapshot = store.task_snapshot("observed", 0).unwrap().unwrap();
-        assert_eq!(snapshot["current_observations"][0]["value"]["sha"], "new");
+        assert_eq!(snapshot["observations"][0]["value"]["sha"], "new");
         assert!(matches!(
             store.record_observation(
                 "conflict",
@@ -2778,6 +2808,11 @@ mod tests {
             first_replay.attempt["attempt_id"],
             first.attempt["attempt_id"]
         );
+        assert!(matches!(
+            store.create_attempt("logical-task", "attempt-conflict", "attempt-key-conflict"),
+            Err(StoreError::Sqlite(_))
+        ));
+        store.set_attempt_state("attempt-1", "ended").unwrap();
         let second = store
             .create_attempt("logical-task", "attempt-2", "attempt-key-2")
             .unwrap();

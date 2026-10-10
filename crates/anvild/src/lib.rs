@@ -7391,6 +7391,10 @@ mod tests {
             .unwrap();
             assert_eq!(body["ordinal"], ordinal);
             if ordinal == 1 {
+                let task_store = store::ControllerStore::open(config.store_path.clone()).unwrap();
+                task_store
+                    .set_attempt_state(body["attempt_id"].as_str().unwrap(), "ended")
+                    .unwrap();
                 let retry = app
                     .clone()
                     .oneshot(
@@ -7464,8 +7468,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(conflict_attempt.status(), StatusCode::CONFLICT);
-        let attempt_id = attempts["attempts"][0]["attempt_id"].as_str().unwrap();
-        assert_eq!(attempts["attempts"][0]["state"], "queued");
+        let live_attempt = attempts["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|attempt| attempt["lifecycle"] != "ended")
+            .expect("one live implementation attempt remains");
+        assert_eq!(
+            attempts["attempts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|attempt| attempt["state"] == "ended")
+                .count(),
+            1
+        );
+        let attempt_id = live_attempt["attempt_id"].as_str().unwrap();
         let get_attempt = app
             .clone()
             .oneshot(
@@ -7583,10 +7601,11 @@ mod tests {
             attempts_after_restart["attempts"].as_array().unwrap().len(),
             2
         );
-        assert_eq!(
-            attempts_after_restart["attempts"][0]["attempt_id"],
-            attempt_id
-        );
+        assert!(attempts_after_restart["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attempt| attempt["attempt_id"] == attempt_id));
         let restart_replay = reopened
             .clone()
             .oneshot(submit_raw(plan.to_string(), "stable-key"))
@@ -7616,6 +7635,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened_attempt["result"]["ordinal"], 1);
+        let restart_store = store::ControllerStore::open(config.store_path.clone()).unwrap();
+        for attempt in attempts_after_restart["attempts"].as_array().unwrap() {
+            restart_store
+                .set_attempt_state(attempt["attempt_id"].as_str().unwrap(), "ended")
+                .unwrap();
+        }
         let unkeyed_attempt = reopened
             .clone()
             .oneshot(
@@ -7710,6 +7735,7 @@ mod tests {
         reopened
             .create_attempt(&ids[42], "attempt-42-1", "attempt-key-42-1")
             .unwrap();
+        reopened.set_attempt_state("attempt-42-1", "ended").unwrap();
         reopened
             .create_attempt(&ids[42], "attempt-42-2", "attempt-key-42-2")
             .unwrap();
