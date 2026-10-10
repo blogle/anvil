@@ -11,6 +11,17 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 use url::Url;
 
+fn next_link(header: &str) -> Option<Url> {
+    header.split(',').find_map(|link| {
+        if !(link.contains("rel=\"next\"") || link.contains("rel=next")) {
+            return None;
+        }
+        let start = link.find('<')? + 1;
+        let end = link[start..].find('>')? + start;
+        Url::parse(&link[start..end]).ok()
+    })
+}
+
 /// GitHub REST port with an explicit least-privilege token and API base URL.
 /// This type has no write methods and never exposes raw provider response bodies.
 pub struct GitHubRestPort {
@@ -64,7 +75,7 @@ impl GitHubRestPort {
         }
     }
 
-    fn get(&self, url: Url) -> Result<Value, ProviderError> {
+    fn get_page(&self, url: Url) -> Result<(Value, Option<Url>), ProviderError> {
         let response = self
             .client
             .request(Method::GET, url)
@@ -89,9 +100,38 @@ impl GitHubRestPort {
         if !status.is_success() {
             return Err(ProviderError::Unavailable);
         }
-        response
+        let next = response
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|value| value.to_str().ok())
+            .and_then(next_link);
+        let value = response
             .json::<Value>()
-            .map_err(|_| ProviderError::InvalidResponse)
+            .map_err(|_| ProviderError::InvalidResponse)?;
+        Ok((value, next))
+    }
+
+    fn get_all_pages(
+        &self,
+        mut url: Url,
+        array_key: Option<&str>,
+    ) -> Result<Vec<Value>, ProviderError> {
+        const MAX_PAGES: usize = 100;
+        let mut rows = Vec::new();
+        for _ in 0..MAX_PAGES {
+            let (value, next) = self.get_page(url)?;
+            let items = match array_key {
+                Some(key) => value.get(key).and_then(Value::as_array),
+                None => value.as_array(),
+            }
+            .ok_or(ProviderError::InvalidResponse)?;
+            rows.extend(items.iter().cloned());
+            match next {
+                Some(next) => url = next,
+                None => return Ok(rows),
+            }
+        }
+        Err(ProviderError::InvalidResponse)
     }
 
     fn get_optional(&self, url: Url) -> Result<Option<Value>, ProviderError> {
@@ -127,6 +167,40 @@ impl GitHubRestPort {
             .map(Some)
             .map_err(|_| ProviderError::InvalidResponse)
     }
+
+    /// GraphQL exposes a PR's merge-queue entry and its current merge-group head commit.
+    /// `None` (outer) means inaccessible/unknown; `Some(None)` means not queued.
+    fn merge_queue_head(&self, owner: &str, repo: &str, number: u64) -> Option<Option<String>> {
+        let url = self.api_base.join("../graphql").ok()?;
+        let query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{headCommit{oid}}}}}";
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&serde_json::json!({"query":query,"variables":{"owner":owner,"name":repo,"number":number}}))
+            .send()
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let value = response.json::<Value>().ok()?;
+        if value.get("errors").is_some_and(|errors| !errors.is_null()) {
+            return None;
+        }
+        let pull = value.pointer("/data/repository/pullRequest")?;
+        let entry = pull.get("mergeQueueEntry")?;
+        if entry.is_null() {
+            return Some(None);
+        }
+        Some(Some(
+            entry
+                .pointer("/headCommit/oid")
+                .and_then(Value::as_str)?
+                .to_owned(),
+        ))
+    }
 }
 
 impl GitHubReadPort for GitHubRestPort {
@@ -157,11 +231,7 @@ impl GitHubReadPort for GitHubRestPort {
                 .append_pair("state", "all")
                 .append_pair("head", &format!("{owner}:{branch}"))
                 .append_pair("per_page", "100");
-            let matches = self.get(url)?;
-            let Some(pulls) = matches.as_array() else {
-                return Err(ProviderError::InvalidResponse);
-            };
-            pulls
+            self.get_all_pages(url, None)?
                 .iter()
                 .filter(|pull| {
                     pull.pointer("/head/ref").and_then(Value::as_str) == Some(branch)
@@ -187,6 +257,13 @@ impl GitHubReadPort for GitHubRestPort {
                     .filter(|sha| !sha.is_empty() && *sha != head_sha)
                     .map(|sha| (sha.to_owned(), EvaluationKind::TestMerge))
                     .unwrap_or_else(|| (head_sha.clone(), EvaluationKind::Head));
+                let merge_group = self.merge_queue_head(owner, repo, number);
+                let (evaluation_sha, evaluation_kind, evaluation_identity_known) = match merge_group
+                {
+                    Some(Some(sha)) => (sha, EvaluationKind::MergeGroup, true),
+                    Some(None) => (evaluation_sha, evaluation_kind, true),
+                    None => (evaluation_sha, evaluation_kind, false),
+                };
                 let merged = pull.get("merged").and_then(Value::as_bool).unwrap_or(false)
                     || pull.get("merged_at").is_some_and(|value| !value.is_null());
                 let state = if merged {
@@ -202,6 +279,7 @@ impl GitHubReadPort for GitHubRestPort {
                     head_sha,
                     evaluation_sha,
                     evaluation_kind,
+                    evaluation_identity_known,
                     state,
                     merged,
                 })
@@ -254,14 +332,22 @@ impl GitHubReadPort for GitHubRestPort {
         // Effective active branch rules include repository/org rulesets.
         let mut rules_url =
             self.endpoint(&["repos", owner, repo, "rules", "branches", base_ref])?;
-        rules_url.query_pairs_mut().append_pair("per_page", "100");
-        let rules = self.get_optional(rules_url)?;
-        let Some(rules) = rules else {
+        rules_url
+            .query_pairs_mut()
+            .append_pair("per_page", "100")
+            .append_pair("page", "1");
+        let rules = match self.get_all_pages(rules_url, None) {
+            Ok(rules) => rules,
+            Err(
+                ProviderError::Unavailable
+                | ProviderError::PermissionDenied
+                | ProviderError::RateLimited,
+            ) => return Ok(Policy::Unavailable),
+            Err(error) => return Err(error),
+        };
+        if rules.is_empty() {
             return Ok(Policy::Unavailable);
-        };
-        let Some(rules) = rules.as_array() else {
-            return Err(ProviderError::InvalidResponse);
-        };
+        }
         for rule in rules.iter().filter(|rule| {
             rule.get("type").and_then(Value::as_str) == Some("required_status_checks")
         }) {
@@ -310,11 +396,7 @@ impl GitHubReadPort for GitHubRestPort {
             "check-runs",
         ])?;
         url.query_pairs_mut().append_pair("per_page", "100");
-        let value = self.get(url)?;
-        value
-            .get("check_runs")
-            .and_then(Value::as_array)
-            .ok_or(ProviderError::InvalidResponse)?
+        self.get_all_pages(url, Some("check_runs"))?
             .iter()
             .map(|run| {
                 let name = run
@@ -374,9 +456,7 @@ impl GitHubReadPort for GitHubRestPort {
         let mut url =
             self.endpoint(&["repos", owner, repo, "commits", evaluation_sha, "statuses"])?;
         url.query_pairs_mut().append_pair("per_page", "100");
-        self.get(url)?
-            .as_array()
-            .ok_or(ProviderError::InvalidResponse)?
+        self.get_all_pages(url, None)?
             .iter()
             .map(|status| {
                 Ok(CommitStatus {
@@ -425,6 +505,11 @@ mod tests {
             when.method(GET).path("/repos/org/repo/pulls").query_param("head","org:anvil/task");
             then.status(200).json_body(json!([{"number":42,"state":"open","merged":false,"head":{"ref":"anvil/task","sha":"head-sha"},"base":{"ref":"main","repo":{"full_name":"org/repo"}},"merge_commit_sha":"test-merge-sha"}]));
         });
+        let queue = server.mock(|when, then| {
+            when.method(POST).path("/graphql");
+            then.status(200)
+                .json_body(json!({"data":{"repository":{"pullRequest":{"mergeQueueEntry":null}}}}));
+        });
         let protection = server.mock(|when, then| {
             when.method(GET)
                 .path("/repos/org/repo/branches/main/protection/required_status_checks");
@@ -432,8 +517,16 @@ mod tests {
                 .json_body(json!({"contexts":["legacy"],"checks":[{"context":"lint","app_id":9}]}));
         });
         let rules = server.mock(|when, then| {
-            when.method(GET).path("/repos/org/repo/rules/branches/main");
-            then.status(200).json_body(json!([{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"CI","integration_id":9}]}}]));
+            when.method(GET)
+                .path("/repos/org/repo/rules/branches/main")
+                .query_param("page", "1")
+                .query_param("per_page", "100");
+            then.status(200).json_body(json!([{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"CI","integration_id":9}]}}]))
+                .header("link",format!("<{}>; rel=\"next\"",server.url("/repos/org/repo/rules/branches/main?per_page=100&page=2")));
+        });
+        let rules_second_page=server.mock(|when,then|{
+            when.method(GET).path("/repos/org/repo/rules/branches/main").query_param("page","2").query_param("per_page","100");
+            then.status(200).json_body(json!([{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"security","integration_id":null}]}}]));
         });
         let checks = server.mock(|when, then| {
             when.method(GET).path("/repos/org/repo/commits/test-merge-sha/check-runs").query_param("per_page","100");
@@ -444,7 +537,7 @@ mod tests {
                 .path("/repos/org/repo/commits/test-merge-sha/statuses")
                 .query_param("per_page", "100");
             then.status(200)
-                .json_body(json!([{"context":"legacy","sha":"test-merge-sha","state":"success"}]));
+                .json_body(json!([{"context":"legacy","sha":"test-merge-sha","state":"success"},{"context":"security","sha":"test-merge-sha","state":"success"}]));
         });
         let port = GitHubRestPort::new(&server.url("/"), "test-token").unwrap();
         let observed = GitHubCodeHost::new(port)
@@ -471,13 +564,22 @@ mod tests {
                 .iter()
                 .map(|c| c.context.as_str())
                 .collect::<Vec<_>>(),
-            ["CI", "legacy", "lint"]
+            ["CI", "legacy", "lint", "security"]
         );
         assert!(observed
             .required_checks
             .iter()
             .all(|c| c.state == anvil_reconcile::CheckState::Passing));
-        for mock in [branch, pulls, protection, rules, checks, statuses] {
+        for mock in [
+            branch,
+            pulls,
+            queue,
+            protection,
+            rules,
+            rules_second_page,
+            checks,
+            statuses,
+        ] {
             mock.assert();
         }
     }
@@ -491,6 +593,11 @@ mod tests {
             then.status(200).json_body(json!({"name":"anvil/task"}));
         });
         server.mock(|when,then|{when.method(GET).path("/repos/org/repo/pulls");then.status(200).json_body(json!([{"number":42,"state":"open","head":{"ref":"anvil/task","sha":"h"},"base":{"ref":"main","repo":{"full_name":"org/repo"}}}]));});
+        server.mock(|when, then| {
+            when.method(POST).path("/graphql");
+            then.status(200)
+                .json_body(json!({"data":{"repository":{"pullRequest":{"mergeQueueEntry":null}}}}));
+        });
         server.mock(|when, then| {
             when.method(GET)
                 .path("/repos/org/repo/branches/main/protection/required_status_checks");
@@ -511,5 +618,50 @@ mod tests {
             .unwrap();
         assert!(!observed.required_policy_known);
         assert!(observed.required_checks.is_empty());
+    }
+
+    #[test]
+    fn merge_queue_entry_uses_exact_merge_group_sha_for_required_checks() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/org/repo/branches/anvil%2Ftask");
+            then.status(200).json_body(json!({"name":"anvil/task"}));
+        });
+        server.mock(|when,then|{when.method(GET).path("/repos/org/repo/pulls").query_param("head","org:anvil/task");then.status(200).json_body(json!([{"number":42,"state":"open","head":{"ref":"anvil/task","sha":"pr-head"},"base":{"ref":"main","repo":{"full_name":"org/repo"}},"merge_commit_sha":"test-merge"}]));});
+        server.mock(|when,then|{when.method(POST).path("/graphql");then.status(200).json_body(json!({"data":{"repository":{"pullRequest":{"mergeQueueEntry":{"headCommit":{"oid":"merge-group-sha"}}}}}}));});
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/org/repo/branches/main/protection/required_status_checks");
+            then.status(404);
+        });
+        server.mock(|when,then|{when.method(GET).path("/repos/org/repo/rules/branches/main");then.status(200).json_body(json!([{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"CI","integration_id":7}]}}]));});
+        server.mock(|when,then|{when.method(GET).path("/repos/org/repo/commits/merge-group-sha/check-runs");then.status(200).json_body(json!({"check_runs":[{"id":8,"name":"CI","head_sha":"merge-group-sha","status":"completed","conclusion":"failure"}]}));});
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/org/repo/commits/merge-group-sha/statuses");
+            then.status(200).json_body(json!([]));
+        });
+        let observed = GitHubCodeHost::new(GitHubRestPort::new(&server.url("/"), "token").unwrap())
+            .observe(&ObservationRequest {
+                repository: "org/repo".into(),
+                base_ref: "main".into(),
+                work_branch: "anvil/task".into(),
+                bound_pr_number: None,
+            })
+            .unwrap();
+        let pr = observed.pull_request.unwrap();
+        assert_eq!(pr.head_sha, "pr-head");
+        assert_eq!(pr.evaluation_sha, "merge-group-sha");
+        assert_eq!(pr.evaluation_kind, EvaluationKind::MergeGroup);
+        assert!(observed.required_policy_known);
+        assert_eq!(
+            observed.required_checks[0].evaluation_sha,
+            "merge-group-sha"
+        );
+        assert_eq!(
+            observed.required_checks[0].state,
+            anvil_reconcile::CheckState::Failing
+        );
     }
 }

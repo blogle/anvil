@@ -63,6 +63,7 @@ impl GitHubReadPort for TestWorld {
                 head_sha: pr.head_sha.clone(),
                 evaluation_sha: pr.evaluation_sha.clone(),
                 evaluation_kind: pr.evaluation_kind.clone(),
+                evaluation_identity_known: true,
                 state: if pr.open { "open" } else { "closed" }.into(),
                 merged: pr.merged,
             }))

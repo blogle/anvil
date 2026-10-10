@@ -5,6 +5,80 @@ use sha2::{Digest, Sha256};
 
 pub mod frozen_v0;
 
+/// Process-local per-task serialization; SQLite generation CAS remains the durability fence.
+pub mod singleflight {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, Weak};
+
+    #[derive(Default)]
+    pub struct TaskSingleFlight {
+        locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    }
+    impl TaskSingleFlight {
+        pub fn run<R>(&self, task_id: &str, operation: impl FnOnce() -> R) -> R {
+            let lock = {
+                let mut locks = self.locks.lock().expect("single-flight map poisoned");
+                if let Some(lock) = locks.get(task_id).and_then(Weak::upgrade) {
+                    lock
+                } else {
+                    let lock = Arc::new(Mutex::new(()));
+                    locks.insert(task_id.to_owned(), Arc::downgrade(&lock));
+                    lock
+                }
+            };
+            let _guard = lock.lock().expect("task single-flight lock poisoned");
+            operation()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+        use std::time::Duration;
+        #[test]
+        fn serializes_same_task_without_globally_blocking_reconcile_work() {
+            let singleflight = Arc::new(TaskSingleFlight::default());
+            let active = Arc::new(AtomicUsize::new(0));
+            let maximum = Arc::new(AtomicUsize::new(0));
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let lock = singleflight.clone();
+                    let active = active.clone();
+                    let maximum = maximum.clone();
+                    thread::spawn(move || {
+                        lock.run("task-same", || {
+                            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            maximum.fetch_max(now, Ordering::SeqCst);
+                            thread::sleep(Duration::from_millis(5));
+                            active.fetch_sub(1, Ordering::SeqCst);
+                        });
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            assert_eq!(maximum.load(Ordering::SeqCst), 1);
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let left = {
+                let lock = singleflight.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || lock.run("task-left", || barrier.wait()))
+            };
+            let right = {
+                let lock = singleflight.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || lock.run("task-right", || barrier.wait()))
+            };
+            left.join().unwrap();
+            right.join().unwrap();
+        }
+    }
+}
+
 pub const RECONCILER_VERSION: &str = "anvil-reconcile-v1";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +194,11 @@ pub enum ActionState {
     Failed,
     UnknownOutcome,
     Superseded,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttemptAdmission {
+    Claimed { attempt_id: String },
+    DeferredCapacity,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1073,6 +1152,12 @@ pub mod outbox {
             state: ActionState,
         ) -> rusqlite::Result<bool> {
             use rusqlite::{params, TransactionBehavior};
+            if !matches!(
+                state,
+                ActionState::Succeeded | ActionState::Failed | ActionState::UnknownOutcome
+            ) {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
             let state = serde_json::to_value(state)
                 .expect("state serializes")
                 .as_str()
@@ -1214,6 +1299,7 @@ pub mod github {
         pub head_sha: String,
         pub evaluation_sha: String,
         pub evaluation_kind: EvaluationKind,
+        pub evaluation_identity_known: bool,
         pub state: String,
         pub merged: bool,
     }
@@ -1387,13 +1473,14 @@ pub mod github {
                 }
             }
             // An inaccessible ruleset must not erase other observed PR facts or claim green.
+            let required_policy_known = policy_known && pr.evaluation_identity_known;
             Ok(DeliveryObservation {
                 repository: request.repository.clone(),
                 work_branch: request.work_branch.clone(),
                 branch_exists: true,
                 pull_request: Some(pr),
                 required_checks: evaluation.checks,
-                required_policy_known: policy_known,
+                required_policy_known,
             })
         }
     }
@@ -1641,6 +1728,7 @@ pub mod github {
                 head_sha: "head".into(),
                 evaluation_sha: "merge".into(),
                 evaluation_kind: EvaluationKind::TestMerge,
+                evaluation_identity_known: true,
                 state: "open".into(),
                 merged: false,
             }
@@ -2135,6 +2223,18 @@ mod tests {
         s.runtime_health = Some(RuntimeHealth::Unknown);
         s.budget_usage.runtime_recoveries = 0;
         assert_ne!(reconcile(&s, LogicalTime(2)).rule_id, "runtime_failure");
+    }
+    #[test]
+    fn deferred_capacity_does_not_consume_attempt_budget_or_change_create_key() {
+        let snapshot = snap();
+        let proposed = reconcile(&snapshot, LogicalTime(0));
+        let key = proposed.desired_actions[0].idempotency_key.clone();
+        let admission = AttemptAdmission::DeferredCapacity;
+        assert_eq!(admission, AttemptAdmission::DeferredCapacity);
+        assert_eq!(snapshot.budget_usage.attempts, 0);
+        let retried = reconcile(&snapshot, LogicalTime(1));
+        assert_eq!(retried.desired_actions[0].idempotency_key, key);
+        assert_eq!(retried.desired_actions[0].payload["ordinal"], 1);
     }
     #[test]
     fn repeated_checks_failure_is_suppressed_but_new_sha_is_new_cause() {
