@@ -99,6 +99,8 @@ pub struct Attempt {
     pub lifecycle: AttemptLifecycle,
     pub turn_state: Option<String>,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub session_healthy: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PriorAction {
@@ -147,6 +149,12 @@ pub struct TaskSnapshot {
     #[serde(default)]
     pub budget_usage: BudgetUsage,
     pub max_attempts: Option<u32>,
+    #[serde(default)]
+    pub max_continuations_by_reason: std::collections::BTreeMap<String, u32>,
+    #[serde(default)]
+    pub max_ci_retries: Option<u32>,
+    #[serde(default)]
+    pub max_execution_ms: Option<u64>,
     pub retry_due_at_ms: Option<i64>,
     pub merge_wait_due_at_ms: Option<i64>,
 }
@@ -243,6 +251,14 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
         d.attention.push("unresolved_blocker".into());
         return d;
     }
+    if s.action_history
+        .iter()
+        .any(|a| a.state == ActionState::UnknownOutcome)
+    {
+        d.rule_id = "unknown_action_outcome".into();
+        d.attention.push("unknown_action_outcome".into());
+        return d;
+    }
     let delivery = s.delivery.as_ref();
     if delivery.is_some_and(|x| x.pr_state.as_deref() == Some("closed") && !x.pr_merged) {
         d.rule_id = "closed_unmerged".into();
@@ -251,6 +267,8 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
     }
     if s.max_attempts
         .is_some_and(|max| s.budget_usage.attempts >= max)
+        || s.max_execution_ms
+            .is_some_and(|max| s.budget_usage.execution_ms >= max)
     {
         d.rule_id = "budget_exhausted".into();
         d.attention.push("needs_budget".into());
@@ -266,7 +284,8 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
         return d;
     }
     if s.attempts.iter().any(|a| {
-        a.lifecycle == AttemptLifecycle::Running || a.turn_state.as_deref() == Some("submitted")
+        (a.lifecycle == AttemptLifecycle::Running && a.turn_state.as_deref() != Some("completed"))
+            || a.turn_state.as_deref() == Some("submitted")
     }) {
         d.rule_id = "active_turn".into();
         return d;
@@ -280,14 +299,38 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
             .map(|c| c.context.clone())
             .collect();
         if !failing.is_empty() {
+            if x.evaluation_kind == Some(EvaluationKind::MergeGroup) {
+                d.rule_id = "merge_group_checks_failing".into();
+                d.attention.push("integration_checks_failing".into());
+                return d;
+            }
             let cause = digest(&format!(
                 "{}:{}",
                 x.pr_head_sha.as_deref().unwrap_or(""),
                 failing.join(",")
             ));
+            let continuation_count = s
+                .budget_usage
+                .continuations_by_reason
+                .get("checks_failed")
+                .copied()
+                .unwrap_or(0);
+            let continuation_exhausted = s
+                .max_continuations_by_reason
+                .get("checks_failed")
+                .is_some_and(|max| continuation_count >= *max)
+                || s.max_ci_retries
+                    .is_some_and(|max| s.budget_usage.ci_retries >= max);
+            if continuation_exhausted {
+                d.rule_id = "budget_exhausted".into();
+                d.attention.push("needs_budget".into());
+                return d;
+            }
             let running = s.attempts.iter().find(|a| {
-                a.lifecycle == AttemptLifecycle::Running
-                    || a.lifecycle == AttemptLifecycle::Ended && a.session_id.is_some()
+                a.session_healthy
+                    && a.session_id.is_some()
+                    && (a.lifecycle == AttemptLifecycle::Running
+                        || a.lifecycle == AttemptLifecycle::Ended)
             });
             if let Some(a) = running {
                 if has_action(s, ActionKind::ChecksFailed, Some(&a.attempt_id), &cause) {
@@ -953,6 +996,9 @@ mod tests {
             action_history: vec![],
             budget_usage: BudgetUsage::default(),
             max_attempts: Some(4),
+            max_continuations_by_reason: Default::default(),
+            max_ci_retries: None,
+            max_execution_ms: None,
             retry_due_at_ms: None,
             merge_wait_due_at_ms: None,
         }
@@ -1004,6 +1050,69 @@ mod tests {
         s.retry_due_at_ms = Some(10);
         assert_eq!(reconcile(&s, LogicalTime(9)).rule_id, "retry_backoff");
         assert_eq!(reconcile(&s, LogicalTime(10)).rule_id, "task_runnable");
+    }
+    #[test]
+    fn checks_failure_continues_only_healthy_attempt_within_budget() {
+        let mut s = snap();
+        s.delivery = Some(Delivery {
+            work_branch: Some("task/demo".into()),
+            base_revision: Some("base".into()),
+            pr_head_sha: Some("head".into()),
+            evaluation_sha: Some("head".into()),
+            evaluation_kind: Some(EvaluationKind::Head),
+            pr_state: Some("open".into()),
+            pr_merged: false,
+            required_checks: vec![RequiredCheck {
+                context: "CI".into(),
+                source: "check_run".into(),
+                state: CheckState::Failing,
+                evaluation_sha: "head".into(),
+            }],
+        });
+        s.attempts.push(Attempt {
+            attempt_id: "a1".into(),
+            ordinal: 1,
+            role: "implementation".into(),
+            lifecycle: AttemptLifecycle::Ended,
+            turn_state: Some("completed".into()),
+            session_id: Some("session".into()),
+            session_healthy: true,
+        });
+        let decision = reconcile(&s, LogicalTime(0));
+        assert_eq!(decision.rule_id, "required_checks_failing");
+        assert_eq!(
+            decision.desired_actions[0].attempt_id.as_deref(),
+            Some("a1")
+        );
+        s.max_continuations_by_reason
+            .insert("checks_failed".into(), 0);
+        let exhausted = reconcile(&s, LogicalTime(0));
+        assert_eq!(exhausted.rule_id, "budget_exhausted");
+        assert!(exhausted.desired_actions.is_empty());
+    }
+
+    #[test]
+    fn merge_group_only_regression_does_not_prompt_worker() {
+        let mut s = snap();
+        s.delivery = Some(Delivery {
+            work_branch: Some("task/demo".into()),
+            base_revision: None,
+            pr_head_sha: Some("head".into()),
+            evaluation_sha: Some("group".into()),
+            evaluation_kind: Some(EvaluationKind::MergeGroup),
+            pr_state: Some("open".into()),
+            pr_merged: false,
+            required_checks: vec![RequiredCheck {
+                context: "CI".into(),
+                source: "check_run".into(),
+                state: CheckState::Failing,
+                evaluation_sha: "group".into(),
+            }],
+        });
+        let decision = reconcile(&s, LogicalTime(0));
+        assert_eq!(decision.rule_id, "merge_group_checks_failing");
+        assert!(decision.desired_actions.is_empty());
+        assert_eq!(decision.attention, ["integration_checks_failing"]);
     }
     #[test]
     fn canonical_hash_ignores_poll_churn() {
