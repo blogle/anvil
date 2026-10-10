@@ -302,8 +302,27 @@ pub struct ActionHistoryEntry {
     pub attempt_id: Option<String>,
     pub cause_fingerprint: String,
     pub idempotency_key: String,
-    pub state: String,
+    pub state: ActionState,
     pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionState {
+    Pending,
+    Executing,
+    Succeeded,
+    Failed,
+    UnknownOutcome,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionClass {
+    Idempotent,
+    Observable,
+    Irreversible,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
