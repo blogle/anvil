@@ -48,6 +48,21 @@ require_text "directory-source chmod canary" "chmod -R u+w source" "$canary_scri
 require_text "canary script baked into daemon" "daemonCanary" "$repo_root/nix/sandbox.nix"
 require_text "OCI smoke executes canary" 'docker exec "$container" /bin/anvil-nix-deployment-canary' "$repo_root/tests/nix-daemon-smoke.sh"
 require_text "deployment startup canary" "command: [/bin/anvil-nix-deployment-canary]" "$repo_root/k8s/base/anvil-nix-daemon.yaml"
+require_text "canary output cleanup" 'nix-store --delete "$output"' "$canary_script"
+require_text "daemon derivation cleanup" 'nix-store --delete "$drv"' "$canary_script"
+entrypoint="$repo_root/runtime/nix-daemon-entrypoint"
+require_text "daemon fails closed on unsafe build metadata" 'refusing to repair shared state at daemon startup' "$entrypoint"
+if grep -Eq 'normalize_build_state|chown root:root /nix|chmod u-s,g-s /nix' "$entrypoint"; then
+  printf 'manifest-security: daemon entrypoint must not repair populated Nix volumes on restart\n' >&2
+  exit 1
+fi
+if grep -Fq 'fsGroup:' "$repo_root/crates/anvild/src/lib.rs"; then
+  printf 'manifest-security: generated sandbox must not set Pod fsGroup on shared volumes\n' >&2
+  exit 1
+fi
+require_text "sandbox shared PVC without volume-level read-only" '"claimName":pvc}}' "$repo_root/crates/anvild/src/lib.rs"
+require_text "Kind checks generated Sandbox fsGroup" '($pod.securityContext.fsGroup == null)' "$repo_root/tests/kind-acceptance.sh"
+require_text "Kind builds fresh derivations across lifecycle" 'fresh_sandbox_build "$api_b_pod" "anvil-lifecycle-after-remove-${cluster}"' "$repo_root/tests/kind-acceptance.sh"
 
 smoke_script="$repo_root/tests/nix-daemon-smoke.sh"
 require_text 'daemon executable smoke' 'test -x /bin/anvil-nix-daemon' "$smoke_script"
@@ -67,7 +82,7 @@ if command -v kustomize >/dev/null 2>&1; then
       exit 1
     fi
     if grep -Eq 'claimName: anvil-nix$|  name: anvil-nix$' <<<"$rendered"; then
-      printf 'manifest-security: %s renders obsolete Nix PVC\n' "$overlay" >&2
+      printf 'manifest-security: %s renders obsolete Nix PVC\n' >&2
       exit 1
     fi
     grep -Fq 'name: github-app-credentials' <<<"$rendered"

@@ -6,6 +6,13 @@ set -euo pipefail
 # rather than just looking up a cached output. No nixpkgs evaluation required.
 export NIX_REMOTE=daemon
 nonce="$(date +%s%N)-$$"
+drv=''
+output=''
+cleanup() {
+  if [ -n "$output" ]; then nix-store --delete "$output" >/dev/null 2>&1 || true; fi
+  if [ -n "$drv" ]; then nix-store --delete "$drv" >/dev/null 2>&1 || true; fi
+}
+trap cleanup EXIT
 expression='derivation { name = "anvil-deployment-canary-'"$nonce"'"; system = "@SYSTEM@"; builder = "@BASH@"; src = "@SOURCE@"; args = [ "-c" "@COREUTILS@/bin/cp -r \"$src\" source; @COREUTILS@/bin/chmod -R u+w source; @COREUTILS@/bin/cat source/fixture.txt > \"$out\"" ]; }'
 drv="$(nix-instantiate --expr "$expression")"
 output="$(nix-store --realise "$drv")"
@@ -13,4 +20,6 @@ if [ "$(cat "$output")" != 'anvil-nix-deployment-canary-ok' ]; then
   echo 'Anvil Nix deployment canary: unexpected build output' >&2
   exit 1
 fi
+# Keep the canary fresh on every execution without accumulating unique outputs
+# in the shared store. The GC roots and database are left untouched.
 echo 'Anvil Nix deployment canary: fresh derivation built successfully'
