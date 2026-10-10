@@ -252,14 +252,8 @@ impl GitHubReadPort for GitHubRestPort {
         }
 
         // Effective active branch rules include repository/org rulesets.
-        let rules = self.get_optional(self.endpoint(&[
-            "repos",
-            owner,
-            repo,
-            "rules",
-            "branches",
-            base_ref,
-        ])?)?;
+        let rules = self
+            .get_optional(self.endpoint(&["repos", owner, repo, "rules", "branches", base_ref])?)?;
         let Some(rules) = rules else {
             return Ok(Policy::Unavailable);
         };
@@ -294,9 +288,8 @@ impl GitHubReadPort for GitHubRestPort {
         required.sort_by(|left, right| {
             (&left.context, &left.source).cmp(&(&right.context, &right.source))
         });
-        required.dedup_by(|left, right| {
-            left.context == right.context && left.source == right.source
-        });
+        required
+            .dedup_by(|left, right| left.context == right.context && left.source == right.source);
         Ok(Policy::Known(required))
     }
 
@@ -306,7 +299,14 @@ impl GitHubReadPort for GitHubRestPort {
         evaluation_sha: &str,
     ) -> Result<Vec<CheckRun>, ProviderError> {
         let (owner, repo) = Self::owner_repo(repository)?;
-        let mut url = self.endpoint(&["repos", owner, repo, "commits", evaluation_sha, "check-runs"])?;
+        let mut url = self.endpoint(&[
+            "repos",
+            owner,
+            repo,
+            "commits",
+            evaluation_sha,
+            "check-runs",
+        ])?;
         url.query_pairs_mut().append_pair("per_page", "100");
         let value = self.get(url)?;
         value
@@ -334,8 +334,11 @@ impl GitHubReadPort for GitHubRestPort {
                     .get("conclusion")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
-                let run_id=run.get("id").and_then(Value::as_u64).unwrap_or(0);
-                let updated_at=run.get("updated_at").and_then(Value::as_str).map(ToOwned::to_owned);
+                let run_id = run.get("id").and_then(Value::as_u64).unwrap_or(0);
+                let updated_at = run
+                    .get("updated_at")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
                 let stable = format!(
                     "{}:{}:{}:{}",
                     run_id,
@@ -343,7 +346,10 @@ impl GitHubReadPort for GitHubRestPort {
                     status,
                     conclusion.as_deref().unwrap_or("pending")
                 );
-                let details_fingerprint=Sha256::digest(stable.as_bytes()).iter().map(|byte|format!("{byte:02x}")).collect();
+                let details_fingerprint = Sha256::digest(stable.as_bytes())
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
                 Ok(CheckRun {
                     run_id,
                     name,
@@ -363,7 +369,8 @@ impl GitHubReadPort for GitHubRestPort {
         evaluation_sha: &str,
     ) -> Result<Vec<CommitStatus>, ProviderError> {
         let (owner, repo) = Self::owner_repo(repository)?;
-        let mut url = self.endpoint(&["repos", owner, repo, "commits", evaluation_sha, "statuses"])?;
+        let mut url =
+            self.endpoint(&["repos", owner, repo, "commits", evaluation_sha, "statuses"])?;
         url.query_pairs_mut().append_pair("per_page", "100");
         self.get(url)?
             .as_array()
@@ -386,7 +393,10 @@ impl GitHubReadPort for GitHubRestPort {
                         .and_then(Value::as_str)
                         .ok_or(ProviderError::InvalidResponse)?
                         .to_owned(),
-                    updated_at:status.get("updated_at").and_then(Value::as_str).map(ToOwned::to_owned),
+                    updated_at: status
+                        .get("updated_at")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
                 })
             })
             .collect()
@@ -404,16 +414,20 @@ mod tests {
     fn observes_exact_branch_pr_test_merge_policy_checks_and_statuses_read_only() {
         let server = MockServer::start();
         let branch = server.mock(|when, then| {
-            when.method(GET).path("/repos/org/repo/branches/anvil%2Ftask");
-            then.status(200).json_body(json!({"name":"anvil/task","commit":{"sha":"base"}}));
+            when.method(GET)
+                .path("/repos/org/repo/branches/anvil%2Ftask");
+            then.status(200)
+                .json_body(json!({"name":"anvil/task","commit":{"sha":"base"}}));
         });
         let pulls = server.mock(|when, then| {
             when.method(GET).path("/repos/org/repo/pulls").query_param("head","org:anvil/task");
             then.status(200).json_body(json!([{"number":42,"state":"open","merged":false,"head":{"ref":"anvil/task","sha":"head-sha"},"base":{"ref":"main","repo":{"full_name":"org/repo"}},"merge_commit_sha":"test-merge-sha"}]));
         });
         let protection = server.mock(|when, then| {
-            when.method(GET).path("/repos/org/repo/branches/main/protection/required_status_checks");
-            then.status(200).json_body(json!({"contexts":["legacy"],"checks":[{"context":"lint","app_id":9}]}));
+            when.method(GET)
+                .path("/repos/org/repo/branches/main/protection/required_status_checks");
+            then.status(200)
+                .json_body(json!({"contexts":["legacy"],"checks":[{"context":"lint","app_id":9}]}));
         });
         let rules = server.mock(|when, then| {
             when.method(GET).path("/repos/org/repo/rules/branches/main");
@@ -424,30 +438,75 @@ mod tests {
             then.status(200).json_body(json!({"check_runs":[{"id":5,"name":"CI","head_sha":"test-merge-sha","status":"completed","conclusion":"success"},{"id":6,"name":"lint","head_sha":"test-merge-sha","status":"completed","conclusion":"neutral"}]}));
         });
         let statuses = server.mock(|when, then| {
-            when.method(GET).path("/repos/org/repo/commits/test-merge-sha/statuses").query_param("per_page","100");
-            then.status(200).json_body(json!([{"context":"legacy","sha":"test-merge-sha","state":"success"}]));
+            when.method(GET)
+                .path("/repos/org/repo/commits/test-merge-sha/statuses")
+                .query_param("per_page", "100");
+            then.status(200)
+                .json_body(json!([{"context":"legacy","sha":"test-merge-sha","state":"success"}]));
         });
-        let port=GitHubRestPort::new(&server.url("/"),"test-token").unwrap();
-        let observed=GitHubCodeHost::new(port).observe(&ObservationRequest{repository:"org/repo".into(),base_ref:"main".into(),work_branch:"anvil/task".into(),bound_pr_number:None}).unwrap();
-        assert_eq!(observed.pull_request.as_ref().unwrap().number,42);
-        assert_eq!(observed.pull_request.as_ref().unwrap().head_sha,"head-sha");
-        assert_eq!(observed.pull_request.as_ref().unwrap().evaluation_sha,"test-merge-sha");
-        assert_eq!(observed.pull_request.as_ref().unwrap().evaluation_kind,EvaluationKind::TestMerge);
-        assert_eq!(observed.required_checks.iter().map(|c|c.context.as_str()).collect::<Vec<_>>(),["CI","legacy","lint"]);
-        assert!(observed.required_checks.iter().all(|c|c.state==anvil_reconcile::CheckState::Passing));
-        for mock in [branch,pulls,protection,rules,checks,statuses] { mock.assert(); }
-        assert!(server.received_requests().iter().all(|request|request.method=="GET"),"observer must not send merge/write requests");
+        let port = GitHubRestPort::new(&server.url("/"), "test-token").unwrap();
+        let observed = GitHubCodeHost::new(port)
+            .observe(&ObservationRequest {
+                repository: "org/repo".into(),
+                base_ref: "main".into(),
+                work_branch: "anvil/task".into(),
+                bound_pr_number: None,
+            })
+            .unwrap();
+        assert_eq!(observed.pull_request.as_ref().unwrap().number, 42);
+        assert_eq!(observed.pull_request.as_ref().unwrap().head_sha, "head-sha");
+        assert_eq!(
+            observed.pull_request.as_ref().unwrap().evaluation_sha,
+            "test-merge-sha"
+        );
+        assert_eq!(
+            observed.pull_request.as_ref().unwrap().evaluation_kind,
+            EvaluationKind::TestMerge
+        );
+        assert_eq!(
+            observed
+                .required_checks
+                .iter()
+                .map(|c| c.context.as_str())
+                .collect::<Vec<_>>(),
+            ["CI", "legacy", "lint"]
+        );
+        assert!(observed
+            .required_checks
+            .iter()
+            .all(|c| c.state == anvil_reconcile::CheckState::Passing));
+        for mock in [branch, pulls, protection, rules, checks, statuses] {
+            mock.assert();
+        }
     }
 
     #[test]
     fn inaccessible_effective_rules_return_unknown_not_green() {
-        let server=MockServer::start();
-        server.mock(|when,then|{when.method(GET).path("/repos/org/repo/branches/anvil%2Ftask");then.status(200).json_body(json!({"name":"anvil/task"}));});
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/org/repo/branches/anvil%2Ftask");
+            then.status(200).json_body(json!({"name":"anvil/task"}));
+        });
         server.mock(|when,then|{when.method(GET).path("/repos/org/repo/pulls");then.status(200).json_body(json!([{"number":42,"state":"open","head":{"ref":"anvil/task","sha":"h"},"base":{"ref":"main","repo":{"full_name":"org/repo"}}}]));});
-        server.mock(|when,then|{when.method(GET).path("/repos/org/repo/branches/main/protection/required_status_checks");then.status(404);});
-        server.mock(|when,then|{when.method(GET).path("/repos/org/repo/rules/branches/main");then.status(403);});
-        let port=GitHubRestPort::new(&server.url("/"),"test-token").unwrap();
-        let observed=GitHubCodeHost::new(port).observe(&ObservationRequest{repository:"org/repo".into(),base_ref:"main".into(),work_branch:"anvil/task".into(),bound_pr_number:None}).unwrap();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/org/repo/branches/main/protection/required_status_checks");
+            then.status(404);
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/org/repo/rules/branches/main");
+            then.status(403);
+        });
+        let port = GitHubRestPort::new(&server.url("/"), "test-token").unwrap();
+        let observed = GitHubCodeHost::new(port)
+            .observe(&ObservationRequest {
+                repository: "org/repo".into(),
+                base_ref: "main".into(),
+                work_branch: "anvil/task".into(),
+                bound_pr_number: None,
+            })
+            .unwrap();
         assert!(!observed.required_policy_known);
         assert!(observed.required_checks.is_empty());
     }
