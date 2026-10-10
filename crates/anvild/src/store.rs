@@ -1457,14 +1457,24 @@ impl ControllerStore {
         reason: &str,
         cascade_descendants: bool,
     ) -> Result<Vec<Value>, StoreError> {
-        let mut canceled = vec![self.terminate_task(
-            task_id,
-            expected_version,
-            anvil_core::TaskTerminal::Canceled {
-                actor: actor.to_owned(),
-                reason: reason.to_owned(),
-            },
-        )?];
+        let root_terminal = anvil_core::TaskTerminal::Canceled {
+            actor: actor.to_owned(),
+            reason: reason.to_owned(),
+        };
+        let root = match self.terminate_task(task_id, expected_version, root_terminal.clone()) {
+            Ok(task) => task,
+            Err(StoreError::Conflict | StoreError::InvalidState(_)) => {
+                let current = self
+                    .get_resource("task", task_id)?
+                    .ok_or(StoreError::NotFound)?;
+                if current["terminal"] != serde_json::to_value(&root_terminal)? {
+                    return Err(StoreError::Conflict);
+                }
+                current
+            }
+            Err(error) => return Err(error),
+        };
+        let mut canceled = vec![root];
         if !cascade_descendants {
             return Ok(canceled);
         }
@@ -1474,11 +1484,11 @@ impl ControllerStore {
                 .lock()
                 .expect("controller store lock poisoned");
             let mut statement = connection.prepare(
-                "WITH RECURSIVE descendants(task_id) AS (
-                     SELECT task_id FROM task_durable_state WHERE parent_task_id=?1
+                "WITH RECURSIVE descendants(task_id,depth) AS (
+                     SELECT task_id,1 FROM task_durable_state WHERE parent_task_id=?1
                      UNION
-                     SELECT child.task_id FROM task_durable_state child JOIN descendants parent ON child.parent_task_id=parent.task_id
-                 ) SELECT task_id FROM descendants ORDER BY task_id",
+                     SELECT child.task_id,parent.depth+1 FROM task_durable_state child JOIN descendants parent ON child.parent_task_id=parent.task_id
+                 ) SELECT task_id FROM descendants ORDER BY depth,task_id",
             )?;
             let rows = statement.query_map([task_id], |row| row.get::<_, String>(0))?;
             rows.collect::<Result<_, _>>()?
@@ -3692,6 +3702,11 @@ mod tests {
             store.get_resource("task", "child-task").unwrap().unwrap()["state"],
             "open"
         );
+        let recovered = store
+            .cancel_task_with_descendants("root-task", 1, "operator", "cancel", true)
+            .unwrap();
+        assert_eq!(recovered.len(), 3);
+        assert!(recovered.iter().all(|task| task["state"] == "canceled"));
 
         let root2 = serde_json::json!({"outcome":"second root"});
         store

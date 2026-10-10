@@ -116,16 +116,18 @@ pub enum ControllerMode {
     Reconciler,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptRole {
+    #[default]
     Implementation,
     Verification,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptLifecycle {
+    #[default]
     Queued,
     Provisioning,
     Running,
@@ -219,6 +221,52 @@ pub struct TaskDependencyRef {
     pub state: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskAttemptSummary {
+    #[serde(default)]
+    pub attempt_id: String,
+    #[serde(default)]
+    pub ordinal: u32,
+    #[serde(default)]
+    pub role: AttemptRole,
+    #[serde(default)]
+    pub lifecycle: AttemptLifecycle,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub start_revision: Option<String>,
+    #[serde(default)]
+    pub turn: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskObservationSummary {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub key: String,
+    pub value: serde_json::Value,
+    pub provenance: ObservationProvenance,
+    #[serde(default)]
+    pub observed_at: Option<String>,
+    #[serde(default)]
+    pub recorded_at: Option<String>,
+    #[serde(default)]
+    pub version: u64,
+    #[serde(default)]
+    pub collection_seq: u64,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskBlockerSummary {
+    pub id: String,
+    pub attempt_id: String,
+    pub question: String,
+    pub context: String,
+    pub version: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskChildSummary {
     pub total: u32,
@@ -273,9 +321,9 @@ pub struct TaskSnapshot {
     pub delivery: Option<serde_json::Value>,
     pub dependencies: TaskDependencySummary,
     pub children: TaskChildSummary,
-    pub attempts: Vec<serde_json::Value>,
-    pub blocker: Option<serde_json::Value>,
-    pub observations: Vec<serde_json::Value>,
+    pub attempts: Vec<TaskAttemptSummary>,
+    pub blocker: Option<TaskBlockerSummary>,
+    pub observations: Vec<TaskObservationSummary>,
     pub action_history: ActionHistorySummary,
     pub budget_usage: BudgetUsage,
     pub retry_schedule: RetrySchedule,
