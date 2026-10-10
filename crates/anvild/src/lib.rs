@@ -2192,7 +2192,6 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
         .route("/v1/capacity", get(get_capacity))
         .route("/v1/tasks", post(create_task).get(list_tasks))
         .route("/v1/tasks/graph", post(create_task_graph))
-        .route("/v1/tasks/:id/complete", post(complete_task))
         .route("/v1/tasks/:id/cancel", post(cancel_task))
         .route("/v1/tasks/:id/obviate", post(obviate_task))
         .route(
@@ -2990,6 +2989,21 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
                     .set_attempt_state(&active.attempt_id, attempt_state)
                     .map_err(|error| ServiceError::Store(error.to_string()))?;
             }
+            if attempt_state == "completed" {
+                let control = store
+                    .task_control(&active.task_id)
+                    .map_err(|error| ServiceError::Store(error.to_string()))?
+                    .ok_or(ServiceError::NotFound)?;
+                if control["controller_mode"] == "legacy" {
+                    store
+                        .complete_legacy_scheduler_attempt(
+                            &active.task_id,
+                            &active.attempt_id,
+                            control["version"].as_u64().unwrap_or_default(),
+                        )
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                }
+            }
         }
     }
 
@@ -3381,57 +3395,69 @@ async fn create_task_graph(
 }
 
 #[derive(Deserialize)]
-struct CompleteTaskRequest {
-    expected_version: u64,
-    evidence_ids: Vec<String>,
-}
-
-async fn complete_task(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(request): Json<CompleteTaskRequest>,
-) -> Result<Json<Value>, ServiceError> {
-    state
-        .store()
-        .map_err(|e| ServiceError::Store(e.into()))?
-        .complete_task(&id, request.expected_version, &request.evidence_ids)
-        .map(Json)
-        .map_err(|error| match error {
-            store::StoreError::NotFound => ServiceError::NotFound,
-            store::StoreError::Conflict => ServiceError::Conflict("task version changed".into()),
-            store::StoreError::InvalidState(message) => ServiceError::Invalid(message),
-            other => ServiceError::Store(other.to_string()),
-        })
-}
-
-#[derive(Deserialize)]
 struct TerminalMutation {
     expected_version: u64,
     reason: String,
     actor: Option<String>,
 }
 
+#[derive(Deserialize, Default)]
+struct CancelTaskQuery {
+    cascade: Option<String>,
+}
+
 async fn cancel_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<CancelTaskQuery>,
     Json(body): Json<TerminalMutation>,
 ) -> Result<Json<Value>, ServiceError> {
     if body.reason.trim().is_empty() {
         return Err(ServiceError::Invalid("reason must not be empty".into()));
     }
-    state
+    if query
+        .cascade
+        .as_deref()
+        .is_some_and(|value| value != "descendants")
+    {
+        return Err(ServiceError::Invalid(
+            "cascade must be omitted or set to descendants".into(),
+        ));
+    }
+    let actor = body.actor.unwrap_or_else(|| "operator".into());
+    let canceled = state
         .store()
         .map_err(|e| ServiceError::Store(e.into()))?
-        .terminate_task(
+        .cancel_task_with_descendants(
             &id,
             body.expected_version,
-            anvil_core::TaskTerminal::Canceled {
-                actor: body.actor.unwrap_or_else(|| "operator".into()),
-                reason: body.reason,
-            },
+            &actor,
+            &body.reason,
+            query.cascade.as_deref() == Some("descendants"),
         )
-        .map(Json)
-        .map_err(map_task_terminal_error)
+        .map_err(map_task_terminal_error)?;
+    for task in &canceled {
+        let task_id = task["task_id"].as_str().unwrap_or_default();
+        let attempts = state
+            .store()
+            .ok()
+            .and_then(|store| store.attempts_for_task(task_id).ok())
+            .unwrap_or_default();
+        {
+            for attempt in attempts {
+                if !matches!(attempt["lifecycle"].as_str(), Some("ended")) {
+                    if let Some(session_id) = attempt["session_id"].as_str() {
+                        if let Err(error) = state.kube.suspend(session_id).await {
+                            warn!(%error, %session_id, "best-effort Task cancellation runtime suspension failed");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(Json(
+        json!({"task":canceled.first(),"canceled_descendants":canceled.len().saturating_sub(1)}),
+    ))
 }
 
 async fn obviate_task(
@@ -3442,7 +3468,7 @@ async fn obviate_task(
     if body.reason.trim().is_empty() {
         return Err(ServiceError::Invalid("reason must not be empty".into()));
     }
-    state
+    let task = state
         .store()
         .map_err(|e| ServiceError::Store(e.into()))?
         .terminate_task(
@@ -3452,8 +3478,22 @@ async fn obviate_task(
                 reason: body.reason,
             },
         )
-        .map(Json)
-        .map_err(map_task_terminal_error)
+        .map_err(map_task_terminal_error)?;
+    let attempts = state
+        .store()
+        .ok()
+        .and_then(|store| store.attempts_for_task(&id).ok())
+        .unwrap_or_default();
+    for attempt in attempts {
+        if !matches!(attempt["lifecycle"].as_str(), Some("ended")) {
+            if let Some(session_id) = attempt["session_id"].as_str() {
+                if let Err(error) = state.kube.suspend(session_id).await {
+                    warn!(%error, %session_id, "best-effort Task obviation runtime suspension failed");
+                }
+            }
+        }
+    }
+    Ok(Json(task))
 }
 
 #[derive(Deserialize)]

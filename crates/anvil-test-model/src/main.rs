@@ -182,6 +182,7 @@ async fn responses(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let is_title_generation = request.to_string().contains("You are a title generator.");
     let tool_count = request
         .get("tools")
         .and_then(Value::as_array)
@@ -227,7 +228,8 @@ async fn responses(
         ))
         .into_response();
     }
-    if prompt.contains("ANVIL-E2E:wait-for-release")
+    if !is_title_generation
+        && prompt.contains("ANVIL-E2E:wait-for-release")
         && std::env::var("ANVIL_TEST_MODEL_GATE").as_deref() == Ok("1")
         && !state.released.load(Ordering::SeqCst)
     {
@@ -384,6 +386,24 @@ fn finish(content: &str, request: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn title_generation_does_not_consume_the_scripted_worker_release_gate() {
+        let state = std::sync::Arc::new(AppState::default());
+        let title_request = json!({
+            "stream":true,
+            "input":[
+                {"role":"developer","content":"You are a title generator. Output one line."},
+                {"role":"user","content":"ANVIL-E2E:edit-file ANVIL-E2E:wait-for-release inspect fixture"}
+            ]
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            responses(State(state), Json(title_request)),
+        )
+        .await
+        .expect("title completion must not block the E2E worker turn");
+    }
 
     #[tokio::test]
     async fn model_listing_is_openai_compatible_and_stable() {

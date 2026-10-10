@@ -28,6 +28,7 @@ type TaskControlRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 #[derive(Debug, Error)]
@@ -1126,7 +1127,7 @@ impl ControllerStore {
 
     /// The single compatibility completion boundary for Legacy scheduler exits and
     /// future trusted observers. Completion is policy-evaluated and Task-CAS fenced.
-    pub fn complete_task(
+    fn complete_task(
         &self,
         task_id: &str,
         expected_version: u64,
@@ -1257,6 +1258,70 @@ impl ControllerStore {
         Ok(task)
     }
 
+    /// Sole trusted compatibility entrypoint used by the Legacy Batch scheduler.
+    /// A factual completed Attempt creates runtime-provenance evidence and then
+    /// uses the same policy/CAS terminal path as every other completion source.
+    pub fn complete_legacy_scheduler_attempt(
+        &self,
+        task_id: &str,
+        attempt_id: &str,
+        expected_version: u64,
+    ) -> Result<Value, StoreError> {
+        let control = self.task_control(task_id)?.ok_or(StoreError::NotFound)?;
+        if control["controller_mode"] != "legacy" {
+            return Err(StoreError::InvalidState(
+                "Legacy scheduler does not own this Task".into(),
+            ));
+        }
+        let policy: anvil_core::CompletionPolicy =
+            serde_json::from_str(control["completion_policy"].as_str().ok_or_else(|| {
+                StoreError::InvalidState("Task has no completion policy".into())
+            })?)?;
+        if !matches!(
+            policy,
+            anvil_core::CompletionPolicy::Evidence { ref required_kinds }
+                if required_kinds.contains(&anvil_core::EvidenceKind::LegacySchedulerExit)
+        ) {
+            return self
+                .get_resource("task", task_id)?
+                .ok_or(StoreError::NotFound);
+        }
+        let attempt = self
+            .get_resource("attempt", attempt_id)?
+            .ok_or(StoreError::NotFound)?;
+        if attempt["task_id"] != task_id || attempt["state"] != "completed" {
+            return Err(StoreError::InvalidState(
+                "Legacy completion requires its completed Attempt".into(),
+            ));
+        }
+        let observation_id = format!("legacy-exit:{attempt_id}");
+        let exists = {
+            let connection = self
+                .connection
+                .lock()
+                .expect("controller store lock poisoned");
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_observations WHERE id=?1 AND task_id=?2)",
+                params![observation_id, task_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        };
+        if !exists {
+            let key = "evidence.legacy_scheduler_exit";
+            let sequence = self.reserve_observation_sequence(task_id, key)?;
+            self.record_observation(
+                &observation_id,
+                task_id,
+                key,
+                &serde_json::json!({"attempt_id":attempt_id,"bridge":"legacy_scheduler_exit"}),
+                "runtime",
+                sequence,
+                None,
+            )?;
+        }
+        self.complete_task(task_id, expected_version, &[observation_id])
+    }
+
     /// Persist a typed non-success terminal before any best-effort runtime shutdown.
     pub fn terminate_task(
         &self,
@@ -1318,6 +1383,65 @@ impl ControllerStore {
         Ok(task)
     }
 
+    pub fn cancel_task_with_descendants(
+        &self,
+        task_id: &str,
+        expected_version: u64,
+        actor: &str,
+        reason: &str,
+        cascade_descendants: bool,
+    ) -> Result<Vec<Value>, StoreError> {
+        let mut canceled = vec![self.terminate_task(
+            task_id,
+            expected_version,
+            anvil_core::TaskTerminal::Canceled {
+                actor: actor.to_owned(),
+                reason: reason.to_owned(),
+            },
+        )?];
+        if !cascade_descendants {
+            return Ok(canceled);
+        }
+        let descendant_ids: Vec<String> = {
+            let connection = self
+                .connection
+                .lock()
+                .expect("controller store lock poisoned");
+            let mut statement = connection.prepare(
+                "WITH RECURSIVE descendants(task_id) AS (
+                     SELECT task_id FROM task_durable_state WHERE parent_task_id=?1
+                     UNION
+                     SELECT child.task_id FROM task_durable_state child JOIN descendants parent ON child.parent_task_id=parent.task_id
+                 ) SELECT task_id FROM descendants ORDER BY task_id",
+            )?;
+            let rows = statement.query_map([task_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        for descendant_id in descendant_ids {
+            let Some(task) = self.get_resource("task", &descendant_id)? else {
+                continue;
+            };
+            if matches!(
+                task["state"].as_str(),
+                Some("completed" | "canceled" | "obviated" | "superseded" | "failed_exhausted")
+            ) {
+                continue;
+            }
+            let control = self
+                .task_control(&descendant_id)?
+                .ok_or(StoreError::NotFound)?;
+            canceled.push(self.terminate_task(
+                &descendant_id,
+                control["version"].as_u64().unwrap_or_default(),
+                anvil_core::TaskTerminal::Canceled {
+                    actor: actor.to_owned(),
+                    reason: format!("descendant of canceled Task {task_id}: {reason}"),
+                },
+            )?);
+        }
+        Ok(canceled)
+    }
+
     /// Construct bounded decision input using a single SQLite read transaction.
     pub fn task_snapshot(
         &self,
@@ -1342,8 +1466,8 @@ impl ControllerStore {
         };
         let task: Value = serde_json::from_str(&task_json)?;
         let control: TaskControlRow = tx.query_row(
-            "SELECT version,operator_hold,controller_mode,reconcile_generation,completion_policy_json,budget_json,verification_spec_json,retry_due_ms,execution_target_json,work_branch,pull_request_binding_json FROM task_durable_state WHERE task_id=?1",
-            [task_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?)),
+            "SELECT version,operator_hold,controller_mode,reconcile_generation,completion_policy_json,budget_json,verification_spec_json,retry_due_ms,execution_target_json,work_branch,pull_request_binding_json,base_revision FROM task_durable_state WHERE task_id=?1",
+            [task_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?)),
         )?;
         let dependencies: Vec<Value> = {
             let mut stmt=tx.prepare("SELECT predecessor_task_id,t.state FROM task_dependencies d JOIN tasks t ON t.task_id=d.predecessor_task_id WHERE d.successor_task_id=?1 ORDER BY d.predecessor_task_id")?;
@@ -1395,6 +1519,11 @@ impl ControllerStore {
             [task_id],
             |row| row.get(0),
         )?;
+        let execution_ms: u64 = tx.query_row(
+            "SELECT COALESCE(SUM(CASE WHEN json_extract(payload_json,'$.started_at') IS NULL THEN 0 ELSE MAX(0,CAST(ROUND((julianday(COALESCE(json_extract(payload_json,'$.ended_at'),datetime(?2/1000,'unixepoch'))) - julianday(json_extract(payload_json,'$.started_at')))*86400000) AS INTEGER)) END),0) FROM attempts WHERE task_id=?1",
+            params![task_id, logical_time],
+            |row| row.get(0),
+        )?;
         let grant_entries: Vec<Value> = {
             let mut stmt = tx.prepare("SELECT grant_id,actor_json,reason,additional_attempts,additional_continuations,additional_ci_retries,additional_execution_seconds,recorded_at FROM task_budget_grants WHERE task_id=?1 ORDER BY recorded_at,grant_id LIMIT 64")?;
             let rows = stmt.query_map([task_id], |row| Ok(serde_json::json!({
@@ -1426,11 +1555,27 @@ impl ControllerStore {
             !active.is_empty(),
             has_execution_target,
         );
+        let observation_value = |key: &str| {
+            observations
+                .iter()
+                .find(|observation| observation["key"] == key)
+                .map(|observation| &observation["value"])
+        };
+        let observed_head =
+            observation_value("delivery.head").or_else(|| observation_value("git.head"));
+        let pr_head_sha =
+            observed_head.and_then(|value| value["sha"].as_str().or_else(|| value.as_str()));
+        let checks = observation_value("delivery.checks");
+        let pull_request = control
+            .10
+            .as_deref()
+            .map(serde_json::from_str::<Value>)
+            .transpose()?;
         let mut snapshot = serde_json::json!({
             "schema_version":1,"task_id":task_id,"task_version":control.0,"logical_time_ms":logical_time,
             "lifecycle":{"state":if matches!(task["state"].as_str(),Some("completed"|"canceled"|"obviated"|"superseded"|"failed_exhausted")) {"terminal"} else {"open"},"terminal":task["terminal"]},"completion_policy":serde_json::from_str::<Value>(&control.4)?,
             "operator_hold":control.1,"controller_mode":controller_mode,"reconcile_generation":control.3,
-            "execution_target":control.8.as_deref().map(serde_json::from_str::<Value>).transpose()? ,"delivery":{"work_branch":control.9,"pull_request":control.10,"base_revision":null,"pr_head_sha":null,"evaluation_sha":null,"evaluation_kind":null,"pr_state":null,"required_checks":[]},
+            "execution_target":control.8.as_deref().map(serde_json::from_str::<Value>).transpose()? ,"delivery":{"work_branch":control.9,"pull_request":pull_request.clone(),"base_revision":control.11,"pr_head_sha":pr_head_sha,"evaluation_sha":checks.and_then(|value|value["evaluation_sha"].as_str()),"evaluation_kind":checks.and_then(|value|value["evaluation_kind"].as_str()),"pr_state":pull_request.as_ref().and_then(|value|value["state"].as_str()),"required_checks":checks.and_then(|value|value["required_checks"].as_array()).cloned().unwrap_or_default()},
             "dependencies":{"all_completed":!dependencies_unresolved,"predecessors":dependencies},"children":{"total":children.len(),"completed":children.iter().filter(|c|c["state"]=="completed").count(),"terminal_noncompleted":children.iter().filter(|c|c["state"]!="completed"&&matches!(c["state"].as_str(),Some("canceled"|"obviated"|"superseded"|"failed_exhausted"))).count()},
             "attempts":attempts,"blocker":blocker,"observations":observations,
             "action_history":{"recent":[]},"budget_usage":{"attempt_count":attempt_count,"grants":serde_json::from_str::<Value>(&grants)?,"spec":serde_json::from_str::<Value>(&control.5)?},
@@ -1443,7 +1588,7 @@ impl ControllerStore {
             "continuations_by_reason": {},
             "ci_retries": 0,
             "verifier_cycles": 0,
-            "execution_ms": 0,
+            "execution_ms": execution_ms,
             "grants": grant_entries,
         });
         snapshot["retry_schedule"]["cause"] = Value::Null;
@@ -2767,6 +2912,28 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_execution_budget_uses_durable_attempt_runtime_intervals() {
+        let (_dir, store) = store();
+        let spec = serde_json::json!({"outcome":"timed work"});
+        store
+            .accept_task("time-key", "test", &spec, "timed-task", &spec)
+            .unwrap();
+        store
+            .create_attempt("timed-task", "timed-attempt", "timed-attempt-key")
+            .unwrap();
+        store.set_attempt_state("timed-attempt", "running").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        store
+            .set_attempt_state("timed-attempt", "completed")
+            .unwrap();
+        let snapshot = store
+            .task_snapshot("timed-task", chrono::Utc::now().timestamp_millis())
+            .unwrap()
+            .unwrap();
+        assert!(snapshot["budget_usage"]["execution_ms"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
     fn blockers_are_attempt_bound_unique_and_cas_resolved() {
         let (_dir, store) = store();
         let spec = serde_json::json!({"outcome":"wait for input"});
@@ -2864,6 +3031,62 @@ mod tests {
             .attach_task_external_ref("external-b", "lific", "ANVIL-1", "hash-c", None)
             .unwrap();
         assert_eq!(reassigned["task_id"], "external-b");
+    }
+
+    #[test]
+    fn cancellation_cascades_only_when_explicit_and_preserves_parent_first() {
+        let (_dir, store) = store();
+        let parent = serde_json::json!({"outcome":"root"});
+        store
+            .accept_task("root-key", "test", &parent, "root-task", &parent)
+            .unwrap();
+        let child = serde_json::json!({"outcome":"child","parent_task_id":"root-task"});
+        store
+            .accept_task("child-key", "test", &child, "child-task", &child)
+            .unwrap();
+        let grandchild = serde_json::json!({"outcome":"grandchild","parent_task_id":"child-task"});
+        store
+            .accept_task(
+                "grandchild-key",
+                "test",
+                &grandchild,
+                "grandchild-task",
+                &grandchild,
+            )
+            .unwrap();
+        let result = store
+            .cancel_task_with_descendants("root-task", 1, "operator", "cancel", false)
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            store.get_resource("task", "child-task").unwrap().unwrap()["state"],
+            "open"
+        );
+
+        let root2 = serde_json::json!({"outcome":"second root"});
+        store
+            .accept_task("root2-key", "test", &root2, "root2", &root2)
+            .unwrap();
+        let child2 = serde_json::json!({"outcome":"child","parent_task_id":"root2"});
+        store
+            .accept_task("child2-key", "test", &child2, "child2", &child2)
+            .unwrap();
+        let grandchild2 = serde_json::json!({"outcome":"grandchild","parent_task_id":"child2"});
+        store
+            .accept_task(
+                "grandchild2-key",
+                "test",
+                &grandchild2,
+                "grandchild2",
+                &grandchild2,
+            )
+            .unwrap();
+        let result = store
+            .cancel_task_with_descendants("root2", 1, "operator", "cascade", true)
+            .unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0]["task_id"], "root2");
+        assert!(result.iter().all(|task| task["state"] == "canceled"));
     }
 
     #[test]
@@ -3094,6 +3317,36 @@ mod tests {
                     reason: "late".into()
                 }
             ),
+            Err(StoreError::InvalidState(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_scheduler_exit_is_the_only_legacy_completion_bridge() {
+        let (_dir, store) = store();
+        let spec = serde_json::json!({
+            "outcome":"legacy batch work",
+            "completion_policy":{"kind":"evidence","required_kinds":["legacy_scheduler_exit"]}
+        });
+        store
+            .accept_task("legacy-key", "test", &spec, "legacy-task", &spec)
+            .unwrap();
+        store
+            .create_attempt("legacy-task", "legacy-attempt", "legacy-attempt-key")
+            .unwrap();
+        store
+            .set_attempt_state("legacy-attempt", "completed")
+            .unwrap();
+        let completed = store
+            .complete_legacy_scheduler_attempt("legacy-task", "legacy-attempt", 2)
+            .unwrap();
+        assert_eq!(completed["state"], "completed");
+        assert_eq!(
+            completed["terminal"]["evidence"][0]["id"],
+            "legacy-exit:legacy-attempt"
+        );
+        assert!(matches!(
+            store.complete_legacy_scheduler_attempt("legacy-task", "legacy-attempt", 2),
             Err(StoreError::InvalidState(_))
         ));
     }

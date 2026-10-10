@@ -468,6 +468,13 @@ fn persist_attempt(
     };
     attempt["lifecycle"] = Value::String(lifecycle.into());
     attempt["exit_reason"] = exit_reason;
+    let transition_time = chrono::Utc::now().to_rfc3339();
+    if lifecycle == "running" && attempt["started_at"].is_null() {
+        attempt["started_at"] = Value::String(transition_time.clone());
+    }
+    if lifecycle == "ended" && attempt["ended_at"].is_null() {
+        attempt["ended_at"] = Value::String(transition_time);
+    }
     if attempt["failure_class"].is_string() {
         let domain = match attempt["failure_class"].as_str().unwrap_or_default() {
             "infrastructure" => "platform",
