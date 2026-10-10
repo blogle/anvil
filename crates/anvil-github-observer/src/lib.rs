@@ -242,9 +242,25 @@ impl GitHubRestPort {
                     .get("state")
                     .and_then(Value::as_str)
                     .ok_or(ProviderError::InvalidResponse)?;
-                latest.insert(login.to_owned(), state.to_owned());
+                let submitted_at = review
+                    .get("submitted_at")
+                    .and_then(Value::as_str)
+                    .or_else(|| review.get("updated_at").and_then(Value::as_str))
+                    .ok_or(ProviderError::InvalidResponse)?;
+                let review_id = review.get("id").and_then(Value::as_u64).unwrap_or_default();
+                let candidate = (submitted_at.to_owned(), review_id, state.to_owned());
+                if latest
+                    .get(login)
+                    .is_none_or(|previous| previous < &candidate)
+                {
+                    latest.insert(login.to_owned(), candidate);
+                }
             }
-            Ok::<_, ProviderError>(latest.values().any(|state| state == "CHANGES_REQUESTED"))
+            Ok::<_, ProviderError>(
+                latest
+                    .values()
+                    .any(|(_, _, state)| state == "CHANGES_REQUESTED"),
+            )
         })();
         match result {
             Ok(changes_requested) => (changes_requested, true),
@@ -580,9 +596,9 @@ mod tests {
         let reviews = server.mock(|when, then| {
             when.method(GET).path("/repos/org/repo/pulls/42/reviews");
             then.status(200).json_body(json!([
-                {"user":{"login":"reviewer"},"state":"CHANGES_REQUESTED"},
-                {"user":{"login":"reviewer"},"state":"COMMENTED"},
-                {"user":{"login":"reviewer-two"},"state":"CHANGES_REQUESTED"}
+                {"id":11,"user":{"login":"reviewer"},"submitted_at":"2026-01-02T00:00:00Z","state":"COMMENTED"},
+                {"id":10,"user":{"login":"reviewer"},"submitted_at":"2026-01-01T00:00:00Z","state":"CHANGES_REQUESTED"},
+                {"id":12,"user":{"login":"reviewer-two"},"submitted_at":"2026-01-03T00:00:00Z","state":"CHANGES_REQUESTED"}
             ]));
         });
         let protection = server.mock(|when, then| {
