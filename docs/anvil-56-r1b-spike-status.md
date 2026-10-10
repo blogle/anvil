@@ -12,13 +12,13 @@ Observed result:
 
 | Experiment | Observation |
 |---|---|
-| Same caller `messageID` resubmitted while first turn was busy | First and duplicate `prompt_async` both returned HTTP 204; only one model request and one assistant turn were observed for the message ID. |
-| Same `messageID` resubmitted after idle | HTTP 204; zero additional model requests and no additional assistant turn were observed. |
+| Same caller `messageID` resubmitted while first turn was busy | First and duplicate `prompt_async` both returned HTTP 204. One model request was active while gated; after release, a second model request was observed for the duplicate, while the persisted history still had one assistant turn. |
+| Same `messageID` resubmitted after idle | HTTP 204; zero additional model requests and no additional assistant turn were observed in this run. |
 | Client socket closed 250 ms after dispatch while model response was gated | The user message persisted. OpenCode had also persisted an assistant placeholder (`time.created` only, no parts, no completion time) before the model response. |
 | OpenCode server killed and restarted with the same temporary profile | The user and incomplete assistant placeholder remained queryable. Releasing the old gated model response did not complete the assistant turn. |
 | Tool side effects | The fixture returned text only; zero tools were requested. Duplicate tool-side-effect behavior remains untested. |
 
-Across the probe the loopback model received three distinct-message requests; neither busy nor idle same-ID duplicate caused another model request. This is **bounded experimental evidence for this specific OpenCode/model timing**, not a general exactly-once/idempotency contract. Production recovery therefore remains observation-first: correlate user/assistant by `messageID`/`parentID`; an empty/incomplete assistant placeholder is not proof of completion or safe resubmission; never blindly resend `UnknownOutcome`.
+Across the probe the loopback model received three requests: the first busy submission, its duplicate after release, and a distinct timeout-probe message. The idle duplicate did not call the model. Thus equal-message-ID behavior differed by timing even though both duplicate HTTP requests returned 204. The busy duplicate caused a second model invocation without a second persisted assistant turn, which is direct evidence not to infer idempotency from status or message history alone. Production recovery remains observation-first: correlate user/assistant by `messageID`/`parentID`; an empty/incomplete assistant placeholder is not proof of completion or safe resubmission; never blindly resend `UnknownOutcome`.
 
 Still unproven: duplicate behavior where a tool side effect is in progress; the exact crash window after `createUserMessage` persistence but before `ensureRunning`; and whether that boundary can leave no assistant placeholder at all. The pinned binary exposes no test-only crash hook at that internal instruction boundary, so the script explicitly reports it unproven rather than manufacturing it through a different API. A user plus incomplete assistant placeholder remains ambiguous and must stay `unknown_outcome`/attention absent stronger evidence.
 
