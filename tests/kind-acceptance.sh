@@ -91,28 +91,6 @@ wait_for_sandbox_pod() {
   return 1
 }
 
-assert_git_diff_ready() {
-  local pod="$1" service_fqdn="$2" deadline=$((SECONDS + 120)) base diff
-  while (( SECONDS < deadline )); do
-    base="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod" -c sandbox -- \
-      curl -fsS "http://$service_fqdn:4097/v1/base" 2>/dev/null || true)"
-    diff="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod" -c sandbox -- \
-      curl -fsS "http://$service_fqdn:4097/v1/diff" 2>/dev/null || true)"
-    if jq -e --argjson diff "$diff" '
-      .status == "ready" and
-      (.base_revision | type == "string" and test("^[0-9a-f]{40,64}$")) and
-      $diff.status == "ready" and
-      $diff.diff.base_revision == .base_revision
-    ' <<<"$base" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 2
-  done
-  printf 'timed out waiting for ready git-diff base and matching diff from %s: base=%s diff=%s\n' \
-    "$service_fqdn" "$base" "$diff" >&2
-  return 1
-}
-
 kind create cluster --name "$cluster" --kubeconfig "$kubeconfig" --wait 120s
 created=1
 
@@ -164,6 +142,7 @@ kubectl --kubeconfig "$kubeconfig" -n "$namespace" create secret generic github-
   --from-literal=ANVIL_GITHUB_INSTALLATION_ID=1 \
   --from-literal=ANVIL_GITHUB_PRIVATE_KEY=unused-in-kind-acceptance \
   --from-literal=ANVIL_SESSION_SIGNING_SECRET="$session_secret" \
+  --from-literal=ANVIL_OPENCODE_SERVER_PASSWORD=kind-only-opencode-password-0123456789abcdef \
   --dry-run=client -o yaml | kubectl --kubeconfig "$kubeconfig" apply -f -
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvild --timeout=180s
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" rollout status deployment/anvil-profile --timeout=180s
@@ -242,7 +221,7 @@ jq -n \
             name:"sandbox",
             image:$image,
             imagePullPolicy:"IfNotPresent",
-            ports:[{name:"opencode",containerPort:4096},{name:"git-diff",containerPort:4097}],
+            ports:[{name:"opencode",containerPort:4096}],
             env:[
               {name:"ANVIL_PROJECT",value:"anvil"},
               {name:"ANVIL_REPOSITORY",value:$repository},
@@ -252,6 +231,8 @@ jq -n \
               {name:"ANVIL_SESSION_ID",value:"fixture-12345678"},
               {name:"ANVIL_CREDENTIAL_URL",value:"http://anvild:8080"},
               {name:"OPENCODE_CONFIG",value:"/anvil/profile/config/opencode.jsonc"},
+              {name:"OPENCODE_SERVER_PASSWORD",value:"kind-only-opencode-password-0123456789abcdef"},
+              {name:"ANVIL_OPENCODE_SERVER_PASSWORD",value:"kind-only-opencode-password-0123456789abcdef"},
               {name:"OPENCODE_CONFIG_DIR",value:"/anvil/profile/config"},
               {name:"HOME",value:"/home/anvil"},
               {name:"XDG_CONFIG_HOME",value:"/home/anvil/.config"},
@@ -261,8 +242,8 @@ jq -n \
               {name:"XDG_RUNTIME_DIR",value:"/home/anvil/.local/state/runtime"},
               {name:"DISPLAY",value:":99"}
             ],
-            readinessProbe:{httpGet:{path:"/global/health",port:"opencode"},periodSeconds:2,timeoutSeconds:1,failureThreshold:60},
-            livenessProbe:{httpGet:{path:"/global/health",port:"opencode"},initialDelaySeconds:15,periodSeconds:10},
+            readinessProbe:{exec:{command:["/bin/bash","-c","curl -fsS -u opencode:$OPENCODE_SERVER_PASSWORD http://127.0.0.1:4096/api/info >/dev/null"]},periodSeconds:2,timeoutSeconds:1,failureThreshold:60},
+            livenessProbe:{exec:{command:["/bin/bash","-c","curl -fsS -u opencode:$OPENCODE_SERVER_PASSWORD http://127.0.0.1:4096/api/info >/dev/null"]},initialDelaySeconds:15,periodSeconds:10},
             volumeMounts:[
               {name:"workspace",mountPath:"/home/anvil"},
               {name:"shared-profile",mountPath:"/anvil/profile"},
@@ -287,7 +268,6 @@ kubectl --kubeconfig "$kubeconfig" -n "$namespace" wait --for=jsonpath='{.status
 service_fqdn="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get sandbox "$sandbox_name" -o json | jq -r '.status.serviceFQDN // empty')"
 test -n "$service_fqdn"
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" get service "$sandbox_name" -o json | jq -e '.spec.ports[] | select(.port == 4096)' >/dev/null
-kubectl --kubeconfig "$kubeconfig" -n "$namespace" get service "$sandbox_name" -o json | jq -e '.spec.ports[] | select(.port == 4097)' >/dev/null
 
 deadline=$((SECONDS + 120))
 while (( SECONDS < deadline )); do
@@ -298,8 +278,8 @@ done
 test -n "$pod_name"
 mount_output="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- mount)"
 [[ "$mount_output" == *"/home/anvil"* ]]
-kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- curl -fsS "http://$service_fqdn:4096/global/health" >/dev/null
-assert_git_diff_ready "$pod_name" "$service_fqdn"
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- curl -fsS -u opencode:kind-only-opencode-password-0123456789abcdef "http://$service_fqdn:4096/api/info" | jq -e '.version | startswith("2.")' >/dev/null
+kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- curl -fsS -u opencode:kind-only-opencode-password-0123456789abcdef "http://$service_fqdn:4096/api/vcs/status" | jq -e 'has("location") and (.data | type == "array")' >/dev/null
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" port-forward service/anvild 18080:8080 >"$tmp/anvild-port-forward.log" 2>&1 & api_forward_pid=$!
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" port-forward service/anvil-router 18082:8082 >"$tmp/router-port-forward.log" 2>&1 & router_forward_pid=$!
 poll http://127.0.0.1:18080/readyz
@@ -332,7 +312,7 @@ for name in "$api_a_name" "$api_b_name"; do
   [ "$name" = "$api_b_name" ] && sandbox_pod="$api_b_pod"
   api_service_fqdn="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" get sandbox "$name" -o json | jq -r '.status.serviceFQDN // empty')"
   test -n "$api_service_fqdn"
-  assert_git_diff_ready "$sandbox_pod" "$api_service_fqdn"
+  kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$sandbox_pod" -- curl -fsS -u "opencode:kind-only-opencode-password-0123456789abcdef" "http://$api_service_fqdn:4096/api/info" | jq -e '.version | startswith("2.")' >/dev/null
 done
 assert_nix_metadata() {
   kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c '
