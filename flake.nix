@@ -15,7 +15,9 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode, sdlc }:
-    flake-utils.lib.eachDefaultSystem (system:
+    # Production CI and OCI images are Linux-only; avoid evaluating the
+    # unsupported x86_64-darwin platform in current nixpkgs.
+    flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
         pkgs = import nixpkgs { inherit system; };
         # The upstream V2 package's install check invokes `opencode --version`
