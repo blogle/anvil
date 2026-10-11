@@ -121,15 +121,40 @@ ci:
     just nix-check
     just build-ci-release
 
-# The SDLC publisher supplies identity context and a JSON map of immutable
-# candidate digests. This hook never rebuilds or pushes images by itself.
+# The SDLC publisher supplies the exact source identity. Promote the existing
+# sha-tagged images; never rebuild them in the release hook.
 release-publish version:
-    test "{{version}}" = "${SDLC_RELEASE_VERSION}"
-    test "${SDLC_RELEASE_VERSION}" =~ '^[0-9]+\.[0-9]+\.[0-9]+$'
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version="{{version}}"
+    test "$version" = "${SDLC_RELEASE_VERSION}"
+    case "$version" in
+      ''|*[!0-9.]*|.*|*.) exit 1 ;;
+    esac
     test -n "${SDLC_RELEASE_MERGED_SHA}"
-    test -n "${SDLC_RELEASE_SOURCE_SHA}"
+    test "${SDLC_RELEASE_MERGED_SHA}" = "$(git rev-parse --verify "${SDLC_RELEASE_MERGED_SHA}^{commit}")"
+    test "${SDLC_RELEASE_MERGED_SHA}" = "$(git rev-parse HEAD)"
+    test "${SDLC_RELEASE_SOURCE_SHA}" = "$(git rev-parse "${SDLC_RELEASE_MERGED_SHA}^1")"
     test -n "${SDLC_RELEASE_RECEIPTS}"
-    test -f "${ANVIL_RELEASE_IMAGE_DIGESTS}"
-    jq -e 'type == "object" and (. as $digests | ["anvil", "anvil-sandbox", "anvil-nix-daemon"] | all(.[] as $name | ($digests[$name] | type == "string" and test("^sha256:[0-9a-f]{64}$"))))' "${ANVIL_RELEASE_IMAGE_DIGESTS}" >/dev/null
+    test -n "${GH_TOKEN:-}"
+    command -v skopeo >/dev/null
+    username="${GHCR_USERNAME:-github-actions[bot]}"
+    receipts="$(mktemp)"
+    trap 'rm -f "$receipts"' EXIT
+    for spec in \
+      'anvil|ghcr.io/blogle/anvil' \
+      'anvil-sandbox|ghcr.io/blogle/anvil-sandbox' \
+      'anvil-nix-daemon|ghcr.io/blogle/anvil-nix-daemon'; do
+      name="${spec%%|*}"
+      image="${spec#*|}"
+      source="docker://${image}:sha-${SDLC_RELEASE_SOURCE_SHA}"
+      digest="$(skopeo inspect --creds "${username}:${GH_TOKEN}" "$source" | jq -er .Digest)"
+      [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+      immutable="docker://${image}@${digest}"
+      for tag in "$version" "v${version}"; do
+        skopeo copy --all --src-creds "${username}:${GH_TOKEN}" --dest-creds "${username}:${GH_TOKEN}" "$immutable" "docker://${image}:${tag}"
+      done
+      jq -n --arg name "$name" --arg image "$image" --arg digest "$digest" --arg version "$version" --arg merged "${SDLC_RELEASE_MERGED_SHA}" --arg source "${SDLC_RELEASE_SOURCE_SHA}" '{name: $name, image: $image, digest: $digest, tags: [$version, ("v" + $version)], version: $version, merged_sha: $merged, source_main_sha: $source}' >> "$receipts"
+    done
     mkdir -p "$(dirname "${SDLC_RELEASE_RECEIPTS}")"
-    jq -n --arg version "${SDLC_RELEASE_VERSION}" --arg merged "${SDLC_RELEASE_MERGED_SHA}" --arg source "${SDLC_RELEASE_SOURCE_SHA}" --slurpfile digests "${ANVIL_RELEASE_IMAGE_DIGESTS}" '{schema: 1, artifacts: [{name: "anvil", image: "ghcr.io/blogle/anvil", digest: $digests[0].anvil, version: $version, merged_sha: $merged, source_main_sha: $source}, {name: "anvil-sandbox", image: "ghcr.io/blogle/anvil-sandbox", digest: $digests[0]."anvil-sandbox", version: $version, merged_sha: $merged, source_main_sha: $source}, {name: "anvil-nix-daemon", image: "ghcr.io/blogle/anvil-nix-daemon", digest: $digests[0]."anvil-nix-daemon", version: $version, merged_sha: $merged, source_main_sha: $source}]}' > "${SDLC_RELEASE_RECEIPTS}"
+    jq -s --arg version "$version" --arg merged "${SDLC_RELEASE_MERGED_SHA}" --arg source "${SDLC_RELEASE_SOURCE_SHA}" '{schema: 1, version: $version, merged_sha: $merged, source_main_sha: $source, artifacts: .}' "$receipts" > "${SDLC_RELEASE_RECEIPTS}"

@@ -15,6 +15,36 @@ jobs:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
     uses: blogle/sdlc/.github/workflows/pr-fast.yml@v1.2.4
 
+  pr-fast-gate:
+    name: sdlc / pr-fast
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push')
+    needs: pr-fast
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the shared fast stage
+        env:
+          PR_FAST_RESULT: ${{ needs.pr-fast.result }}
+        run: test "$PR_FAST_RESULT" = success
+
   candidate:
-    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: >-
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'pull_request' && startsWith(github.head_ref, 'mergify/merge-queue/')) ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     uses: blogle/sdlc/.github/workflows/candidate.yml@v1.2.4
+
+  candidate-gate:
+    name: sdlc / candidate
+    if: >-
+      always() && (
+        github.event_name == 'merge_group' ||
+        (github.event_name == 'pull_request' && startsWith(github.head_ref, 'mergify/merge-queue/')) ||
+        (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      )
+    needs: candidate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the shared candidate stage
+        env:
+          CANDIDATE_RESULT: ${{ needs.candidate.result }}
+        run: test "$CANDIDATE_RESULT" = success

@@ -13,7 +13,8 @@ deploys on a feature branch.
 canonical `SDLC default branch` ruleset. The policy workflow only reads the
 GitHub ruleset API with the Actions token and never applies changes or runs PR
 code. Other applicable checks should be green; expensive candidate/Kind lanes
-run through merge-group or main events, not ordinary source PR admission.
+run through native merge-group, Mergify synthetic PR, or main events, not
+ordinary source PR admission.
 
 The shared v1.2.4 policy declaration uses `require_policy_check: false` for
 the canonical first-onboarding bootstrap. The local stable gate adds the
@@ -35,9 +36,8 @@ rerun the PR and the same check can pass. A follow-up reviewed change can set
 The policy renderer in v1.2.4 requires an active ruleset named `SDLC default
 branch`, targeting `main`, with squash-only PRs, deletion and non-fast-forward
 prevention, stale-review dismissal, and required checks `sdlc / pr-fast` and
-`sdlc / policy`. Configure the provider app as the only intended release
-bypass if the reviewed policy requires it; do not add legacy protection or
-parent rulesets. The release App needs contents-write and pull-request-write
+`sdlc / policy`. The canonical SDLC ruleset has zero bypass actors. Do not add
+legacy protection or parent rulesets. The release App needs contents-write and pull-request-write
 permissions, with credentials stored as `SDLC_RELEASE_APP_ID` and
 `SDLC_RELEASE_APP_PRIVATE_KEY`, and `vars.SDLC_RELEASE_BOT_LOGIN` set to its
 login. Publication also requires `vars.SDLC_RELEASE_ACTIVATE=true`; neither
@@ -45,13 +45,21 @@ is assumed or enabled here.
 
 ## Release Safety
 
-The release caller is manual and has an explicit `activate` gate. The
-consumer-owned `just release-publish <version>` hook requires the exact
-merged/source identities and a JSON file containing immutable digests for all
-three production GHCR images. It does not rebuild or push images. The SDLC
-publisher verifies the merged SHA, tag, durable receipt, and policy before it
-can call the hook. Mergify activation and release activation remain separate
-user decisions.
+The release callers are inert until `vars.SDLC_RELEASE_ACTIVATE=true` and the
+user separately provisions the release App. The consumer-owned
+`just release-publish <version>` hook resolves each existing
+`sha-${source_main_sha}` image, verifies its immutable digest, and promotes
+that exact digest to SemVer and `vSemVer` GHCR tags without rebuilding. It
+requires `skopeo`, GHCR credentials, and package write permission. SDLC
+v1.2.4's shared publisher currently grants `contents: write` but not
+`packages: write`, so OCI promotion is an explicit upstream SDLC #38 blocker
+until that contract is extended or the publisher supplies an approved package
+token. The hook fails closed rather than pretending publication succeeded.
+
+The current `.mergify.yml` still requires at least one human approval. A
+future reviewed policy/Mergify change may move to the autonomous SDLC standard
+after the canonical ruleset is active, but this onboarding PR does not change
+Mergify behavior, add `integration:auto`, or queue itself.
 
 ## Validation Gap
 

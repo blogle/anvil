@@ -1,0 +1,36 @@
+name: SDLC release
+
+# The shared release-merge workflow dispatches this exact consumer filename.
+# It remains inert until the user enables the release variable and, for a
+# manual run, explicitly supplies activate=true.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      merged_sha:
+        description: Actual squash-merged release commit to publish
+        required: false
+        type: string
+        default: ""
+      activate:
+        description: Explicitly activate release reconciliation/publication
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  reconcile:
+    if: >-
+      vars.SDLC_RELEASE_ACTIVATE == 'true' &&
+      (github.event_name == 'push' || inputs.activate == true)
+    uses: blogle/sdlc/.github/workflows/release.yml@v1.2.4
+    with:
+      merged_sha: ${{ inputs.merged_sha || '' }}
+      activate: ${{ inputs.activate || vars.SDLC_RELEASE_ACTIVATE == 'true' }}
+      sdlc_ref: github:blogle/sdlc/v1.2.4
+    secrets: inherit
