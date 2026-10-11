@@ -23,6 +23,8 @@ jobs:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Evaluate flake
         run: time nix flake check --no-build --system x86_64-linux
+      - name: Build one derivation through the Nix daemon
+        run: time nix build --no-link .#checks.x86_64-linux.sdlc-stage-contract
       - name: Rust format
         run: time nix develop .#kind-ci --command cargo fmt --all --check
 
