@@ -194,6 +194,7 @@ name = "anvild"
 version = "0.1.0"
 dependencies = [
  "anvil-core",
+ "anvil-reconcile",
  "anyhow",
  "async-trait",
  "axum 0.7.9",

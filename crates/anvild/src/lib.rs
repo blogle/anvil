@@ -2096,6 +2096,7 @@ impl AppState {
             }
         }
         self.start_batch_scheduler();
+        self.start_shadow_reconciler();
         Ok(())
     }
 
@@ -2118,6 +2119,21 @@ impl AppState {
                 interval.tick().await;
                 if let Err(error) = run_batch_scheduler_tick(&state).await {
                     warn!(%error, "batch scheduler tick failed");
+                }
+            }
+        });
+    }
+
+    /// Persist comparisons for Legacy-owned Shadow Tasks. This loop only writes the
+    /// decision/outbox ledger; no Shadow action is ever claimed or dispatched here.
+    fn start_shadow_reconciler(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                if let Err(error) = run_shadow_reconciliation_tick(&state) {
+                    warn!(%error, "shadow reconciliation tick failed");
                 }
             }
         });
@@ -2203,6 +2219,7 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
         )
         .route("/v1/tasks/:id/budget-grants", post(grant_task_budget))
         .route("/v1/tasks/:id/snapshot", get(get_task_snapshot))
+        .route("/v1/tasks/:id/decisions", get(get_task_decisions))
         .route("/v1/tasks/:id", get(get_task))
         .route(
             "/v1/tasks/:id/attempts",
@@ -3275,6 +3292,84 @@ async fn get_task_snapshot(
         .map_err(|error| ServiceError::Store(error.to_string()))?
         .map(Json)
         .ok_or(ServiceError::NotFound)
+}
+
+#[derive(Deserialize)]
+struct DecisionQuery {
+    cursor: Option<u64>,
+    limit: Option<usize>,
+}
+
+async fn get_task_decisions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<DecisionQuery>,
+) -> Result<Json<Value>, ServiceError> {
+    let decisions = anvil_reconcile::outbox::SqliteDecisionStore::open(&state.config.store_path)
+        .and_then(|store| {
+            store.decisions_json(&id, query.cursor.unwrap_or(0), query.limit.unwrap_or(50))
+        })
+        .map_err(|error| ServiceError::Store(error.to_string()))?;
+    let next = decisions
+        .last()
+        .and_then(|decision| decision["decision_sequence"].as_u64());
+    Ok(Json(json!({"decisions":decisions,"next_cursor":next})))
+}
+
+fn run_shadow_reconciliation_tick(state: &AppState) -> Result<(), String> {
+    let task_store = state.store().map_err(str::to_owned)?;
+    let mut decisions =
+        anvil_reconcile::outbox::SqliteDecisionStore::open(&state.config.store_path)
+            .map_err(|error| error.to_string())?;
+    let now = Utc::now().timestamp_millis();
+    let mut after = 0;
+    loop {
+        let (tasks, next) = task_store
+            .task_page_filtered(
+                after,
+                100,
+                &store::TaskListFilters {
+                    lifecycle: Some("open".into()),
+                    parent: None,
+                    runnable: None,
+                    external_provider: None,
+                    external_id: None,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        for task in tasks {
+            let Some(task_id) = task["id"].as_str().or_else(|| task["task_id"].as_str()) else {
+                continue;
+            };
+            let Some(mut snapshot) = task_store
+                .task_snapshot(task_id, now)
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            if snapshot["controller_mode"] != "shadow" {
+                continue;
+            }
+            snapshot["action_history"] = decisions
+                .action_history_json(task_id, 128)
+                .map_err(|error| error.to_string())?;
+            let (typed, logical_time) = anvil_reconcile::frozen_v0::decode_snapshot(&snapshot)?;
+            let decision = anvil_reconcile::reconcile(&typed, logical_time);
+            let record =
+                anvil_reconcile::DecisionRecord::new(&typed, logical_time, &snapshot, &decision);
+            let expected_generation = decisions
+                .generation(task_id)
+                .map_err(|error| error.to_string())?
+                .unwrap_or(0);
+            decisions
+                // Proposed Shadow actions live only in this replayable decision.
+                .commit_shadow_decision(task_id, expected_generation, typed.task_version, &record)
+                .map_err(|error| error.to_string())?;
+        }
+        let Some(cursor) = next else { break };
+        after = cursor;
+    }
+    Ok(())
 }
 
 async fn create_task_graph(

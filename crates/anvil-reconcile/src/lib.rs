@@ -1108,7 +1108,18 @@ pub mod outbox {
             decision: &DecisionRecord,
             desired: &[ProposedAction],
         ) -> rusqlite::Result<CommitResult> {
-            use rusqlite::{params, TransactionBehavior};
+            self.commit_inner(task_id, expected_generation, decision, desired, None)
+        }
+
+        fn commit_inner(
+            &mut self,
+            task_id: &str,
+            expected_generation: u64,
+            decision: &DecisionRecord,
+            desired: &[ProposedAction],
+            expected_task_version: Option<u64>,
+        ) -> rusqlite::Result<CommitResult> {
+            use rusqlite::{params, OptionalExtension, TransactionBehavior};
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1126,6 +1137,20 @@ pub mod outbox {
                     actual_generation: actual,
                 });
             }
+            if let Some(expected_version) = expected_task_version {
+                let current_version: Option<u64> = tx
+                    .query_row(
+                        "SELECT version FROM task_durable_state WHERE task_id=?1",
+                        [task_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if current_version != Some(expected_version) {
+                    return Ok(CommitResult::Conflict {
+                        actual_generation: actual,
+                    });
+                }
+            }
             let mut statement = tx.prepare("SELECT idempotency_key FROM reconcile_desired_actions WHERE task_id=?1 ORDER BY idempotency_key")?;
             let previous: BTreeSet<String> = statement
                 .query_map([task_id], |r| r.get(0))?
@@ -1133,39 +1158,54 @@ pub mod outbox {
             drop(statement);
             let next: BTreeSet<String> =
                 desired.iter().map(|a| a.idempotency_key.clone()).collect();
-            if previous == next {
+            let previous_decision: Option<String> = tx.query_row(
+                "SELECT record_json FROM reconcile_decisions WHERE task_id=?1 ORDER BY sequence DESC LIMIT 1",
+                [task_id],
+                |row| row.get(0),
+            ).optional()?;
+            let decision_changed = previous_decision
+                .and_then(|raw| serde_json::from_str::<DecisionRecord>(&raw).ok())
+                .is_none_or(|previous| {
+                    previous.snapshot_hash != decision.snapshot_hash
+                        || previous.actions_hash != decision.actions_hash
+                        || previous.rule_id != decision.rule_id
+                });
+            if previous == next && !decision_changed {
                 return Ok(CommitResult::Unchanged { generation: actual });
             }
-            let generation = actual + 1;
-            let mut statement = tx.prepare("SELECT idempotency_key FROM reconcile_actions WHERE task_id=?1 AND state='pending'")?;
-            let pending: Vec<String> = statement
-                .query_map([task_id], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            drop(statement);
-            for key in pending {
-                if !next.contains(&key) {
-                    tx.execute("UPDATE reconcile_actions SET state='superseded' WHERE task_id=?1 AND idempotency_key=?2 AND state='pending'", params![task_id,key])?;
-                }
-            }
+            let actions_changed = previous != next;
+            let generation = actual + u64::from(actions_changed);
             let mut inserted = 0;
-            for action in desired {
-                let changed = tx.execute(
+            if actions_changed {
+                let mut statement = tx.prepare("SELECT idempotency_key FROM reconcile_actions WHERE task_id=?1 AND state='pending'")?;
+                let pending: Vec<String> = statement
+                    .query_map([task_id], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                drop(statement);
+                for key in pending {
+                    if !next.contains(&key) {
+                        tx.execute("UPDATE reconcile_actions SET state='superseded' WHERE task_id=?1 AND idempotency_key=?2 AND state='pending'", params![task_id,key])?;
+                    }
+                }
+                for action in desired {
+                    let changed = tx.execute(
                     "INSERT OR IGNORE INTO reconcile_actions(task_id,idempotency_key,generation,action_json,state) VALUES(?1,?2,?3,?4,'pending')",
                     params![task_id, action.idempotency_key, generation, serde_json::to_string(action).expect("action serializes")],
                 )?;
-                inserted += changed;
+                    inserted += changed;
+                }
+                tx.execute(
+                    "DELETE FROM reconcile_desired_actions WHERE task_id=?1",
+                    [task_id],
+                )?;
+                for key in &next {
+                    tx.execute("INSERT INTO reconcile_desired_actions(task_id,idempotency_key,generation) VALUES(?1,?2,?3)", params![task_id,key,generation])?;
+                }
+                tx.execute(
+                    "UPDATE reconcile_control SET generation=?2 WHERE task_id=?1",
+                    params![task_id, generation],
+                )?;
             }
-            tx.execute(
-                "DELETE FROM reconcile_desired_actions WHERE task_id=?1",
-                [task_id],
-            )?;
-            for key in &next {
-                tx.execute("INSERT INTO reconcile_desired_actions(task_id,idempotency_key,generation) VALUES(?1,?2,?3)", params![task_id,key,generation])?;
-            }
-            tx.execute(
-                "UPDATE reconcile_control SET generation=?2 WHERE task_id=?1",
-                params![task_id, generation],
-            )?;
             let sequence: u64 = tx.query_row(
                 "SELECT COALESCE(MAX(sequence),0)+1 FROM reconcile_decisions WHERE task_id=?1",
                 [task_id],
@@ -1188,6 +1228,24 @@ pub mod outbox {
                 generation,
                 inserted,
             })
+        }
+
+        /// Persist a Shadow decision while ensuring its proposed Actions never become
+        /// claimable outbox rows, even if controller mode changes before a later claim.
+        pub fn commit_shadow_decision(
+            &mut self,
+            task_id: &str,
+            expected_generation: u64,
+            expected_task_version: u64,
+            decision: &DecisionRecord,
+        ) -> rusqlite::Result<CommitResult> {
+            self.commit_inner(
+                task_id,
+                expected_generation,
+                decision,
+                &[],
+                Some(expected_task_version),
+            )
         }
         pub fn claim(
             &mut self,
@@ -1334,6 +1392,84 @@ pub mod outbox {
                     },
                 )
                 .optional()
+        }
+
+        /// Return the durable outbox history required to make continuation decisions safely.
+        /// A query error is propagated; callers must not treat it as an empty ledger.
+        pub fn action_history_json(&self, task_id: &str, limit: usize) -> rusqlite::Result<Value> {
+            let mut statement = self.connection.prepare(
+                "SELECT action_json,generation,state FROM reconcile_actions WHERE task_id=?1 ORDER BY generation DESC,idempotency_key LIMIT ?2",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![task_id, limit.clamp(1, 128) as i64],
+                |row| {
+                    let action: String = row.get(0)?;
+                    let generation: u64 = row.get(1)?;
+                    let state: String = row.get(2)?;
+                    let action: Value = serde_json::from_str(&action).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok((action, generation, state))
+                },
+            )?;
+            let mut relevant = Vec::new();
+            let mut continuations = BTreeSet::new();
+            for row in rows {
+                let (action, generation, state) = row?;
+                let kind = action["kind"].as_str().unwrap_or_default();
+                let cause = action["cause_fingerprint"].as_str().unwrap_or_default();
+                if matches!(
+                    kind,
+                    "checks_failed" | "merge_conflict" | "send_continuation"
+                ) {
+                    continuations.insert(cause.to_owned());
+                }
+                relevant.push(serde_json::json!({
+                    "action_kind": kind,
+                    "attempt_id": action["attempt_id"],
+                    "cause_fingerprint": cause,
+                    "idempotency_key": action["idempotency_key"],
+                    "state": state,
+                    "turn_id": action.pointer("/payload/turn_id"),
+                    "generation": generation
+                }));
+            }
+            Ok(serde_json::json!({
+                "availability":"authoritative",
+                "relevant":relevant,
+                "continuation_fingerprints_sent":continuations.into_iter().collect::<Vec<_>>(),
+                "last_consumed_evidence":null
+            }))
+        }
+
+        pub fn decisions_json(
+            &self,
+            task_id: &str,
+            after: u64,
+            limit: usize,
+        ) -> rusqlite::Result<Vec<Value>> {
+            let mut statement = self.connection.prepare(
+                "SELECT record_json FROM reconcile_decisions WHERE task_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![task_id, after, limit.clamp(1, 100) as i64],
+                |row| row.get::<_, String>(0),
+            )?;
+            rows.map(|row| {
+                let raw = row?;
+                serde_json::from_str(&raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .collect()
         }
     }
 }
@@ -2978,6 +3114,92 @@ mod outbox_tests {
         assert_eq!(
             store.action_state("t", "durable-key").unwrap(),
             Some(ActionState::Succeeded)
+        );
+    }
+
+    #[test]
+    fn sqlite_persists_empty_shadow_decision_once_and_replays_after_restart() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut first = record();
+        first.generation = 0;
+        first.snapshot_hash = "semantic-snapshot".into();
+        first.actions_hash = actions_hash(&[]);
+        first.canonical_snapshot_json = json!({"logical_time_ms": 10});
+        {
+            let mut store = SqliteDecisionStore::open(file.path()).unwrap();
+            assert_eq!(
+                store.commit("t", 0, &first, &[]).unwrap(),
+                CommitResult::Applied {
+                    generation: 0,
+                    inserted: 0
+                }
+            );
+            assert_eq!(store.decision_count("t").unwrap(), 1);
+        }
+        let mut next = first.clone();
+        next.logical_time_ms = 15;
+        next.canonical_snapshot_json = json!({"logical_time_ms": 15});
+        let mut store = SqliteDecisionStore::open(file.path()).unwrap();
+        assert_eq!(
+            store.commit("t", 0, &next, &[]).unwrap(),
+            CommitResult::Unchanged { generation: 0 }
+        );
+        assert_eq!(store.decision_count("t").unwrap(), 1);
+        let replay = store.decision_record("t", 1).unwrap().unwrap();
+        assert_eq!(replay.snapshot_hash, "semantic-snapshot");
+        assert_eq!(replay.generation, 0);
+    }
+
+    #[test]
+    fn shadow_action_history_is_reported_authoritative_only_from_outbox_rows() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut store = SqliteDecisionStore::open(file.path()).unwrap();
+        assert_eq!(
+            store.action_history_json("t", 16).unwrap()["availability"],
+            "authoritative"
+        );
+        store
+            .commit("t", 0, &record(), &[desired("history-key")])
+            .unwrap();
+        let history = store.action_history_json("t", 16).unwrap();
+        assert_eq!(history["relevant"][0]["idempotency_key"], "history-key");
+        assert_eq!(history["relevant"][0]["state"], "pending");
+    }
+
+    #[test]
+    fn shadow_proposals_are_durable_but_never_claimable_after_mode_transition() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut store = SqliteDecisionStore::open(file.path()).unwrap();
+        let setup = rusqlite::Connection::open(file.path()).unwrap();
+        setup.execute_batch("CREATE TABLE task_durable_state(task_id TEXT PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO task_durable_state VALUES('t',1);").unwrap();
+        drop(setup);
+        let mut decision = record();
+        decision.canonical_actions_json = serde_json::to_value([desired("shadow-only")]).unwrap();
+        decision.actions_hash = actions_hash(&[desired("shadow-only")]);
+        assert_eq!(
+            store.commit_shadow_decision("t", 0, 1, &decision).unwrap(),
+            CommitResult::Applied {
+                generation: 0,
+                inserted: 0
+            }
+        );
+        assert_eq!(
+            store
+                .decision_record("t", 1)
+                .unwrap()
+                .unwrap()
+                .canonical_actions_json[0]["idempotency_key"],
+            "shadow-only"
+        );
+        assert_eq!(store.action_state("t", "shadow-only").unwrap(), None);
+        assert!(!store
+            .claim("t", "shadow-only", 0, ControllerMode::Reconciler, false)
+            .unwrap());
+        assert_eq!(
+            store.commit_shadow_decision("t", 0, 0, &decision).unwrap(),
+            CommitResult::Conflict {
+                actual_generation: 0
+            }
         );
     }
 

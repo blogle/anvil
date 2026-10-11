@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 anvil-core.workspace = true
+anvil-reconcile = { path = "../anvil-reconcile" }
 anyhow = "1.0"
 async-trait = "0.1"
 axum = "0.7"
