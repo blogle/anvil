@@ -7894,14 +7894,30 @@ impl OpenCode {
         }
     }
     async fn is_v2(&self) -> bool {
-        let mut request = self.client.get(self.base.join("api/info").unwrap());
-        if let Ok(password) = env::var("ANVIL_OPENCODE_SERVER_PASSWORD") {
+        let Ok(url) = self.base.join("api/info") else {
+            return false;
+        };
+        let mut request = self.client.get(url);
+        if let Some(password) = self.password.as_ref() {
             request = request.basic_auth("opencode", Some(password));
         }
-        request
-            .send()
+        let Ok(response) = request.send().await else {
+            return false;
+        };
+        if !response.status().is_success() {
+            return false;
+        }
+        response
+            .json::<Value>()
             .await
-            .is_ok_and(|response| response.status().is_success())
+            .ok()
+            .and_then(|info| {
+                info.get("version")
+                    .and_then(Value::as_str)
+                    .and_then(|version| version.split('.').next())
+                    .and_then(|major| major.trim_start_matches('v').parse::<u32>().ok())
+            })
+            .is_some_and(|major| major >= 2)
     }
     async fn health(&self) -> Result<(), ServiceError> {
         if self.is_v2().await {
@@ -7915,7 +7931,7 @@ impl OpenCode {
         }
     }
     async fn status_snapshot(&self) -> Result<Value, ServiceError> {
-        if self.is_v2().await? {
+        if self.is_v2().await {
             let response = self
                 .request("api/session/active", reqwest::Method::GET, None)
                 .await?;
@@ -7926,12 +7942,25 @@ impl OpenCode {
         }
     }
     async fn session_messages(&self, id: &str) -> Result<Value, ServiceError> {
-        self.request(
-            &format!("session/{id}/message?limit={ACTIVITY_MESSAGE_LIMIT}"),
-            reqwest::Method::GET,
-            None,
-        )
-        .await
+        if self.is_v2().await {
+            let response = self
+                .request(
+                    &format!("api/session/{id}/message?limit={ACTIVITY_MESSAGE_LIMIT}"),
+                    reqwest::Method::GET,
+                    None,
+                )
+                .await?;
+            Ok(normalize_v2_messages(
+                response.get("data").cloned().unwrap_or(response),
+            ))
+        } else {
+            self.request(
+                &format!("session/{id}/message?limit={ACTIVITY_MESSAGE_LIMIT}"),
+                reqwest::Method::GET,
+                None,
+            )
+            .await
+        }
     }
     async fn session_message_page(
         &self,
@@ -7942,7 +7971,7 @@ impl OpenCode {
             .base
             .join(&format!("session/{id}/message"))
             .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
-        let v2 = self.is_v2().await?;
+        let v2 = self.is_v2().await;
         if v2 {
             url = self
                 .base
@@ -8017,47 +8046,6 @@ impl OpenCode {
             Ok((messages, next_cursor))
         }
     }
-    async fn is_v2(&self) -> Result<bool, ServiceError> {
-        let url = self
-            .base
-            .join("api/info")
-            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
-        let mut request = self.client.get(url);
-        if let Some(password) = self.password.as_ref() {
-            request = request.basic_auth("opencode", Some(password));
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
-        match response.status() {
-            status if status.is_success() => {
-                if !response
-                    .headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .is_some_and(|content_type| content_type.starts_with("application/json"))
-                {
-                    // V1 serves its SPA fallback for unknown /api paths with HTTP 200.
-                    return Ok(false);
-                }
-                let info = response
-                    .json::<Value>()
-                    .await
-                    .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
-                let major = info
-                    .get("version")
-                    .and_then(Value::as_str)
-                    .and_then(|version| version.split('.').next())
-                    .and_then(|major| major.trim_start_matches('v').parse::<u32>().ok());
-                Ok(major.is_some_and(|major| major >= 2))
-            }
-            reqwest::StatusCode::NOT_FOUND => Ok(false),
-            status => Err(ServiceError::OpenCode(format!(
-                "HTTP {status} detecting OpenCode API version"
-            ))),
-        }
-    }
     async fn event_stream(&self) -> Result<reqwest::Response, ServiceError> {
         let url = self
             .base
@@ -8090,7 +8078,7 @@ impl OpenCode {
         Ok(response)
     }
     async fn session_exists(&self, id: &str) -> Result<bool, ServiceError> {
-        let path = if self.is_v2().await? {
+        let path = if self.is_v2().await {
             format!("api/session/{id}")
         } else {
             format!("session/{id}")
