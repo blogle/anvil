@@ -1587,11 +1587,48 @@ impl ControllerStore {
         task_id: &str,
         logical_time: i64,
     ) -> Result<Option<Value>, StoreError> {
+        self.build_task_snapshot(task_id, logical_time, false)
+    }
+
+    /// Build the canonical reconciler snapshot and its outbox history from the
+    /// same SQLite read transaction. A missing/unreadable outbox is an error, not
+    /// an authoritative empty action set.
+    pub fn task_reconciliation_snapshot(
+        &self,
+        task_id: &str,
+        logical_time: i64,
+    ) -> Result<Option<Value>, StoreError> {
+        self.build_task_snapshot(task_id, logical_time, true)
+    }
+
+    fn build_task_snapshot(
+        &self,
+        task_id: &str,
+        logical_time: i64,
+        include_action_history: bool,
+    ) -> Result<Option<Value>, StoreError> {
         let mut connection = self
             .connection
             .lock()
             .expect("controller store lock poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let snapshot = self.build_task_snapshot_in_transaction(
+            &tx,
+            task_id,
+            logical_time,
+            include_action_history,
+        )?;
+        tx.commit()?;
+        Ok(snapshot)
+    }
+
+    fn build_task_snapshot_in_transaction(
+        &self,
+        tx: &Transaction<'_>,
+        task_id: &str,
+        logical_time: i64,
+        include_action_history: bool,
+    ) -> Result<Option<Value>, StoreError> {
         let task: Option<String> = tx
             .query_row(
                 "SELECT payload_json FROM tasks WHERE task_id=?1",
@@ -1600,7 +1637,6 @@ impl ControllerStore {
             )
             .optional()?;
         let Some(task_json) = task else {
-            tx.commit()?;
             return Ok(None);
         };
         let task: Value = serde_json::from_str(&task_json)?;
@@ -1821,6 +1857,13 @@ impl ControllerStore {
             "continuation_fingerprints_sent": [],
             "last_consumed_evidence": null
         });
+        if include_action_history {
+            let history =
+                anvil_reconcile::outbox::SqliteDecisionStore::action_history_json_from_connection(
+                    &tx, task_id, 128,
+                )?;
+            snapshot["action_history"] = history;
+        }
         snapshot["budget_usage"] = serde_json::json!({
             "limits": effective_budget,
             "attempts": attempt_count,
@@ -1832,8 +1875,118 @@ impl ControllerStore {
         });
         snapshot["retry_schedule"]["cause"] = retry_cause.map(Value::String).unwrap_or(Value::Null);
         snapshot["merge_wait_due_at_ms"] = Value::Null;
-        tx.commit()?;
         Ok(Some(snapshot))
+    }
+
+    /// Revalidate and persist a decision with its outbox delta in one SQLite
+    /// write transaction. The evaluated snapshot is rebuilt on this transaction's
+    /// boundary; any Task fact, ownership, hold, or authoritative-history race
+    /// returns a CAS conflict for the scheduler to retry.
+    pub fn commit_reconcile_decision(
+        &self,
+        task_id: &str,
+        logical_time: i64,
+        evaluated_snapshot: &Value,
+        decision_record: &anvil_reconcile::DecisionRecord,
+        proposed_actions: &[anvil_reconcile::ProposedAction],
+    ) -> Result<anvil_reconcile::outbox::CommitResult, StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(current_snapshot) =
+            self.build_task_snapshot_in_transaction(&tx, task_id, logical_time, true)?
+        else {
+            return Err(StoreError::NotFound);
+        };
+        let (current, current_logical_time) =
+            anvil_reconcile::frozen_v0::decode_snapshot(&current_snapshot)
+                .map_err(|error| StoreError::InvalidState(error))?;
+        let snapshot_matches = anvil_reconcile::snapshot_hash(&current_snapshot)
+            == anvil_reconcile::snapshot_hash(evaluated_snapshot)
+            && current_logical_time.0 == decision_record.logical_time_ms
+            && decision_record.task_id == task_id
+            && decision_record.task_version == current.task_version
+            && decision_record.snapshot_hash == anvil_reconcile::snapshot_hash(evaluated_snapshot)
+            && decision_record.canonical_snapshot_json
+                == anvil_reconcile::canonical_evaluated_snapshot(evaluated_snapshot)
+            && decision_record.actions_hash == anvil_reconcile::actions_hash(proposed_actions)
+            && decision_record.canonical_actions_json == serde_json::to_value(proposed_actions)?;
+        if !snapshot_matches {
+            return Ok(anvil_reconcile::outbox::CommitResult::Conflict {
+                actual_generation: current_snapshot
+                    .pointer("/action_history/generation")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            });
+        }
+        let history = &current_snapshot["action_history"];
+        let fence = anvil_reconcile::outbox::TaskCommitFence {
+            task_version: current.task_version,
+            controller_mode: current.controller_mode.clone(),
+            operator_hold: current.operator_hold,
+            reconcile_generation: current.reconcile_generation,
+            action_generation: history["generation"].as_u64().unwrap_or(0),
+            action_history_fingerprint: history["ledger_fingerprint"]
+                .as_str()
+                .ok_or_else(|| StoreError::InvalidState("missing action-history fence".into()))?
+                .to_owned(),
+        };
+        let mut persisted_decision = decision_record.clone();
+        let result = match current.controller_mode {
+            anvil_reconcile::ControllerMode::Legacy => {
+                return Ok(anvil_reconcile::outbox::CommitResult::Conflict {
+                    actual_generation: fence.action_generation,
+                });
+            }
+            anvil_reconcile::ControllerMode::Shadow => {
+                persisted_decision.authorization_blocked_reason = Some("shadow_mode".into());
+                anvil_reconcile::outbox::commit_shadow_decision_in_transaction(
+                    &tx,
+                    task_id,
+                    &fence,
+                    &persisted_decision,
+                )?
+            }
+            anvil_reconcile::ControllerMode::Reconciler => {
+                let authorization_block = if history["availability"] != "authoritative" {
+                    Some("action_history_unavailable")
+                } else if current.budget_usage.attempts > 0 {
+                    // Existing Attempts may carry legacy turns absent from this
+                    // outbox. The later takeover increment must adopt/prove that
+                    // history before the proposal can become executable intent.
+                    Some("legacy_history_not_adopted")
+                } else {
+                    None
+                };
+                if let Some(reason) = authorization_block {
+                    persisted_decision.authorization_blocked_reason = Some(reason.into());
+                    anvil_reconcile::outbox::commit_reconciler_decision_only_in_transaction(
+                        &tx,
+                        task_id,
+                        &fence,
+                        &persisted_decision,
+                    )?
+                } else {
+                    anvil_reconcile::outbox::commit_reconciler_decision_in_transaction(
+                        &tx,
+                        task_id,
+                        &fence,
+                        &persisted_decision,
+                        proposed_actions,
+                    )?
+                }
+            }
+        };
+        if matches!(
+            result,
+            anvil_reconcile::outbox::CommitResult::Conflict { .. }
+        ) {
+            return Ok(result);
+        }
+        tx.commit()?;
+        Ok(result)
     }
 
     /// Compare-and-swap the mutable controller fields. Immutable task intent is

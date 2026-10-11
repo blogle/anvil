@@ -910,6 +910,8 @@ pub struct DecisionRecord {
     pub snapshot_hash: String,
     pub actions_hash: String,
     pub rule_id: String,
+    #[serde(default)]
+    pub authorization_blocked_reason: Option<String>,
     pub canonical_snapshot_json: Value,
     pub canonical_actions_json: Value,
 }
@@ -929,6 +931,7 @@ impl DecisionRecord {
             snapshot_hash: snapshot_hash(source),
             actions_hash: actions_hash(&d.desired_actions),
             rule_id: d.rule_id.clone(),
+            authorization_blocked_reason: None,
             canonical_snapshot_json: snapshot,
             canonical_actions_json: actions,
         }
@@ -998,6 +1001,329 @@ pub mod outbox {
         Applied { generation: u64, inserted: usize },
         Unchanged { generation: u64 },
         Conflict { actual_generation: u64 },
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct TaskCommitFence {
+        pub task_version: u64,
+        pub controller_mode: ControllerMode,
+        pub operator_hold: bool,
+        pub reconcile_generation: u64,
+        pub action_generation: u64,
+        pub action_history_fingerprint: String,
+    }
+
+    fn persist_decision_only_tx(
+        tx: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        generation: u64,
+        decision: &DecisionRecord,
+    ) -> rusqlite::Result<CommitResult> {
+        use rusqlite::OptionalExtension;
+        let previous_decision: Option<String> = tx
+            .query_row(
+                "SELECT record_json FROM reconcile_decisions WHERE task_id=?1 ORDER BY sequence DESC LIMIT 1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let unchanged = previous_decision
+            .and_then(|raw| serde_json::from_str::<DecisionRecord>(&raw).ok())
+            .is_some_and(|previous| {
+                previous.snapshot_hash == decision.snapshot_hash
+                    && previous.actions_hash == decision.actions_hash
+                    && previous.rule_id == decision.rule_id
+            });
+        if unchanged {
+            return Ok(CommitResult::Unchanged { generation });
+        }
+        let sequence: u64 = tx.query_row(
+            "SELECT COALESCE(MAX(sequence),0)+1 FROM reconcile_decisions WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        let mut committed = decision.clone();
+        committed.generation = generation;
+        committed.decision_sequence = sequence;
+        tx.execute(
+            "INSERT INTO reconcile_decisions(task_id,sequence,generation,record_json) VALUES(?1,?2,?3,?4)",
+            rusqlite::params![task_id, sequence, generation, serde_json::to_string(&committed).expect("decision serializes")],
+        )?;
+        Ok(CommitResult::Applied {
+            generation,
+            inserted: 0,
+        })
+    }
+
+    fn commit_reconciler_tx(
+        tx: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        expected_generation: u64,
+        decision: &DecisionRecord,
+        desired: &[ProposedAction],
+        fence: Option<&TaskCommitFence>,
+    ) -> rusqlite::Result<CommitResult> {
+        use rusqlite::{params, OptionalExtension};
+        tx.execute(
+            "INSERT OR IGNORE INTO reconcile_control(task_id,generation) VALUES(?1,0)",
+            [task_id],
+        )?;
+        let actual: u64 = tx.query_row(
+            "SELECT generation FROM reconcile_control WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        if actual != expected_generation {
+            return Ok(CommitResult::Conflict {
+                actual_generation: actual,
+            });
+        }
+        if let Some(fence) = fence {
+            if fence.controller_mode != ControllerMode::Reconciler {
+                return Ok(CommitResult::Conflict {
+                    actual_generation: actual,
+                });
+            }
+            let current: Option<(u64, String, bool, u64)> = tx
+                .query_row(
+                    "SELECT version,controller_mode,operator_hold,reconcile_generation FROM task_durable_state WHERE task_id=?1",
+                    [task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            if current
+                != Some((
+                    fence.task_version,
+                    "reconciler".into(),
+                    fence.operator_hold,
+                    fence.reconcile_generation,
+                ))
+            {
+                return Ok(CommitResult::Conflict {
+                    actual_generation: actual,
+                });
+            }
+            let history =
+                SqliteDecisionStore::action_history_json_from_connection(tx, task_id, 128)?;
+            if history["ledger_fingerprint"] != fence.action_history_fingerprint {
+                return Ok(CommitResult::Conflict {
+                    actual_generation: actual,
+                });
+            }
+            if decision.rule_id == "action_history_unavailable" {
+                return persist_decision_only_tx(tx, task_id, actual, decision);
+            }
+        }
+
+        let mut statement = tx.prepare(
+            "SELECT idempotency_key FROM reconcile_desired_actions WHERE task_id=?1 ORDER BY idempotency_key",
+        )?;
+        let previous: BTreeSet<String> = statement
+            .query_map([task_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(statement);
+        let next: BTreeSet<String> = desired
+            .iter()
+            .map(|action| action.idempotency_key.clone())
+            .collect();
+        let previous_decision: Option<String> = tx
+            .query_row(
+                "SELECT record_json FROM reconcile_decisions WHERE task_id=?1 ORDER BY sequence DESC LIMIT 1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let decision_changed = previous_decision
+            .and_then(|raw| serde_json::from_str::<DecisionRecord>(&raw).ok())
+            .is_none_or(|previous| {
+                previous.snapshot_hash != decision.snapshot_hash
+                    || previous.actions_hash != decision.actions_hash
+                    || previous.rule_id != decision.rule_id
+            });
+        if previous == next && !decision_changed {
+            return Ok(CommitResult::Unchanged { generation: actual });
+        }
+        let actions_changed = previous != next;
+        let generation = actual + u64::from(actions_changed);
+        let mut inserted = 0;
+        if actions_changed {
+            let mut statement = tx.prepare(
+                "SELECT idempotency_key FROM reconcile_actions WHERE task_id=?1 AND state='pending'",
+            )?;
+            let pending: Vec<String> = statement
+                .query_map([task_id], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            drop(statement);
+            for key in pending {
+                if !next.contains(&key) {
+                    tx.execute(
+                        "UPDATE reconcile_actions SET state='superseded' WHERE task_id=?1 AND idempotency_key=?2 AND state='pending'",
+                        params![task_id, key],
+                    )?;
+                }
+            }
+            for action in desired {
+                let reactivated = tx.execute(
+                    "UPDATE reconcile_actions SET state='pending',generation=?3,action_json=?4 WHERE task_id=?1 AND idempotency_key=?2 AND state='superseded'",
+                    params![task_id, action.idempotency_key, generation, serde_json::to_string(action).expect("action serializes")],
+                )?;
+                if reactivated == 0 {
+                    inserted += tx.execute(
+                        "INSERT OR IGNORE INTO reconcile_actions(task_id,idempotency_key,generation,action_json,state) VALUES(?1,?2,?3,?4,'pending')",
+                        params![task_id, action.idempotency_key, generation, serde_json::to_string(action).expect("action serializes")],
+                    )?;
+                }
+            }
+            tx.execute(
+                "DELETE FROM reconcile_desired_actions WHERE task_id=?1",
+                [task_id],
+            )?;
+            for key in &next {
+                tx.execute(
+                    "INSERT INTO reconcile_desired_actions(task_id,idempotency_key,generation) VALUES(?1,?2,?3)",
+                    params![task_id, key, generation],
+                )?;
+            }
+            tx.execute(
+                "UPDATE reconcile_control SET generation=?2 WHERE task_id=?1",
+                params![task_id, generation],
+            )?;
+        }
+        let sequence: u64 = tx.query_row(
+            "SELECT COALESCE(MAX(sequence),0)+1 FROM reconcile_decisions WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        let mut committed = decision.clone();
+        committed.generation = generation;
+        committed.decision_sequence = sequence;
+        tx.execute(
+            "INSERT INTO reconcile_decisions(task_id,sequence,generation,record_json) VALUES(?1,?2,?3,?4)",
+            params![task_id, sequence, generation, serde_json::to_string(&committed).expect("decision serializes")],
+        )?;
+        Ok(CommitResult::Applied {
+            generation,
+            inserted,
+        })
+    }
+
+    /// Commit a Reconciler decision/outbox delta inside the Task store's SQLite
+    /// transaction so its revalidated Task snapshot and action history are fenced
+    /// atomically with the durable intent.
+    pub fn commit_reconciler_decision_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        fence: &TaskCommitFence,
+        decision: &DecisionRecord,
+        desired: &[ProposedAction],
+    ) -> rusqlite::Result<CommitResult> {
+        commit_reconciler_tx(
+            tx,
+            task_id,
+            fence.action_generation,
+            decision,
+            desired,
+            Some(fence),
+        )
+    }
+
+    pub fn commit_shadow_decision_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        fence: &TaskCommitFence,
+        decision: &DecisionRecord,
+    ) -> rusqlite::Result<CommitResult> {
+        use rusqlite::OptionalExtension;
+        if fence.controller_mode != ControllerMode::Shadow {
+            return Ok(CommitResult::Conflict {
+                actual_generation: fence.action_generation,
+            });
+        }
+        let task_state: Option<(u64, String, bool, u64)> = tx
+            .query_row(
+                "SELECT version,controller_mode,operator_hold,reconcile_generation FROM task_durable_state WHERE task_id=?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let generation: Option<u64> = tx
+            .query_row(
+                "SELECT generation FROM reconcile_control WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let generation = generation.unwrap_or(0);
+        if task_state
+            != Some((
+                fence.task_version,
+                "shadow".into(),
+                fence.operator_hold,
+                fence.reconcile_generation,
+            ))
+            || generation != fence.action_generation
+        {
+            return Ok(CommitResult::Conflict {
+                actual_generation: generation,
+            });
+        }
+        let history = SqliteDecisionStore::action_history_json_from_connection(tx, task_id, 128)?;
+        if history["ledger_fingerprint"] != fence.action_history_fingerprint {
+            return Ok(CommitResult::Conflict {
+                actual_generation: generation,
+            });
+        }
+        persist_decision_only_tx(tx, task_id, generation, decision)
+    }
+
+    /// Persist a Reconciler proposal for audit/replay while denying action
+    /// authorization until legacy action history has an adoption proof.
+    pub fn commit_reconciler_decision_only_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        fence: &TaskCommitFence,
+        decision: &DecisionRecord,
+    ) -> rusqlite::Result<CommitResult> {
+        use rusqlite::OptionalExtension;
+        if fence.controller_mode != ControllerMode::Reconciler {
+            return Ok(CommitResult::Conflict {
+                actual_generation: fence.action_generation,
+            });
+        }
+        let task_state: Option<(u64, String, bool, u64)> = tx
+            .query_row(
+                "SELECT version,controller_mode,operator_hold,reconcile_generation FROM task_durable_state WHERE task_id=?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let generation: Option<u64> = tx
+            .query_row(
+                "SELECT generation FROM reconcile_control WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let generation = generation.unwrap_or(0);
+        if task_state
+            != Some((
+                fence.task_version,
+                "reconciler".into(),
+                fence.operator_hold,
+                fence.reconcile_generation,
+            ))
+            || generation != fence.action_generation
+        {
+            return Ok(CommitResult::Conflict {
+                actual_generation: generation,
+            });
+        }
+        let history = SqliteDecisionStore::action_history_json_from_connection(tx, task_id, 128)?;
+        if history["ledger_fingerprint"] != fence.action_history_fingerprint {
+            return Ok(CommitResult::Conflict {
+                actual_generation: generation,
+            });
+        }
+        persist_decision_only_tx(tx, task_id, generation, decision)
     }
     #[derive(Default)]
     pub struct MemoryDecisionStore {
@@ -1161,104 +1487,23 @@ pub mod outbox {
             expected_generation: u64,
             decision: &DecisionRecord,
             desired: &[ProposedAction],
-            expected_task_version: Option<u64>,
+            task_fence: Option<&TaskCommitFence>,
         ) -> rusqlite::Result<CommitResult> {
-            use rusqlite::{params, OptionalExtension, TransactionBehavior};
+            use rusqlite::TransactionBehavior;
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute(
-                "INSERT OR IGNORE INTO reconcile_control(task_id,generation) VALUES(?1,0)",
-                [task_id],
+            let result = commit_reconciler_tx(
+                &tx,
+                task_id,
+                expected_generation,
+                decision,
+                desired,
+                task_fence,
             )?;
-            let actual: u64 = tx.query_row(
-                "SELECT generation FROM reconcile_control WHERE task_id=?1",
-                [task_id],
-                |r| r.get(0),
-            )?;
-            if actual != expected_generation {
-                return Ok(CommitResult::Conflict {
-                    actual_generation: actual,
-                });
+            if matches!(result, CommitResult::Conflict { .. }) {
+                return Ok(result);
             }
-            if let Some(expected_version) = expected_task_version {
-                let current_version: Option<u64> = tx
-                    .query_row(
-                        "SELECT version FROM task_durable_state WHERE task_id=?1",
-                        [task_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if current_version != Some(expected_version) {
-                    return Ok(CommitResult::Conflict {
-                        actual_generation: actual,
-                    });
-                }
-            }
-            let mut statement = tx.prepare("SELECT idempotency_key FROM reconcile_desired_actions WHERE task_id=?1 ORDER BY idempotency_key")?;
-            let previous: BTreeSet<String> = statement
-                .query_map([task_id], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            drop(statement);
-            let next: BTreeSet<String> =
-                desired.iter().map(|a| a.idempotency_key.clone()).collect();
-            let previous_decision: Option<String> = tx.query_row(
-                "SELECT record_json FROM reconcile_decisions WHERE task_id=?1 ORDER BY sequence DESC LIMIT 1",
-                [task_id],
-                |row| row.get(0),
-            ).optional()?;
-            let decision_changed = previous_decision
-                .and_then(|raw| serde_json::from_str::<DecisionRecord>(&raw).ok())
-                .is_none_or(|previous| {
-                    previous.snapshot_hash != decision.snapshot_hash
-                        || previous.actions_hash != decision.actions_hash
-                        || previous.rule_id != decision.rule_id
-                });
-            if previous == next && !decision_changed {
-                return Ok(CommitResult::Unchanged { generation: actual });
-            }
-            let actions_changed = previous != next;
-            let generation = actual + u64::from(actions_changed);
-            let mut inserted = 0;
-            if actions_changed {
-                let mut statement = tx.prepare("SELECT idempotency_key FROM reconcile_actions WHERE task_id=?1 AND state='pending'")?;
-                let pending: Vec<String> = statement
-                    .query_map([task_id], |r| r.get(0))?
-                    .collect::<rusqlite::Result<_>>()?;
-                drop(statement);
-                for key in pending {
-                    if !next.contains(&key) {
-                        tx.execute("UPDATE reconcile_actions SET state='superseded' WHERE task_id=?1 AND idempotency_key=?2 AND state='pending'", params![task_id,key])?;
-                    }
-                }
-                for action in desired {
-                    let changed = tx.execute(
-                    "INSERT OR IGNORE INTO reconcile_actions(task_id,idempotency_key,generation,action_json,state) VALUES(?1,?2,?3,?4,'pending')",
-                    params![task_id, action.idempotency_key, generation, serde_json::to_string(action).expect("action serializes")],
-                )?;
-                    inserted += changed;
-                }
-                tx.execute(
-                    "DELETE FROM reconcile_desired_actions WHERE task_id=?1",
-                    [task_id],
-                )?;
-                for key in &next {
-                    tx.execute("INSERT INTO reconcile_desired_actions(task_id,idempotency_key,generation) VALUES(?1,?2,?3)", params![task_id,key,generation])?;
-                }
-                tx.execute(
-                    "UPDATE reconcile_control SET generation=?2 WHERE task_id=?1",
-                    params![task_id, generation],
-                )?;
-            }
-            let sequence: u64 = tx.query_row(
-                "SELECT COALESCE(MAX(sequence),0)+1 FROM reconcile_decisions WHERE task_id=?1",
-                [task_id],
-                |r| r.get(0),
-            )?;
-            let mut committed_decision = decision.clone();
-            committed_decision.generation = generation;
-            committed_decision.decision_sequence = sequence;
-            tx.execute("INSERT INTO reconcile_decisions(task_id,sequence,generation,record_json) VALUES(?1,?2,?3,?4)", params![task_id,sequence,generation,serde_json::to_string(&committed_decision).expect("decision serializes")])?;
             #[cfg(test)]
             if failpoints::hit("reconcile.before_decision_commit") {
                 return Err(rusqlite::Error::InvalidQuery);
@@ -1268,10 +1513,7 @@ pub mod outbox {
             if failpoints::hit("reconcile.after_decision_commit") {
                 return Err(rusqlite::Error::InvalidQuery);
             }
-            Ok(CommitResult::Applied {
-                generation,
-                inserted,
-            })
+            Ok(result)
         }
 
         /// Persist a Shadow decision while ensuring its proposed Actions never become
@@ -1279,65 +1521,22 @@ pub mod outbox {
         pub fn commit_shadow_decision(
             &mut self,
             task_id: &str,
-            expected_generation: u64,
-            expected_task_version: u64,
+            fence: &TaskCommitFence,
             decision: &DecisionRecord,
         ) -> rusqlite::Result<CommitResult> {
-            use rusqlite::{OptionalExtension, TransactionBehavior};
+            if fence.controller_mode != ControllerMode::Shadow {
+                return Ok(CommitResult::Conflict {
+                    actual_generation: fence.action_generation,
+                });
+            }
+            use rusqlite::TransactionBehavior;
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let task_state: Option<(u64, String)> = tx
-                .query_row(
-                    "SELECT version,controller_mode FROM task_durable_state WHERE task_id=?1",
-                    [task_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            let generation: Option<u64> = tx
-                .query_row(
-                    "SELECT generation FROM reconcile_control WHERE task_id=?1",
-                    [task_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let generation = generation.unwrap_or(0);
-            if task_state != Some((expected_task_version, "shadow".into()))
-                || generation != expected_generation
-            {
-                return Ok(CommitResult::Conflict {
-                    actual_generation: generation,
-                });
+            let result = commit_shadow_decision_in_transaction(&tx, task_id, fence, decision)?;
+            if matches!(result, CommitResult::Conflict { .. }) {
+                return Ok(result);
             }
-            let previous_decision: Option<String> = tx
-                .query_row(
-                    "SELECT record_json FROM reconcile_decisions WHERE task_id=?1 ORDER BY sequence DESC LIMIT 1",
-                    [task_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let unchanged = previous_decision
-                .and_then(|raw| serde_json::from_str::<DecisionRecord>(&raw).ok())
-                .is_some_and(|previous| {
-                    previous.snapshot_hash == decision.snapshot_hash
-                        && previous.actions_hash == decision.actions_hash
-                        && previous.rule_id == decision.rule_id
-                });
-            if unchanged {
-                return Ok(CommitResult::Unchanged { generation });
-            }
-            let sequence: u64 = tx.query_row(
-                "SELECT COALESCE(MAX(sequence),0)+1 FROM reconcile_decisions WHERE task_id=?1",
-                [task_id],
-                |row| row.get(0),
-            )?;
-            let mut committed = decision.clone();
-            committed.generation = generation;
-            committed.decision_sequence = sequence;
-            tx.execute(
-                "INSERT INTO reconcile_decisions(task_id,sequence,generation,record_json) VALUES(?1,?2,?3,?4)",
-                rusqlite::params![task_id, sequence, generation, serde_json::to_string(&committed).expect("decision serializes")],
-            )?;
             #[cfg(test)]
             if failpoints::hit("reconcile.before_decision_commit") {
                 return Err(rusqlite::Error::InvalidQuery);
@@ -1347,10 +1546,7 @@ pub mod outbox {
             if failpoints::hit("reconcile.after_decision_commit") {
                 return Err(rusqlite::Error::InvalidQuery);
             }
-            Ok(CommitResult::Applied {
-                generation,
-                inserted: 0,
-            })
+            Ok(result)
         }
         pub fn claim(
             &mut self,
@@ -1502,38 +1698,75 @@ pub mod outbox {
         /// Return the durable outbox history required to make continuation decisions safely.
         /// A query error is propagated; callers must not treat it as an empty ledger.
         pub fn action_history_json(&self, task_id: &str, limit: usize) -> rusqlite::Result<Value> {
+            Self::action_history_json_from_connection(&self.connection, task_id, limit)
+        }
+
+        /// Read the bounded decision summary and full-ledger fingerprint on the
+        /// caller's SQLite read transaction. Task facts and action history can
+        /// therefore share one database snapshot.
+        pub fn action_history_json_from_connection(
+            connection: &rusqlite::Connection,
+            task_id: &str,
+            limit: usize,
+        ) -> rusqlite::Result<Value> {
+            use rusqlite::OptionalExtension;
             let limit = limit.clamp(1, 128);
-            let mut statement = self.connection.prepare(
-                "SELECT action_json,generation,state FROM reconcile_actions WHERE task_id=?1 ORDER BY generation DESC,idempotency_key LIMIT ?2",
+            let generation: Option<u64> = connection
+                .query_row(
+                    "SELECT generation FROM reconcile_control WHERE task_id=?1",
+                    [task_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let mut statement = connection.prepare(
+                "SELECT action_json,generation,state FROM reconcile_actions WHERE task_id=?1 ORDER BY generation DESC,idempotency_key",
             )?;
-            let rows =
-                statement.query_map(rusqlite::params![task_id, (limit + 1) as i64], |row| {
-                    let action: String = row.get(0)?;
-                    let generation: u64 = row.get(1)?;
-                    let state: String = row.get(2)?;
-                    let action: Value = serde_json::from_str(&action).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?;
-                    Ok((action, generation, state))
-                })?;
-            let mut relevant = Vec::new();
-            let mut continuations = BTreeSet::new();
+            let rows = statement.query_map([task_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut hasher = Sha256::new();
+            let mut retained = Vec::with_capacity(limit);
+            let mut truncated = false;
             for row in rows {
-                if relevant.len() == limit {
-                    return Ok(serde_json::json!({
-                        "availability":"unavailable",
-                        "coverage":"reconciler_outbox_only",
-                        "relevant":[],
-                        "continuation_fingerprints_sent":[],
-                        "last_consumed_evidence":null,
-                        "unavailable_reason":"action_history_truncated"
-                    }));
+                let (action_json, generation, state) = row?;
+                hasher.update((action_json.len() as u64).to_be_bytes());
+                hasher.update(action_json.as_bytes());
+                hasher.update(generation.to_be_bytes());
+                hasher.update((state.len() as u64).to_be_bytes());
+                hasher.update(state.as_bytes());
+                if retained.len() < limit {
+                    retained.push((action_json, generation, state));
+                } else {
+                    truncated = true;
                 }
-                let (action, generation, state) = row?;
+            }
+            let ledger_fingerprint = format!("{:x}", hasher.finalize());
+            if truncated {
+                return Ok(serde_json::json!({
+                    "availability":"unavailable",
+                    "coverage":"reconciler_outbox_only",
+                    "generation":generation.unwrap_or(0),
+                    "ledger_fingerprint":ledger_fingerprint,
+                    "relevant":[],
+                    "continuation_fingerprints_sent":[],
+                    "last_consumed_evidence":null,
+                    "unavailable_reason":"action_history_truncated"
+                }));
+            }
+            let mut relevant = Vec::with_capacity(retained.len());
+            let mut continuations = BTreeSet::new();
+            for (action_json, generation, state) in retained {
+                let action: Value = serde_json::from_str(&action_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
                 let kind = action["kind"].as_str().unwrap_or_default();
                 let cause = action["cause_fingerprint"].as_str().unwrap_or_default();
                 if matches!(
@@ -1558,6 +1791,8 @@ pub mod outbox {
             Ok(serde_json::json!({
                 "availability":"authoritative",
                 "coverage":"reconciler_outbox_only",
+                "generation":generation.unwrap_or(0),
+                "ledger_fingerprint":ledger_fingerprint,
                 "relevant":relevant,
                 "continuation_fingerprints_sent":continuations.into_iter().collect::<Vec<_>>(),
                 "last_consumed_evidence":null
@@ -3171,8 +3406,25 @@ mod outbox_tests {
             snapshot_hash: "s".into(),
             actions_hash: "a".into(),
             rule_id: "test".into(),
+            authorization_blocked_reason: None,
             canonical_snapshot_json: json!({}),
             canonical_actions_json: json!([]),
+        }
+    }
+
+    fn fence(
+        store: &SqliteDecisionStore,
+        task_version: u64,
+        controller_mode: ControllerMode,
+    ) -> TaskCommitFence {
+        let history = store.action_history_json("t", 128).unwrap();
+        TaskCommitFence {
+            task_version,
+            controller_mode,
+            operator_hold: false,
+            reconcile_generation: 0,
+            action_generation: store.generation("t").unwrap().unwrap_or(0),
+            action_history_fingerprint: history["ledger_fingerprint"].as_str().unwrap().to_owned(),
         }
     }
     #[test]
@@ -3339,7 +3591,7 @@ mod outbox_tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut store = SqliteDecisionStore::open(file.path()).unwrap();
         let setup = rusqlite::Connection::open(file.path()).unwrap();
-        setup.execute_batch("CREATE TABLE task_durable_state(task_id TEXT PRIMARY KEY, version INTEGER NOT NULL, controller_mode TEXT NOT NULL); INSERT INTO task_durable_state VALUES('t',1,'shadow');").unwrap();
+        setup.execute_batch("CREATE TABLE task_durable_state(task_id TEXT PRIMARY KEY, version INTEGER NOT NULL, controller_mode TEXT NOT NULL, operator_hold INTEGER NOT NULL DEFAULT 0, reconcile_generation INTEGER NOT NULL DEFAULT 0); INSERT INTO task_durable_state VALUES('t',1,'shadow',0,0);").unwrap();
         drop(setup);
         let executable_action = desired("existing-executable");
         assert_eq!(
@@ -3354,8 +3606,11 @@ mod outbox_tests {
         let mut decision = record();
         decision.canonical_actions_json = serde_json::to_value([desired("shadow-only")]).unwrap();
         decision.actions_hash = actions_hash(&[desired("shadow-only")]);
+        let task_fence = fence(&store, 1, ControllerMode::Shadow);
         failpoints::arm("reconcile.before_decision_commit");
-        assert!(store.commit_shadow_decision("t", 1, 1, &decision).is_err());
+        assert!(store
+            .commit_shadow_decision("t", &task_fence, &decision)
+            .is_err());
         assert_eq!(store.decision_count("t").unwrap(), 1);
         assert_eq!(store.generation("t").unwrap(), Some(1));
         assert_eq!(
@@ -3363,7 +3618,9 @@ mod outbox_tests {
             Some(ActionState::Pending)
         );
         assert_eq!(
-            store.commit_shadow_decision("t", 1, 1, &decision).unwrap(),
+            store
+                .commit_shadow_decision("t", &task_fence, &decision)
+                .unwrap(),
             CommitResult::Applied {
                 generation: 1,
                 inserted: 0
@@ -3386,7 +3643,16 @@ mod outbox_tests {
             .claim("t", "shadow-only", 1, ControllerMode::Reconciler, false)
             .unwrap());
         assert_eq!(
-            store.commit_shadow_decision("t", 1, 0, &decision).unwrap(),
+            store
+                .commit_shadow_decision(
+                    "t",
+                    &TaskCommitFence {
+                        task_version: 0,
+                        ..task_fence.clone()
+                    },
+                    &decision
+                )
+                .unwrap(),
             CommitResult::Conflict {
                 actual_generation: 1
             }
@@ -3415,7 +3681,7 @@ mod outbox_tests {
         mode_changed_decision.snapshot_hash = "new-shadow-evaluation".into();
         assert_eq!(
             store
-                .commit_shadow_decision("t", 1, 1, &mode_changed_decision)
+                .commit_shadow_decision("t", &task_fence, &mode_changed_decision)
                 .unwrap(),
             CommitResult::Conflict {
                 actual_generation: 1
