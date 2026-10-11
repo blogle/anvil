@@ -72,6 +72,8 @@
         packages.anvil-nix-daemon-image = sandbox.daemonImage;
         packages.anvil-nix-daemon-upgrade-test-image = sandbox.daemonUpgradeImage;
         packages.anvil-nix-daemon-upgrade-test-canary = sandbox.daemonUpgradeCanary;
+        packages.sdlc = sdlc.packages.${system}.sdlc;
+        packages.nix-eval-jobs = sdlc.packages.${system}.nix-eval-jobs;
         packages.shared-nix-directory-source-smoke = pkgs.stdenv.mkDerivation {
           pname = "anvil-shared-nix-directory-source-smoke";
           version = "1";

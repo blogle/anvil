@@ -22,7 +22,7 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Evaluate flake
-        run: time nix flake check --no-build
+        run: time nix flake check --no-build --system x86_64-linux
       - name: Rust format
         run: time nix develop .#kind-ci --command cargo fmt --all --check
 

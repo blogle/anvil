@@ -60,7 +60,7 @@ jobs:
         run: |
           printf 'anvil-image-cache-hit=%s\n' '${{ steps.restore.outputs.cache-hit }}'
       - name: Validate flake outputs
-        run: time nix --option build-users-group "" flake check --no-build
+        run: time nix --option build-users-group "" flake check --no-build --system x86_64-linux
       - name: Build OCI archives
         run: |
           set -euo pipefail
@@ -277,7 +277,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v19
       - name: Run Nix checks
-        run: time nix --option build-users-group "" flake check
+        run: time nix --option build-users-group "" flake check --system x86_64-linux
       - name: Build production images
         run: |
           nix --option build-users-group "" build .#anvil-image -o result-anvil
