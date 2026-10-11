@@ -229,6 +229,14 @@ jobs:
         run: |
           time ANVIL_KIND_ARTIFACT_DIR="$GITHUB_WORKSPACE/image-artifacts" \
             nix develop .#kind-ci --command just e2e-k8s
+      - name: Upload bounded Kind lifecycle diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anvil-kind-lifecycle-diagnostics
+          path: kind-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 7
 
 
   batch-image-gate:
