@@ -59,6 +59,8 @@ export OPENCODE_CONFIG="$profile/config/opencode.jsonc" OPENCODE_CONFIG_DIR="$pr
 export HOME="$profile/home" XDG_CONFIG_HOME="$profile/home/.config" XDG_CACHE_HOME="$profile/home/.cache"
 export XDG_DATA_HOME="$profile/home/.local/share" XDG_STATE_HOME="$profile/home/.local/state"
 export OPENAI_API_KEY=local-anvil-test-only
+export ANVIL_OPENCODE_SERVER_PASSWORD=local-anvil-opencode-password-for-e2e-only
+export OPENCODE_SERVER_PASSWORD="$ANVIL_OPENCODE_SERVER_PASSWORD"
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
 opencode serve --hostname 127.0.0.1 --port 4097 >"$tmp/profile.log" 2>&1 & profile_pid=$!
 export ANVIL_SANDBOX_BACKEND=local ANVIL_BIND_PORT=8080 ANVIL_LOCAL_RUNTIME_ROOT="$runtime"
@@ -72,7 +74,7 @@ unset ANVIL_STORE_PATH
 
 poll() {
   local url="$1" deadline=$((SECONDS + 90))
-  until curl --max-time 2 -fsS "$url" >/dev/null 2>&1; do
+  until curl --max-time 2 -fsS --user "opencode:$ANVIL_OPENCODE_SERVER_PASSWORD" "$url" >/dev/null 2>&1; do
     if (( SECONDS >= deadline )); then
       printf 'timed out waiting for %s\n' "$url" >&2
       for log in "$tmp"/*.log; do printf '\n--- %s ---\n' "$log" >&2; cat "$log" >&2; done
@@ -110,11 +112,11 @@ create_session() {
 
 worker_health() {
   local session="$1"
-  poll "http://$(jq -r .service <<<"$session"):$(jq -r .opencode_port <<<"$session")/global/health"
+  poll "http://$(jq -r .service <<<"$session"):$(jq -r .opencode_port <<<"$session")/api/info"
 }
 
 poll http://127.0.0.1:4098/healthz
-poll http://127.0.0.1:4097/global/health
+poll http://127.0.0.1:4097/api/info
 poll http://127.0.0.1:8080/readyz
 [[ -f "$tmp/controller.sqlite3" ]] || { printf 'controller store was not created beside history\n' >&2; exit 1; }
 
