@@ -1,17 +1,55 @@
 { pkgs, craneLib, opencode, nix2containerPkgs, repoRoot }:
 
 let
+  browserFontsConf = pkgs.makeFontsConf {
+    fontDirectories = [ pkgs.dejavu_fonts ];
+  };
   # Keep the Cargo source filter here so the root flake only wires modules
   # together.  The web application is part of the Rust build input.
+  crateFixturePathFilter = path: type:
+    let
+      sourcePath = toString path;
+      isCratesPath = pkgs.lib.hasSuffix "/crates" sourcePath
+        || pkgs.lib.hasInfix "/crates/" sourcePath;
+      isExcludedPath = builtins.any
+        (segment: pkgs.lib.hasInfix "/${segment}/" sourcePath || pkgs.lib.hasSuffix "/${segment}" sourcePath)
+        [ ".git" "target" ".cache" "node_modules" ];
+    in
+    isCratesPath && !isExcludedPath && (
+      type == "directory"
+      || pkgs.lib.hasSuffix "/fixtures" sourcePath
+      || pkgs.lib.hasInfix "/fixtures/" sourcePath
+    );
+
   src = pkgs.lib.cleanSourceWith {
     src = repoRoot;
     filter = path: type:
       craneLib.filterCargoSources path type
+      || crateFixturePathFilter path type
       || pkgs.lib.hasSuffix "/web" (toString path)
       || pkgs.lib.hasInfix "/web/" (toString path)
       || pkgs.lib.hasSuffix "/runtime" (toString path)
       || pkgs.lib.hasSuffix "/runtime/git-identity" (toString path);
   };
+
+  fixtureSourceSmoke =
+    assert crateFixturePathFilter "/repo/crates/anvild/tests/fixtures/controller-v8-sanitized.json" "regular";
+    assert crateFixturePathFilter "/repo/crates/anvil-core/tests/fixtures/task-snapshot-v1/fresh-open-executable.json" "regular";
+    assert crateFixturePathFilter "/repo/crates/anvil-reconcile/fixtures/action-history-v1.json" "regular";
+    assert crateFixturePathFilter "/repo/crates/anvil-reconcile/fixtures" "directory";
+    assert !(crateFixturePathFilter "/repo/crates/anvild/target" "directory");
+    assert !(crateFixturePathFilter "/repo/crates/anvild/target/debug/fixture.json" "regular");
+    assert !(crateFixturePathFilter "/repo/crates/anvil-core/.cache" "directory");
+    assert !(crateFixturePathFilter "/repo/.git/fixtures/file.json" "regular");
+    pkgs.runCommand "anvil-crate-fixture-source-smoke" { } ''
+      test -f "${src}/crates/anvild/tests/fixtures/controller-v8-sanitized.json"
+      test -f "${src}/crates/anvild/tests/fixtures/task-migration-mappings-v1.json"
+      test -d "${src}/crates/anvil-core/tests/fixtures/task-snapshot-v1"
+      if [ -d "${src}/crates/anvil-reconcile" ]; then
+        test -d "${src}/crates/anvil-reconcile/fixtures"
+      fi
+      mkdir -p "$out"
+    '';
 
   baseArgs = {
     inherit src;
@@ -122,9 +160,12 @@ let
       pkgs.gh pkgs.curl pkgs.jq pkgs.kubectl pkgs.kustomize pkgs.nix pkgs.nodejs
       pkgs.process-compose pkgs.watchexec nix2containerPkgs.skopeo-nix2container pkgs.umoci pkgs.crun pkgs.kind pkgs.util-linux
       opencode.packages.${pkgs.system}.default
-    ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.chromium ];
+    ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+      pkgs.chromium pkgs.fontconfig pkgs.dejavu_fonts
+    ];
     shellHook = ''
       export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$PWD/target}"
+      export FONTCONFIG_FILE="${browserFontsConf}"
       if [ -z "''${CARGO_HOME:-}" ]; then
         export CARGO_HOME="$CARGO_TARGET_DIR/.cargo-home"
         mkdir -p "$CARGO_HOME"
@@ -167,6 +208,7 @@ in
     ciReleaseBinaries
     checks
     devShell
+    fixtureSourceSmoke
     mkBinary
     src;
 }

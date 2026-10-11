@@ -5,6 +5,700 @@ use std::{fmt, net::IpAddr};
 use thiserror::Error;
 use url::Url;
 
+/// Immutable completion contract attached to an accepted durable Task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum CompletionPolicy {
+    Evidence { required_kinds: Vec<EvidenceKind> },
+    AllChildrenCompleted,
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    LegacySchedulerExit,
+    DeliveryComplete,
+    DeterministicVerification,
+    ManualCompletion,
+}
+
+/// Provenance is carried at the type boundary so agent claims cannot be promoted
+/// to completion evidence by callers of the completion evaluator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationProvenance {
+    Runtime,
+    Platform,
+    External,
+    Agent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationRef {
+    pub id: String,
+    pub version: u64,
+    pub kind: EvidenceKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrustedEvidence(ObservationRef);
+
+impl TrustedEvidence {
+    pub fn from_observation(
+        reference: ObservationRef,
+        provenance: ObservationProvenance,
+    ) -> Result<Self, ValidationError> {
+        if provenance == ObservationProvenance::Agent {
+            return Err(ValidationError::Invalid {
+                field: "completion_evidence",
+                reason: "agent-provenance observations are not trusted completion evidence".into(),
+            });
+        }
+        Ok(Self(reference))
+    }
+
+    pub fn observation(&self) -> &ObservationRef {
+        &self.0
+    }
+}
+
+pub fn completion_policy_satisfied(
+    policy: &CompletionPolicy,
+    evidence: &[TrustedEvidence],
+    children: &[TaskTerminal],
+) -> bool {
+    match policy {
+        CompletionPolicy::Evidence { required_kinds } => {
+            !required_kinds.is_empty()
+                && required_kinds.iter().all(|required| {
+                    evidence
+                        .iter()
+                        .any(|trusted| trusted.observation().kind == *required)
+                })
+        }
+        CompletionPolicy::AllChildrenCompleted => {
+            !children.is_empty()
+                && children
+                    .iter()
+                    .all(|child| matches!(child, TaskTerminal::Completed { .. }))
+        }
+        CompletionPolicy::Manual => evidence
+            .iter()
+            .any(|trusted| trusted.observation().kind == EvidenceKind::ManualCompletion),
+    }
+}
+
+pub fn validate_completion_policy(policy: &CompletionPolicy) -> Result<(), ValidationError> {
+    if let CompletionPolicy::Evidence { required_kinds } = policy {
+        if required_kinds.is_empty() {
+            return Err(ValidationError::Invalid {
+                field: "completion_policy.required_kinds",
+                reason: "must contain at least one trusted evidence kind".into(),
+            });
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        if required_kinds.iter().any(|kind| !unique.insert(*kind)) {
+            return Err(ValidationError::Invalid {
+                field: "completion_policy.required_kinds",
+                reason: "must not contain duplicate evidence kinds".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TaskTerminal {
+    Completed {
+        evidence: Vec<ObservationRef>,
+    },
+    Canceled {
+        actor: String,
+        reason: String,
+    },
+    Obviated {
+        reason: String,
+    },
+    Superseded {
+        by_task_id: String,
+    },
+    FailedExhausted {
+        attempt_budget: u32,
+        last_failure: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerMode {
+    Legacy,
+    Shadow,
+    Reconciler,
+}
+
+/// Whether the returned action list is authoritative. Missing metadata (`None`)
+/// and `Unavailable` must never be treated as a known-empty action ledger.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptRole {
+    #[default]
+    Implementation,
+    Verification,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptLifecycle {
+    #[default]
+    Queued,
+    Provisioning,
+    Running,
+    Ended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptExitReason {
+    CompletedTurn,
+    RuntimeLost,
+    Orphaned,
+    Canceled,
+    Abandoned,
+    Failed,
+    Replaced,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureDomain {
+    Work,
+    Agent,
+    Sandbox,
+    Platform,
+    Dependency,
+    Orchestrator,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Failure {
+    pub domain: FailureDomain,
+    pub code: String,
+    pub summary: String,
+    pub artifact_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attempt {
+    pub id: String,
+    pub version: u64,
+    pub task_id: String,
+    pub ordinal: u32,
+    pub role: AttemptRole,
+    pub session_id: Option<String>,
+    pub start_revision: Option<String>,
+    pub lifecycle: AttemptLifecycle,
+    pub exit_reason: Option<AttemptExitReason>,
+    pub failure: Option<Failure>,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskBudget {
+    pub max_attempts: u32,
+    pub max_continuations_per_reason: u32,
+    pub max_verifier_cycles: u32,
+    pub max_ci_retries: u32,
+    pub max_execution_seconds: u64,
+    #[serde(default)]
+    pub max_model_cost: Option<String>,
+}
+
+impl Default for TaskBudget {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            max_continuations_per_reason: 2,
+            max_verifier_cycles: 0,
+            max_ci_retries: 2,
+            max_execution_seconds: 14_400,
+            max_model_cost: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum TaskLifecycle {
+    Open,
+    Terminal { terminal: TaskTerminal },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPhase {
+    Terminal,
+    Blocked,
+    Running,
+    Runnable,
+    Waiting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskDependencySummary {
+    pub all_completed: bool,
+    pub predecessors: Vec<TaskDependencyRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskDependencyRef {
+    pub task_id: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskAttemptSummary {
+    #[serde(default)]
+    pub attempt_id: String,
+    #[serde(default)]
+    pub ordinal: u32,
+    #[serde(default)]
+    pub role: AttemptRole,
+    #[serde(default)]
+    pub lifecycle: AttemptLifecycle,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub start_revision: Option<String>,
+    #[serde(default)]
+    pub turn: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskObservationSummary {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub key: String,
+    pub value: serde_json::Value,
+    pub provenance: ObservationProvenance,
+    #[serde(default)]
+    pub observed_at: Option<String>,
+    #[serde(default)]
+    pub recorded_at: Option<String>,
+    #[serde(default)]
+    pub version: u64,
+    #[serde(default)]
+    pub collection_seq: u64,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskBlockerSummary {
+    pub id: String,
+    pub attempt_id: String,
+    pub question: String,
+    pub context: String,
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskChildSummary {
+    pub total: u32,
+    pub completed: u32,
+    pub terminal_noncompleted: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionHistorySummary {
+    #[serde(default)]
+    pub availability: Option<ActionHistoryAvailability>,
+    pub relevant: Vec<ActionHistoryEntry>,
+    pub continuation_fingerprints_sent: Vec<String>,
+    #[serde(default)]
+    pub last_consumed_evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionHistoryAvailability {
+    #[default]
+    Unavailable,
+    Authoritative,
+}
+
+/// Shared read boundary for action history owned by the reconciler/outbox lane.
+/// Implementations should return `Unavailable` when their authoritative ledger
+/// cannot be read; they must not convert read failure into an authoritative empty set.
+pub trait TaskActionHistoryReadPort {
+    fn read_action_history(&self, task_id: &str, limit: usize) -> ActionHistorySummary;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionHistoryEntry {
+    pub action_kind: String,
+    pub attempt_id: Option<String>,
+    pub cause_fingerprint: String,
+    pub idempotency_key: String,
+    pub state: ActionState,
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionState {
+    Pending,
+    Executing,
+    Succeeded,
+    Failed,
+    UnknownOutcome,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionClass {
+    Idempotent,
+    Observable,
+    Irreversible,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetUsage {
+    #[serde(default)]
+    pub limits: TaskBudget,
+    pub attempts: u32,
+    pub continuations_by_reason: std::collections::BTreeMap<String, u32>,
+    pub ci_retries: u32,
+    pub verifier_cycles: u32,
+    pub execution_ms: u64,
+    pub grants: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrySchedule {
+    pub due_at_ms: Option<i64>,
+    pub cause: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryKind {
+    PullRequest,
+    LocalBranch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TaskExecutionTarget {
+    GitRepository {
+        #[serde(default)]
+        project: Option<String>,
+        repository: String,
+        base_ref: String,
+        delivery: DeliveryKind,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VerificationSpec {
+    #[serde(default)]
+    pub holdout_scenarios: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedTaskSpec {
+    pub outcome: String,
+    pub acceptance_criteria: Vec<String>,
+    pub completion_policy: CompletionPolicy,
+    pub verification_spec: VerificationSpec,
+    pub budget: TaskBudget,
+    pub execution_target: Option<TaskExecutionTarget>,
+}
+
+/// Parse and validate immutable Task intent before any storage transaction is
+/// opened. This is shared by service/API code and the Task repository so graph
+/// and singleton acceptance cannot silently diverge.
+pub fn validate_task_spec(
+    specification: &serde_json::Value,
+) -> Result<ValidatedTaskSpec, ValidationError> {
+    let outcome = specification
+        .get("outcome")
+        .and_then(serde_json::Value::as_str)
+        .filter(|outcome| !outcome.trim().is_empty())
+        .ok_or(ValidationError::Empty { field: "outcome" })?
+        .to_owned();
+    if outcome.len() > 32_768 {
+        return Err(ValidationError::Invalid {
+            field: "outcome",
+            reason: "must be at most 32768 bytes".into(),
+        });
+    }
+    let acceptance_criteria = match specification.get("acceptance_criteria") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| ValidationError::Invalid {
+                field: "acceptance_criteria",
+                reason: "must be an array of non-empty strings".into(),
+            })?
+            .iter()
+            .map(|criterion| {
+                criterion
+                    .as_str()
+                    .filter(|criterion| !criterion.trim().is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| ValidationError::Invalid {
+                        field: "acceptance_criteria",
+                        reason: "must contain only non-empty strings".into(),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    if acceptance_criteria.len() > 256
+        || acceptance_criteria
+            .iter()
+            .any(|criterion| criterion.len() > 4096)
+    {
+        return Err(ValidationError::Invalid {
+            field: "acceptance_criteria",
+            reason: "must contain at most 256 criteria of at most 4096 bytes each".into(),
+        });
+    }
+    let execution_target = match specification
+        .get("execution_target")
+        .filter(|value| !value.is_null())
+    {
+        None => None,
+        Some(value) => {
+            let mut normalized = value.clone();
+            if let Some(delivery) = normalized
+                .get("delivery")
+                .and_then(|item| item.get("kind"))
+                .and_then(serde_json::Value::as_str)
+            {
+                normalized["delivery"] = serde_json::json!(delivery);
+            }
+            if normalized["kind"] != "git_repository" {
+                return Err(ValidationError::Invalid {
+                    field: "execution_target.kind",
+                    reason: "only git_repository is supported".into(),
+                });
+            }
+            if let Some(project) = normalized
+                .get("project")
+                .and_then(serde_json::Value::as_str)
+            {
+                Project::new(project)?;
+            }
+            Repository::new(normalized["repository"].as_str().unwrap_or_default())?;
+            GitRef::new(normalized["base_ref"].as_str().unwrap_or_default())?;
+            Some(
+                serde_json::from_value(normalized).map_err(|error| ValidationError::Invalid {
+                    field: "execution_target",
+                    reason: error.to_string(),
+                })?,
+            )
+        }
+    };
+    let completion_policy = match specification.get("completion_policy") {
+        Some(value) => {
+            serde_json::from_value(value.clone()).map_err(|error| ValidationError::Invalid {
+                field: "completion_policy",
+                reason: error.to_string(),
+            })?
+        }
+        None => match &execution_target {
+            None => CompletionPolicy::AllChildrenCompleted,
+            Some(_) => CompletionPolicy::Evidence {
+                required_kinds: vec![EvidenceKind::DeliveryComplete],
+            },
+        },
+    };
+    validate_completion_policy(&completion_policy)?;
+    let verification_spec = match specification.get("verification_spec") {
+        None | Some(serde_json::Value::Null) => VerificationSpec {
+            holdout_scenarios: Vec::new(),
+        },
+        Some(value) => {
+            serde_json::from_value(value.clone()).map_err(|error| ValidationError::Invalid {
+                field: "verification_spec",
+                reason: error.to_string(),
+            })?
+        }
+    };
+    if verification_spec.holdout_scenarios.len() > 256
+        || verification_spec
+            .holdout_scenarios
+            .iter()
+            .any(|scenario| scenario.to_string().len() > 65_536)
+    {
+        return Err(ValidationError::Invalid {
+            field: "verification_spec.holdout_scenarios",
+            reason: "must contain at most 256 scenarios of at most 65536 bytes each".into(),
+        });
+    }
+    let budget = match specification.get("budget") {
+        None | Some(serde_json::Value::Null) => TaskBudget::default(),
+        Some(value) => {
+            serde_json::from_value(value.clone()).map_err(|error| ValidationError::Invalid {
+                field: "budget",
+                reason: error.to_string(),
+            })?
+        }
+    };
+    if budget.max_attempts == 0
+        || budget.max_attempts > 1_000
+        || budget.max_continuations_per_reason > 1_000
+        || budget.max_verifier_cycles > 100
+        || budget.max_ci_retries > 1_000
+        || budget.max_execution_seconds == 0
+        || budget.max_execution_seconds > 31_536_000
+        || budget.max_model_cost.as_deref().is_some_and(|cost| {
+            cost.len() > 64
+                || cost
+                    .parse::<f64>()
+                    .map_or(true, |value| !value.is_finite() || value < 0.0)
+        })
+    {
+        return Err(ValidationError::Invalid {
+            field: "budget",
+            reason: "allocation is outside supported positive bounds".into(),
+        });
+    }
+    Ok(ValidatedTaskSpec {
+        outcome,
+        acceptance_criteria,
+        completion_policy,
+        verification_spec,
+        budget,
+        execution_target,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckEvaluationKind {
+    Head,
+    TestMerge,
+    MergeGroup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckState {
+    Pending,
+    Passing,
+    Failing,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskPullRequestBinding {
+    pub provider: String,
+    pub repository: String,
+    pub number: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRequiredCheck {
+    pub context: String,
+    pub source: String,
+    pub state: CheckState,
+    pub evaluation_sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskDeliverySummary {
+    #[serde(default)]
+    pub work_branch: Option<String>,
+    #[serde(default)]
+    pub base_revision: Option<String>,
+    #[serde(default)]
+    pub pull_request: Option<TaskPullRequestBinding>,
+    #[serde(default)]
+    pub pr_head_sha: Option<String>,
+    #[serde(default)]
+    pub evaluation_sha: Option<String>,
+    #[serde(default)]
+    pub evaluation_kind: Option<CheckEvaluationKind>,
+    #[serde(default)]
+    pub pr_state: Option<String>,
+    #[serde(default)]
+    pub required_checks: Vec<TaskRequiredCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSnapshot {
+    pub schema_version: u32,
+    pub task_id: String,
+    pub task_version: u64,
+    pub logical_time_ms: i64,
+    pub lifecycle: TaskLifecycle,
+    pub completion_policy: CompletionPolicy,
+    pub operator_hold: bool,
+    pub controller_mode: ControllerMode,
+    pub reconcile_generation: u64,
+    pub execution_target: Option<TaskExecutionTarget>,
+    pub delivery: Option<TaskDeliverySummary>,
+    pub dependencies: TaskDependencySummary,
+    pub children: TaskChildSummary,
+    pub attempts: Vec<TaskAttemptSummary>,
+    pub blocker: Option<TaskBlockerSummary>,
+    pub observations: Vec<TaskObservationSummary>,
+    pub action_history: ActionHistorySummary,
+    pub budget_usage: BudgetUsage,
+    pub retry_schedule: RetrySchedule,
+    pub phase: TaskPhase,
+    pub merge_wait_due_at_ms: Option<i64>,
+}
+
+impl TaskSnapshot {
+    /// Project the ANVIL-56-owned action read port into this canonical snapshot.
+    /// The unavailable state is preserved when that port is not yet wired.
+    pub fn with_action_history(
+        mut self,
+        reader: &impl TaskActionHistoryReadPort,
+        limit: usize,
+    ) -> Self {
+        let limit = limit.clamp(1, 128);
+        self.action_history = reader.read_action_history(&self.task_id, limit);
+        self.action_history.relevant.truncate(limit);
+        self.action_history
+            .continuation_fingerprints_sent
+            .truncate(limit);
+        self
+    }
+}
+
+/// Coarse snapshot phase. This function deliberately performs no I/O.
+pub fn derive_task_phase(
+    lifecycle: &str,
+    has_blocker: bool,
+    has_active_attempt: bool,
+    has_execution_target: bool,
+) -> &'static str {
+    if matches!(
+        lifecycle,
+        "completed" | "canceled" | "obviated" | "superseded" | "failed_exhausted"
+    ) {
+        "terminal"
+    } else if has_blocker {
+        "blocked"
+    } else if has_active_attempt {
+        "running"
+    } else if lifecycle == "queued" || (lifecycle == "open" && has_execution_target) {
+        "runnable"
+    } else {
+        "waiting"
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
     #[error("{field} must not be empty")]
@@ -619,6 +1313,227 @@ pub fn parse_preview_hostname(hostname: &str, base_domain: &str) -> Option<(Sess
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregate_completion_requires_declared_children_and_all_completed() {
+        let policy = CompletionPolicy::AllChildrenCompleted;
+        assert!(!completion_policy_satisfied(&policy, &[], &[]));
+        assert!(!completion_policy_satisfied(
+            &policy,
+            &[],
+            &[TaskTerminal::Canceled {
+                actor: "operator".into(),
+                reason: "not complete".into(),
+            }]
+        ));
+        assert!(completion_policy_satisfied(
+            &policy,
+            &[],
+            &[TaskTerminal::Completed { evidence: vec![] }]
+        ));
+        let vacuous_evidence = CompletionPolicy::Evidence {
+            required_kinds: Vec::new(),
+        };
+        let fabricated_trust = TrustedEvidence::from_observation(
+            ObservationRef {
+                id: "not-authorized".into(),
+                version: 1,
+                kind: EvidenceKind::DeliveryComplete,
+            },
+            ObservationProvenance::External,
+        )
+        .unwrap();
+        assert!(!completion_policy_satisfied(
+            &vacuous_evidence,
+            &[fabricated_trust],
+            &[]
+        ));
+        assert!(validate_completion_policy(&vacuous_evidence).is_err());
+    }
+
+    #[test]
+    fn task_snapshot_v0_fixture_deserializes_and_round_trips() {
+        let fixtures = [
+            include_str!("../tests/fixtures/task-snapshot-v1/fresh-open-executable.json"),
+            include_str!(
+                "../tests/fixtures/task-snapshot-v1/failed-checks-prior-continuation.json"
+            ),
+            include_str!("../tests/fixtures/task-snapshot-v1/merged-pr-stale-red-checks.json"),
+            include_str!("../tests/fixtures/task-snapshot-v1/operator-hold.json"),
+            include_str!("../tests/fixtures/task-snapshot-v1/unresolved-blocker.json"),
+            include_str!("../tests/fixtures/task-snapshot-v1/budget-exhaustion.json"),
+            include_str!(
+                "../tests/fixtures/task-snapshot-v1/dependency-terminal-noncompleted.json"
+            ),
+            include_str!("../tests/fixtures/task-snapshot-v1/missing-pr-branch.json"),
+            include_str!("../tests/fixtures/task-snapshot-v1/shadow-inflight-attempt.json"),
+            include_str!("../tests/fixtures/task-snapshot-v1/empty-aggregate-root.json"),
+            include_str!("../tests/fixtures/task-snapshot-v1/merge-group-sha-mismatch.json"),
+        ];
+        for fixture in fixtures {
+            let snapshot: TaskSnapshot = serde_json::from_str(fixture).unwrap();
+            assert_eq!(snapshot.schema_version, 1);
+            let encoded = serde_json::to_value(&snapshot).unwrap();
+            for required in [
+                "logical_time_ms",
+                "lifecycle",
+                "dependencies",
+                "children",
+                "attempts",
+                "observations",
+                "action_history",
+                "budget_usage",
+                "retry_schedule",
+                "delivery",
+                "merge_wait_due_at_ms",
+            ] {
+                assert!(encoded.get(required).is_some(), "missing {required}");
+            }
+            let decoded: TaskSnapshot = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, snapshot);
+        }
+    }
+
+    #[test]
+    fn action_history_read_port_projects_exact_history_and_fails_closed_when_unavailable() {
+        struct FakeActionHistory {
+            summary: ActionHistorySummary,
+        }
+        impl TaskActionHistoryReadPort for FakeActionHistory {
+            fn read_action_history(&self, task_id: &str, _limit: usize) -> ActionHistorySummary {
+                assert_eq!(task_id, "task_demo");
+                self.summary.clone()
+            }
+        }
+        struct UnavailableActionHistory;
+        impl TaskActionHistoryReadPort for UnavailableActionHistory {
+            fn read_action_history(&self, _task_id: &str, _limit: usize) -> ActionHistorySummary {
+                ActionHistorySummary {
+                    availability: Some(ActionHistoryAvailability::Unavailable),
+                    relevant: Vec::new(),
+                    continuation_fingerprints_sent: Vec::new(),
+                    last_consumed_evidence: None,
+                }
+            }
+        }
+
+        let fixture = include_str!("../tests/fixtures/task-snapshot-v1/fresh-open-executable.json");
+        let snapshot: TaskSnapshot = serde_json::from_str(fixture).unwrap();
+        assert_eq!(
+            snapshot.action_history.availability, None,
+            "missing provider metadata must not masquerade as an authoritative empty ledger"
+        );
+        assert_eq!(snapshot.controller_mode, ControllerMode::Reconciler);
+        let unavailable = snapshot
+            .clone()
+            .with_action_history(&UnavailableActionHistory, 10);
+        assert_eq!(
+            unavailable.action_history.availability,
+            Some(ActionHistoryAvailability::Unavailable)
+        );
+        assert!(unavailable.action_history.relevant.is_empty());
+
+        let first_entry = ActionHistoryEntry {
+            action_kind: "send_turn".into(),
+            attempt_id: Some("attempt_1".into()),
+            cause_fingerprint: "checks-failed:abc".into(),
+            idempotency_key: "send-turn-key".into(),
+            state: ActionState::UnknownOutcome,
+            turn_id: Some("turn_1".into()),
+            generation: Some(7),
+        };
+        let provider = FakeActionHistory {
+            summary: ActionHistorySummary {
+                availability: Some(ActionHistoryAvailability::Authoritative),
+                relevant: vec![
+                    first_entry,
+                    ActionHistoryEntry {
+                        action_kind: "send_turn".into(),
+                        attempt_id: Some("attempt_1".into()),
+                        cause_fingerprint: "checks-failed:def".into(),
+                        idempotency_key: "send-turn-key-2".into(),
+                        state: ActionState::Succeeded,
+                        turn_id: Some("turn_2".into()),
+                        generation: Some(8),
+                    },
+                ],
+                continuation_fingerprints_sent: vec![
+                    "checks-failed:abc".into(),
+                    "checks-failed:def".into(),
+                ],
+                last_consumed_evidence: Some("observation_9".into()),
+            },
+        };
+        let projected = snapshot.with_action_history(&provider, 1);
+        assert_eq!(
+            projected.action_history.availability,
+            Some(ActionHistoryAvailability::Authoritative)
+        );
+        assert_eq!(
+            projected.action_history.relevant[0].cause_fingerprint,
+            "checks-failed:abc"
+        );
+        assert_eq!(
+            projected.action_history.relevant[0].idempotency_key,
+            "send-turn-key"
+        );
+        assert_eq!(
+            projected.action_history.relevant[0].turn_id.as_deref(),
+            Some("turn_1")
+        );
+        assert_eq!(projected.action_history.relevant[0].generation, Some(7));
+        assert_eq!(projected.action_history.relevant.len(), 1);
+        assert_eq!(
+            projected
+                .action_history
+                .continuation_fingerprints_sent
+                .len(),
+            1
+        );
+        assert_eq!(
+            projected.action_history.relevant[0].state,
+            ActionState::UnknownOutcome
+        );
+        assert_eq!(
+            projected.action_history.last_consumed_evidence.as_deref(),
+            Some("observation_9")
+        );
+    }
+
+    #[test]
+    fn agent_observations_cannot_become_trusted_completion_evidence() {
+        let reference = ObservationRef {
+            id: "observation-1".into(),
+            version: 1,
+            kind: EvidenceKind::DeliveryComplete,
+        };
+        assert!(
+            TrustedEvidence::from_observation(reference.clone(), ObservationProvenance::Agent)
+                .is_err()
+        );
+        assert_eq!(
+            TrustedEvidence::from_observation(reference.clone(), ObservationProvenance::External)
+                .unwrap()
+                .observation(),
+            &reference
+        );
+    }
+
+    #[test]
+    fn task_phase_derivation_is_coarse_and_pure() {
+        assert_eq!(
+            derive_task_phase("completed", false, false, false),
+            "terminal"
+        );
+        assert_eq!(derive_task_phase("open", true, true, true), "blocked");
+        assert_eq!(derive_task_phase("open", false, true, true), "running");
+        assert_eq!(derive_task_phase("queued", false, false, true), "runnable");
+        assert_eq!(derive_task_phase("open", false, false, false), "waiting");
+        assert_eq!(
+            derive_task_phase("retry_wait", false, false, true),
+            "waiting"
+        );
+    }
 
     #[test]
     fn git_metadata_clears_pr_on_branch_change_and_detached_head() {

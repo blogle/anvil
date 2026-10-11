@@ -1,0 +1,23 @@
+{
+  "attempt_states": [
+    {"legacy_state":"abandoned","lifecycle":"ended","exit_reason":"abandoned"},
+    {"legacy_state":"canceled","lifecycle":"ended","exit_reason":"canceled"},
+    {"legacy_state":"cancelled","lifecycle":"ended","exit_reason":"canceled"},
+    {"legacy_state":"completed","lifecycle":"ended","exit_reason":"completed_turn"},
+    {"legacy_state":"exhausted","lifecycle":"ended","exit_reason":"failed"},
+    {"legacy_state":"failed","lifecycle":"ended","exit_reason":"failed"},
+    {"legacy_state":"orphaned","lifecycle":"ended","exit_reason":"orphaned"},
+    {"legacy_state":"provisioning","lifecycle":"provisioning","exit_reason":null},
+    {"legacy_state":"queued","lifecycle":"queued","exit_reason":null},
+    {"legacy_state":"replaced","lifecycle":"ended","exit_reason":"replaced"},
+    {"legacy_state":"retry_wait","lifecycle":"ended","exit_reason":"failed"},
+    {"legacy_state":"running","lifecycle":"running","exit_reason":null},
+    {"legacy_state":"succeeded","lifecycle":"ended","exit_reason":"completed_turn"}
+  ],
+  "failures": [
+    {"legacy_failure":"execution","canonical_domain":"work","canonical_code":"legacy_execution"},
+    {"legacy_failure":"infrastructure","canonical_domain":"platform","canonical_code":"legacy_infrastructure"},
+    {"legacy_failure":"non_retryable","canonical_domain":"unknown","canonical_code":"legacy_non_retryable"},
+    {"legacy_failure":"unclassified","canonical_domain":"unknown","canonical_code":"legacy_unclassified"}
+  ]
+}

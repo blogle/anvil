@@ -156,7 +156,7 @@ impl Config {
             value => {
                 return Err(ServiceError::Config(format!(
                     "unsupported ANVIL_SANDBOX_BACKEND={value}; expected kubernetes or local"
-                )))
+                )));
             }
         };
         let production = sandbox_backend == SandboxBackend::Kubernetes;
@@ -2190,10 +2190,29 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
         .route("/v1/batches/:id", get(get_batch))
         .route("/v1/batches/:id/digest", get(get_batch_digest))
         .route("/v1/capacity", get(get_capacity))
+        .route("/v1/tasks", post(create_task).get(list_tasks))
+        .route("/v1/tasks/graph", post(create_task_graph))
+        .route("/v1/tasks/:id/cancel", post(cancel_task))
+        .route("/v1/tasks/:id/obviate", post(obviate_task))
+        .route(
+            "/v1/tasks/:id/controller-mode",
+            post(set_task_controller_mode),
+        )
+        .route("/v1/tasks/:id/budget-grants", post(grant_task_budget))
+        .route("/v1/tasks/:id/snapshot", get(get_task_snapshot))
         .route("/v1/tasks/:id", get(get_task))
         .route(
             "/v1/tasks/:id/attempts",
             get(list_attempts).post(create_attempt),
+        )
+        .route(
+            "/v1/tasks/:id/external-refs",
+            get(list_task_external_refs).post(attach_task_external_ref),
+        )
+        .route("/v1/attempts/:id/blockers", post(create_attempt_blocker))
+        .route(
+            "/v1/tasks/:id/blockers/:blocker_id/resolve",
+            post(resolve_task_blocker),
         )
         .route(
             "/v1/attempts/:id",
@@ -2903,6 +2922,16 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
     let store = state
         .store()
         .map_err(|error| ServiceError::Store(error.into()))?;
+    // Recover a crash after the Legacy scheduler observed a completed turn and
+    // persisted its bridge evidence but before the Task terminal CAS committed.
+    for (task_id, attempt_id, version) in store
+        .legacy_completion_candidates()
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+    {
+        store
+            .complete_legacy_scheduler_attempt(&task_id, &attempt_id, version)
+            .map_err(|error| ServiceError::Store(error.to_string()))?;
+    }
     // Observe authoritative backend lifecycle state before claiming dependent work.
     for active in store
         .active_attempts()
@@ -2973,6 +3002,21 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
                 store
                     .set_attempt_state(&active.attempt_id, attempt_state)
                     .map_err(|error| ServiceError::Store(error.to_string()))?;
+            }
+            if attempt_state == "completed" {
+                let control = store
+                    .task_control(&active.task_id)
+                    .map_err(|error| ServiceError::Store(error.to_string()))?
+                    .ok_or(ServiceError::NotFound)?;
+                if control["controller_mode"] == "legacy" {
+                    store
+                        .complete_legacy_scheduler_attempt(
+                            &active.task_id,
+                            &active.attempt_id,
+                            control["version"].as_u64().unwrap_or_default(),
+                        )
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                }
             }
         }
     }
@@ -3078,25 +3122,498 @@ async fn get_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ServiceError> {
+    let store = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?;
+    let mut task = store
+        .get_resource("task", &id)
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+        .ok_or(ServiceError::NotFound)?;
+    if let Some(control) = store
+        .task_control(&id)
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+    {
+        task["version"] = control["version"].clone();
+        task["operator_hold"] = control["operator_hold"].clone();
+        task["controller_mode"] = control["controller_mode"].clone();
+        task["reconcile_generation"] = control["reconcile_generation"].clone();
+        task["completion_policy"] =
+            serde_json::from_str(control["completion_policy"].as_str().unwrap_or("null"))
+                .unwrap_or(Value::Null);
+        task["verification_spec"] =
+            serde_json::from_str(control["verification_spec"].as_str().unwrap_or("null"))
+                .unwrap_or(Value::Null);
+        task["budget"] = serde_json::from_str(control["budget"].as_str().unwrap_or("null"))
+            .unwrap_or(Value::Null);
+        task["execution_target"] = control["execution_target"]
+            .as_str()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or(Value::Null);
+        task["work_branch"] = control["work_branch"].clone();
+        task["pull_request_binding"] = control["pull_request_binding"]
+            .as_str()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or(Value::Null);
+        task["base_revision"] = control["base_revision"].clone();
+        task["terminal"] = control["terminal"]
+            .as_str()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or(Value::Null);
+    }
+    Ok(Json(task))
+}
+
+async fn create_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(specification): Json<Value>,
+) -> Result<(StatusCode, Json<Value>), ServiceError> {
+    let outcome = specification["outcome"].as_str().unwrap_or_default();
+    if outcome.trim().is_empty() {
+        return Err(ServiceError::Invalid("outcome must not be empty".into()));
+    }
+    validate_durable_task_spec(&specification)?;
+    let completion_policy = specification
+        .get("completion_policy")
+        .cloned()
+        .unwrap_or_else(|| {
+            if specification["execution_target"].is_null() {
+                json!({"kind":"all_children_completed"})
+            } else {
+                json!({"kind":"evidence","required_kinds":["delivery_complete"]})
+            }
+        });
+    serde_json::from_value::<anvil_core::CompletionPolicy>(completion_policy.clone())
+        .map_err(|error| ServiceError::Invalid(format!("invalid completion_policy: {error}")))?;
+    let request = json!({"specification":specification,"completion_policy":completion_policy});
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let mut accepted_spec = specification;
+    accepted_spec["completion_policy"] = completion_policy;
+    let result = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .accept_task(&key, "api", &request, &task_id, &accepted_spec)
+        .map_err(|error| match error {
+            store::StoreError::Conflict => {
+                ServiceError::Conflict("task idempotency key conflict".into())
+            }
+            other => ServiceError::Store(other.to_string()),
+        })?;
+    Ok((
+        if result.created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(result.task),
+    ))
+}
+
+fn validate_durable_task_spec(specification: &Value) -> Result<(), ServiceError> {
+    anvil_core::validate_task_spec(specification)
+        .map(|_| ())
+        .map_err(|error| ServiceError::Invalid(error.to_string()))
+}
+
+#[derive(Deserialize)]
+struct TaskListQuery {
+    after: Option<String>,
+    limit: Option<usize>,
+    lifecycle: Option<String>,
+    parent: Option<String>,
+    runnable: Option<bool>,
+    external_provider: Option<String>,
+    external_id: Option<String>,
+}
+
+async fn list_tasks(
+    State(state): State<AppState>,
+    Query(query): Query<TaskListQuery>,
+) -> Result<Json<Value>, ServiceError> {
+    let after = match query.after.as_deref() {
+        None => 0,
+        Some(cursor) => cursor
+            .strip_prefix("task1.")
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value >= 0)
+            .ok_or_else(|| ServiceError::Invalid("invalid Task cursor".into()))?,
+    };
+    let filters = store::TaskListFilters {
+        lifecycle: query.lifecycle,
+        parent: query.parent,
+        runnable: query.runnable,
+        external_provider: query.external_provider,
+        external_id: query.external_id,
+    };
+    let (tasks, next) = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .task_page_filtered(after, query.limit.unwrap_or(50), &filters)
+        .map_err(|error| ServiceError::Store(error.to_string()))?;
+    Ok(Json(
+        json!({"tasks":tasks,"next_cursor":next.map(|sequence|format!("task1.{sequence}"))}),
+    ))
+}
+
+async fn get_task_snapshot(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ServiceError> {
     state
         .store()
         .map_err(|error| ServiceError::Store(error.into()))?
-        .get_resource("task", &id)
+        .task_snapshot(&id, Utc::now().timestamp_millis())
         .map_err(|error| ServiceError::Store(error.to_string()))?
         .map(Json)
         .ok_or(ServiceError::NotFound)
 }
 
+async fn create_task_graph(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Result<(StatusCode, Json<Value>), ServiceError> {
+    let raw_nodes = request["nodes"]
+        .as_array()
+        .ok_or_else(|| ServiceError::Invalid("nodes must be an array".into()))?;
+    let raw_edges = request["dependencies"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if raw_nodes.is_empty() || raw_nodes.len() > 256 || raw_edges.len() > 2048 {
+        return Err(ServiceError::Invalid("graph size exceeds limits".into()));
+    }
+    let mut nodes = Vec::with_capacity(raw_nodes.len());
+    for node in raw_nodes {
+        let key = node["key"]
+            .as_str()
+            .filter(|key| !key.trim().is_empty())
+            .ok_or_else(|| ServiceError::Invalid("each graph node requires a key".into()))?
+            .to_owned();
+        let spec = node.get("task").cloned().unwrap_or(Value::Null);
+        if spec["outcome"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            return Err(ServiceError::Invalid(format!(
+                "node {key} requires outcome"
+            )));
+        }
+        validate_durable_task_spec(&spec)?;
+        let completion = spec.get("completion_policy").cloned().unwrap_or_else(|| {
+            if spec["execution_target"].is_null() {
+                json!({"kind":"all_children_completed"})
+            } else {
+                json!({"kind":"evidence","required_kinds":["delivery_complete"]})
+            }
+        });
+        serde_json::from_value::<anvil_core::CompletionPolicy>(completion).map_err(|error| {
+            ServiceError::Invalid(format!("node {key}: invalid completion policy: {error}"))
+        })?;
+        nodes.push((key, uuid::Uuid::new_v4().to_string(), spec));
+    }
+    let mut edges = Vec::new();
+    for edge in raw_edges {
+        let predecessor = edge["predecessor"]
+            .as_str()
+            .ok_or_else(|| ServiceError::Invalid("dependency requires predecessor".into()))?
+            .to_owned();
+        let successor = edge["successor"]
+            .as_str()
+            .ok_or_else(|| ServiceError::Invalid("dependency requires successor".into()))?
+            .to_owned();
+        edges.push((predecessor, successor));
+    }
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let result = state
+        .store()
+        .map_err(|e| ServiceError::Store(e.into()))?
+        .accept_task_graph(&key, "api", &request, &nodes, &edges)
+        .map_err(|error| match error {
+            store::StoreError::Conflict => {
+                ServiceError::Conflict("task graph idempotency conflict".into())
+            }
+            store::StoreError::InvalidState(message) => ServiceError::Invalid(message),
+            other => ServiceError::Store(other.to_string()),
+        })?;
+    Ok((
+        if result.created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(result.task),
+    ))
+}
+
+#[derive(Deserialize)]
+struct TerminalMutation {
+    expected_version: u64,
+    reason: String,
+    actor: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct CancelTaskQuery {
+    cascade: Option<String>,
+}
+
+async fn cancel_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<CancelTaskQuery>,
+    Json(body): Json<TerminalMutation>,
+) -> Result<Json<Value>, ServiceError> {
+    if body.reason.trim().is_empty() {
+        return Err(ServiceError::Invalid("reason must not be empty".into()));
+    }
+    if query
+        .cascade
+        .as_deref()
+        .is_some_and(|value| value != "descendants")
+    {
+        return Err(ServiceError::Invalid(
+            "cascade must be omitted or set to descendants".into(),
+        ));
+    }
+    let actor = body.actor.unwrap_or_else(|| "operator".into());
+    let canceled = state
+        .store()
+        .map_err(|e| ServiceError::Store(e.into()))?
+        .cancel_task_with_descendants(
+            &id,
+            body.expected_version,
+            &actor,
+            &body.reason,
+            query.cascade.as_deref() == Some("descendants"),
+        )
+        .map_err(map_task_terminal_error)?;
+    for task in &canceled {
+        let task_id = task["task_id"].as_str().unwrap_or_default();
+        let attempts = state
+            .store()
+            .ok()
+            .and_then(|store| store.attempts_for_task(task_id).ok())
+            .unwrap_or_default();
+        {
+            for attempt in attempts {
+                if !matches!(attempt["lifecycle"].as_str(), Some("ended")) {
+                    if let Some(session_id) = attempt["session_id"].as_str() {
+                        if let Err(error) = state.kube.suspend(session_id).await {
+                            warn!(%error, %session_id, "best-effort Task cancellation runtime suspension failed");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(Json(
+        json!({"task":canceled.first(),"canceled_descendants":canceled.len().saturating_sub(1)}),
+    ))
+}
+
+async fn obviate_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<TerminalMutation>,
+) -> Result<Json<Value>, ServiceError> {
+    if body.reason.trim().is_empty() {
+        return Err(ServiceError::Invalid("reason must not be empty".into()));
+    }
+    let task = state
+        .store()
+        .map_err(|e| ServiceError::Store(e.into()))?
+        .terminate_task(
+            &id,
+            body.expected_version,
+            anvil_core::TaskTerminal::Obviated {
+                reason: body.reason,
+            },
+        )
+        .map_err(map_task_terminal_error)?;
+    let attempts = state
+        .store()
+        .ok()
+        .and_then(|store| store.attempts_for_task(&id).ok())
+        .unwrap_or_default();
+    for attempt in attempts {
+        if !matches!(attempt["lifecycle"].as_str(), Some("ended")) {
+            if let Some(session_id) = attempt["session_id"].as_str() {
+                if let Err(error) = state.kube.suspend(session_id).await {
+                    warn!(%error, %session_id, "best-effort Task obviation runtime suspension failed");
+                }
+            }
+        }
+    }
+    Ok(Json(task))
+}
+
+#[derive(Deserialize)]
+struct ControllerModeMutation {
+    expected_version: u64,
+    operator_hold: bool,
+    controller_mode: anvil_core::ControllerMode,
+}
+
+async fn set_task_controller_mode(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ControllerModeMutation>,
+) -> Result<Json<Value>, ServiceError> {
+    let mode = match request.controller_mode {
+        anvil_core::ControllerMode::Legacy => "legacy",
+        anvil_core::ControllerMode::Shadow => "shadow",
+        anvil_core::ControllerMode::Reconciler => "reconciler",
+    };
+    let store = state.store().map_err(|e| ServiceError::Store(e.into()))?;
+    let version = store
+        .set_task_control(&id, request.expected_version, request.operator_hold, mode)
+        .map_err(map_task_terminal_error)?;
+    store
+        .get_resource("task", &id)
+        .map_err(|e| ServiceError::Store(e.to_string()))?
+        .map(|mut task| {
+            task["version"] = json!(version);
+            task["operator_hold"] = json!(request.operator_hold);
+            task["controller_mode"] = json!(mode);
+            Json(task)
+        })
+        .ok_or(ServiceError::NotFound)
+}
+
+#[derive(Deserialize)]
+struct BudgetGrantMutation {
+    expected_version: u64,
+    actor: String,
+    reason: String,
+    additional_attempts: u32,
+    additional_continuations: u32,
+    additional_ci_retries: u32,
+    additional_execution_seconds: u64,
+}
+
+async fn grant_task_budget(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<BudgetGrantMutation>,
+) -> Result<Json<Value>, ServiceError> {
+    let store = state.store().map_err(|e| ServiceError::Store(e.into()))?;
+    let version = store
+        .grant_task_budget(
+            &id,
+            request.expected_version,
+            &request.actor,
+            &request.reason,
+            request.additional_attempts,
+            request.additional_continuations,
+            request.additional_ci_retries,
+            request.additional_execution_seconds,
+        )
+        .map_err(map_task_terminal_error)?;
+    store
+        .get_resource("task", &id)
+        .map_err(|e| ServiceError::Store(e.to_string()))?
+        .map(|mut task| {
+            task["version"] = json!(version);
+            Json(task)
+        })
+        .ok_or(ServiceError::NotFound)
+}
+
+fn map_task_terminal_error(error: store::StoreError) -> ServiceError {
+    match error {
+        store::StoreError::NotFound => ServiceError::NotFound,
+        store::StoreError::Conflict => ServiceError::Conflict("task version changed".into()),
+        store::StoreError::InvalidState(message) => ServiceError::Invalid(message),
+        other => ServiceError::Store(other.to_string()),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct AttemptListQuery {
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
 async fn list_attempts(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<AttemptListQuery>,
 ) -> Result<Json<Value>, ServiceError> {
-    let attempts = state
+    let after = match query.after.as_deref() {
+        None => 0,
+        Some(cursor) => cursor
+            .strip_prefix("attempt1.")
+            .and_then(|ordinal| ordinal.parse::<u32>().ok())
+            .ok_or_else(|| ServiceError::Invalid("invalid Attempt cursor".into()))?,
+    };
+    let (attempts, next) = state
         .store()
         .map_err(|error| ServiceError::Store(error.into()))?
-        .attempts_for_task(&id)
+        .attempt_page(&id, after, query.limit.unwrap_or(50))
         .map_err(|error| ServiceError::Store(error.to_string()))?;
-    Ok(Json(json!({"task_id":id,"attempts":attempts})))
+    Ok(Json(
+        json!({"task_id":id,"attempts":attempts,"next_cursor":next.map(|ordinal|format!("attempt1.{ordinal}"))}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct AttachExternalRefRequest {
+    provider: String,
+    external_id: String,
+    source_hash: String,
+    url: Option<String>,
+}
+
+async fn attach_task_external_ref(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    Json(request): Json<AttachExternalRefRequest>,
+) -> Result<(StatusCode, Json<Value>), ServiceError> {
+    let reference = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .attach_task_external_ref(
+            &task_id,
+            &request.provider,
+            &request.external_id,
+            &request.source_hash,
+            request.url.as_deref(),
+        )
+        .map_err(|error| match error {
+            store::StoreError::NotFound => ServiceError::NotFound,
+            store::StoreError::Conflict => {
+                ServiceError::Conflict("external reference is already bound to active work".into())
+            }
+            store::StoreError::InvalidState(reason) => ServiceError::Invalid(reason),
+            other => ServiceError::Store(other.to_string()),
+        })?;
+    Ok((StatusCode::OK, Json(reference)))
+}
+
+async fn list_task_external_refs(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<Json<Value>, ServiceError> {
+    let references = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .external_refs_for_task(&task_id)
+        .map_err(|error| ServiceError::Store(error.to_string()))?;
+    Ok(Json(json!({"task_id":task_id,"external_refs":references})))
 }
 
 async fn create_attempt(
@@ -3128,6 +3645,86 @@ async fn create_attempt(
         StatusCode::OK
     };
     Ok((status, Json(acceptance.attempt)))
+}
+
+#[derive(Deserialize)]
+struct CreateBlockerRequest {
+    expected_task_version: u64,
+    question: String,
+    context: String,
+}
+
+async fn create_attempt_blocker(
+    State(state): State<AppState>,
+    Path(attempt_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<CreateBlockerRequest>,
+) -> Result<(StatusCode, Json<Value>), ServiceError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or(ServiceError::Unauthorized)?;
+    let signer = state
+        .capability_signer
+        .as_ref()
+        .ok_or(ServiceError::Unauthorized)?;
+    let claims = signer
+        .verify_for_refresh(token)
+        .map_err(|_| ServiceError::Unauthorized)?;
+    if claims.expires_at <= Utc::now().timestamp() {
+        return Err(ServiceError::Unauthorized);
+    }
+    let blocker = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .create_attempt_blocker(
+            &attempt_id,
+            &claims.session_id,
+            request.expected_task_version,
+            &request.question,
+            &request.context,
+        )
+        .map_err(|error| match error {
+            store::StoreError::NotFound => ServiceError::NotFound,
+            store::StoreError::Conflict => {
+                ServiceError::Conflict("blocker CAS or session binding conflict".into())
+            }
+            store::StoreError::InvalidState(reason) => ServiceError::Invalid(reason),
+            other => ServiceError::Store(other.to_string()),
+        })?;
+    Ok((StatusCode::CREATED, Json(blocker)))
+}
+
+#[derive(Deserialize)]
+struct ResolveBlockerRequest {
+    expected_task_version: u64,
+    actor: String,
+    resolution: String,
+}
+
+async fn resolve_task_blocker(
+    State(state): State<AppState>,
+    Path((task_id, blocker_id)): Path<(String, String)>,
+    Json(request): Json<ResolveBlockerRequest>,
+) -> Result<Json<Value>, ServiceError> {
+    state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .resolve_task_blocker(
+            &task_id,
+            &blocker_id,
+            request.expected_task_version,
+            &request.actor,
+            &request.resolution,
+        )
+        .map(Json)
+        .map_err(|error| match error {
+            store::StoreError::NotFound => ServiceError::NotFound,
+            store::StoreError::Conflict => ServiceError::Conflict("blocker CAS conflict".into()),
+            store::StoreError::InvalidState(reason) => ServiceError::Invalid(reason),
+            other => ServiceError::Store(other.to_string()),
+        })
 }
 
 #[derive(Deserialize)]
@@ -3189,6 +3786,8 @@ async fn idempotency_middleware(
         || method == axum::http::Method::DELETE;
     if key.is_none()
         || path == "/v1/batches"
+        || (method == axum::http::Method::POST
+            && matches!(path.as_str(), "/v1/tasks" | "/v1/tasks/graph"))
         || (path.starts_with("/v1/tasks/") && path.ends_with("/attempts"))
         || path.ends_with("/credentials/github")
         || !is_mutation
@@ -3204,7 +3803,7 @@ async fn idempotency_middleware(
         Ok(bytes) => bytes,
         Err(error) => {
             return ServiceError::Invalid(format!("unable to read request body: {error}"))
-                .into_response()
+                .into_response();
         }
     };
     let semantic = serde_json::from_slice::<Value>(&bytes)
@@ -3253,7 +3852,7 @@ async fn idempotency_middleware(
             return ServiceError::Conflict(
                 "Idempotency-Key was already used for a different operation or request".into(),
             )
-            .into_response()
+            .into_response();
         }
         Err(error) => return ServiceError::Store(error).into_response(),
     };
@@ -3294,7 +3893,7 @@ async fn idempotency_middleware(
         Ok(bytes) => bytes,
         Err(error) => {
             return ServiceError::Store(format!("unable to persist HTTP result: {error}"))
-                .into_response()
+                .into_response();
         }
     };
     let body_value = serde_json::from_slice::<Value>(&bytes)
@@ -6373,8 +6972,39 @@ pub struct OpenCode {
     client: reqwest::Client,
     base: Url,
 }
+
+#[cfg(test)]
+thread_local! {
+    static FORBID_OPENCODE_CLIENT_CONSTRUCTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+struct OpenCodeConstructionGuard;
+
+#[cfg(test)]
+impl OpenCodeConstructionGuard {
+    fn forbidden() -> Self {
+        FORBID_OPENCODE_CLIENT_CONSTRUCTION.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for OpenCodeConstructionGuard {
+    fn drop(&mut self) {
+        FORBID_OPENCODE_CLIENT_CONSTRUCTION.with(|flag| flag.set(false));
+    }
+}
+
 impl OpenCode {
     pub fn new(base: String, t: Duration) -> Self {
+        #[cfg(test)]
+        FORBID_OPENCODE_CLIENT_CONSTRUCTION.with(|flag| {
+            assert!(
+                !flag.get(),
+                "OpenCode client constructed during durable Task recovery"
+            );
+        });
         Self {
             client: reqwest::Client::builder().timeout(t).build().unwrap(),
             base: Url::parse(&base).unwrap(),
@@ -6621,6 +7251,274 @@ mod tests {
             .unwrap();
         let value = serde_json::from_slice(&body).unwrap();
         (status, value)
+    }
+
+    async fn post_json_with_key(
+        app: &Router,
+        uri: &str,
+        key: &str,
+        value: &Value,
+    ) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(uri)
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", key)
+                    .body(Body::from(value.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&body).unwrap();
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn task_acceptance_http_rejects_malformed_specs_without_reserving_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        let app = router(AppState::new(config.clone(), FakeSandbox));
+        let store = store::ControllerStore::open(&config.store_path).unwrap();
+
+        let (status, _) = post_json_with_key(
+            &app,
+            "/v1/tasks",
+            "bad-singleton-budget",
+            &json!({
+                "outcome":"bad budget",
+                "budget":{"max_attempts":"three","max_execution_seconds":60}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(store.get("bad-singleton-budget").unwrap().is_none());
+        assert!(store
+            .get_resource("task", "bad-singleton-budget")
+            .unwrap()
+            .is_none());
+
+        let before_graph_tasks = store.task_page(0, 100).unwrap().0.len();
+        let (status, _) = post_json_with_key(
+            &app,
+            "/v1/tasks/graph",
+            "bad-graph-delivery",
+            &json!({
+                "nodes":[{"key":"bad","task":{
+                    "outcome":"bad target",
+                    "execution_target":{"kind":"git_repository","project":"demo","repository":"https://github.com/example/repo.git","base_ref":"main","delivery":{"kind":"irc"}}
+                }}],
+                "dependencies":[]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(store.get("bad-graph-delivery").unwrap().is_none());
+        let after_graph_tasks = store.task_page(0, 100).unwrap().0.len();
+        assert_eq!(after_graph_tasks, before_graph_tasks);
+
+        let (status, accepted) = post_json_with_key(
+            &app,
+            "/v1/tasks",
+            "valid-defaults-after-rejection",
+            &json!({"outcome":"valid legacy-compatible default"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            accepted["completion_policy"]["kind"],
+            "all_children_completed"
+        );
+        drop(store);
+
+        let reopened = store::ControllerStore::open(&config.store_path).unwrap();
+        let snapshot = reopened
+            .task_snapshot(
+                accepted["task_id"].as_str().unwrap(),
+                Utc::now().timestamp_millis(),
+            )
+            .unwrap()
+            .unwrap();
+        let typed: anvil_core::TaskSnapshot = serde_json::from_value(snapshot).unwrap();
+        assert_eq!(typed.task_id, accepted["task_id"]);
+        assert_eq!(typed.budget_usage.limits.max_attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn durable_task_recovery_never_constructs_an_opencode_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        let task_spec = json!({"outcome":"recover from SQLite"});
+        {
+            let store = store::ControllerStore::open(&config.store_path).unwrap();
+            store
+                .accept_task(
+                    "recover-key",
+                    "test",
+                    &task_spec,
+                    "recover-task",
+                    &task_spec,
+                )
+                .unwrap();
+        }
+        let app = router(AppState::new(config, FakeSandbox));
+        let _guard = OpenCodeConstructionGuard::forbidden();
+        let (status, snapshot) = get_json(&app, "/v1/tasks/recover-task/snapshot").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(snapshot["task_id"], "recover-task");
+        assert_eq!(snapshot["lifecycle"], json!({"state":"open"}));
+    }
+
+    #[tokio::test]
+    async fn blocker_http_routes_enforce_attempt_capability_and_task_cas() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        config.session_signing_secret = Some("b".repeat(32));
+        let store = store::ControllerStore::open(config.store_path.clone()).unwrap();
+        let state = AppState::new(config.clone(), FakeSandbox);
+        let spec = json!({"outcome":"wait for operator"});
+        store
+            .accept_task(
+                "blocker-http-task",
+                "test",
+                &spec,
+                "blocker-http-task",
+                &spec,
+            )
+            .unwrap();
+        store
+            .create_attempt(
+                "blocker-http-task",
+                "blocker-http-attempt",
+                "blocker-http-attempt-key",
+            )
+            .unwrap();
+        store
+            .bind_attempt_session("blocker-http-attempt", "ses-blocker")
+            .unwrap();
+        let signer =
+            github::CapabilitySigner::new("b".repeat(32), Duration::from_secs(60)).unwrap();
+        let capability = signer.mint("ses-blocker", "example/repo").unwrap();
+        let app = router(state);
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/attempts/blocker-http-attempt/blockers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"expected_task_version":2,"question":"q","context":"c"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/attempts/blocker-http-attempt/blockers")
+                    .header("authorization", format!("Bearer {capability}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"expected_task_version":2,"question":"q","context":"c"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let blocker: Value = serde_json::from_slice(
+            &axum::body::to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let resolved = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/tasks/blocker-http-task/blockers/{}/resolve", blocker["id"].as_str().unwrap()))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"expected_task_version":3,"actor":"operator","resolution":"answered"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.status(), StatusCode::OK);
+        assert_eq!(
+            store
+                .task_snapshot("blocker-http-task", 0)
+                .unwrap()
+                .unwrap()["blocker"],
+            Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn task_external_reference_http_routes_are_idempotent_and_readable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        let store = store::ControllerStore::open(&config.store_path).unwrap();
+        let specification = json!({"outcome":"imported work"});
+        store
+            .accept_task(
+                "external-api-key",
+                "test",
+                &specification,
+                "external-api-task",
+                &specification,
+            )
+            .unwrap();
+        let app = router(AppState::new(config, FakeSandbox));
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks/external-api-task/external-refs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "provider":"lific",
+                        "external_id":"ANVIL-55",
+                        "source_hash":"sha256:fixture",
+                        "url":"https://lific.test/ANVIL-55"
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first: Value = serde_json::from_slice(
+            &axum::body::to_bytes(first.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let second = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second: Value = serde_json::from_slice(
+            &axum::body::to_bytes(second.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["id"], second["id"]);
+        let (status, listing) = get_json(&app, "/v1/tasks/external-api-task/external-refs").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listing["external_refs"].as_array().unwrap().len(), 1);
+        assert_eq!(listing["external_refs"][0]["source_hash"], "sha256:fixture");
     }
 
     #[tokio::test]
@@ -6948,6 +7846,10 @@ mod tests {
             .unwrap();
             assert_eq!(body["ordinal"], ordinal);
             if ordinal == 1 {
+                let task_store = store::ControllerStore::open(config.store_path.clone()).unwrap();
+                task_store
+                    .set_attempt_state(body["attempt_id"].as_str().unwrap(), "ended")
+                    .unwrap();
                 let retry = app
                     .clone()
                     .oneshot(
@@ -7021,8 +7923,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(conflict_attempt.status(), StatusCode::CONFLICT);
-        let attempt_id = attempts["attempts"][0]["attempt_id"].as_str().unwrap();
-        assert_eq!(attempts["attempts"][0]["state"], "queued");
+        let live_attempt = attempts["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|attempt| attempt["lifecycle"] != "ended")
+            .expect("one live implementation attempt remains");
+        assert_eq!(
+            attempts["attempts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|attempt| attempt["state"] == "ended")
+                .count(),
+            1
+        );
+        let attempt_id = live_attempt["attempt_id"].as_str().unwrap();
         let get_attempt = app
             .clone()
             .oneshot(
@@ -7140,10 +8056,11 @@ mod tests {
             attempts_after_restart["attempts"].as_array().unwrap().len(),
             2
         );
-        assert_eq!(
-            attempts_after_restart["attempts"][0]["attempt_id"],
-            attempt_id
-        );
+        assert!(attempts_after_restart["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attempt| attempt["attempt_id"] == attempt_id));
         let restart_replay = reopened
             .clone()
             .oneshot(submit_raw(plan.to_string(), "stable-key"))
@@ -7173,6 +8090,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened_attempt["result"]["ordinal"], 1);
+        let restart_store = store::ControllerStore::open(config.store_path.clone()).unwrap();
+        for attempt in attempts_after_restart["attempts"].as_array().unwrap() {
+            restart_store
+                .set_attempt_state(attempt["attempt_id"].as_str().unwrap(), "ended")
+                .unwrap();
+        }
         let unkeyed_attempt = reopened
             .clone()
             .oneshot(
@@ -7267,6 +8190,7 @@ mod tests {
         reopened
             .create_attempt(&ids[42], "attempt-42-1", "attempt-key-42-1")
             .unwrap();
+        reopened.set_attempt_state("attempt-42-1", "ended").unwrap();
         reopened
             .create_attempt(&ids[42], "attempt-42-2", "attempt-key-42-2")
             .unwrap();
@@ -7879,6 +8803,8 @@ mod tests {
     }
 
     fn config(profile_opencode_url: String) -> Config {
+        let test_temp_dir = std::env::temp_dir();
+        let test_instance = uuid::Uuid::new_v4();
         Config {
             sandbox_backend: SandboxBackend::Kubernetes,
             bind_port: 8080,
@@ -7901,8 +8827,8 @@ mod tests {
             session_signing_secret: None,
             session_capability_ttl: Duration::from_secs(86400),
             github_api_url: "https://api.github.com".into(),
-            history_path: PathBuf::from("/tmp/anvil-history.jsonl"),
-            store_path: PathBuf::from(format!("/tmp/anvil-test-{}.sqlite3", uuid::Uuid::new_v4())),
+            history_path: test_temp_dir.join(format!("anvil-history-{test_instance}.jsonl")),
+            store_path: test_temp_dir.join(format!("anvil-test-{test_instance}.sqlite3")),
             concurrency_limit: 4,
             provisioning_max_attempts: 3,
             provisioning_retry_base: Duration::from_millis(10),
