@@ -69,11 +69,14 @@ pub fn completion_policy_satisfied(
     children: &[TaskTerminal],
 ) -> bool {
     match policy {
-        CompletionPolicy::Evidence { required_kinds } => required_kinds.iter().all(|required| {
-            evidence
-                .iter()
-                .any(|trusted| trusted.observation().kind == *required)
-        }),
+        CompletionPolicy::Evidence { required_kinds } => {
+            !required_kinds.is_empty()
+                && required_kinds.iter().all(|required| {
+                    evidence
+                        .iter()
+                        .any(|trusted| trusted.observation().kind == *required)
+                })
+        }
         CompletionPolicy::AllChildrenCompleted => {
             !children.is_empty()
                 && children
@@ -84,6 +87,25 @@ pub fn completion_policy_satisfied(
             .iter()
             .any(|trusted| trusted.observation().kind == EvidenceKind::ManualCompletion),
     }
+}
+
+pub fn validate_completion_policy(policy: &CompletionPolicy) -> Result<(), ValidationError> {
+    if let CompletionPolicy::Evidence { required_kinds } = policy {
+        if required_kinds.is_empty() {
+            return Err(ValidationError::Invalid {
+                field: "completion_policy.required_kinds",
+                reason: "must contain at least one trusted evidence kind".into(),
+            });
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        if required_kinds.iter().any(|kind| !unique.insert(*kind)) {
+            return Err(ValidationError::Invalid {
+                field: "completion_policy.required_kinds",
+                reason: "must not contain duplicate evidence kinds".into(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -381,6 +403,182 @@ pub enum TaskExecutionTarget {
         base_ref: String,
         delivery: DeliveryKind,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VerificationSpec {
+    #[serde(default)]
+    pub holdout_scenarios: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedTaskSpec {
+    pub outcome: String,
+    pub acceptance_criteria: Vec<String>,
+    pub completion_policy: CompletionPolicy,
+    pub verification_spec: VerificationSpec,
+    pub budget: TaskBudget,
+    pub execution_target: Option<TaskExecutionTarget>,
+}
+
+/// Parse and validate immutable Task intent before any storage transaction is
+/// opened. This is shared by service/API code and the Task repository so graph
+/// and singleton acceptance cannot silently diverge.
+pub fn validate_task_spec(
+    specification: &serde_json::Value,
+) -> Result<ValidatedTaskSpec, ValidationError> {
+    let outcome = specification
+        .get("outcome")
+        .and_then(serde_json::Value::as_str)
+        .filter(|outcome| !outcome.trim().is_empty())
+        .ok_or(ValidationError::Empty { field: "outcome" })?
+        .to_owned();
+    if outcome.len() > 32_768 {
+        return Err(ValidationError::Invalid {
+            field: "outcome",
+            reason: "must be at most 32768 bytes".into(),
+        });
+    }
+    let acceptance_criteria = match specification.get("acceptance_criteria") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| ValidationError::Invalid {
+                field: "acceptance_criteria",
+                reason: "must be an array of non-empty strings".into(),
+            })?
+            .iter()
+            .map(|criterion| {
+                criterion
+                    .as_str()
+                    .filter(|criterion| !criterion.trim().is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| ValidationError::Invalid {
+                        field: "acceptance_criteria",
+                        reason: "must contain only non-empty strings".into(),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    if acceptance_criteria.len() > 256
+        || acceptance_criteria
+            .iter()
+            .any(|criterion| criterion.len() > 4096)
+    {
+        return Err(ValidationError::Invalid {
+            field: "acceptance_criteria",
+            reason: "must contain at most 256 criteria of at most 4096 bytes each".into(),
+        });
+    }
+    let execution_target = match specification
+        .get("execution_target")
+        .filter(|value| !value.is_null())
+    {
+        None => None,
+        Some(value) => {
+            let mut normalized = value.clone();
+            if let Some(delivery) = normalized
+                .get("delivery")
+                .and_then(|item| item.get("kind"))
+                .and_then(serde_json::Value::as_str)
+            {
+                normalized["delivery"] = serde_json::json!(delivery);
+            }
+            if normalized["kind"] != "git_repository" {
+                return Err(ValidationError::Invalid {
+                    field: "execution_target.kind",
+                    reason: "only git_repository is supported".into(),
+                });
+            }
+            if let Some(project) = normalized
+                .get("project")
+                .and_then(serde_json::Value::as_str)
+            {
+                Project::new(project)?;
+            }
+            Repository::new(normalized["repository"].as_str().unwrap_or_default())?;
+            GitRef::new(normalized["base_ref"].as_str().unwrap_or_default())?;
+            Some(
+                serde_json::from_value(normalized).map_err(|error| ValidationError::Invalid {
+                    field: "execution_target",
+                    reason: error.to_string(),
+                })?,
+            )
+        }
+    };
+    let completion_policy = match specification.get("completion_policy") {
+        Some(value) => {
+            serde_json::from_value(value.clone()).map_err(|error| ValidationError::Invalid {
+                field: "completion_policy",
+                reason: error.to_string(),
+            })?
+        }
+        None => match &execution_target {
+            None => CompletionPolicy::AllChildrenCompleted,
+            Some(_) => CompletionPolicy::Evidence {
+                required_kinds: vec![EvidenceKind::DeliveryComplete],
+            },
+        },
+    };
+    validate_completion_policy(&completion_policy)?;
+    let verification_spec = match specification.get("verification_spec") {
+        None | Some(serde_json::Value::Null) => VerificationSpec {
+            holdout_scenarios: Vec::new(),
+        },
+        Some(value) => {
+            serde_json::from_value(value.clone()).map_err(|error| ValidationError::Invalid {
+                field: "verification_spec",
+                reason: error.to_string(),
+            })?
+        }
+    };
+    if verification_spec.holdout_scenarios.len() > 256
+        || verification_spec
+            .holdout_scenarios
+            .iter()
+            .any(|scenario| scenario.to_string().len() > 65_536)
+    {
+        return Err(ValidationError::Invalid {
+            field: "verification_spec.holdout_scenarios",
+            reason: "must contain at most 256 scenarios of at most 65536 bytes each".into(),
+        });
+    }
+    let budget = match specification.get("budget") {
+        None | Some(serde_json::Value::Null) => TaskBudget::default(),
+        Some(value) => {
+            serde_json::from_value(value.clone()).map_err(|error| ValidationError::Invalid {
+                field: "budget",
+                reason: error.to_string(),
+            })?
+        }
+    };
+    if budget.max_attempts == 0
+        || budget.max_attempts > 1_000
+        || budget.max_continuations_per_reason > 1_000
+        || budget.max_verifier_cycles > 100
+        || budget.max_ci_retries > 1_000
+        || budget.max_execution_seconds == 0
+        || budget.max_execution_seconds > 31_536_000
+        || budget.max_model_cost.as_deref().is_some_and(|cost| {
+            cost.len() > 64
+                || cost
+                    .parse::<f64>()
+                    .map_or(true, |value| !value.is_finite() || value < 0.0)
+        })
+    {
+        return Err(ValidationError::Invalid {
+            field: "budget",
+            reason: "allocation is outside supported positive bounds".into(),
+        });
+    }
+    Ok(ValidatedTaskSpec {
+        outcome,
+        acceptance_criteria,
+        completion_policy,
+        verification_spec,
+        budget,
+        execution_target,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1133,6 +1331,24 @@ mod tests {
             &[],
             &[TaskTerminal::Completed { evidence: vec![] }]
         ));
+        let vacuous_evidence = CompletionPolicy::Evidence {
+            required_kinds: Vec::new(),
+        };
+        let fabricated_trust = TrustedEvidence::from_observation(
+            ObservationRef {
+                id: "not-authorized".into(),
+                version: 1,
+                kind: EvidenceKind::DeliveryComplete,
+            },
+            ObservationProvenance::External,
+        )
+        .unwrap();
+        assert!(!completion_policy_satisfied(
+            &vacuous_evidence,
+            &[fabricated_trust],
+            &[]
+        ));
+        assert!(validate_completion_policy(&vacuous_evidence).is_err());
     }
 
     #[test]

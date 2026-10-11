@@ -3216,60 +3216,9 @@ async fn create_task(
 }
 
 fn validate_durable_task_spec(specification: &Value) -> Result<(), ServiceError> {
-    if let Some(criteria) = specification.get("acceptance_criteria") {
-        let criteria = criteria
-            .as_array()
-            .ok_or_else(|| ServiceError::Invalid("acceptance_criteria must be an array".into()))?;
-        if criteria
-            .iter()
-            .any(|item| item.as_str().is_none_or(|text| text.trim().is_empty()))
-        {
-            return Err(ServiceError::Invalid(
-                "acceptance_criteria must contain non-empty strings".into(),
-            ));
-        }
-    }
-    if let Some(target) = specification
-        .get("execution_target")
-        .filter(|value| !value.is_null())
-    {
-        if target["kind"] != "git_repository" {
-            return Err(ServiceError::Invalid(
-                "execution_target.kind must be git_repository".into(),
-            ));
-        }
-        Project::new(target["project"].as_str().unwrap_or_default())
-            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-        Repository::new(target["repository"].as_str().unwrap_or_default())
-            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-        GitRef::new(target["base_ref"].as_str().unwrap_or_default())
-            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-        if !matches!(
-            target["delivery"]["kind"].as_str(),
-            Some("pull_request" | "local_branch")
-        ) {
-            return Err(ServiceError::Invalid(
-                "execution_target.delivery.kind must be pull_request or local_branch".into(),
-            ));
-        }
-    }
-    if let Some(value) = specification.get("budget") {
-        let budget: anvil_core::TaskBudget = serde_json::from_value(value.clone())
-            .map_err(|error| ServiceError::Invalid(format!("invalid budget: {error}")))?;
-        if budget.max_attempts == 0 || budget.max_execution_seconds == 0 {
-            return Err(ServiceError::Invalid(
-                "budget attempt and execution limits must be positive".into(),
-            ));
-        }
-    }
-    if let Some(value) = specification.get("verification_spec") {
-        if !value["holdout_scenarios"].is_array() {
-            return Err(ServiceError::Invalid(
-                "verification_spec.holdout_scenarios must be an array".into(),
-            ));
-        }
-    }
-    Ok(())
+    anvil_core::validate_task_spec(specification)
+        .map(|_| ())
+        .map_err(|error| ServiceError::Invalid(error.to_string()))
 }
 
 #[derive(Deserialize)]
@@ -7302,6 +7251,102 @@ mod tests {
             .unwrap();
         let value = serde_json::from_slice(&body).unwrap();
         (status, value)
+    }
+
+    async fn post_json_with_key(
+        app: &Router,
+        uri: &str,
+        key: &str,
+        value: &Value,
+    ) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(uri)
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", key)
+                    .body(Body::from(value.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&body).unwrap();
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn task_acceptance_http_rejects_malformed_specs_without_reserving_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        let app = router(AppState::new(config.clone(), FakeSandbox));
+        let store = store::ControllerStore::open(&config.store_path).unwrap();
+
+        let (status, _) = post_json_with_key(
+            &app,
+            "/v1/tasks",
+            "bad-singleton-budget",
+            &json!({
+                "outcome":"bad budget",
+                "budget":{"max_attempts":"three","max_execution_seconds":60}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(store.get("bad-singleton-budget").unwrap().is_none());
+        assert!(store
+            .get_resource("task", "bad-singleton-budget")
+            .unwrap()
+            .is_none());
+
+        let before_graph_tasks = store.task_page(0, 100).unwrap().0.len();
+        let (status, _) = post_json_with_key(
+            &app,
+            "/v1/tasks/graph",
+            "bad-graph-delivery",
+            &json!({
+                "nodes":[{"key":"bad","task":{
+                    "outcome":"bad target",
+                    "execution_target":{"kind":"git_repository","project":"demo","repository":"https://github.com/example/repo.git","base_ref":"main","delivery":{"kind":"irc"}}
+                }}],
+                "dependencies":[]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(store.get("bad-graph-delivery").unwrap().is_none());
+        let after_graph_tasks = store.task_page(0, 100).unwrap().0.len();
+        assert_eq!(after_graph_tasks, before_graph_tasks);
+
+        let (status, accepted) = post_json_with_key(
+            &app,
+            "/v1/tasks",
+            "valid-defaults-after-rejection",
+            &json!({"outcome":"valid legacy-compatible default"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            accepted["completion_policy"]["kind"],
+            "all_children_completed"
+        );
+        drop(store);
+
+        let reopened = store::ControllerStore::open(&config.store_path).unwrap();
+        let snapshot = reopened
+            .task_snapshot(
+                accepted["task_id"].as_str().unwrap(),
+                Utc::now().timestamp_millis(),
+            )
+            .unwrap()
+            .unwrap();
+        let typed: anvil_core::TaskSnapshot = serde_json::from_value(snapshot).unwrap();
+        assert_eq!(typed.task_id, accepted["task_id"]);
+        assert_eq!(typed.budget_usage.limits.max_attempts, 3);
     }
 
     #[tokio::test]

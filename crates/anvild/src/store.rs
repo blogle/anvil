@@ -740,6 +740,25 @@ impl ControllerStore {
         task_id: &str,
         specification: &Value,
     ) -> Result<TaskAcceptance, StoreError> {
+        let validated = anvil_core::validate_task_spec(specification)
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+        let outcome = validated.outcome.as_str();
+        let target_json = validated
+            .execution_target
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        let target = target_json.as_ref();
+        let project = target
+            .and_then(|value| value["project"].as_str())
+            .unwrap_or_default();
+        let repository = target
+            .and_then(|value| value["repository"].as_str())
+            .unwrap_or_default();
+        let completion_policy = serde_json::to_value(&validated.completion_policy)?;
+        let verification = serde_json::to_value(&validated.verification_spec)?;
+        let budget = serde_json::to_value(&validated.budget)?;
+        let acceptance_criteria = serde_json::to_value(&validated.acceptance_criteria)?;
         let hash = format!("{:x}", Sha256::digest(canonical_json(request).as_bytes()));
         let now = chrono::Utc::now().to_rfc3339();
         let mut connection = self
@@ -776,38 +795,8 @@ impl ControllerStore {
         )? {
             return Err(StoreError::Conflict);
         }
-        let outcome = specification["outcome"].as_str().unwrap_or_default();
-        let target = specification
-            .get("execution_target")
-            .filter(|v| !v.is_null());
-        let project = target
-            .and_then(|v| v["project"].as_str())
-            .unwrap_or_default();
-        let repository = target
-            .and_then(|v| v["repository"].as_str())
-            .unwrap_or_default();
         let runnable = target.is_some();
         let state = if runnable { "queued" } else { "open" };
-        let completion_policy = specification
-            .get("completion_policy")
-            .cloned()
-            .unwrap_or_else(|| {
-                if runnable {
-                    serde_json::json!({"kind":"evidence","required_kinds":["delivery_complete"]})
-                } else {
-                    serde_json::json!({"kind":"all_children_completed"})
-                }
-            });
-        let verification = specification
-            .get("verification_spec")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({"holdout_scenarios":[]}));
-        let budget = specification.get("budget").cloned().unwrap_or_else(|| {
-            serde_json::json!({
-                "max_attempts":3,"max_continuations_per_reason":2,"max_verifier_cycles":0,
-                "max_ci_retries":2,"max_execution_seconds":14400,"max_model_cost":null
-            })
-        });
         let branch = runnable.then(|| format!("anvil/{task_id}"));
         let parent_task_id = specification["parent_task_id"].as_str();
         if let Some(parent) = parent_task_id {
@@ -825,7 +814,7 @@ impl ControllerStore {
         }
         let task = serde_json::json!({
             "task_id":task_id,"batch_id":null,"outcome":outcome,
-            "acceptance_criteria":specification["acceptance_criteria"],
+            "acceptance_criteria":acceptance_criteria,
             "execution_target":target,"work_branch":branch,"completion_policy":completion_policy,
             "verification_spec":verification,"budget":budget,"parent_task_id":parent_task_id,
             "dependencies":[],"state":state,"version":1
@@ -866,6 +855,17 @@ impl ControllerStore {
                 "task graph exceeds configured bounds".into(),
             ));
         }
+        let validated_nodes: std::collections::HashMap<String, anvil_core::ValidatedTaskSpec> =
+            nodes
+                .iter()
+                .map(|(client_key, _, spec)| {
+                    anvil_core::validate_task_spec(spec)
+                        .map(|validated| (client_key.clone(), validated))
+                        .map_err(|error| {
+                            StoreError::InvalidState(format!("node {client_key}: {error}"))
+                        })
+                })
+                .collect::<Result<_, _>>()?;
         let hash = format!("{:x}", Sha256::digest(canonical_json(request).as_bytes()));
         let now = chrono::Utc::now().to_rfc3339();
         let mut connection = self
@@ -919,13 +919,14 @@ impl ControllerStore {
             )? {
                 return Err(StoreError::Conflict);
             }
-            let outcome = spec["outcome"].as_str().unwrap_or_default();
-            if outcome.trim().is_empty() {
-                return Err(StoreError::InvalidState(format!(
-                    "node {client_key} has no outcome"
-                )));
-            }
-            let target = spec.get("execution_target").filter(|v| !v.is_null());
+            let validated = &validated_nodes[client_key];
+            let outcome = &validated.outcome;
+            let target_value = validated
+                .execution_target
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?;
+            let target = target_value.as_ref();
             let project = target
                 .and_then(|v| v["project"].as_str())
                 .unwrap_or_default();
@@ -943,20 +944,12 @@ impl ControllerStore {
                 .as_str()
                 .and_then(|value| ids.get(value))
                 .cloned();
-            let task = json!({"task_id":task_id,"batch_id":null,"node_key":client_key,"outcome":outcome,"acceptance_criteria":spec["acceptance_criteria"],"execution_target":target,"completion_policy":spec["completion_policy"],"parent_task_id":parent,"dependencies":deps,"state":state,"version":1});
+            let policy = serde_json::to_value(&validated.completion_policy)?;
+            let budget = serde_json::to_value(&validated.budget)?;
+            let verification = serde_json::to_value(&validated.verification_spec)?;
+            let criteria = serde_json::to_value(&validated.acceptance_criteria)?;
+            let task = json!({"task_id":task_id,"batch_id":null,"node_key":client_key,"outcome":outcome,"acceptance_criteria":criteria,"execution_target":target,"completion_policy":policy,"parent_task_id":parent,"dependencies":deps,"budget":budget,"verification_spec":verification,"state":state,"version":1});
             tx.execute("INSERT INTO tasks(task_id,batch_id,client_task_id,project,repository,prompt,state,payload_json,created_at) VALUES(?1,NULL,?1,?2,?3,?4,?5,?6,?7)",params![task_id,project,repository,outcome,state,serde_json::to_string(&task)?,now])?;
-            let policy = spec.get("completion_policy").cloned().unwrap_or_else(|| {
-                if target.is_some() {
-                    json!({"kind":"evidence","required_kinds":["delivery_complete"]})
-                } else {
-                    json!({"kind":"all_children_completed"})
-                }
-            });
-            let budget=spec.get("budget").cloned().unwrap_or_else(||json!({"max_attempts":3,"max_continuations_per_reason":2,"max_verifier_cycles":0,"max_ci_retries":2,"max_execution_seconds":14400,"max_model_cost":null}));
-            let verification = spec
-                .get("verification_spec")
-                .cloned()
-                .unwrap_or_else(|| json!({"holdout_scenarios":[]}));
             tx.execute("INSERT INTO task_durable_state(task_id,completion_policy_json,verification_spec_json,budget_json,execution_target_json,work_branch,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![task_id,serde_json::to_string(&policy)?,serde_json::to_string(&verification)?,serde_json::to_string(&budget)?,target.map(serde_json::to_string).transpose()?,target.map(|_|format!("anvil/{task_id}")),now])?;
             tx.execute("INSERT INTO orchestration_resources(resource_type,resource_id,batch_id,task_id,attempt_id,payload_json,created_at,updated_at) VALUES('task',?1,NULL,?1,NULL,?2,?3,?3)",params![task_id,serde_json::to_string(&task)?,now])?;
             append_resource_change(&tx, "task", task_id, &task)?;
@@ -1094,8 +1087,9 @@ impl ControllerStore {
         Ok(next as u64)
     }
 
-    /// Persist a collected fact. Arrival order cannot let an older in-flight
-    /// collection replace the current value; same-sequence disagreement is invalid.
+    /// Persist an agent claim. Callers cannot select factual provenance through
+    /// this general ingestion path; provider/runtime/operator attestations need
+    /// their own authorized writer before they can become completion evidence.
     #[allow(clippy::too_many_arguments)]
     pub fn record_observation(
         &self,
@@ -1107,6 +1101,61 @@ impl ControllerStore {
         collection_seq: u64,
         expires_at: Option<&str>,
     ) -> Result<(), StoreError> {
+        if provenance != "agent" {
+            return Err(StoreError::InvalidState(
+                "non-agent observations require an authorized provider ingestion path".into(),
+            ));
+        }
+        self.record_observation_with_provenance(
+            observation_id,
+            task_id,
+            key,
+            value,
+            "agent",
+            collection_seq,
+            expires_at,
+            false,
+        )
+    }
+
+    fn record_legacy_scheduler_evidence(
+        &self,
+        observation_id: &str,
+        task_id: &str,
+        attempt_id: &str,
+        collection_seq: u64,
+    ) -> Result<(), StoreError> {
+        self.record_observation_with_provenance(
+            observation_id,
+            task_id,
+            "evidence.legacy_scheduler_exit",
+            &serde_json::json!({"attempt_id":attempt_id,"bridge":"legacy_scheduler_exit"}),
+            "runtime",
+            collection_seq,
+            None,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_observation_with_provenance(
+        &self,
+        observation_id: &str,
+        task_id: &str,
+        key: &str,
+        value: &Value,
+        provenance: &str,
+        collection_seq: u64,
+        expires_at: Option<&str>,
+        authorized_legacy_bridge: bool,
+    ) -> Result<(), StoreError> {
+        if authorized_legacy_bridge
+            && (key != "evidence.legacy_scheduler_exit" || provenance != "runtime")
+        {
+            return Err(StoreError::InvalidState(
+                "Legacy evidence writer is restricted to the scheduler-exit bridge".into(),
+            ));
+        }
         if !matches!(provenance, "runtime" | "platform" | "external" | "agent") {
             return Err(StoreError::InvalidState(
                 "invalid observation provenance".into(),
@@ -1119,6 +1168,19 @@ impl ControllerStore {
             .lock()
             .expect("controller store lock poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if authorized_legacy_bridge {
+            let attempt_id = value["attempt_id"].as_str().unwrap_or_default();
+            let valid_attempt = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attempts WHERE attempt_id=?1 AND task_id=?2 AND json_extract(payload_json,'$.state')='completed')",
+                params![attempt_id, task_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !valid_attempt || value["bridge"] != "legacy_scheduler_exit" {
+                return Err(StoreError::InvalidState(
+                    "Legacy evidence requires its completed Task Attempt".into(),
+                ));
+            }
+        }
         let reserved: Option<i64> = tx
             .query_row(
                 "SELECT next_sequence FROM task_observation_sequences WHERE task_id=?1 AND key=?2",
@@ -1166,8 +1228,9 @@ impl ControllerStore {
         Ok(())
     }
 
-    /// The single compatibility completion boundary for Legacy scheduler exits and
-    /// future trusted observers. Completion is policy-evaluated and Task-CAS fenced.
+    /// The compatibility completion boundary for the authorized Legacy scheduler
+    /// exit bridge. Other evidence producers remain fail-closed until their own
+    /// authenticated ingestion paths are connected. Completion is Task-CAS fenced.
     fn complete_task(
         &self,
         task_id: &str,
@@ -1199,8 +1262,8 @@ impl ControllerStore {
         let mut refs = Vec::new();
         let mut trusted = Vec::new();
         for id in evidence_ids {
-            let row:Option<(String,String,i64,Option<String>)>=tx.query_row("SELECT o.key,o.provenance,o.version,o.expires_at FROM task_observations o JOIN task_observation_current c ON c.observation_id=o.id WHERE o.id=?1 AND o.task_id=?2",params![id,task_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-            let Some((key, provenance, obs_version, expires_at)) = row else {
+            let row:Option<(String,String,i64,Option<String>,String)>=tx.query_row("SELECT o.key,o.provenance,o.version,o.expires_at,o.value_json FROM task_observations o JOIN task_observation_current c ON c.observation_id=o.id WHERE o.id=?1 AND o.task_id=?2",params![id,task_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+            let Some((key, provenance, obs_version, expires_at, raw_value)) = row else {
                 continue;
             };
             if provenance == "agent"
@@ -1210,11 +1273,15 @@ impl ControllerStore {
             {
                 continue;
             }
-            let kind = match key.rsplit('.').next().unwrap_or(key.as_str()) {
-                "legacy_scheduler_exit" => anvil_core::EvidenceKind::LegacySchedulerExit,
-                "delivery_complete" => anvil_core::EvidenceKind::DeliveryComplete,
-                "deterministic_verification" => anvil_core::EvidenceKind::DeterministicVerification,
-                "manual_completion" => anvil_core::EvidenceKind::ManualCompletion,
+            let value: Value = serde_json::from_str(&raw_value)?;
+            let kind = match (key.as_str(), provenance.as_str()) {
+                ("evidence.legacy_scheduler_exit", "runtime")
+                    if value["bridge"] == "legacy_scheduler_exit"
+                        && tx.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM attempts WHERE attempt_id=?1 AND task_id=?2 AND json_extract(payload_json,'$.state')='completed')",
+                            params![value["attempt_id"].as_str().unwrap_or_default(),task_id],
+                            |row| row.get::<_, bool>(0),
+                        )? => anvil_core::EvidenceKind::LegacySchedulerExit,
                 _ => continue,
             };
             let reference = anvil_core::ObservationRef {
@@ -1352,15 +1419,7 @@ impl ControllerStore {
         if !exists {
             let key = "evidence.legacy_scheduler_exit";
             let sequence = self.reserve_observation_sequence(task_id, key)?;
-            self.record_observation(
-                &observation_id,
-                task_id,
-                key,
-                &serde_json::json!({"attempt_id":attempt_id,"bridge":"legacy_scheduler_exit"}),
-                "runtime",
-                sequence,
-                None,
-            )?;
+            self.record_legacy_scheduler_evidence(&observation_id, task_id, attempt_id, sequence)?;
         }
         hit_task_store_failpoint("legacy_scheduler.after_evidence_before_terminal")?;
         self.complete_task(task_id, expected_version, &[observation_id])
@@ -3325,7 +3384,7 @@ mod tests {
 
         let terminal_spec = serde_json::json!({
             "outcome":"trusted terminal",
-            "completion_policy":{"kind":"evidence","required_kinds":["delivery_complete"]}
+            "completion_policy":{"kind":"evidence","required_kinds":["legacy_scheduler_exit"]}
         });
         store
             .accept_task(
@@ -3336,23 +3395,19 @@ mod tests {
                 &terminal_spec,
             )
             .unwrap();
-        let sequence = store
-            .reserve_observation_sequence("fp-terminal-task", "evidence.delivery_complete")
+        store
+            .create_attempt(
+                "fp-terminal-task",
+                "fp-terminal-attempt",
+                "fp-terminal-attempt-key",
+            )
             .unwrap();
         store
-            .record_observation(
-                "fp-terminal-evidence",
-                "fp-terminal-task",
-                "evidence.delivery_complete",
-                &serde_json::json!({"ok":true}),
-                "external",
-                sequence,
-                None,
-            )
+            .set_attempt_state("fp-terminal-attempt", "completed")
             .unwrap();
         arm_task_store_failpoint("task.terminal.before_commit");
         assert!(store
-            .complete_task("fp-terminal-task", 1, &["fp-terminal-evidence".into()])
+            .complete_legacy_scheduler_attempt("fp-terminal-task", "fp-terminal-attempt", 2)
             .is_err());
         drop(store);
         let store = ControllerStore::open(&path).unwrap();
@@ -3365,7 +3420,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .complete_task("fp-terminal-task", 1, &["fp-terminal-evidence".into()])
+                .complete_legacy_scheduler_attempt("fp-terminal-task", "fp-terminal-attempt", 2)
                 .unwrap()["state"],
             "completed"
         );
@@ -3488,8 +3543,11 @@ mod tests {
                 let _ = store.set_attempt_and_task_state("crash-attempt", "running", "running");
             }
             "task.terminal.before_commit" | "task.terminal.after_commit" => {
-                let _ =
-                    store.complete_task("crash-terminal-task", 1, &["crash-terminal-proof".into()]);
+                let _ = store.complete_legacy_scheduler_attempt(
+                    "crash-terminal-task",
+                    "crash-terminal-attempt",
+                    2,
+                );
             }
             "blocker.create.before_commit" | "blocker.create.after_commit" => {
                 let _ = store.create_attempt_blocker(
@@ -3537,7 +3595,7 @@ mod tests {
                 &attempt_spec,
             )
             .unwrap();
-        let terminal_spec = serde_json::json!({"outcome":"terminal task","completion_policy":{"kind":"evidence","required_kinds":["delivery_complete"]}});
+        let terminal_spec = serde_json::json!({"outcome":"terminal task","completion_policy":{"kind":"evidence","required_kinds":["legacy_scheduler_exit"]}});
         store
             .accept_task(
                 "seed-terminal",
@@ -3547,19 +3605,15 @@ mod tests {
                 &terminal_spec,
             )
             .unwrap();
-        let sequence = store
-            .reserve_observation_sequence("crash-terminal-task", "evidence.delivery_complete")
+        store
+            .create_attempt(
+                "crash-terminal-task",
+                "crash-terminal-attempt",
+                "crash-terminal-attempt-key",
+            )
             .unwrap();
         store
-            .record_observation(
-                "crash-terminal-proof",
-                "crash-terminal-task",
-                "evidence.delivery_complete",
-                &serde_json::json!({"merged":true}),
-                "external",
-                sequence,
-                None,
-            )
+            .set_attempt_state("crash-terminal-attempt", "completed")
             .unwrap();
         let blocker_spec = serde_json::json!({"outcome":"blocker task"});
         store
@@ -4371,6 +4425,56 @@ mod tests {
     }
 
     #[test]
+    fn malformed_task_specs_are_rejected_before_single_or_graph_acceptance() {
+        let (directory, store) = store();
+        let invalid_specs = [
+            serde_json::json!({"outcome":"empty evidence","completion_policy":{"kind":"evidence","required_kinds":[]}}),
+            serde_json::json!({"outcome":"bad budget","budget":{"max_attempts":"three","max_continuations_per_reason":2,"max_verifier_cycles":0,"max_ci_retries":2,"max_execution_seconds":100,"max_model_cost":null}}),
+            serde_json::json!({"outcome":"zero budget","budget":{"max_attempts":0,"max_continuations_per_reason":2,"max_verifier_cycles":0,"max_ci_retries":2,"max_execution_seconds":100,"max_model_cost":null}}),
+            serde_json::json!({"outcome":"bad target","execution_target":{"kind":"git_repository","project":"demo","repository":"https://example.test/repo","base_ref":"main","delivery":"irc"}}),
+            serde_json::json!({"outcome":"bad verification","verification_spec":{"holdout_scenarios":"none"}}),
+        ];
+        for (index, spec) in invalid_specs.iter().enumerate() {
+            let key = format!("invalid-task-{index}");
+            let task_id = format!("invalid-task-{index}");
+            assert!(matches!(
+                store.accept_task(&key, "test", spec, &task_id, spec),
+                Err(StoreError::InvalidState(_))
+            ));
+            assert!(store.get_resource("task", &task_id).unwrap().is_none());
+            assert!(
+                store.get(&key).unwrap().is_none(),
+                "invalid input consumed idempotency"
+            );
+        }
+        let graph_spec = serde_json::json!({
+            "outcome":"invalid graph node",
+            "completion_policy":{"kind":"evidence","required_kinds":[]}
+        });
+        assert!(matches!(
+            store.accept_task_graph(
+                "invalid-graph-key",
+                "test",
+                &serde_json::json!({"graph":"invalid"}),
+                &[("node".into(), "invalid-graph-task".into(), graph_spec)],
+                &[]
+            ),
+            Err(StoreError::InvalidState(_))
+        ));
+        assert!(store
+            .get_resource("task", "invalid-graph-task")
+            .unwrap()
+            .is_none());
+        assert!(store.get("invalid-graph-key").unwrap().is_none());
+        drop(store);
+        let reopened = ControllerStore::open(directory.path().join("controller.sqlite3")).unwrap();
+        assert!(reopened
+            .get_resource("task", "invalid-task-0")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn detached_task_acceptance_is_atomic_replayable_and_snapshotable() {
         let (dir, store) = store();
         let request = serde_json::json!({"outcome":"compile the project","execution_target":{"kind":"git_repository","project":"demo","repository":"https://example.test/r","base_ref":"main","delivery":{"kind":"local_branch"}}});
@@ -4466,7 +4570,7 @@ mod tests {
                 "observed",
                 "git.head",
                 &serde_json::json!({"sha":"new"}),
-                "runtime",
+                "agent",
                 second,
                 None,
             )
@@ -4477,7 +4581,7 @@ mod tests {
                 "observed",
                 "git.head",
                 &serde_json::json!({"sha":"old"}),
-                "runtime",
+                "agent",
                 first,
                 None,
             )
@@ -4490,7 +4594,7 @@ mod tests {
                 "observed",
                 "git.head",
                 &serde_json::json!({"sha":"different"}),
-                "runtime",
+                "agent",
                 second,
                 None
             ),
@@ -4499,9 +4603,13 @@ mod tests {
     }
 
     #[test]
-    fn completion_is_fresh_trusted_policy_checked_and_terminal_cas_fenced() {
+    fn observation_ingestion_cannot_assert_non_agent_completion_evidence() {
         let (_dir, store) = store();
-        let specification = serde_json::json!({"outcome":"deliver","completion_policy":{"kind":"evidence","required_kinds":["delivery_complete"]}});
+        let specification = serde_json::json!({
+            "outcome":"deliver",
+            "execution_target":{"kind":"git_repository","project":"demo","repository":"https://github.com/owner/repo.git","base_ref":"main","delivery":{"kind":"pull_request"}},
+            "completion_policy":{"kind":"evidence","required_kinds":["delivery_complete"]}
+        });
         store
             .accept_task(
                 "complete-task",
@@ -4511,6 +4619,57 @@ mod tests {
                 &specification,
             )
             .unwrap();
+        assert_eq!(
+            store
+                .bind_task_delivery(
+                    "complete-me",
+                    1,
+                    None,
+                    Some(&serde_json::json!({
+                        "provider":"github",
+                        "repository":"owner/repo",
+                        "number":7,
+                        "head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }))
+                )
+                .unwrap(),
+            2
+        );
+        for (key, provenance) in [
+            ("arbitrary.delivery_complete", "external"),
+            ("arbitrary.manual_completion", "platform"),
+            ("delivery.merged", "runtime"),
+            ("delivery.merged", "external"),
+            ("operator.manual_completion", "platform"),
+        ] {
+            let sequence = store
+                .reserve_observation_sequence("complete-me", key)
+                .unwrap();
+            assert!(matches!(
+                store.record_observation(
+                    &format!("spoof-{}-{provenance}", key.replace('.', "-")),
+                    "complete-me",
+                    key,
+                    &serde_json::json!({
+                        "provider":"github",
+                        "repository":"owner/repo",
+                        "number":7,
+                        "merged":true,
+                        "pr_head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "merge_commit_sha":"0123456789012345678901234567890123456789",
+                        "action":"manual_completion",
+                        "actor":{"kind":"operator","id":"spoofed"}
+                    }),
+                    provenance,
+                    sequence,
+                    None,
+                ),
+                Err(StoreError::InvalidState(_))
+            ));
+        }
+
+        // A caller may record its own claim, but the agent provenance and a
+        // suffix-compatible key cannot satisfy trusted completion.
         let agent_seq = store
             .reserve_observation_sequence("complete-me", "evidence.delivery_complete")
             .unwrap();
@@ -4519,60 +4678,79 @@ mod tests {
                 "agent-proof",
                 "complete-me",
                 "evidence.delivery_complete",
-                &serde_json::json!({"claimed":true}),
+                &serde_json::json!({"merged":true}),
                 "agent",
                 agent_seq,
                 None,
             )
             .unwrap();
         assert!(matches!(
-            store.complete_task("complete-me", 1, &["agent-proof".into()]),
+            store.complete_task("complete-me", 2, &["agent-proof".into()]),
             Err(StoreError::InvalidState(_))
         ));
-        let trusted_seq = store
-            .reserve_observation_sequence("complete-me", "evidence.delivery_complete")
-            .unwrap();
-        store
-            .record_observation(
-                "trusted-proof",
-                "complete-me",
-                "evidence.delivery_complete",
-                &serde_json::json!({"merged":true}),
+
+        // Simulate rows restored from an untrusted historical source. Neither
+        // expired facts nor a GitHub-shaped claim for the wrong PR head can
+        // be promoted by the completion evaluator.
+        let connection = store.connection.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let expired = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        for (id, key, provenance, value, expires_at, sequence) in [
+            (
+                "wrong-head",
+                "delivery.merged",
                 "external",
-                trusted_seq,
+                serde_json::json!({
+                    "provider":"github","repository":"owner/repo","number":7,"merged":true,
+                    "pr_head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "merge_commit_sha":"0123456789012345678901234567890123456789"
+                }),
                 None,
-            )
-            .unwrap();
-        let completed = store
-            .complete_task("complete-me", 1, &["trusted-proof".into()])
-            .unwrap();
-        assert_eq!(completed["state"], "completed");
-        assert_eq!(completed["terminal"]["kind"], "completed");
-        assert_eq!(completed["terminal"]["evidence"][0]["id"], "trusted-proof");
-        let completed_snapshot = store.task_snapshot("complete-me", 0).unwrap().unwrap();
-        let typed_snapshot: anvil_core::TaskSnapshot =
-            serde_json::from_value(completed_snapshot.clone()).unwrap();
-        assert!(matches!(
-            typed_snapshot.lifecycle,
-            anvil_core::TaskLifecycle::Terminal {
-                terminal: anvil_core::TaskTerminal::Completed { .. }
-            }
-        ));
-        assert_eq!(
-            completed_snapshot["lifecycle"]["terminal"]["evidence"][0]["id"],
-            "trusted-proof"
-        );
-        assert!(matches!(
-            store.terminate_task(
-                "complete-me",
-                2,
-                anvil_core::TaskTerminal::Canceled {
-                    actor: "operator".into(),
-                    reason: "late".into()
-                }
+                1,
             ),
-            Err(StoreError::InvalidState(_))
-        ));
+            (
+                "stale-merge",
+                "delivery.merged",
+                "external",
+                serde_json::json!({
+                    "provider":"github","repository":"owner/repo","number":7,"merged":true,
+                    "pr_head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "merge_commit_sha":"0123456789012345678901234567890123456789"
+                }),
+                Some(expired.as_str()),
+                2,
+            ),
+            (
+                "spoofed-manual",
+                "operator.manual_completion",
+                "platform",
+                serde_json::json!({"action":"manual_completion","actor":{"kind":"operator","id":"spoofed"}}),
+                None,
+                1,
+            ),
+        ] {
+            connection.execute(
+                "INSERT INTO task_observations(id,task_id,key,value_json,provenance,observed_at,recorded_at,version,collection_seq,expires_at) VALUES(?1,'complete-me',?2,?3,?4,?5,?5,1,?6,?7)",
+                params![id,key,value.to_string(),provenance,now,sequence,expires_at],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO task_observation_current(task_id,key,observation_id) VALUES('complete-me',?1,?2) ON CONFLICT(task_id,key) DO UPDATE SET observation_id=excluded.observation_id",
+                params![key,id],
+            ).unwrap();
+        }
+        drop(connection);
+        for id in ["wrong-head", "stale-merge", "spoofed-manual"] {
+            if id != "spoofed-manual" {
+                store.connection.lock().unwrap().execute(
+                    "UPDATE task_observation_current SET observation_id=?1 WHERE task_id='complete-me' AND key='delivery.merged'",
+                    [id],
+                ).unwrap();
+            }
+            assert!(matches!(
+                store.complete_task("complete-me", 2, &[id.into()]),
+                Err(StoreError::InvalidState(_))
+            ));
+        }
     }
 
     #[test]
