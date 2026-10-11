@@ -43,3 +43,6 @@ Provider credentials and global OpenCode configuration are shared through the
 Anvil profile. Each sandbox retains its own checkout, home, session database,
 conversation, logs, and working tree. `just` is reserved for development and
 deployment workflows; `anvilctl` is the operator interface.
+
+SDLC process guidance is the official pinned `blogle/sdlc` skill installed by
+`nix develop -c just skills`; use `just skills-update` to refresh it.

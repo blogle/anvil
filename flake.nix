@@ -27,8 +27,8 @@
         opencodePackage = opencode.packages.${system}.default.overrideAttrs (_: { doInstallCheck = false; });
         craneLib = crane.mkLib pkgs;
         rust = import ./nix/rust.nix {
-          inherit pkgs craneLib;
-          inherit opencodePackage;
+          inherit pkgs craneLib opencodePackage;
+          sdlcCli = sdlc.packages.${system}.sdlc;
           nix2containerPkgs = nix2container.packages.${system};
           repoRoot = ./.;
         };

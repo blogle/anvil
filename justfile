@@ -116,6 +116,14 @@ smoke:
 smoke-clean:
     kubectl delete sandbox -n anvil -l app.kubernetes.io/managed-by=anvil
 
+# Install the official SDLC and Mergify skills through Vercel's pinned CLI.
+skills:
+    skills add https://github.com/blogle/sdlc/tree/v1.2.4/skills/sdlc --skill sdlc --agent opencode --yes
+    skills add https://github.com/Mergifyio/mergify-cli --skill '*' --agent opencode --yes
+
+skills-update:
+    skills update -p -y
+
 ci:
     just check
     just nix-check
