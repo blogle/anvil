@@ -14,7 +14,7 @@ permissions:
 jobs:
   merge:
     if: vars.SDLC_RELEASE_ACTIVATE == 'true'
-    uses: blogle/sdlc/.github/workflows/release-merge.yml@v1.2.4
+    uses: blogle/sdlc/.github/workflows/release-merge.yml@v1.3.0
     with:
-      sdlc_ref: github:blogle/sdlc/v1.2.4
+      sdlc_ref: github:blogle/sdlc/v1.3.0
     secrets: inherit

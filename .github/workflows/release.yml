@@ -28,9 +28,9 @@ jobs:
     if: >-
       vars.SDLC_RELEASE_ACTIVATE == 'true' &&
       (github.event_name == 'push' || inputs.activate == true)
-    uses: blogle/sdlc/.github/workflows/release.yml@v1.2.4
+    uses: blogle/sdlc/.github/workflows/release.yml@v1.3.0
     with:
       merged_sha: ${{ inputs.merged_sha || '' }}
       activate: ${{ inputs.activate || vars.SDLC_RELEASE_ACTIVATE == 'true' }}
-      sdlc_ref: github:blogle/sdlc/v1.2.4
+      sdlc_ref: github:blogle/sdlc/v1.3.0
     secrets: inherit

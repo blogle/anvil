@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   policy:
-    uses: blogle/sdlc/.github/workflows/policy-check.yml@v1.2.4
+    uses: blogle/sdlc/.github/workflows/policy-check.yml@v1.3.0
 
   gate:
     name: sdlc / policy
@@ -19,22 +19,7 @@ jobs:
     needs: policy
     runs-on: ubuntu-latest
     steps:
-      - name: Require shared policy validation
-        env:
-          POLICY_RESULT: ${{ needs.policy.result }}
-        run: test "$POLICY_RESULT" = success
-      - name: Require the live canonical ruleset
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          rulesets="$(gh api "repos/${REPOSITORY}/rulesets?includes_parents=true" --paginate)"
-          jq -e --arg repo "$REPOSITORY" '
-            [ .[] | select(.name == "SDLC default branch" and (.source // $repo) == $repo and .enforcement == "active") ] | length == 1
-          ' <<<"$rulesets" >/dev/null || {
-            echo 'canonical SDLC ruleset is absent; this intentional onboarding failure is read-only' >&2
-            echo 'user action: nix develop -c sdlc policy plan --repo '"$REPOSITORY" >&2
-            echo 'then: nix develop -c sdlc policy apply --repo '"$REPOSITORY" >&2
-            exit 1
-          }
+      - uses: blogle/sdlc/actions/status-gate@v1.3.0
+        with:
+          result: ${{ needs.policy.result }}
+          stage: policy
