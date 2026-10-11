@@ -35,7 +35,7 @@ capture_build_diagnostics() {
 
 cleanup() {
   local status=$?
-  if [ "$status" -ne 0 ]; then
+  if [ "$status" -ne 0 ] && [ "$created" = 1 ]; then
     capture_build_diagnostics failure
     printf '\n--- build-time cgroup and event diagnostics ---\n' >&2
     if [ -f "$diagnostics_dir/kind-build-diagnostics.log" ]; then cat "$diagnostics_dir/kind-build-diagnostics.log" >&2; fi
