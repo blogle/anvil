@@ -151,10 +151,10 @@ async fn completion(
         .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
         .count();
     let (tool, args) = match tool_responses {
-        0 => ("read", json!({"filePath":"target.txt"})),
+        0 => ("read", json!({"path":"target.txt"})),
         1 => (
             "edit",
-            json!({"filePath":"target.txt","oldString":"before\n","newString":"after\n"}),
+            json!({"path":"target.txt","oldString":"before\n","newString":"after\n"}),
         ),
         _ => {
             return (
@@ -267,10 +267,10 @@ async fn responses(
         };
     }
     let scripted = match tool_responses {
-        0 => Some(("read", json!({"filePath":"target.txt"}))),
+        0 => Some(("read", json!({"path":"target.txt"}))),
         1 => Some((
             "edit",
-            json!({"filePath":"target.txt","oldString":"before\n","newString":"after\n"}),
+            json!({"path":"target.txt","oldString":"before\n","newString":"after\n"}),
         )),
         _ => None,
     };
