@@ -168,6 +168,28 @@ pub enum ActionKind {
     MergeConflict,
     ObserveDelivery,
 }
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorActionKind {
+    CreateAttempt,
+    RecoverRuntime,
+    ChecksFailed,
+    MergeConflict,
+    ObserveDelivery,
+    SendTurn,
+    SendContinuation,
+}
+impl From<&ActionKind> for PriorActionKind {
+    fn from(kind: &ActionKind) -> Self {
+        match kind {
+            ActionKind::CreateAttempt => Self::CreateAttempt,
+            ActionKind::RecoverRuntime => Self::RecoverRuntime,
+            ActionKind::ChecksFailed => Self::ChecksFailed,
+            ActionKind::MergeConflict => Self::MergeConflict,
+            ActionKind::ObserveDelivery => Self::ObserveDelivery,
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryStrategy {
@@ -252,7 +274,7 @@ pub struct Attempt {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PriorAction {
-    pub action_kind: ActionKind,
+    pub action_kind: PriorActionKind,
     pub attempt_id: Option<String>,
     pub cause_fingerprint: String,
     pub idempotency_key: String,
@@ -392,13 +414,28 @@ fn make_action(
 }
 fn has_action(s: &TaskSnapshot, kind: ActionKind, attempt: Option<&str>, cause: &str) -> bool {
     s.action_history.iter().any(|a| {
-        a.action_kind == kind
-            && a.attempt_id.as_deref() == attempt
-            && a.cause_fingerprint == cause
-            && matches!(
-                a.state,
-                ActionState::Succeeded | ActionState::UnknownOutcome | ActionState::Executing
-            )
+        let same_cause = a.attempt_id.as_deref() == attempt && a.cause_fingerprint == cause;
+        let prompt_history = matches!(
+            a.action_kind,
+            PriorActionKind::SendTurn | PriorActionKind::SendContinuation
+        );
+        let action_kind_matches = a.action_kind == PriorActionKind::from(&kind);
+        same_cause
+            && ((prompt_history
+                && matches!(
+                    a.state,
+                    ActionState::Pending
+                        | ActionState::Succeeded
+                        | ActionState::UnknownOutcome
+                        | ActionState::Executing
+                ))
+                || (action_kind_matches
+                    && matches!(
+                        a.state,
+                        ActionState::Succeeded
+                            | ActionState::UnknownOutcome
+                            | ActionState::Executing
+                    )))
     })
 }
 
@@ -2331,7 +2368,7 @@ mod tests {
         let first = reconcile(&s, LogicalTime(0));
         let action = &first.desired_actions[0];
         s.action_history.push(PriorAction {
-            action_kind: ActionKind::ChecksFailed,
+            action_kind: PriorActionKind::ChecksFailed,
             attempt_id: action.attempt_id.clone(),
             cause_fingerprint: action.cause_fingerprint.clone(),
             idempotency_key: action.idempotency_key.clone(),
@@ -2459,14 +2496,165 @@ mod tests {
         );
     }
     #[test]
+    fn all_current_canonical_55_fixtures_decode_with_history_semantics_preserved() {
+        const FIXTURES: [&str; 11] = [
+            include_str!("../fixtures/upstream-55-8c189ff/budget-exhaustion.json"),
+            include_str!("../fixtures/upstream-55-8c189ff/dependency-terminal-noncompleted.json"),
+            include_str!("../fixtures/upstream-55-8c189ff/empty-aggregate-root.json"),
+            include_str!("../fixtures/upstream-55-8c189ff/failed-checks-prior-continuation.json"),
+            include_str!("../fixtures/upstream-55-8c189ff/fresh-open-executable.json"),
+            include_str!("../fixtures/upstream-55-8c189ff/merge-group-sha-mismatch.json"),
+            include_str!("../fixtures/upstream-55-8c189ff/merged-pr-stale-red-checks.json"),
+            include_str!("../fixtures/upstream-55-8c189ff/missing-pr-branch.json"),
+            include_str!("../fixtures/upstream-55-8c189ff/operator-hold.json"),
+            include_str!("../fixtures/upstream-55-8c189ff/shadow-inflight-attempt.json"),
+            include_str!("../fixtures/upstream-55-8c189ff/unresolved-blocker.json"),
+        ];
+        assert_eq!(
+            include_str!("../fixtures/upstream-55-8c189ff/source-commit.txt").trim(),
+            "8c189ff1723096d5ac212ef47349ce0816a5ddd7"
+        );
+        let mut decoded = Vec::new();
+        for raw in FIXTURES {
+            let source: Value = serde_json::from_str(raw).unwrap();
+            decoded.push(frozen_v0::decode_snapshot(&source).unwrap());
+        }
+        let failed_checks = &decoded[3].0;
+        assert_eq!(
+            failed_checks.action_history_availability,
+            Some(ActionHistoryAvailability::Authoritative)
+        );
+        assert_eq!(
+            failed_checks.action_history[0].action_kind,
+            PriorActionKind::SendContinuation
+        );
+        assert_eq!(
+            failed_checks.action_history[0].state,
+            ActionState::Succeeded
+        );
+        assert_eq!(
+            failed_checks.action_history[0].turn_id.as_deref(),
+            Some("turn_1")
+        );
+        assert_eq!(failed_checks.action_history[0].generation, Some(2));
+        assert_eq!(decoded[7].0.delivery.as_ref().unwrap().work_branch, None);
+        assert!(!decoded[6].0.delivery.as_ref().unwrap().pr_merged);
+        assert!(!completion_satisfied(&decoded[6].0));
+        assert!(decoded[2].0.child_count == 0);
+        assert!(decoded[5].0.delivery.as_ref().is_some_and(|delivery| {
+            delivery.pr_head_sha != delivery.evaluation_sha
+                && delivery.evaluation_kind == Some(EvaluationKind::MergeGroup)
+        }));
+        for (snapshot, now) in &decoded {
+            let decision = reconcile(snapshot, *now);
+            assert!(decision.desired_actions.is_empty());
+            assert_eq!(
+                decision,
+                replay(snapshot, *now, RECONCILER_VERSION).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_send_turn_and_continuation_history_suppress_duplicate_effects() {
+        let mut source: Value = serde_json::from_str(include_str!(
+            "../fixtures/upstream-55-8c189ff/failed-checks-prior-continuation.json"
+        ))
+        .unwrap();
+        source["action_history"]["relevant"][0]["cause_fingerprint"] = json!("same-cause");
+        let (decoded, _) = frozen_v0::decode_snapshot(&source).unwrap();
+        assert_eq!(
+            decoded.action_history[0].action_kind,
+            PriorActionKind::SendContinuation
+        );
+
+        let mut snapshot = snap();
+        snapshot.delivery = Some(Delivery {
+            work_branch: Some("task/demo".into()),
+            base_revision: Some("base".into()),
+            pr_head_sha: Some("head".into()),
+            evaluation_sha: Some("head".into()),
+            evaluation_kind: Some(EvaluationKind::Head),
+            pr_state: Some("open".into()),
+            check_policy_known: true,
+            unexpected_force_push: false,
+            changes_requested: false,
+            review_state_known: true,
+            merge_conflict: false,
+            pr_merged: false,
+            required_checks: vec![RequiredCheck {
+                context: "CI".into(),
+                source: "check_run".into(),
+                state: CheckState::Failing,
+                evaluation_sha: "head".into(),
+                failure_fingerprint: Some("failure-1".into()),
+            }],
+        });
+        snapshot.attempts.push(Attempt {
+            attempt_id: "attempt-1".into(),
+            ordinal: 1,
+            role: "implementation".into(),
+            lifecycle: AttemptLifecycle::Ended,
+            turn_state: Some("completed".into()),
+            session_id: Some("session-1".into()),
+            session_healthy: true,
+        });
+        let trigger = reconcile(&snapshot, LogicalTime(0));
+        assert_eq!(trigger.rule_id, "required_checks_failing");
+        let cause = trigger.desired_actions[0].cause_fingerprint.clone();
+
+        for kind in [PriorActionKind::SendContinuation, PriorActionKind::SendTurn] {
+            for state in [
+                ActionState::Pending,
+                ActionState::Executing,
+                ActionState::Succeeded,
+                ActionState::UnknownOutcome,
+            ] {
+                let mut prior_effect = snapshot.clone();
+                prior_effect.action_history.push(PriorAction {
+                    action_kind: kind,
+                    attempt_id: Some("attempt-1".into()),
+                    cause_fingerprint: cause.clone(),
+                    idempotency_key: format!("{kind:?}:{state:?}"),
+                    state,
+                    turn_id: Some("turn-1".into()),
+                    generation: Some(9),
+                });
+                let decision = reconcile(&prior_effect, LogicalTime(0));
+                assert!(matches!(
+                    decision.rule_id.as_str(),
+                    "no_progress" | "unknown_action_outcome"
+                ));
+                assert!(decision.desired_actions.is_empty());
+                assert_eq!(decision, reconcile(&prior_effect, LogicalTime(1)));
+                assert_eq!(
+                    decision,
+                    replay(&prior_effect, LogicalTime(0), RECONCILER_VERSION).unwrap()
+                );
+            }
+        }
+
+        source["action_history"]["relevant"][0]["action_kind"] = json!("unrecognized_send");
+        assert!(frozen_v0::decode_snapshot(&source)
+            .unwrap_err()
+            .contains("unsupported action_history v1 action_kind"));
+        source["action_history"]["relevant"][0]["action_kind"] = json!("send_turn");
+        let (send_turn, _) = frozen_v0::decode_snapshot(&source).unwrap();
+        assert_eq!(
+            send_turn.action_history[0].action_kind,
+            PriorActionKind::SendTurn
+        );
+    }
+
+    #[test]
     fn canonical_55_budget_and_action_history_are_fail_closed() {
-        const SOURCE_COMMIT: &str = "4b836ac8f06309c6facf45bdce51e848deb8173c";
+        const SOURCE_COMMIT: &str = "8c189ff1723096d5ac212ef47349ce0816a5ddd7";
         assert_eq!(
             SOURCE_COMMIT,
-            include_str!("../fixtures/upstream-55-4b836ac/source-commit.txt").trim()
+            include_str!("../fixtures/upstream-55-8c189ff/source-commit.txt").trim()
         );
         let fresh: Value = serde_json::from_str(include_str!(
-            "../fixtures/upstream-55-4b836ac/fresh-open-executable.json"
+            "../fixtures/upstream-55-8c189ff/fresh-open-executable.json"
         ))
         .unwrap();
         let (fresh_snapshot, now) = frozen_v0::decode_snapshot(&fresh).unwrap();
@@ -2521,7 +2709,7 @@ mod tests {
         for state in [ActionState::Executing, ActionState::UnknownOutcome] {
             let mut ambiguous = authoritative.clone();
             ambiguous.action_history.push(PriorAction {
-                action_kind: ActionKind::CreateAttempt,
+                action_kind: PriorActionKind::CreateAttempt,
                 attempt_id: None,
                 cause_fingerprint: "implementation:1".into(),
                 idempotency_key: "same-key".into(),
@@ -2535,7 +2723,7 @@ mod tests {
         }
 
         let budget: Value = serde_json::from_str(include_str!(
-            "../fixtures/upstream-55-4b836ac/budget-exhaustion.json"
+            "../fixtures/upstream-55-8c189ff/budget-exhaustion.json"
         ))
         .unwrap();
         let (exhausted, now) = frozen_v0::decode_snapshot(&budget).unwrap();
@@ -2560,9 +2748,18 @@ mod tests {
             .unwrap()
             .remove("limits");
         missing_limits["budget"] = json!({"max_attempts":99});
+        assert_eq!(
+            frozen_v0::decode_snapshot(&missing_limits)
+                .unwrap()
+                .0
+                .max_attempts,
+            Some(3),
+            "the canonical DTO's finite, typed default applies only to an ungranted budget"
+        );
+        missing_limits["budget_usage"]["grants"] = json!([{"reason":"grant"}]);
         assert!(frozen_v0::decode_snapshot(&missing_limits)
             .unwrap_err()
-            .contains("missing required typed budget_usage.limits"));
+            .contains("missing effective budget_usage.limits for granted budget"));
         let mut invalid_limits = fresh.clone();
         invalid_limits["budget_usage"]["limits"] = json!({"max_attempts":99});
         assert!(frozen_v0::decode_snapshot(&invalid_limits)
@@ -2578,7 +2775,7 @@ mod tests {
     #[test]
     fn canonical_55_provider_facts_never_imply_trusted_green_or_completion() {
         let mut source: Value = serde_json::from_str(include_str!(
-            "../fixtures/upstream-55-4b836ac/fresh-open-executable.json"
+            "../fixtures/upstream-55-8c189ff/fresh-open-executable.json"
         ))
         .unwrap();
         source["delivery"] = json!({

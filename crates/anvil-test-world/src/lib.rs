@@ -282,7 +282,7 @@ mod tests {
             Some("attempt_1")
         );
         snapshot.action_history.push(PriorAction {
-            action_kind: ActionKind::ChecksFailed,
+            action_kind: anvil_reconcile::PriorActionKind::ChecksFailed,
             attempt_id: repair.desired_actions[0].attempt_id.clone(),
             cause_fingerprint: repair.desired_actions[0].cause_fingerprint.clone(),
             idempotency_key: repair.desired_actions[0].idempotency_key.clone(),

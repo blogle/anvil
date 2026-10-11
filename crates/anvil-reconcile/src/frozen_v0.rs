@@ -36,6 +36,22 @@ struct FrozenBudgetLimits {
     _max_model_cost: Option<String>,
 }
 
+impl Default for FrozenBudgetLimits {
+    fn default() -> Self {
+        // This is TaskBudget::default from the canonical #55 DTO. It is used
+        // only for legacy fixture JSON with no grants and no serialized limits.
+        Self {
+            max_attempts: 3,
+            max_continuations_per_reason: 2,
+            max_verifier_cycles: 0,
+            max_ci_retries: 2,
+            max_execution_seconds: 14_400,
+            max_runtime_recoveries: None,
+            _max_model_cost: None,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct FrozenBudgetUsage {
     attempts: u32,
@@ -94,13 +110,20 @@ pub fn decode_snapshot(source: &Value) -> Result<(TaskSnapshot, LogicalTime), St
         .and_then(|value| {
             serde_json::from_value(value).map_err(|_| "invalid typed budget_usage counters")
         })?;
-    let limits: FrozenBudgetLimits = source
-        .pointer("/budget_usage/limits")
-        .ok_or("missing required typed budget_usage.limits")
-        .and_then(|limits_value| {
-            serde_json::from_value(limits_value.clone())
-                .map_err(|_| "invalid typed budget_usage.limits")
-        })?;
+    let limits: FrozenBudgetLimits = match source.pointer("/budget_usage/limits") {
+        Some(limits_value) => serde_json::from_value(limits_value.clone())
+            .map_err(|_| "invalid typed budget_usage.limits")?,
+        None if source
+            .pointer("/budget_usage/grants")
+            .and_then(Value::as_array)
+            .is_some_and(|grants| !grants.is_empty()) =>
+        {
+            return Err("missing effective budget_usage.limits for granted budget".into());
+        }
+        // The canonical TaskSnapshot DTO declares TaskBudget as serde-defaulted.
+        // Its explicit, finite defaults are valid for ungranted fixture snapshots.
+        None => FrozenBudgetLimits::default(),
+    };
     let max_attempts = Some(limits.max_attempts);
     let max_continuation = Some(limits.max_continuations_per_reason);
     let max_ci_retries = Some(limits.max_ci_retries);
@@ -217,8 +240,13 @@ fn decode_delivery(source: &Value) -> Result<Option<Delivery>, String> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let pr_state = string(raw.get("pr_state"));
+    let work_branch = if raw.get("branch_present").and_then(Value::as_bool) == Some(false) {
+        None
+    } else {
+        string(raw.get("work_branch"))
+    };
     Ok(Some(Delivery {
-        work_branch: string(raw.get("work_branch")),
+        work_branch,
         base_revision: string(raw.get("base_revision")),
         pr_head_sha: string(raw.get("pr_head_sha")),
         evaluation_sha: string(raw.get("evaluation_sha")),
@@ -310,7 +338,7 @@ fn decode_actions(source: &Value) -> Result<Vec<PriorAction>, String> {
         .iter()
         .map(|raw| {
             Ok(PriorAction {
-                action_kind: decode(raw.get("action_kind")).ok_or("invalid action kind")?,
+                action_kind: decode_action_kind_v1(raw.get("action_kind"))?,
                 attempt_id: string(raw.get("attempt_id")),
                 cause_fingerprint: string(raw.get("cause_fingerprint"))
                     .ok_or("missing action cause fingerprint")?,
@@ -322,6 +350,25 @@ fn decode_actions(source: &Value) -> Result<Vec<PriorAction>, String> {
             })
         })
         .collect()
+}
+
+/// Version 1 is the action-kind vocabulary used by ANVIL-55's current
+/// TaskActionHistoryReadPort. Unknown spellings fail decoding rather than
+/// disappearing from an authoritative ledger and authorizing a duplicate.
+fn decode_action_kind_v1(value: Option<&Value>) -> Result<PriorActionKind, String> {
+    match value.and_then(Value::as_str) {
+        Some("create_attempt") => Ok(PriorActionKind::CreateAttempt),
+        Some("recover_runtime") => Ok(PriorActionKind::RecoverRuntime),
+        Some("checks_failed") => Ok(PriorActionKind::ChecksFailed),
+        Some("merge_conflict") => Ok(PriorActionKind::MergeConflict),
+        Some("observe_delivery") => Ok(PriorActionKind::ObserveDelivery),
+        Some("send_turn") => Ok(PriorActionKind::SendTurn),
+        Some("send_continuation") => Ok(PriorActionKind::SendContinuation),
+        Some(other) => Err(format!(
+            "unsupported action_history v1 action_kind: {other}"
+        )),
+        None => Err("missing or invalid action_history v1 action_kind".into()),
+    }
 }
 
 fn decode_runtime_health(source: &Value) -> (Option<RuntimeHealth>, Option<String>) {
