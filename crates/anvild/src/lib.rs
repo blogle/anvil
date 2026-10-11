@@ -4818,12 +4818,20 @@ async fn activity(
         .into();
     }
     if has_authoritative_session_status && messages.execution_state == "running" {
-        if let Some(user_message_id) = session
-            .current_run
-            .as_ref()
-            .and_then(|run| run.user_message_id.as_ref())
-            .map(|id| id.0.as_str())
-        {
+        let active_request_id = object
+            .run_record
+            .user_message_id()
+            .map(|id| id.0.clone())
+            .or_else(|| {
+                messages
+                    .telemetry
+                    .requests
+                    .iter()
+                    .filter(|request| request.state == "submitted")
+                    .max_by_key(|request| request.number)
+                    .map(|request| request.id.clone())
+            });
+        if let Some(user_message_id) = active_request_id {
             if let Some(request) = messages
                 .telemetry
                 .requests
@@ -6589,7 +6597,7 @@ fn status_is_busy(status: &Value, session_id: &str) -> bool {
         .get(session_id)
         .and_then(|value| value.get("type"))
         .and_then(Value::as_str)
-        == Some("busy")
+        .is_some_and(|state| matches!(state, "busy" | "running"))
 }
 
 fn execution_state(status: &Value, session_id: Option<&str>) -> &'static str {
@@ -6601,7 +6609,7 @@ fn execution_state(status: &Value, session_id: Option<&str>) -> &'static str {
             return "failed";
         }
         return match current.get("type").and_then(Value::as_str) {
-            Some("busy") => "running",
+            Some("busy" | "running") => "running",
             Some("idle") => "idle",
             _ => "idle",
         };
@@ -7556,8 +7564,15 @@ impl OpenCode {
             .map(|_| ())
     }
     async fn status_snapshot(&self) -> Result<Value, ServiceError> {
-        self.request("session/status", reqwest::Method::GET, None)
-            .await
+        if self.is_v2().await? {
+            let response = self
+                .request("api/session/active", reqwest::Method::GET, None)
+                .await?;
+            Ok(response.get("data").cloned().unwrap_or(Value::Null))
+        } else {
+            self.request("session/status", reqwest::Method::GET, None)
+                .await
+        }
     }
     async fn session_messages(&self, id: &str) -> Result<Value, ServiceError> {
         self.request(
@@ -7665,7 +7680,27 @@ impl OpenCode {
             .await
             .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
         match response.status() {
-            status if status.is_success() => Ok(true),
+            status if status.is_success() => {
+                if !response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|content_type| content_type.starts_with("application/json"))
+                {
+                    // V1 serves its SPA fallback for unknown /api paths with HTTP 200.
+                    return Ok(false);
+                }
+                let info = response
+                    .json::<Value>()
+                    .await
+                    .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+                let major = info
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .and_then(|version| version.split('.').next())
+                    .and_then(|major| major.trim_start_matches('v').parse::<u32>().ok());
+                Ok(major.is_some_and(|major| major >= 2))
+            }
             reqwest::StatusCode::NOT_FOUND => Ok(false),
             status => Err(ServiceError::OpenCode(format!(
                 "HTTP {status} detecting OpenCode API version"
@@ -7696,10 +7731,12 @@ impl OpenCode {
         Ok(response)
     }
     async fn session_exists(&self, id: &str) -> Result<bool, ServiceError> {
-        match self
-            .request(&format!("session/{id}"), reqwest::Method::GET, None)
-            .await
-        {
+        let path = if self.is_v2().await? {
+            format!("api/session/{id}")
+        } else {
+            format!("session/{id}")
+        };
+        match self.request(&path, reqwest::Method::GET, None).await {
             Ok(_) => Ok(true),
             Err(ServiceError::OpenCode(error)) if error.starts_with("HTTP 404 ") => Ok(false),
             Err(error) => Err(error),
@@ -7789,6 +7826,9 @@ impl OpenCode {
         let mut q = self.client.request(m, u);
         if let Some(v) = b {
             q = q.json(&v)
+        }
+        if let Some(password) = self.password.as_ref() {
+            q = q.basic_auth("opencode", Some(password));
         }
         let r = q
             .send()
@@ -11235,6 +11275,12 @@ mod tests {
     #[tokio::test]
     async fn opencode_message_fetch_uses_bounded_cursor_window() {
         let server = MockServer::start();
+        let v1_info = server.mock(|when, then| {
+            when.method(GET).path("/api/info");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({"version":"1.18.30+test"}));
+        });
         let older_messages = (0..ACTIVITY_MESSAGE_LIMIT)
             .map(|index| {
                 json!({
@@ -11261,6 +11307,7 @@ mod tests {
             .unwrap();
         assert_eq!(messages.as_array().unwrap().len(), ACTIVITY_MESSAGE_LIMIT);
         assert_eq!(cursor.as_deref(), Some("older-000"));
+        v1_info.assert();
         page.assert();
     }
 
@@ -11272,7 +11319,9 @@ mod tests {
             when.method(GET)
                 .path("/api/info")
                 .header("authorization", auth);
-            then.status(200).json_body(json!({"version":"2.0.26+test"}));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({"version":"2.0.26+test"}));
         });
         let newest = server.mock(|when, then| {
             when.method(GET)
@@ -11330,6 +11379,48 @@ mod tests {
         assert_eq!(cursor, None);
         newest.assert();
         older.assert();
+    }
+
+    #[tokio::test]
+    async fn v2_activity_binding_and_status_use_authenticated_native_routes() {
+        let server = MockServer::start();
+        let auth = "Basic b3BlbmNvZGU6dGVzdC1wYXNzd29yZA==";
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/info")
+                .header("authorization", auth);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({"version":"2.0.26+test"}));
+        });
+        let session = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/session/ses-v2")
+                .header("authorization", auth);
+            then.status(200).json_body(json!({
+                "location":{"directory":"/workspace"},
+                "data":{"id":"ses-v2","title":"Activity fixture"}
+            }));
+        });
+        let active = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/session/active")
+                .header("authorization", auth);
+            then.status(200).json_body(json!({
+                "location":{"directory":"/workspace"},
+                "data":{"ses-v2":{"type":"running"}}
+            }));
+        });
+        let op = OpenCode::new_with_password(
+            server.url(""),
+            Duration::from_secs(5),
+            Some("test-password".into()),
+        );
+        assert!(op.session_exists("ses-v2").await.unwrap());
+        let status = op.status_snapshot().await.unwrap();
+        assert_eq!(execution_state(&status, Some("ses-v2")), "running");
+        session.assert();
+        active.assert();
     }
 
     #[tokio::test]
