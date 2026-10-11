@@ -173,7 +173,7 @@ For mutations, use existing `Idempotency-Key` policy and CAS/409 mismatch semant
 - Both lanes check consistent serde round-trip, exact SHA binding, generation no-op stability, and action idempotency.
 - 56's R1c end-to-end integration and controller authority cutover **wait until 55's canonical store/API lands**. Its R1a/R1b kernel/adapter work does not.
 - Verify pinned OpenCode v1.18.30 ambiguous SendTurn recovery, legacy/shadow cutover, and named failpoints before enabling R1 production autonomous execution.
-- Commands: `nix develop -c just check` and `nix develop -c just e2e`. Never substitute `nix --option build-users-group ""`.
+- Commands: `nix develop -c just check` and `nix develop -c just e2e`. Never disable the multi-user Nix build group.
 
 ## 8. Git isolation, PRs and convergence
 

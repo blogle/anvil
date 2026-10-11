@@ -60,7 +60,7 @@ jobs:
         run: |
           printf 'anvil-image-cache-hit=%s\n' '${{ steps.restore.outputs.cache-hit }}'
       - name: Validate flake outputs
-        run: time nix --option build-users-group "" flake check --no-build --system x86_64-linux
+        run: time nix flake check --no-build --system x86_64-linux
       - name: Build OCI archives
         run: |
           set -euo pipefail
@@ -70,7 +70,7 @@ jobs:
           mkdir -p "$cache_dir"
           if [ -s "$cache_dir/paths" ]; then
             cache_start=$SECONDS
-            nix --option build-users-group "" copy --no-check-sigs --from "file://$cache_dir" $(<"$cache_dir/paths")
+            nix copy --no-check-sigs --from "file://$cache_dir" $(<"$cache_dir/paths")
             printf 'anvil-cache-import-seconds=%s\n' "$((SECONDS - cache_start))" | tee -a image-build-timings.txt
           else
             printf '%s\n' 'anvil-cache-import-seconds=0 (miss)' | tee -a image-build-timings.txt
@@ -81,7 +81,7 @@ jobs:
             start=$SECONDS
             started_at="$(date -u +%FT%TZ)"
             printf '%s-start=%s\n' "$name" "$started_at"
-            nix --option build-users-group "" build --no-link --print-out-paths "$output" > "paths/$name"
+            nix build --no-link --print-out-paths "$output" > "paths/$name"
             ended_at="$(date -u +%FT%TZ)"
             printf '%s-end=%s\n' "$name" "$ended_at"
             printf '%s-seconds=%s\n' "$name" "$((SECONDS - start))"
@@ -152,14 +152,14 @@ jobs:
           docker load < image-artifacts/anvil-nix-daemon-image.tar
           nix develop .#kind-ci --command bash tests/nix-daemon-smoke.sh ghcr.io/blogle/anvil-nix-daemon:kind-e2e
           cache_export_start=$SECONDS
-          nix --option build-users-group "" path-info --recursive \
+          nix path-info --recursive \
             .#anvil-image-ci .#anvil-ci-release-cargo-artifacts > "$cache_dir/paths.new"
-          cache_nar_bytes="$(nix --option build-users-group "" path-info --json --recursive \
+          cache_nar_bytes="$(nix path-info --json --recursive \
             .#anvil-image-ci .#anvil-ci-release-cargo-artifacts \
             | jq '[.[] | .narSize] | add // 0')"
           printf 'anvil-cache-nar-bytes=%s\n' "$cache_nar_bytes" | tee -a image-build-timings.txt
           if [ "$cache_nar_bytes" -le 2147483648 ]; then
-            nix --option build-users-group "" copy --no-check-sigs --to "file://$cache_dir" $(<"$cache_dir/paths.new")
+            nix copy --no-check-sigs --to "file://$cache_dir" $(<"$cache_dir/paths.new")
             mv "$cache_dir/paths.new" "$cache_dir/paths"
           else
             rm -rf "$cache_dir"
@@ -277,13 +277,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v19
       - name: Run Nix checks
-        run: time nix --option build-users-group "" flake check --system x86_64-linux
+        run: time nix flake check --system x86_64-linux
       - name: Build production images
         run: |
-          nix --option build-users-group "" build .#anvil-image -o result-anvil
+          nix build .#anvil-image -o result-anvil
           docker load < result-anvil
-          nix --option build-users-group "" run .#anvil-sandbox-image.copyToDockerDaemon
-          nix --option build-users-group "" run .#anvil-nix-daemon-image.copyToDockerDaemon
+          nix run .#anvil-sandbox-image.copyToDockerDaemon
+          nix run .#anvil-nix-daemon-image.copyToDockerDaemon
           docker image inspect anvil:dev >/dev/null
           docker image inspect ghcr.io/blogle/anvil-sandbox:main >/dev/null
           docker image inspect ghcr.io/blogle/anvil-nix-daemon:main >/dev/null
