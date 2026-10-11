@@ -72,7 +72,10 @@
         packages.anvil-sandbox-image-push = sandbox.sandboxImagePush;
         packages.import-sandbox-image-k3s = sandbox.importSandboxImageK3s;
 
-        checks = rust.checks // { inherit frontend; };
+        checks = rust.checks // {
+          inherit frontend;
+          crateFixtureSource = rust.fixtureSourceSmoke;
+        };
         devShells.default = rust.devShell;
         # Kind already validates Rust in the independent local-first job. This
         # shell keeps the shared-daemon contract focused on environment entry

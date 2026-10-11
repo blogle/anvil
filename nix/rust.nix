@@ -6,15 +6,50 @@ let
   };
   # Keep the Cargo source filter here so the root flake only wires modules
   # together.  The web application is part of the Rust build input.
+  crateFixturePathFilter = path: type:
+    let
+      sourcePath = toString path;
+      isCratesPath = pkgs.lib.hasSuffix "/crates" sourcePath
+        || pkgs.lib.hasInfix "/crates/" sourcePath;
+      isExcludedPath = builtins.any
+        (segment: pkgs.lib.hasInfix "/${segment}/" sourcePath || pkgs.lib.hasSuffix "/${segment}" sourcePath)
+        [ ".git" "target" ".cache" "node_modules" ];
+    in
+    isCratesPath && !isExcludedPath && (
+      type == "directory"
+      || pkgs.lib.hasSuffix "/fixtures" sourcePath
+      || pkgs.lib.hasInfix "/fixtures/" sourcePath
+    );
+
   src = pkgs.lib.cleanSourceWith {
     src = repoRoot;
     filter = path: type:
       craneLib.filterCargoSources path type
+      || crateFixturePathFilter path type
       || pkgs.lib.hasSuffix "/web" (toString path)
       || pkgs.lib.hasInfix "/web/" (toString path)
       || pkgs.lib.hasSuffix "/runtime" (toString path)
       || pkgs.lib.hasSuffix "/runtime/git-identity" (toString path);
   };
+
+  fixtureSourceSmoke =
+    assert crateFixturePathFilter "/repo/crates/anvild/tests/fixtures/controller-v8-sanitized.json" "regular";
+    assert crateFixturePathFilter "/repo/crates/anvil-core/tests/fixtures/task-snapshot-v1/fresh-open-executable.json" "regular";
+    assert crateFixturePathFilter "/repo/crates/anvil-reconcile/fixtures/action-history-v1.json" "regular";
+    assert crateFixturePathFilter "/repo/crates/anvil-reconcile/fixtures" "directory";
+    assert !(crateFixturePathFilter "/repo/crates/anvild/target" "directory");
+    assert !(crateFixturePathFilter "/repo/crates/anvild/target/debug/fixture.json" "regular");
+    assert !(crateFixturePathFilter "/repo/crates/anvil-core/.cache" "directory");
+    assert !(crateFixturePathFilter "/repo/.git/fixtures/file.json" "regular");
+    pkgs.runCommand "anvil-crate-fixture-source-smoke" { } ''
+      test -f "${src}/crates/anvild/tests/fixtures/controller-v8-sanitized.json"
+      test -f "${src}/crates/anvild/tests/fixtures/task-migration-mappings-v1.json"
+      test -d "${src}/crates/anvil-core/tests/fixtures/task-snapshot-v1"
+      if [ -d "${src}/crates/anvil-reconcile" ]; then
+        test -d "${src}/crates/anvil-reconcile/fixtures"
+      fi
+      mkdir -p "$out"
+    '';
 
   baseArgs = {
     inherit src;
@@ -173,6 +208,7 @@ in
     ciReleaseBinaries
     checks
     devShell
+    fixtureSourceSmoke
     mkBinary
     src;
 }

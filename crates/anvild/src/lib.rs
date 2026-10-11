@@ -8803,6 +8803,8 @@ mod tests {
     }
 
     fn config(profile_opencode_url: String) -> Config {
+        let test_temp_dir = std::env::temp_dir();
+        let test_instance = uuid::Uuid::new_v4();
         Config {
             sandbox_backend: SandboxBackend::Kubernetes,
             bind_port: 8080,
@@ -8825,8 +8827,8 @@ mod tests {
             session_signing_secret: None,
             session_capability_ttl: Duration::from_secs(86400),
             github_api_url: "https://api.github.com".into(),
-            history_path: PathBuf::from("/tmp/anvil-history.jsonl"),
-            store_path: PathBuf::from(format!("/tmp/anvil-test-{}.sqlite3", uuid::Uuid::new_v4())),
+            history_path: test_temp_dir.join(format!("anvil-history-{test_instance}.jsonl")),
+            store_path: test_temp_dir.join(format!("anvil-test-{test_instance}.sqlite3")),
             concurrency_limit: 4,
             provisioning_max_attempts: 3,
             provisioning_retry_base: Duration::from_millis(10),
