@@ -26,10 +26,12 @@ startup transitions are not retained by the current Agent Sandbox resource and
 are therefore not fabricated in the timeline.
 
 OpenCode event polling is bounded to the latest 100 messages; older pages are
-loaded on demand with OpenCode's cursor. The merged browser window is capped at
-500 events and the response's `event_window` carries the cursor and truncation
-state. Tool payloads are credential-redacted on the server before serialization,
-and reasoning parts are never included.
+loaded on demand through Anvil's stable cursor contract. The backend adapts V1
+message-ID `before` cursors and V2 opaque `cursor.previous` values into that
+contract. The merged browser window is capped at 500 events and the response's
+`event_window` carries the cursor and truncation state. Tool payloads are
+credential-redacted on the server before serialization, and reasoning or
+non-displayable V2 content is never included.
 
 The dashboard is colocated with `anvild` as small static assets served from the
 same origin. It uses modest polling for state refresh and calculates timers in

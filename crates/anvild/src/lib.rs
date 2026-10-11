@@ -4817,6 +4817,25 @@ async fn activity(
         }
         .into();
     }
+    if has_authoritative_session_status && messages.execution_state == "running" {
+        if let Some(user_message_id) = session
+            .current_run
+            .as_ref()
+            .and_then(|run| run.user_message_id.as_ref())
+            .map(|id| id.0.as_str())
+        {
+            if let Some(request) = messages
+                .telemetry
+                .requests
+                .iter_mut()
+                .find(|request| request.id == user_message_id && request.state == "submitted")
+            {
+                request.state = "running".into();
+                request.last_activity_at = Some(chrono_like_now());
+            }
+        }
+    }
+    messages.requests = messages.telemetry.requests.clone();
     messages.session.execution_state = messages.execution_state.clone();
     if messages.telemetry.execution != object.telemetry.execution
         || messages.telemetry.execution_error != object.telemetry.execution_error
@@ -6191,6 +6210,92 @@ fn message_items(value: Value) -> Vec<Value> {
     }
 }
 
+/// Convert OpenCode V2's flat message records into the stable message/part shape
+/// consumed by the Activity projector. Only explicit user-visible text and tool
+/// content is retained; reasoning and unknown content types are discarded.
+fn normalize_v2_messages(value: Value) -> Value {
+    let Some(messages) = value.as_array() else {
+        return Value::Array(Vec::new());
+    };
+    let mut messages = messages.clone();
+    messages.sort_by(|left, right| {
+        let left_time = left
+            .pointer("/time/created")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let right_time = right
+            .pointer("/time/created")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        left_time.cmp(&right_time).then_with(|| {
+            left.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .cmp(right.get("id").and_then(Value::as_str).unwrap_or_default())
+        })
+    });
+    let mut latest_user = None::<String>;
+    Value::Array(
+        messages
+            .into_iter()
+            .map(|message| {
+                let role = message
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let id = message
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if role == "user" {
+                    latest_user = Some(id.to_owned());
+                }
+                let parts = if role == "user" {
+                    message
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(|text| vec![json!({"type":"text","text":text})])
+                        .unwrap_or_default()
+                } else if role == "assistant" {
+                    message
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(
+                            |content| match content.get("type").and_then(Value::as_str) {
+                                Some("text") => content
+                                    .get("text")
+                                    .cloned()
+                                    .map(|text| json!({"type":"text","text":text})),
+                                Some("tool") => Some(json!({
+                                    "type":"tool",
+                                    "tool":content.get("name"),
+                                    "state":content.get("state").cloned().unwrap_or(Value::Null)
+                                })),
+                                _ => None,
+                            },
+                        )
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let mut info = message;
+                if let Some(object) = info.as_object_mut() {
+                    object.insert("role".into(), Value::String(role.clone()));
+                    if role == "assistant" {
+                        if let Some(parent) = latest_user.as_ref() {
+                            object.insert("parentID".into(), Value::String(parent.clone()));
+                        }
+                    }
+                }
+                json!({"info":info,"parts":parts})
+            })
+            .collect(),
+    )
+}
+
 fn bounded_message_items(value: Value, limit: usize) -> (Vec<Value>, Option<ActivityEventWindow>) {
     let has_message_collection = value.is_array()
         || value
@@ -7401,6 +7506,7 @@ fn redact_config(value: Value) -> Value {
 pub struct OpenCode {
     client: reqwest::Client,
     base: Url,
+    password: Option<String>,
 }
 
 #[cfg(test)]
@@ -7435,9 +7541,13 @@ impl OpenCode {
                 "OpenCode client constructed during durable Task recovery"
             );
         });
+        Self::new_with_password(base, t, env::var("ANVIL_OPENCODE_SERVER_PASSWORD").ok())
+    }
+    fn new_with_password(base: String, t: Duration, password: Option<String>) -> Self {
         Self {
             client: reqwest::Client::builder().timeout(t).build().unwrap(),
             base: Url::parse(&base).unwrap(),
+            password,
         }
     }
     async fn health(&self) -> Result<(), ServiceError> {
@@ -7466,16 +7576,29 @@ impl OpenCode {
             .base
             .join(&format!("session/{id}/message"))
             .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+        let v2 = self.is_v2().await?;
+        if v2 {
+            url = self
+                .base
+                .join(&format!("api/session/{id}/message"))
+                .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+        }
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("limit", &ACTIVITY_MESSAGE_LIMIT.to_string());
-            if let Some(before) = before {
-                query.append_pair("before", before);
+            if let Some(cursor) = before {
+                query.append_pair(if v2 { "cursor" } else { "before" }, cursor);
+            } else if v2 {
+                query.append_pair("order", "desc");
             }
         }
-        let response = self
-            .client
-            .get(url)
+        let mut request = self.client.get(url);
+        if v2 {
+            if let Some(password) = self.password.as_ref() {
+                request = request.basic_auth("opencode", Some(password));
+            }
+        }
+        let response = request
             .send()
             .await
             .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
@@ -7485,16 +7608,69 @@ impl OpenCode {
                 "HTTP {status} fetching OpenCode message page"
             )));
         }
-        let next_cursor = response
-            .headers()
-            .get("x-next-cursor")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let messages = response
+        let response = response
             .json::<Value>()
             .await
             .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
-        Ok((messages, next_cursor))
+        if v2 {
+            let next_cursor = response
+                .pointer("/cursor/previous")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let messages =
+                normalize_v2_messages(response.get("data").cloned().unwrap_or(Value::Null));
+            Ok((messages, next_cursor))
+        } else {
+            let messages = Value::Array(message_items(response));
+            let items = message_items(messages.clone());
+            let next_cursor = (items.len() >= ACTIVITY_MESSAGE_LIMIT)
+                .then(|| {
+                    items
+                        .iter()
+                        .min_by_key(|message| {
+                            let info = message.get("info").unwrap_or(message);
+                            (
+                                timestamp_millis(
+                                    info.get("time").and_then(|time| time.get("created")),
+                                )
+                                .unwrap_or_default(),
+                                info.get("id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                            )
+                        })
+                        .and_then(|message| {
+                            message.pointer("/info/id").or_else(|| message.get("id"))
+                        })
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .flatten()
+                .filter(|cursor| Some(cursor.as_str()) != before);
+            Ok((messages, next_cursor))
+        }
+    }
+    async fn is_v2(&self) -> Result<bool, ServiceError> {
+        let url = self
+            .base
+            .join("api/info")
+            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+        let mut request = self.client.get(url);
+        if let Some(password) = self.password.as_ref() {
+            request = request.basic_auth("opencode", Some(password));
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+        match response.status() {
+            status if status.is_success() => Ok(true),
+            reqwest::StatusCode::NOT_FOUND => Ok(false),
+            status => Err(ServiceError::OpenCode(format!(
+                "HTTP {status} detecting OpenCode API version"
+            ))),
+        }
     }
     async fn event_stream(&self) -> Result<reqwest::Response, ServiceError> {
         let url = self
@@ -11059,23 +11235,101 @@ mod tests {
     #[tokio::test]
     async fn opencode_message_fetch_uses_bounded_cursor_window() {
         let server = MockServer::start();
+        let older_messages = (0..ACTIVITY_MESSAGE_LIMIT)
+            .map(|index| {
+                json!({
+                    "info": {
+                        "id": format!("older-{index:03}"),
+                        "role": "user",
+                        "time": {"created": index as i64}
+                    },
+                    "parts": [{"type":"text","text":"older prompt"}]
+                })
+            })
+            .collect::<Vec<_>>();
         let page = server.mock(|when, then| {
             when.method(GET)
                 .path("/session/ses-window/message")
                 .query_param("limit", ACTIVITY_MESSAGE_LIMIT.to_string())
                 .query_param("before", "opaque-cursor");
-            then.status(200)
-                .header("x-next-cursor", "next-opaque")
-                .json_body(json!([{"id":"older-message"}]));
+            then.status(200).json_body(json!(older_messages));
         });
         let op = OpenCode::new(server.url(""), Duration::from_secs(5));
-        assert_eq!(
-            op.session_message_page("ses-window", Some("opaque-cursor"))
-                .await
-                .unwrap(),
-            (json!([{"id":"older-message"}]), Some("next-opaque".into()))
-        );
+        let (messages, cursor) = op
+            .session_message_page("ses-window", Some("opaque-cursor"))
+            .await
+            .unwrap();
+        assert_eq!(messages.as_array().unwrap().len(), ACTIVITY_MESSAGE_LIMIT);
+        assert_eq!(cursor.as_deref(), Some("older-000"));
         page.assert();
+    }
+
+    #[tokio::test]
+    async fn v2_activity_pages_use_basic_auth_opaque_cursor_and_visible_parts_only() {
+        let server = MockServer::start();
+        let auth = "Basic b3BlbmNvZGU6dGVzdC1wYXNzd29yZA==";
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/info")
+                .header("authorization", auth);
+            then.status(200).json_body(json!({"version":"2.0.26+test"}));
+        });
+        let newest = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/session/ses-v2/message")
+                .query_param("limit", ACTIVITY_MESSAGE_LIMIT.to_string())
+                .query_param("order", "desc")
+                .header("authorization", auth);
+            then.status(200).json_body(json!({
+                "location":{"directory":"/workspace"},
+                "data":[
+                    {"id":"msg-a","type":"assistant","time":{"created":2,"completed":3},"content":[
+                        {"type":"text","text":"Public response"},
+                        {"type":"reasoning","text":"PRIVATE REASONING"},
+                        {"type":"tool","name":"read","state":{"status":"completed","title":"src/lib.rs","input":{"filePath":"src/lib.rs"},"output":{"summary":"12 lines read"}}}
+                    ]},
+                    {"id":"msg-u","type":"user","time":{"created":1},"text":"Inspect the source."}
+                ],
+                "cursor":{"previous":"v2-opaque-older","next":null}
+            }));
+        });
+        let older = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/session/ses-v2/message")
+                .query_param("limit", ACTIVITY_MESSAGE_LIMIT.to_string())
+                .query_param("cursor", "v2-opaque-older")
+                .header("authorization", auth);
+            then.status(200).json_body(json!({
+                "location":{"directory":"/workspace"},
+                "data":[{"id":"msg-old","type":"user","time":{"created":0},"text":"Older prompt"}],
+                "cursor":{"previous":null,"next":"v2-opaque-newer"}
+            }));
+        });
+        let op = OpenCode::new_with_password(
+            server.url(""),
+            Duration::from_secs(5),
+            Some("test-password".into()),
+        );
+        let (messages, cursor) = op.session_message_page("ses-v2", None).await.unwrap();
+        let messages = messages.as_array().unwrap();
+        assert_eq!(messages[0]["info"]["id"], "msg-u");
+        assert_eq!(messages[0]["parts"][0]["text"], "Inspect the source.");
+        assert_eq!(messages[1]["parts"][0]["text"], "Public response");
+        assert_eq!(messages[1]["parts"][1]["type"], "tool");
+        assert!(messages[1]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|part| part["text"] != "PRIVATE REASONING"));
+        assert_eq!(cursor.as_deref(), Some("v2-opaque-older"));
+        let (older_page, cursor) = op
+            .session_message_page("ses-v2", cursor.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(older_page[0]["info"]["id"], "msg-old");
+        assert_eq!(cursor, None);
+        newest.assert();
+        older.assert();
     }
 
     #[tokio::test]

@@ -113,12 +113,15 @@ When `include_events=true`, OpenCode's durable message API is requested with a
 projects user-visible text and tool events, redacts credential-shaped data on the
 server, and caps the combined Activity timeline at 500 events. The optional
 `event_window` response object reports the per-page message limit and count, the
-merged number of loaded messages, the OpenCode `next_cursor`, and whether the
-500-event projection cap dropped entries.
-Pass `before=<next_cursor>` with `include_events=true` to load an older page. Each
-poll reads only the latest page; older pages load on demand. Consumers must
-preserve the cursor/truncation metadata rather than interpreting a bounded page
-as a complete transcript. Hidden reasoning parts are excluded.
+merged number of loaded messages, Anvil's `next_cursor`, and whether the
+500-event projection cap dropped entries. For OpenCode V1, Anvil derives an
+older-page cursor from the oldest message ID and passes it as `before`; for V2,
+Anvil forwards OpenCode's opaque `cursor.previous`. In both cases, clients pass
+`before=<next_cursor>` with `include_events=true` to load an older page. Each poll
+reads only the latest page; older pages load on demand. Consumers must preserve
+the cursor/truncation metadata rather than interpreting a bounded page as a
+complete transcript. Hidden reasoning and non-displayable V2 content are
+excluded.
 The watcher reconciles OpenCode status and the exact bound current session on
 startup/reconnect and uses message identity only to correlate an active Anvil
 run. No model tool call is required for lifecycle transitions.
