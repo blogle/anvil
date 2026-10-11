@@ -8632,6 +8632,246 @@ mod tests {
         assert_eq!(outbox.decision_count("fenced-shadow-task").unwrap(), 1);
     }
 
+    #[test]
+    fn reconciler_attempt_origin_requires_exact_successful_create_action_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("controller.sqlite3");
+        let task_store = store::ControllerStore::open(&database).unwrap();
+        accept_executable_task(&task_store, "origin-proof-task");
+        task_store
+            .set_task_control("origin-proof-task", 2, false, "reconciler")
+            .unwrap();
+        let mut outbox = anvil_reconcile::outbox::SqliteDecisionStore::open(&database).unwrap();
+        let matching = anvil_reconcile::ProposedAction {
+            schema_version: 1,
+            kind: anvil_reconcile::ActionKind::CreateAttempt,
+            task_id: "origin-proof-task".into(),
+            attempt_id: None,
+            cause_fingerprint: "implementation:1".into(),
+            idempotency_key: "matching-attempt-submission".into(),
+            class: anvil_reconcile::ActionClass::Idempotent,
+            recovery_strategy: anvil_reconcile::RecoveryStrategy::RetryIdempotently,
+            rule_id: "task_runnable".into(),
+            payload: json!({"role":"implementation","ordinal":1}),
+        };
+        let mismatched = anvil_reconcile::ProposedAction {
+            idempotency_key: "different-submission-key".into(),
+            ..matching.clone()
+        };
+        let now = Utc::now().timestamp_millis();
+        let snapshot = task_store
+            .task_reconciliation_snapshot("origin-proof-task", now)
+            .unwrap()
+            .unwrap();
+        let (typed, logical_time) = anvil_reconcile::frozen_v0::decode_snapshot(&snapshot).unwrap();
+        let hypothetical = anvil_reconcile::Decision {
+            rule_id: "task_runnable".into(),
+            desired_actions: vec![matching.clone(), mismatched.clone()],
+            attention: Vec::new(),
+        };
+        let record =
+            anvil_reconcile::DecisionRecord::new(&typed, logical_time, &snapshot, &hypothetical);
+        assert_eq!(
+            outbox
+                .commit(
+                    "origin-proof-task",
+                    0,
+                    &record,
+                    &hypothetical.desired_actions,
+                )
+                .unwrap(),
+            anvil_reconcile::outbox::CommitResult::Applied {
+                generation: 1,
+                inserted: 2
+            }
+        );
+        task_store
+            .create_attempt(
+                "origin-proof-task",
+                "origin-proof-attempt",
+                &matching.idempotency_key,
+            )
+            .unwrap();
+        let setup = rusqlite::Connection::open(&database).unwrap();
+        setup.execute(
+            "UPDATE reconcile_actions SET state='succeeded' WHERE task_id=?1 AND idempotency_key=?2",
+            rusqlite::params!["origin-proof-task", mismatched.idempotency_key],
+        ).unwrap();
+        drop(setup);
+
+        let unproven = task_store
+            .task_reconciliation_snapshot("origin-proof-task", now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unproven["action_history"]["attempt_origin_coverage"],
+            "incomplete"
+        );
+        assert_eq!(unproven["action_history"]["unadopted_attempt_count"], 1);
+        assert_eq!(
+            outbox
+                .action_state("origin-proof-task", &matching.idempotency_key)
+                .unwrap(),
+            Some(anvil_reconcile::ActionState::Pending)
+        );
+
+        assert!(outbox
+            .claim(
+                "origin-proof-task",
+                &matching.idempotency_key,
+                1,
+                anvil_reconcile::ControllerMode::Reconciler,
+                false,
+            )
+            .unwrap());
+        assert!(outbox
+            .record_result_after_side_effect(
+                "origin-proof-task",
+                &matching.idempotency_key,
+                anvil_reconcile::ActionState::Succeeded,
+            )
+            .unwrap());
+        let adopted = task_store
+            .task_reconciliation_snapshot("origin-proof-task", now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            adopted["action_history"]["attempt_origin_coverage"],
+            "complete"
+        );
+        assert_eq!(adopted["action_history"]["unadopted_attempt_count"], 0);
+    }
+
+    #[test]
+    fn reconciler_created_attempt_allows_durable_checks_failed_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("controller.sqlite3");
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = database.clone();
+        let state = AppState::new(config, FakeSandbox);
+        let task_store = state.store().unwrap();
+        accept_executable_task(task_store, "reconciler-repair-task");
+        task_store
+            .set_task_control("reconciler-repair-task", 2, false, "reconciler")
+            .unwrap();
+
+        run_task_reconciliation_tick(&state).unwrap();
+        let mut outbox = anvil_reconcile::outbox::SqliteDecisionStore::open(&database).unwrap();
+        let create_record = outbox
+            .decision_record("reconciler-repair-task", 1)
+            .unwrap()
+            .unwrap();
+        let create_key = create_record.canonical_actions_json[0]["idempotency_key"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            create_record.canonical_actions_json[0]["kind"],
+            "create_attempt"
+        );
+        assert!(outbox
+            .claim(
+                "reconciler-repair-task",
+                &create_key,
+                1,
+                anvil_reconcile::ControllerMode::Reconciler,
+                false,
+            )
+            .unwrap());
+        task_store
+            .create_attempt("reconciler-repair-task", "reconciler-attempt", &create_key)
+            .unwrap();
+        assert!(outbox
+            .record_result_after_side_effect(
+                "reconciler-repair-task",
+                &create_key,
+                anvil_reconcile::ActionState::Succeeded,
+            )
+            .unwrap());
+        task_store
+            .bind_attempt_session("reconciler-attempt", "reconciler-session")
+            .unwrap();
+        task_store
+            .set_attempt_state("reconciler-attempt", "completed")
+            .unwrap();
+        let before_delivery = task_store
+            .task_snapshot("reconciler-repair-task", Utc::now().timestamp_millis())
+            .unwrap()
+            .unwrap();
+        task_store
+            .bind_task_delivery(
+                "reconciler-repair-task",
+                before_delivery["task_version"].as_u64().unwrap(),
+                Some("0123456789abcdef0123456789abcdef01234567"),
+                Some(&json!({"provider":"github","repository":"example/reconciler","number":29})),
+            )
+            .unwrap();
+        add_test_observation(
+            &database,
+            "reconciler-repair-task",
+            "runtime.execution",
+            &json!({"attempt_id":"reconciler-attempt","health":"healthy","turn_state":"completed"}),
+        );
+        add_test_observation(
+            &database,
+            "reconciler-repair-task",
+            "delivery.head",
+            &json!({"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}),
+        );
+        add_test_observation(
+            &database,
+            "reconciler-repair-task",
+            "delivery.pull_request",
+            &json!({"state":"open","review_state_known":true,"changes_requested":false,"merged":false}),
+        );
+        add_test_observation(
+            &database,
+            "reconciler-repair-task",
+            "delivery.checks",
+            &json!({
+                "evaluation_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "evaluation_kind":"head","required_policy_known":true,
+                "required_checks":[{"context":"CI","source":"check_run","state":"failing","evaluation_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","failure_fingerprint":"unit-failure"}]
+            }),
+        );
+        let snapshot = task_store
+            .task_reconciliation_snapshot("reconciler-repair-task", Utc::now().timestamp_millis())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot["action_history"]["attempt_origin_coverage"],
+            "complete"
+        );
+        run_task_reconciliation_tick(&state).unwrap();
+        let checks = outbox
+            .decision_record("reconciler-repair-task", 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(checks.rule_id, "required_checks_failing");
+        assert_eq!(checks.canonical_actions_json[0]["kind"], "checks_failed");
+        assert_eq!(checks.authorization_blocked_reason, None);
+        let checks_key = checks.canonical_actions_json[0]["idempotency_key"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            outbox
+                .action_state("reconciler-repair-task", checks_key)
+                .unwrap(),
+            Some(anvil_reconcile::ActionState::Pending)
+        );
+        assert_eq!(
+            outbox.generation("reconciler-repair-task").unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            task_store
+                .attempts_for_task("reconciler-repair-task")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn decisions_api_distinguishes_missing_tasks_and_pages_with_exclusive_cursors() {
         let directory = tempfile::tempdir().unwrap();

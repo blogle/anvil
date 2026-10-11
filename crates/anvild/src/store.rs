@@ -1708,6 +1708,24 @@ impl ControllerStore {
             [task_id],
             |row| row.get(0),
         )?;
+        let unadopted_attempt_count: i64 = if include_action_history {
+            tx.query_row(
+                "SELECT COUNT(*) FROM attempts a
+                 WHERE a.task_id=?1 AND NOT EXISTS(
+                   SELECT 1 FROM attempt_submissions s
+                   JOIN reconcile_actions r ON r.task_id=s.task_id AND r.idempotency_key=s.idempotency_key
+                   WHERE s.task_id=a.task_id AND s.attempt_id=a.attempt_id
+                     AND r.state='succeeded'
+                     AND json_extract(r.action_json,'$.kind')='create_attempt'
+                     AND json_extract(r.action_json,'$.payload.ordinal')=a.ordinal
+                     AND json_extract(r.action_json,'$.payload.role')=json_extract(a.payload_json,'$.role')
+                 )",
+                [task_id],
+                |row| row.get(0),
+            )?
+        } else {
+            0
+        };
         let execution_ms: u64 = tx.query_row(
             "SELECT COALESCE(SUM(CASE WHEN json_extract(payload_json,'$.started_at') IS NULL THEN 0 ELSE MAX(0,CAST(ROUND((julianday(COALESCE(json_extract(payload_json,'$.ended_at'),datetime(?2/1000,'unixepoch'))) - julianday(json_extract(payload_json,'$.started_at')))*86400000) AS INTEGER)) END),0) FROM attempts WHERE task_id=?1",
             params![task_id, logical_time],
@@ -1858,10 +1876,17 @@ impl ControllerStore {
             "last_consumed_evidence": null
         });
         if include_action_history {
-            let history =
+            let mut history =
                 anvil_reconcile::outbox::SqliteDecisionStore::action_history_json_from_connection(
-                    &tx, task_id, 128,
+                    tx, task_id, 128,
                 )?;
+            history["attempt_origin_coverage"] =
+                serde_json::json!(if unadopted_attempt_count == 0 {
+                    "complete"
+                } else {
+                    "incomplete"
+                });
+            history["unadopted_attempt_count"] = serde_json::json!(unadopted_attempt_count);
             snapshot["action_history"] = history;
         }
         snapshot["budget_usage"] = serde_json::json!({
@@ -1902,7 +1927,7 @@ impl ControllerStore {
         };
         let (current, current_logical_time) =
             anvil_reconcile::frozen_v0::decode_snapshot(&current_snapshot)
-                .map_err(|error| StoreError::InvalidState(error))?;
+                .map_err(StoreError::InvalidState)?;
         let snapshot_matches = anvil_reconcile::snapshot_hash(&current_snapshot)
             == anvil_reconcile::snapshot_hash(evaluated_snapshot)
             && current_logical_time.0 == decision_record.logical_time_ms
@@ -1952,10 +1977,10 @@ impl ControllerStore {
             anvil_reconcile::ControllerMode::Reconciler => {
                 let authorization_block = if history["availability"] != "authoritative" {
                     Some("action_history_unavailable")
-                } else if current.budget_usage.attempts > 0 {
-                    // Existing Attempts may carry legacy turns absent from this
-                    // outbox. The later takeover increment must adopt/prove that
-                    // history before the proposal can become executable intent.
+                } else if history["attempt_origin_coverage"] != "complete" {
+                    // Existing Attempts require an exact successful CreateAttempt
+                    // outbox/submission binding before their history can authorize
+                    // new executable intent.
                     Some("legacy_history_not_adopted")
                 } else {
                     None
