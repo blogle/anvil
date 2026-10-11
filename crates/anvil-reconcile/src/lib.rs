@@ -1502,12 +1502,12 @@ pub mod outbox {
         /// Return the durable outbox history required to make continuation decisions safely.
         /// A query error is propagated; callers must not treat it as an empty ledger.
         pub fn action_history_json(&self, task_id: &str, limit: usize) -> rusqlite::Result<Value> {
+            let limit = limit.clamp(1, 128);
             let mut statement = self.connection.prepare(
                 "SELECT action_json,generation,state FROM reconcile_actions WHERE task_id=?1 ORDER BY generation DESC,idempotency_key LIMIT ?2",
             )?;
-            let rows = statement.query_map(
-                rusqlite::params![task_id, limit.clamp(1, 128) as i64],
-                |row| {
+            let rows =
+                statement.query_map(rusqlite::params![task_id, (limit + 1) as i64], |row| {
                     let action: String = row.get(0)?;
                     let generation: u64 = row.get(1)?;
                     let state: String = row.get(2)?;
@@ -1519,11 +1519,20 @@ pub mod outbox {
                         )
                     })?;
                     Ok((action, generation, state))
-                },
-            )?;
+                })?;
             let mut relevant = Vec::new();
             let mut continuations = BTreeSet::new();
             for row in rows {
+                if relevant.len() == limit {
+                    return Ok(serde_json::json!({
+                        "availability":"unavailable",
+                        "coverage":"reconciler_outbox_only",
+                        "relevant":[],
+                        "continuation_fingerprints_sent":[],
+                        "last_consumed_evidence":null,
+                        "unavailable_reason":"action_history_truncated"
+                    }));
+                }
                 let (action, generation, state) = row?;
                 let kind = action["kind"].as_str().unwrap_or_default();
                 let cause = action["cause_fingerprint"].as_str().unwrap_or_default();
@@ -3320,6 +3329,9 @@ mod outbox_tests {
             json!(["cause-executing", "cause-succeeded", "cause-unknown"])
         );
         assert_eq!(history["relevant"].as_array().unwrap().len(), 6);
+        let truncated = store.action_history_json("t", 2).unwrap();
+        assert_eq!(truncated["availability"], "unavailable");
+        assert_eq!(truncated["unavailable_reason"], "action_history_truncated");
     }
 
     #[test]
