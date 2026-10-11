@@ -9,10 +9,36 @@ namespace=anvil
 source_repo="${ANVIL_KIND_SOURCE_REPOSITORY:-https://github.com/blogle/anvil.git}"
 source_ref="${ANVIL_KIND_SOURCE_REF:-${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-$(git -C "$root" branch --show-current)}}}"
 created=0 api_forward_pid="" router_forward_pid="" pod_name=""
+diagnostics_dir="${GITHUB_WORKSPACE:-$root}/kind-diagnostics"
+
+capture_build_diagnostics() {
+  local label="$1"
+  mkdir -p "$diagnostics_dir"
+  {
+    printf '\n--- %s %s ---\n' "$label" "$(date -u +%FT%TZ)"
+    kubectl --kubeconfig "$kubeconfig" -n "$namespace" get pods -o wide || true
+    kubectl --kubeconfig "$kubeconfig" -n "$namespace" get events --sort-by=.lastTimestamp || true
+    kubectl --kubeconfig "$kubeconfig" -n "$namespace" get pod -l app.kubernetes.io/name=anvil-nix-daemon -o json | jq -r '
+      .items[] | "pod=\(.metadata.name) phase=\(.status.phase) containers=\([.status.containerStatuses[]? | [.name,.restartCount,.state] | @json] | join(" "))"' || true
+    kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec deployment/anvil-nix-daemon -c nix-daemon -- /bin/bash -c '
+      for file in memory.current memory.max memory.events memory.pressure; do
+        if [ -r "/sys/fs/cgroup/$file" ]; then printf "cgroup-%s=" "$file"; tr "\n" " " < "/sys/fs/cgroup/$file"; printf "\n"; fi
+      done
+      printf "daemon-processes:\n"
+      ps -eo pid,ppid,stat,rss,etime,args --sort=-rss | head -n 30
+      printf "active-builds:\n"
+      for file in /proc/[0-9]*/cmdline; do tr "\\0" " " < "$file" 2>/dev/null | grep -E "nix-daemon|/nix/store/.*builder" || true; done
+    ' || true
+    kubectl --kubeconfig "$kubeconfig" get --raw "/api/v1/nodes/$(kubectl --kubeconfig "$kubeconfig" get nodes -o jsonpath='{.items[0].metadata.name}')/proxy/stats/summary" 2>/dev/null | jq '{node: .node, systemContainers: [.node.runtime.imageFs, .node.fs]}' || true
+  } >>"$diagnostics_dir/kind-build-diagnostics.log" 2>&1
+}
 
 cleanup() {
   local status=$?
   if [ "$status" -ne 0 ]; then
+    capture_build_diagnostics failure
+    printf '\n--- build-time cgroup and event diagnostics ---\n' >&2
+    if [ -f "$diagnostics_dir/kind-build-diagnostics.log" ]; then cat "$diagnostics_dir/kind-build-diagnostics.log" >&2; fi
     printf '\n--- isolated Kind diagnostics ---\n' >&2
     kubectl --kubeconfig "$kubeconfig" get pods,pvc,sandbox -A -o wide >&2 || true
     kubectl --kubeconfig "$kubeconfig" -n anvil logs deployment/anvild --all-containers=true >&2 || true
@@ -346,12 +372,16 @@ directory_source_path="$(agent_exec "$api_b_pod" /bin/bash -lc '
 agent_exec "$api_b_pod" /bin/bash -c 'test "$(cat "$1/fixture.txt")" = "directory source passed through the shared Nix daemon"' -- "$directory_source_path"
 fresh_sandbox_build() {
   local pod="$1" name="$2" bash_path build_path command_literal output
+  printf 'lifecycle-build-start name=%s time=%s pod=%s\n' "$name" "$(date -u +%FT%TZ)" "$pod"
+  capture_build_diagnostics "before-$name"
   bash_path="$(agent_exec "$pod" readlink -f /bin/bash)"
   build_path="$(agent_exec "$pod" printenv PATH)"
   command_literal="$(jq -Rn --arg path "$build_path" --arg value 'mkdir -p source; printf fresh-build > source/input; chmod 0700 source; chmod 0755 source; cp source/input "$out"' '"export PATH=\($path); \($value)"')"
-  output="$(agent_exec "$pod" nix build --no-link --print-out-paths --impure --expr "derivation { name = \"$name\"; system = builtins.currentSystem; builder = \"$bash_path\"; args = [ \"-c\" $command_literal ]; }")"
+  output="$(agent_exec "$pod" nix build --print-build-logs --no-link --print-out-paths --impure --expr "derivation { name = \"$name\"; system = builtins.currentSystem; builder = \"$bash_path\"; args = [ \"-c\" $command_literal ]; }")"
   [[ "$output" = /nix/store/* ]]
   agent_exec "$pod" /bin/bash -c 'test "$(cat "$1")" = fresh-build' -- "$output"
+  printf 'lifecycle-build-end name=%s time=%s output=%s\n' "$name" "$(date -u +%FT%TZ)" "$output"
+  capture_build_diagnostics "after-$name"
 }
 fresh_sandbox_build "$api_b_pod" "anvil-lifecycle-before-remove-${cluster}"
 if agent_exec "$api_b_pod" nix path-info "$upgrade_canary" >/dev/null 2>&1; then
@@ -359,8 +389,11 @@ if agent_exec "$api_b_pod" nix path-info "$upgrade_canary" >/dev/null 2>&1; then
   exit 1
 fi
 curl -fsS -X DELETE "http://127.0.0.1:18080/v1/sessions/$api_a_id" >/dev/null
+printf 'sandbox-remove-start session=%s sandbox=%s time=%s\n' "$api_a_id" "$api_a_name" "$(date -u +%FT%TZ)"
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" wait --for=delete "sandbox/$api_a_name" --timeout=120s
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" wait --for=delete "pod/$api_a_pod" --timeout=120s
+printf 'sandbox-remove-complete session=%s sandbox=%s time=%s\n' "$api_a_id" "$api_a_name" "$(date -u +%FT%TZ)"
+capture_build_diagnostics after-sandbox-removal
 agent_exec "$api_b_pod" nix path-info "$shared_path" >/dev/null
 assert_nix_metadata
 fresh_sandbox_build "$api_b_pod" "anvil-lifecycle-after-remove-${cluster}"
