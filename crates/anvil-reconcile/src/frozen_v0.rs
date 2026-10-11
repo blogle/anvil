@@ -240,6 +240,7 @@ fn decode_delivery(source: &Value) -> Result<Option<Delivery>, String> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let pr_state = string(raw.get("pr_state"));
+    let (changes_requested, review_state_known) = decode_review_state(source, raw);
     let work_branch = if raw.get("branch_present").and_then(Value::as_bool) == Some(false) {
         None
     } else {
@@ -258,8 +259,8 @@ fn decode_delivery(source: &Value) -> Result<Option<Delivery>, String> {
         pr_state,
         check_policy_known,
         unexpected_force_push: bool_value(raw.get("unexpected_force_push")),
-        changes_requested: bool_value(raw.get("changes_requested")),
-        review_state_known: decode_review_state(source, raw).0,
+        changes_requested,
+        review_state_known,
         merge_conflict: bool_value(raw.get("merge_conflict")),
         required_checks,
     }))
@@ -306,14 +307,24 @@ fn decode_attempts(source: &Value) -> Result<Vec<Attempt>, String> {
                 .iter()
                 .filter(|observation| {
                     string(observation.get("attempt_id")).as_deref() == Some(&attempt_id)
+                        || (string(observation.get("key")).as_deref() == Some("runtime.execution")
+                            && string(observation.pointer("/value/attempt_id")).as_deref()
+                                == Some(&attempt_id))
                 })
                 .collect();
             let session_healthy = attempt_observations.iter().any(|observation| {
-                string(observation.get("runtime_health")).as_deref() == Some("healthy")
+                (string(observation.get("runtime_health")).as_deref() == Some("healthy")
+                    || string(observation.pointer("/value/runtime_health")).as_deref()
+                        == Some("healthy")
+                    || string(observation.pointer("/value/health")).as_deref() == Some("healthy"))
                     && (bool_value(observation.get("fresh"))
                         || string(observation.get("freshness")).as_deref() == Some("fresh"))
             });
-            let turn_state = string(raw.pointer("/turn/state"));
+            let turn_state = string(raw.pointer("/turn/state")).or_else(|| {
+                attempt_observations
+                    .iter()
+                    .find_map(|observation| string(observation.pointer("/value/turn_state")))
+            });
             Ok(Attempt {
                 attempt_id,
                 ordinal: number(raw.get("ordinal")) as u32,
