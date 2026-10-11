@@ -257,6 +257,10 @@ mod tests {
             runtime_failure_fingerprint: None,
             max_runtime_recoveries: Some(2),
             action_history: vec![],
+            action_history_availability: Some(
+                anvil_reconcile::ActionHistoryAvailability::Authoritative,
+            ),
+            last_consumed_evidence: None,
             workspace_fact_hash: None,
             budget_usage: BudgetUsage {
                 attempts: 1,
@@ -265,6 +269,7 @@ mod tests {
             max_attempts: Some(4),
             max_continuations_by_reason: Default::default(),
             max_ci_retries: Some(2),
+            max_verifier_cycles: Some(0),
             max_execution_ms: Some(300_000),
             retry_due_at_ms: None,
             merge_wait_due_at_ms: Some(1_000),
@@ -282,6 +287,8 @@ mod tests {
             cause_fingerprint: repair.desired_actions[0].cause_fingerprint.clone(),
             idempotency_key: repair.desired_actions[0].idempotency_key.clone(),
             state: ActionState::Succeeded,
+            turn_id: None,
+            generation: None,
         });
         assert_eq!(reconcile(&snapshot, LogicalTime(1)).rule_id, "no_progress");
 

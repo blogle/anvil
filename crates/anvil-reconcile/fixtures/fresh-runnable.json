@@ -17,6 +17,7 @@
   "attempts": [],
   "unresolved_blocker": false,
   "action_history": [],
+  "action_history_availability": "authoritative",
   "budget_usage": {"attempts": 0, "continuations_by_reason": {}, "ci_retries": 0, "verifier_cycles": 0, "execution_ms": 0},
   "max_attempts": 4,
   "retry_due_at_ms": null,

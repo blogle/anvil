@@ -195,6 +195,12 @@ pub enum ActionState {
     UnknownOutcome,
     Superseded,
 }
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionHistoryAvailability {
+    Unavailable,
+    Authoritative,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttemptAdmission {
     Claimed { attempt_id: String },
@@ -251,6 +257,10 @@ pub struct PriorAction {
     pub cause_fingerprint: String,
     pub idempotency_key: String,
     pub state: ActionState,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub generation: Option<u64>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BudgetUsage {
@@ -299,6 +309,10 @@ pub struct TaskSnapshot {
     #[serde(default)]
     pub action_history: Vec<PriorAction>,
     #[serde(default)]
+    pub action_history_availability: Option<ActionHistoryAvailability>,
+    #[serde(default)]
+    pub last_consumed_evidence: Option<String>,
+    #[serde(default)]
     pub workspace_fact_hash: Option<String>,
     #[serde(default)]
     pub budget_usage: BudgetUsage,
@@ -307,6 +321,8 @@ pub struct TaskSnapshot {
     pub max_continuations_by_reason: std::collections::BTreeMap<String, u32>,
     #[serde(default)]
     pub max_ci_retries: Option<u32>,
+    #[serde(default)]
+    pub max_verifier_cycles: Option<u32>,
     #[serde(default)]
     pub max_execution_ms: Option<u64>,
     pub retry_due_at_ms: Option<i64>,
@@ -443,6 +459,11 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
     {
         d.rule_id = "budget_exhausted".into();
         d.attention.push("needs_budget".into());
+        return d;
+    }
+    if s.action_history_availability != Some(ActionHistoryAvailability::Authoritative) {
+        d.rule_id = "action_history_unavailable".into();
+        d.attention.push("action_history_unavailable".into());
         return d;
     }
     if s.retry_due_at_ms.is_some_and(|due| now.0 < due) {
@@ -677,11 +698,17 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
     }
     d.rule_id = "task_runnable".into();
     let ordinal = s.budget_usage.attempts + 1;
+    let cause = format!("implementation:{ordinal}");
+    if has_action(s, ActionKind::CreateAttempt, None, &cause) {
+        d.rule_id = "no_progress".into();
+        d.attention.push("no_progress".into());
+        return d;
+    }
     d.desired_actions.push(make_action(
         &s.task_id,
         None,
         ActionKind::CreateAttempt,
-        format!("implementation:{ordinal}"),
+        cause,
         json!({"role":"implementation","ordinal":ordinal}),
         "task_runnable",
     ));
@@ -1991,11 +2018,14 @@ mod tests {
             runtime_failure_fingerprint: None,
             max_runtime_recoveries: Some(2),
             action_history: vec![],
+            action_history_availability: Some(ActionHistoryAvailability::Authoritative),
+            last_consumed_evidence: None,
             workspace_fact_hash: None,
             budget_usage: BudgetUsage::default(),
             max_attempts: Some(4),
             max_continuations_by_reason: Default::default(),
             max_ci_retries: None,
+            max_verifier_cycles: None,
             max_execution_ms: None,
             retry_due_at_ms: None,
             merge_wait_due_at_ms: None,
@@ -2306,6 +2336,8 @@ mod tests {
             cause_fingerprint: action.cause_fingerprint.clone(),
             idempotency_key: action.idempotency_key.clone(),
             state: ActionState::Succeeded,
+            turn_id: None,
+            generation: None,
         });
         assert_eq!(reconcile(&s, LogicalTime(1)).rule_id, "no_progress");
         s.workspace_fact_hash = Some("workspace-changed".into());
@@ -2425,6 +2457,169 @@ mod tests {
             serde_json::to_value(decision.desired_actions).unwrap(),
             golden["actions"]
         );
+    }
+    #[test]
+    fn canonical_55_budget_and_action_history_are_fail_closed() {
+        const SOURCE_COMMIT: &str = "4b836ac8f06309c6facf45bdce51e848deb8173c";
+        assert_eq!(
+            SOURCE_COMMIT,
+            include_str!("../fixtures/upstream-55-4b836ac/source-commit.txt").trim()
+        );
+        let fresh: Value = serde_json::from_str(include_str!(
+            "../fixtures/upstream-55-4b836ac/fresh-open-executable.json"
+        ))
+        .unwrap();
+        let (fresh_snapshot, now) = frozen_v0::decode_snapshot(&fresh).unwrap();
+        assert_eq!(fresh_snapshot.max_attempts, Some(3));
+        assert_eq!(fresh_snapshot.max_execution_ms, Some(14_400_000));
+        assert_eq!(fresh_snapshot.action_history_availability, None);
+        let unavailable = reconcile(&fresh_snapshot, now);
+        assert_eq!(unavailable.rule_id, "action_history_unavailable");
+        assert!(unavailable.desired_actions.is_empty());
+
+        let mut unavailable_wire = fresh.clone();
+        unavailable_wire["action_history"]["availability"] = json!("unavailable");
+        let (decoded_unavailable, _) = frozen_v0::decode_snapshot(&unavailable_wire).unwrap();
+        assert_eq!(
+            decoded_unavailable.action_history_availability,
+            Some(ActionHistoryAvailability::Unavailable)
+        );
+        let mut authoritative_wire = fresh.clone();
+        authoritative_wire["action_history"]["availability"] = json!("authoritative");
+        let (decoded_authoritative, _) = frozen_v0::decode_snapshot(&authoritative_wire).unwrap();
+        assert_eq!(
+            decoded_authoritative.action_history_availability,
+            Some(ActionHistoryAvailability::Authoritative)
+        );
+        authoritative_wire["action_history"]["relevant"] = json!([{
+            "action_kind":"create_attempt", "attempt_id":null,
+            "cause_fingerprint":"implementation:1", "idempotency_key":"stable-key",
+            "state":"unknown_outcome", "turn_id":"turn-7", "generation":3
+        }]);
+        let (history_snapshot, _) = frozen_v0::decode_snapshot(&authoritative_wire).unwrap();
+        let prior = &history_snapshot.action_history[0];
+        assert_eq!(prior.state, ActionState::UnknownOutcome);
+        assert_eq!(prior.turn_id.as_deref(), Some("turn-7"));
+        assert_eq!(prior.generation, Some(3));
+        for mode in [ControllerMode::Legacy, ControllerMode::Shadow] {
+            let mut inert = decoded_unavailable.clone();
+            inert.controller_mode = mode;
+            assert_eq!(reconcile(&inert, now).rule_id, "controller_not_authorized");
+            assert!(reconcile(&inert, now).desired_actions.is_empty());
+        }
+
+        let mut authoritative = fresh_snapshot.clone();
+        authoritative.action_history_availability = Some(ActionHistoryAvailability::Authoritative);
+        assert_eq!(reconcile(&authoritative, now).rule_id, "task_runnable");
+        let mut unavailable_explicit = authoritative.clone();
+        unavailable_explicit.action_history_availability =
+            Some(ActionHistoryAvailability::Unavailable);
+        assert_eq!(
+            reconcile(&unavailable_explicit, now).rule_id,
+            "action_history_unavailable"
+        );
+        for state in [ActionState::Executing, ActionState::UnknownOutcome] {
+            let mut ambiguous = authoritative.clone();
+            ambiguous.action_history.push(PriorAction {
+                action_kind: ActionKind::CreateAttempt,
+                attempt_id: None,
+                cause_fingerprint: "implementation:1".into(),
+                idempotency_key: "same-key".into(),
+                state,
+                turn_id: Some("turn-7".into()),
+                generation: Some(3),
+            });
+            // An ambiguous action must never be dispatched again, including a
+            // duplicate trigger with the same action kind and cause.
+            assert!(reconcile(&ambiguous, now).desired_actions.is_empty());
+        }
+
+        let budget: Value = serde_json::from_str(include_str!(
+            "../fixtures/upstream-55-4b836ac/budget-exhaustion.json"
+        ))
+        .unwrap();
+        let (exhausted, now) = frozen_v0::decode_snapshot(&budget).unwrap();
+        assert_eq!(exhausted.max_attempts, Some(3));
+        assert_eq!(exhausted.max_continuations_by_reason["checks_failed"], 2);
+        assert_eq!(reconcile(&exhausted, now).rule_id, "budget_exhausted");
+
+        let mut granted_source = budget.clone();
+        granted_source["budget_usage"]["limits"]["max_attempts"] = json!(4);
+        granted_source["budget_usage"]["limits"]["max_execution_seconds"] = json!(7200);
+        granted_source["budget_usage"]["grants"] =
+            json!([{"actor":"operator","reason":"audited grant"}]);
+        let (mut granted, now) = frozen_v0::decode_snapshot(&granted_source).unwrap();
+        assert_eq!(granted.max_attempts, Some(4));
+        assert_eq!(granted.max_execution_ms, Some(7_200_000));
+        granted.action_history_availability = Some(ActionHistoryAvailability::Authoritative);
+        assert_eq!(reconcile(&granted, now).rule_id, "task_runnable");
+
+        let mut missing_limits = fresh.clone();
+        missing_limits["budget_usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("limits");
+        missing_limits["budget"] = json!({"max_attempts":99});
+        assert!(frozen_v0::decode_snapshot(&missing_limits)
+            .unwrap_err()
+            .contains("missing required typed budget_usage.limits"));
+        let mut invalid_limits = fresh.clone();
+        invalid_limits["budget_usage"]["limits"] = json!({"max_attempts":99});
+        assert!(frozen_v0::decode_snapshot(&invalid_limits)
+            .unwrap_err()
+            .contains("invalid typed budget_usage.limits"));
+        let mut overflow = fresh.clone();
+        overflow["budget_usage"]["limits"]["max_execution_seconds"] = json!(u64::MAX);
+        assert!(frozen_v0::decode_snapshot(&overflow)
+            .unwrap_err()
+            .contains("overflows milliseconds"));
+    }
+
+    #[test]
+    fn canonical_55_provider_facts_never_imply_trusted_green_or_completion() {
+        let mut source: Value = serde_json::from_str(include_str!(
+            "../fixtures/upstream-55-4b836ac/fresh-open-executable.json"
+        ))
+        .unwrap();
+        source["delivery"] = json!({
+            "work_branch":"anvil/task_demo", "base_revision":"base",
+            "pull_request":{"provider":"github","repository":"example/repo","number":7},
+            "pr_head_sha":"head-current", "evaluation_sha":"head-stale",
+            "evaluation_kind":"head", "pr_state":"open", "required_checks":[]
+        });
+        source["observations"] = json!([
+            {"key":"delivery_complete","value":{"state":"merged","sha":"head-stale"},"provenance":"agent","expires_at":"2000-01-01T00:00:00Z"},
+            {"key":"delivery_complete","value":{"state":"merged","sha":"head-current"},"provenance":"external","expires_at":"2999-01-01T00:00:00Z"},
+            {"key":"review_state","value":{"state":"approved"},"provenance":"external","expires_at":"2999-01-01T00:00:00Z"}
+        ]);
+        let (snapshot, now) = frozen_v0::decode_snapshot(&source).unwrap();
+        let delivery = snapshot.delivery.as_ref().unwrap();
+        assert!(!delivery.check_policy_known);
+        assert!(
+            !delivery.review_state_known,
+            "canonical key/value facts need observer adaptation"
+        );
+        assert!(
+            !delivery.pr_merged,
+            "a merged-looking stale/agent observation is not merge proof"
+        );
+        assert!(snapshot.completion_evidence.is_empty());
+        assert_ne!(
+            delivery.pr_head_sha.as_deref(),
+            delivery.evaluation_sha.as_deref()
+        );
+        let mut authorized = snapshot;
+        authorized.action_history_availability = Some(ActionHistoryAvailability::Authoritative);
+        let decision = reconcile(&authorized, now);
+        assert_eq!(decision.rule_id, "review_state_unknown");
+        assert!(decision.desired_actions.is_empty());
+
+        source["observations"] = json!([
+            {"key":"delivery_complete","value":{"state":"merged","sha":"head-current"},"provenance":"external","expires_at":"2000-01-01T00:00:00Z"}
+        ]);
+        let (expired, _) = frozen_v0::decode_snapshot(&source).unwrap();
+        assert!(expired.completion_evidence.is_empty());
+        assert!(!completion_satisfied(&expired));
     }
 
     #[test]

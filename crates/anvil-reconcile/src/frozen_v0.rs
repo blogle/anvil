@@ -2,6 +2,7 @@
 //! Keep this at the boundary until ANVIL-55's serializer is merged and compatibility-tested.
 use crate::*;
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
 fn object<'a>(value: &'a Value, key: &str) -> Option<&'a Map<String, Value>> {
@@ -22,6 +23,29 @@ fn decode<T: DeserializeOwned>(value: Option<&Value>) -> Option<T> {
         .and_then(|raw| serde_json::from_value(raw).ok())
 }
 
+#[derive(Deserialize)]
+struct FrozenBudgetLimits {
+    max_attempts: u32,
+    max_continuations_per_reason: u32,
+    max_verifier_cycles: u32,
+    max_ci_retries: u32,
+    max_execution_seconds: u64,
+    #[serde(default)]
+    max_runtime_recoveries: Option<u32>,
+    #[serde(rename = "max_model_cost", default)]
+    _max_model_cost: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FrozenBudgetUsage {
+    attempts: u32,
+    continuations_by_reason: std::collections::BTreeMap<String, u32>,
+    ci_retries: u32,
+    verifier_cycles: u32,
+    execution_ms: u64,
+    #[serde(default)]
+    runtime_recoveries: u32,
+}
 /// Convert the exact pinned TaskSnapshot shape. Provider collection time and sequence remain in
 /// the source JSON for audit, while the kernel receives only semantic normalized facts.
 pub fn decode_snapshot(source: &Value) -> Result<(TaskSnapshot, LogicalTime), String> {
@@ -52,25 +76,40 @@ pub fn decode_snapshot(source: &Value) -> Result<(TaskSnapshot, LogicalTime), St
     let children = object(source, "children");
     let dependencies = object(source, "dependencies");
     let blocker = source.get("blocker").filter(|v| !v.is_null());
-    let action_history = decode_actions(source);
-    let budget_usage = decode_budget_usage(source);
-    let budget = source.get("budget");
-    let max_attempts = budget
-        .and_then(|b| b.get("max_attempts"))
-        .and_then(Value::as_u64)
-        .map(|n| n as u32);
-    let max_continuation = budget
-        .and_then(|b| b.get("max_continuations_per_reason"))
-        .and_then(Value::as_u64)
-        .map(|n| n as u32);
-    let max_ci_retries = budget
-        .and_then(|b| b.get("max_ci_retries"))
-        .and_then(Value::as_u64)
-        .map(|n| n as u32);
-    let max_execution_ms = budget
-        .and_then(|b| b.get("max_execution_seconds"))
-        .and_then(Value::as_u64)
-        .map(|n| n.saturating_mul(1000));
+    let action_history = decode_actions(source)?;
+    let last_consumed_evidence = string(source.pointer("/action_history/last_consumed_evidence"));
+    let action_history_availability = match source.pointer("/action_history/availability") {
+        Some(Value::String(value)) if value == "authoritative" => {
+            Some(ActionHistoryAvailability::Authoritative)
+        }
+        Some(Value::String(value)) if value == "unavailable" => {
+            Some(ActionHistoryAvailability::Unavailable)
+        }
+        _ => None,
+    };
+    let budget_usage: FrozenBudgetUsage = source
+        .get("budget_usage")
+        .cloned()
+        .ok_or("missing budget_usage")
+        .and_then(|value| {
+            serde_json::from_value(value).map_err(|_| "invalid typed budget_usage counters")
+        })?;
+    let limits: FrozenBudgetLimits = source
+        .pointer("/budget_usage/limits")
+        .ok_or("missing required typed budget_usage.limits")
+        .and_then(|limits_value| {
+            serde_json::from_value(limits_value.clone())
+                .map_err(|_| "invalid typed budget_usage.limits")
+        })?;
+    let max_attempts = Some(limits.max_attempts);
+    let max_continuation = Some(limits.max_continuations_per_reason);
+    let max_ci_retries = Some(limits.max_ci_retries);
+    let max_execution_ms = Some(
+        limits
+            .max_execution_seconds
+            .checked_mul(1000)
+            .ok_or("budget_usage.limits.max_execution_seconds overflows milliseconds")?,
+    );
     let mut max_continuations_by_reason = std::collections::BTreeMap::new();
     if let Some(limit) = max_continuation {
         max_continuations_by_reason.insert("checks_failed".into(), limit);
@@ -116,16 +155,25 @@ pub fn decode_snapshot(source: &Value) -> Result<(TaskSnapshot, LogicalTime), St
         unresolved_blocker: blocker.is_some_and(|b| !bool_value(b.get("resolved"))),
         runtime_health: runtime.0,
         runtime_failure_fingerprint: runtime.1,
-        max_runtime_recoveries: budget
-            .and_then(|b| b.get("max_runtime_recoveries"))
-            .and_then(Value::as_u64)
-            .map(|n| n as u32),
+        // Runtime recovery is not part of canonical TaskBudget yet. Until it is
+        // projected explicitly, fail closed rather than inventing a retry cap.
+        max_runtime_recoveries: Some(limits.max_runtime_recoveries.unwrap_or(0)),
         action_history,
+        action_history_availability,
+        last_consumed_evidence,
         workspace_fact_hash,
-        budget_usage,
+        budget_usage: BudgetUsage {
+            attempts: budget_usage.attempts,
+            continuations_by_reason: budget_usage.continuations_by_reason,
+            ci_retries: budget_usage.ci_retries,
+            verifier_cycles: budget_usage.verifier_cycles,
+            execution_ms: budget_usage.execution_ms,
+            runtime_recoveries: budget_usage.runtime_recoveries,
+        },
         max_attempts,
         max_continuations_by_reason,
         max_ci_retries,
+        max_verifier_cycles: Some(limits.max_verifier_cycles),
         max_execution_ms,
         retry_due_at_ms,
         merge_wait_due_at_ms,
@@ -162,10 +210,12 @@ fn decode_delivery(source: &Value) -> Result<Option<Delivery>, String> {
     }
     let checks_value = raw.get("required_checks");
     let required_checks = decode::<Vec<RequiredCheck>>(checks_value).unwrap_or_default();
+    // An empty canonical required_checks array can mean that the provider policy
+    // was not observed. Only the observer's explicit known bit grants authority.
     let check_policy_known = raw
         .get("required_check_policy_known")
         .and_then(Value::as_bool)
-        .unwrap_or(checks_value.is_some());
+        .unwrap_or(false);
     let pr_state = string(raw.get("pr_state"));
     Ok(Some(Delivery {
         work_branch: string(raw.get("work_branch")),
@@ -173,7 +223,10 @@ fn decode_delivery(source: &Value) -> Result<Option<Delivery>, String> {
         pr_head_sha: string(raw.get("pr_head_sha")),
         evaluation_sha: string(raw.get("evaluation_sha")),
         evaluation_kind: decode(raw.get("evaluation_kind")),
-        pr_merged: bool_value(raw.get("pr_merged")) || pr_state.as_deref() == Some("merged"),
+        // Canonical TaskDeliverySummary state is descriptive, not a merge-proof
+        // observation bound to this PR head. Only trusted observer output may set
+        // the explicit flag (and that adapter separately binds the SHA).
+        pr_merged: bool_value(raw.get("pr_merged")),
         pr_state,
         check_policy_known,
         unexpected_force_push: bool_value(raw.get("unexpected_force_push")),
@@ -246,35 +299,29 @@ fn decode_attempts(source: &Value) -> Result<Vec<Attempt>, String> {
         .collect()
 }
 
-fn decode_actions(source: &Value) -> Vec<PriorAction> {
-    source
-        .pointer("/action_history/relevant")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|raw| {
-            Some(PriorAction {
-                action_kind: decode(raw.get("action_kind"))?,
+fn decode_actions(source: &Value) -> Result<Vec<PriorAction>, String> {
+    let Some(values) = source.pointer("/action_history/relevant") else {
+        return Err("missing action_history.relevant".into());
+    };
+    let Some(values) = values.as_array() else {
+        return Err("invalid action_history.relevant".into());
+    };
+    values
+        .iter()
+        .map(|raw| {
+            Ok(PriorAction {
+                action_kind: decode(raw.get("action_kind")).ok_or("invalid action kind")?,
                 attempt_id: string(raw.get("attempt_id")),
-                cause_fingerprint: string(raw.get("cause_fingerprint"))?,
-                idempotency_key: string(raw.get("idempotency_key"))?,
-                state: decode(raw.get("state"))?,
+                cause_fingerprint: string(raw.get("cause_fingerprint"))
+                    .ok_or("missing action cause fingerprint")?,
+                idempotency_key: string(raw.get("idempotency_key"))
+                    .ok_or("missing action idempotency key")?,
+                state: decode(raw.get("state")).ok_or("invalid action state")?,
+                turn_id: string(raw.get("turn_id")),
+                generation: raw.get("generation").and_then(Value::as_u64),
             })
         })
         .collect()
-}
-
-fn decode_budget_usage(source: &Value) -> BudgetUsage {
-    let raw = source.get("budget_usage");
-    BudgetUsage {
-        attempts: number(raw.and_then(|v| v.get("attempts"))) as u32,
-        continuations_by_reason: decode(raw.and_then(|v| v.get("continuations_by_reason")))
-            .unwrap_or_default(),
-        ci_retries: number(raw.and_then(|v| v.get("ci_retries"))) as u32,
-        verifier_cycles: number(raw.and_then(|v| v.get("verifier_cycles"))) as u32,
-        execution_ms: number(raw.and_then(|v| v.get("execution_ms"))),
-        runtime_recoveries: number(raw.and_then(|v| v.get("runtime_recoveries"))) as u32,
-    }
 }
 
 fn decode_runtime_health(source: &Value) -> (Option<RuntimeHealth>, Option<String>) {
