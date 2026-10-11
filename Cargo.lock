@@ -94,6 +94,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "anvil-github-observer"
+version = "0.1.0"
+dependencies = [
+ "anvil-reconcile",
+ "httpmock",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "url",
+]
+
+[[package]]
 name = "anvil-mcp"
 version = "0.1.0"
 dependencies = [
@@ -110,6 +122,17 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "anvil-reconcile"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -141,6 +164,13 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "anvil-test-world"
+version = "0.1.0"
+dependencies = [
+ "anvil-reconcile",
 ]
 
 [[package]]
@@ -2384,6 +2414,7 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http 1.5.0",
