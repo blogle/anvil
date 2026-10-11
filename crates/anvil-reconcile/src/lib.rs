@@ -461,7 +461,10 @@ pub fn reconcile(s: &TaskSnapshot, now: LogicalTime) -> Decision {
         d.rule_id = "delivery_merged_observed".into();
         return d;
     }
-    if s.controller_mode != ControllerMode::Reconciler {
+    // Legacy remains the execution authority and is not shadow-evaluated here.
+    // Shadow deliberately runs the same pure rules as Reconciler; persistence
+    // keeps its proposals outside the executable action-intent ledger.
+    if s.controller_mode == ControllerMode::Legacy {
         d.rule_id = "controller_not_authorized".into();
         return d;
     }
@@ -806,25 +809,29 @@ fn completion_evidence_matches_binding(
 
 /// Canonical JSON for a snapshot, excluding polling time and collection churn.
 pub fn canonical_snapshot(snapshot: &Value) -> Value {
-    fn clean(v: &Value, key: Option<&str>) -> Value {
+    fn clean(v: &Value, key: Option<&str>, remove_volatile: bool) -> Value {
         match v {
             Value::Object(m) => Value::Object(
                 m.iter()
                     .filter(|(k, _)| {
-                        !matches!(
-                            k.as_str(),
-                            "logical_time_ms"
-                                | "recorded_at"
-                                | "collection_sequence"
-                                | "poll_timestamp"
-                                | "decision_audit"
-                        )
+                        !remove_volatile
+                            || !matches!(
+                                k.as_str(),
+                                "logical_time_ms"
+                                    | "recorded_at"
+                                    | "collection_sequence"
+                                    | "poll_timestamp"
+                                    | "decision_audit"
+                            )
                     })
-                    .map(|(k, v)| (k.clone(), clean(v, Some(k))))
+                    .map(|(k, v)| (k.clone(), clean(v, Some(k), remove_volatile)))
                     .collect(),
             ),
             Value::Array(a) => {
-                let mut values: Vec<_> = a.iter().map(|value| clean(value, None)).collect();
+                let mut values: Vec<_> = a
+                    .iter()
+                    .map(|value| clean(value, None, remove_volatile))
+                    .collect();
                 if matches!(
                     key,
                     Some(
@@ -844,7 +851,44 @@ pub fn canonical_snapshot(snapshot: &Value) -> Value {
             _ => v.clone(),
         }
     }
-    clean(snapshot, None)
+    clean(snapshot, None, true)
+}
+
+/// Canonically ordered, complete evaluated input retained for exact replay.
+/// Unlike the semantic hash projection, this preserves logical time and all
+/// volatile collection metadata that was present in the evaluated snapshot.
+pub fn canonical_evaluated_snapshot(snapshot: &Value) -> Value {
+    fn order_sets(value: &Value, key: Option<&str>) -> Value {
+        match value {
+            Value::Object(values) => Value::Object(
+                values
+                    .iter()
+                    .map(|(key, value)| (key.clone(), order_sets(value, Some(key))))
+                    .collect(),
+            ),
+            Value::Array(values) => {
+                let mut ordered: Vec<_> =
+                    values.iter().map(|value| order_sets(value, None)).collect();
+                if matches!(
+                    key,
+                    Some(
+                        "predecessors"
+                            | "relevant"
+                            | "continuation_fingerprints_sent"
+                            | "required_checks"
+                            | "grants"
+                    )
+                ) {
+                    ordered.sort_by_key(|value| {
+                        serde_json::to_string(value).expect("JSON value serializes")
+                    });
+                }
+                Value::Array(ordered)
+            }
+            _ => value.clone(),
+        }
+    }
+    order_sets(snapshot, None)
 }
 pub fn snapshot_hash(snapshot: &Value) -> String {
     digest(&serde_json::to_string(&canonical_snapshot(snapshot)).expect("JSON value serializes"))
@@ -871,7 +915,7 @@ pub struct DecisionRecord {
 }
 impl DecisionRecord {
     pub fn new(s: &TaskSnapshot, now: LogicalTime, source: &Value, d: &Decision) -> Self {
-        let snapshot = canonical_snapshot(source);
+        let snapshot = canonical_evaluated_snapshot(source);
         let actions = serde_json::to_value(&d.desired_actions).expect("actions serialize");
         Self {
             schema_version: 1,
@@ -1239,13 +1283,74 @@ pub mod outbox {
             expected_task_version: u64,
             decision: &DecisionRecord,
         ) -> rusqlite::Result<CommitResult> {
-            self.commit_inner(
-                task_id,
-                expected_generation,
-                decision,
-                &[],
-                Some(expected_task_version),
-            )
+            use rusqlite::{OptionalExtension, TransactionBehavior};
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let task_state: Option<(u64, String)> = tx
+                .query_row(
+                    "SELECT version,controller_mode FROM task_durable_state WHERE task_id=?1",
+                    [task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let generation: Option<u64> = tx
+                .query_row(
+                    "SELECT generation FROM reconcile_control WHERE task_id=?1",
+                    [task_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let generation = generation.unwrap_or(0);
+            if task_state != Some((expected_task_version, "shadow".into()))
+                || generation != expected_generation
+            {
+                return Ok(CommitResult::Conflict {
+                    actual_generation: generation,
+                });
+            }
+            let previous_decision: Option<String> = tx
+                .query_row(
+                    "SELECT record_json FROM reconcile_decisions WHERE task_id=?1 ORDER BY sequence DESC LIMIT 1",
+                    [task_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let unchanged = previous_decision
+                .and_then(|raw| serde_json::from_str::<DecisionRecord>(&raw).ok())
+                .is_some_and(|previous| {
+                    previous.snapshot_hash == decision.snapshot_hash
+                        && previous.actions_hash == decision.actions_hash
+                        && previous.rule_id == decision.rule_id
+                });
+            if unchanged {
+                return Ok(CommitResult::Unchanged { generation });
+            }
+            let sequence: u64 = tx.query_row(
+                "SELECT COALESCE(MAX(sequence),0)+1 FROM reconcile_decisions WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            let mut committed = decision.clone();
+            committed.generation = generation;
+            committed.decision_sequence = sequence;
+            tx.execute(
+                "INSERT INTO reconcile_decisions(task_id,sequence,generation,record_json) VALUES(?1,?2,?3,?4)",
+                rusqlite::params![task_id, sequence, generation, serde_json::to_string(&committed).expect("decision serializes")],
+            )?;
+            #[cfg(test)]
+            if failpoints::hit("reconcile.before_decision_commit") {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            tx.commit()?;
+            #[cfg(test)]
+            if failpoints::hit("reconcile.after_decision_commit") {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            Ok(CommitResult::Applied {
+                generation,
+                inserted: 0,
+            })
         }
         pub fn claim(
             &mut self,
@@ -1425,6 +1530,9 @@ pub mod outbox {
                 if matches!(
                     kind,
                     "checks_failed" | "merge_conflict" | "send_continuation"
+                ) && matches!(
+                    state.as_str(),
+                    "executing" | "succeeded" | "unknown_outcome"
                 ) {
                     continuations.insert(cause.to_owned());
                 }
@@ -1440,36 +1548,48 @@ pub mod outbox {
             }
             Ok(serde_json::json!({
                 "availability":"authoritative",
+                "coverage":"reconciler_outbox_only",
                 "relevant":relevant,
                 "continuation_fingerprints_sent":continuations.into_iter().collect::<Vec<_>>(),
                 "last_consumed_evidence":null
             }))
         }
 
-        pub fn decisions_json(
+        pub fn decision_page(
             &self,
             task_id: &str,
             after: u64,
             limit: usize,
-        ) -> rusqlite::Result<Vec<Value>> {
+        ) -> rusqlite::Result<(Vec<Value>, Option<u64>)> {
+            let page_size = limit.clamp(1, 100);
             let mut statement = self.connection.prepare(
-                "SELECT record_json FROM reconcile_decisions WHERE task_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3",
+                "SELECT sequence,record_json FROM reconcile_decisions WHERE task_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3",
             )?;
             let rows = statement.query_map(
-                rusqlite::params![task_id, after, limit.clamp(1, 100) as i64],
-                |row| row.get::<_, String>(0),
+                rusqlite::params![task_id, after, (page_size + 1) as i64],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
             )?;
-            rows.map(|row| {
-                let raw = row?;
-                serde_json::from_str(&raw).map_err(|error| {
+            let mut page = Vec::with_capacity(page_size);
+            let mut next = None;
+            for (index, row) in rows.enumerate() {
+                let (sequence, raw) = row?;
+                if index == page_size {
+                    next = page
+                        .last()
+                        .map(|(last_sequence, _): &(u64, Value)| *last_sequence);
+                    break;
+                }
+                let decision = serde_json::from_str(&raw).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        0,
+                        1,
                         rusqlite::types::Type::Text,
                         Box::new(error),
                     )
-                })
-            })
-            .collect()
+                })?;
+                page.push((sequence, decision));
+            }
+            let decisions = page.into_iter().map(|(_, decision)| decision).collect();
+            Ok((decisions, next))
         }
     }
 }
@@ -2825,12 +2945,19 @@ mod tests {
         assert_eq!(prior.state, ActionState::UnknownOutcome);
         assert_eq!(prior.turn_id.as_deref(), Some("turn-7"));
         assert_eq!(prior.generation, Some(3));
-        for mode in [ControllerMode::Legacy, ControllerMode::Shadow] {
-            let mut inert = decoded_unavailable.clone();
-            inert.controller_mode = mode;
-            assert_eq!(reconcile(&inert, now).rule_id, "controller_not_authorized");
-            assert!(reconcile(&inert, now).desired_actions.is_empty());
-        }
+        let mut legacy = decoded_unavailable.clone();
+        legacy.controller_mode = ControllerMode::Legacy;
+        assert_eq!(reconcile(&legacy, now).rule_id, "controller_not_authorized");
+        assert!(reconcile(&legacy, now).desired_actions.is_empty());
+        let mut shadow_history_unavailable = decoded_unavailable.clone();
+        shadow_history_unavailable.controller_mode = ControllerMode::Shadow;
+        assert_eq!(
+            reconcile(&shadow_history_unavailable, now).rule_id,
+            "action_history_unavailable"
+        );
+        assert!(reconcile(&shadow_history_unavailable, now)
+            .desired_actions
+            .is_empty());
 
         let mut authoritative = fresh_snapshot.clone();
         authoritative.action_history_availability = Some(ActionHistoryAvailability::Authoritative);
@@ -3158,48 +3285,134 @@ mod outbox_tests {
             store.action_history_json("t", 16).unwrap()["availability"],
             "authoritative"
         );
+        let history_action = |key: &str| {
+            let mut action = desired(key);
+            action.cause_fingerprint = format!("cause-{key}");
+            action
+        };
         store
-            .commit("t", 0, &record(), &[desired("history-key")])
+            .commit(
+                "t",
+                0,
+                &record(),
+                &[
+                    history_action("pending"),
+                    history_action("failed"),
+                    history_action("superseded"),
+                    history_action("executing"),
+                    history_action("succeeded"),
+                    history_action("unknown"),
+                ],
+            )
             .unwrap();
+        let setup = rusqlite::Connection::open(file.path()).unwrap();
+        setup.execute("UPDATE reconcile_actions SET state='failed' WHERE task_id='t' AND idempotency_key='failed'", []).unwrap();
+        setup.execute("UPDATE reconcile_actions SET state='superseded' WHERE task_id='t' AND idempotency_key='superseded'", []).unwrap();
+        setup.execute("UPDATE reconcile_actions SET state='executing' WHERE task_id='t' AND idempotency_key='executing'", []).unwrap();
+        setup.execute("UPDATE reconcile_actions SET state='succeeded' WHERE task_id='t' AND idempotency_key='succeeded'", []).unwrap();
+        setup.execute("UPDATE reconcile_actions SET state='unknown_outcome' WHERE task_id='t' AND idempotency_key='unknown'", []).unwrap();
+        drop(setup);
         let history = store.action_history_json("t", 16).unwrap();
-        assert_eq!(history["relevant"][0]["idempotency_key"], "history-key");
-        assert_eq!(history["relevant"][0]["state"], "pending");
+        assert_eq!(history["availability"], "authoritative");
+        assert_eq!(history["coverage"], "reconciler_outbox_only");
+        assert_eq!(
+            history["continuation_fingerprints_sent"],
+            json!(["cause-executing", "cause-succeeded", "cause-unknown"])
+        );
+        assert_eq!(history["relevant"].as_array().unwrap().len(), 6);
     }
 
     #[test]
-    fn shadow_proposals_are_durable_but_never_claimable_after_mode_transition() {
+    fn shadow_decision_only_write_preserves_existing_executable_intents() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut store = SqliteDecisionStore::open(file.path()).unwrap();
         let setup = rusqlite::Connection::open(file.path()).unwrap();
-        setup.execute_batch("CREATE TABLE task_durable_state(task_id TEXT PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO task_durable_state VALUES('t',1);").unwrap();
+        setup.execute_batch("CREATE TABLE task_durable_state(task_id TEXT PRIMARY KEY, version INTEGER NOT NULL, controller_mode TEXT NOT NULL); INSERT INTO task_durable_state VALUES('t',1,'shadow');").unwrap();
         drop(setup);
+        let executable_action = desired("existing-executable");
+        assert_eq!(
+            store
+                .commit("t", 0, &record(), std::slice::from_ref(&executable_action))
+                .unwrap(),
+            CommitResult::Applied {
+                generation: 1,
+                inserted: 1
+            }
+        );
         let mut decision = record();
         decision.canonical_actions_json = serde_json::to_value([desired("shadow-only")]).unwrap();
         decision.actions_hash = actions_hash(&[desired("shadow-only")]);
+        failpoints::arm("reconcile.before_decision_commit");
+        assert!(store.commit_shadow_decision("t", 1, 1, &decision).is_err());
+        assert_eq!(store.decision_count("t").unwrap(), 1);
+        assert_eq!(store.generation("t").unwrap(), Some(1));
         assert_eq!(
-            store.commit_shadow_decision("t", 0, 1, &decision).unwrap(),
+            store.action_state("t", "existing-executable").unwrap(),
+            Some(ActionState::Pending)
+        );
+        assert_eq!(
+            store.commit_shadow_decision("t", 1, 1, &decision).unwrap(),
             CommitResult::Applied {
-                generation: 0,
+                generation: 1,
                 inserted: 0
             }
         );
         assert_eq!(
             store
-                .decision_record("t", 1)
+                .decision_record("t", 2)
                 .unwrap()
                 .unwrap()
                 .canonical_actions_json[0]["idempotency_key"],
             "shadow-only"
         );
         assert_eq!(store.action_state("t", "shadow-only").unwrap(), None);
+        assert_eq!(
+            store.action_state("t", "existing-executable").unwrap(),
+            Some(ActionState::Pending)
+        );
         assert!(!store
-            .claim("t", "shadow-only", 0, ControllerMode::Reconciler, false)
+            .claim("t", "shadow-only", 1, ControllerMode::Reconciler, false)
             .unwrap());
         assert_eq!(
-            store.commit_shadow_decision("t", 0, 0, &decision).unwrap(),
+            store.commit_shadow_decision("t", 1, 0, &decision).unwrap(),
             CommitResult::Conflict {
-                actual_generation: 0
+                actual_generation: 1
             }
+        );
+        assert_eq!(store.generation("t").unwrap(), Some(1));
+        assert_eq!(store.decision_count("t").unwrap(), 2);
+        let setup = rusqlite::Connection::open(file.path()).unwrap();
+        let desired_keys: Vec<String> = {
+            let mut query = setup
+                .prepare("SELECT idempotency_key FROM reconcile_desired_actions WHERE task_id='t'")
+                .unwrap();
+            query
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(desired_keys, vec!["existing-executable"]);
+        setup
+            .execute(
+                "UPDATE task_durable_state SET controller_mode='legacy' WHERE task_id='t'",
+                [],
+            )
+            .unwrap();
+        let mut mode_changed_decision = decision;
+        mode_changed_decision.snapshot_hash = "new-shadow-evaluation".into();
+        assert_eq!(
+            store
+                .commit_shadow_decision("t", 1, 1, &mode_changed_decision)
+                .unwrap(),
+            CommitResult::Conflict {
+                actual_generation: 1
+            }
+        );
+        assert_eq!(store.decision_count("t").unwrap(), 2);
+        assert_eq!(
+            store.action_state("t", "existing-executable").unwrap(),
+            Some(ActionState::Pending)
         );
     }
 

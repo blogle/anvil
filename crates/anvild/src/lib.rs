@@ -329,6 +329,8 @@ pub enum ServiceError {
     Profile(String),
     #[error("session not found")]
     NotFound,
+    #[error("task not found")]
+    TaskNotFound,
     #[error("unauthorized")]
     Unauthorized,
     #[error("forbidden: {0}")]
@@ -357,7 +359,7 @@ impl IntoResponse for ServiceError {
             return (status, Json(json!({"error": error.diagnostic()}))).into_response();
         }
         let status = match &self {
-            ServiceError::NotFound => StatusCode::NOT_FOUND,
+            ServiceError::NotFound | ServiceError::TaskNotFound => StatusCode::NOT_FOUND,
             ServiceError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServiceError::Forbidden(_) => StatusCode::FORBIDDEN,
             ServiceError::Conflict(_) => StatusCode::CONFLICT,
@@ -3305,14 +3307,21 @@ async fn get_task_decisions(
     Path(id): Path<String>,
     Query(query): Query<DecisionQuery>,
 ) -> Result<Json<Value>, ServiceError> {
-    let decisions = anvil_reconcile::outbox::SqliteDecisionStore::open(&state.config.store_path)
-        .and_then(|store| {
-            store.decisions_json(&id, query.cursor.unwrap_or(0), query.limit.unwrap_or(50))
-        })
-        .map_err(|error| ServiceError::Store(error.to_string()))?;
-    let next = decisions
-        .last()
-        .and_then(|decision| decision["decision_sequence"].as_u64());
+    let task_exists = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .task_snapshot(&id, Utc::now().timestamp_millis())
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+        .is_some();
+    if !task_exists {
+        return Err(ServiceError::TaskNotFound);
+    }
+    let (decisions, next) =
+        anvil_reconcile::outbox::SqliteDecisionStore::open(&state.config.store_path)
+            .and_then(|store| {
+                store.decision_page(&id, query.cursor.unwrap_or(0), query.limit.unwrap_or(50))
+            })
+            .map_err(|error| ServiceError::Store(error.to_string()))?;
     Ok(Json(json!({"decisions":decisions,"next_cursor":next})))
 }
 
@@ -8060,6 +8069,281 @@ mod tests {
             .unwrap();
         let value = serde_json::from_slice(&body).unwrap();
         (status, value)
+    }
+
+    fn add_test_observation(database: &std::path::Path, task_id: &str, key: &str, value: &Value) {
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let now = Utc::now().to_rfc3339();
+        let id = format!("{task_id}:{key}");
+        connection.execute(
+            "INSERT INTO task_observations(id,task_id,key,value_json,provenance,observed_at,recorded_at,version,collection_seq,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?6,1,1,NULL)",
+            rusqlite::params![id, task_id, key, value.to_string(), if key.starts_with("runtime.") { "runtime" } else { "external" }, now],
+        ).unwrap();
+        connection
+            .execute(
+                "INSERT INTO task_observation_current(task_id,key,observation_id) VALUES(?1,?2,?3)",
+                rusqlite::params![task_id, key, id],
+            )
+            .unwrap();
+    }
+
+    fn accept_executable_task(store: &store::ControllerStore, task_id: &str) {
+        store
+            .accept_task(
+                &format!("{task_id}-key"),
+                "shadow-integration-test",
+                &json!({"task_id":task_id}),
+                task_id,
+                &json!({
+                    "outcome":"shadow integration",
+                    "execution_target":{
+                        "kind":"git_repository",
+                        "repository":"https://example.test/shadow.git",
+                        "base_ref":"main",
+                        "delivery":"pull_request"
+                    }
+                }),
+            )
+            .unwrap();
+        store.set_task_control(task_id, 1, false, "shadow").unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_shadow_sweeps_propose_and_replay_without_executable_effects() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("controller.sqlite3");
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = database.clone();
+        let state = AppState::new(config.clone(), FakeSandbox);
+        let task_store = state.store().unwrap();
+        accept_executable_task(task_store, "shadow-runnable");
+
+        accept_executable_task(task_store, "shadow-checks-failed");
+        task_store
+            .bind_task_delivery(
+                "shadow-checks-failed",
+                2,
+                Some("0123456789abcdef0123456789abcdef01234567"),
+                Some(&json!({"provider":"github","repository":"example/shadow","number":17})),
+            )
+            .unwrap();
+        let attempt = task_store
+            .create_attempt(
+                "shadow-checks-failed",
+                "attempt-shadow",
+                "attempt-shadow-key",
+            )
+            .unwrap()
+            .attempt;
+        task_store
+            .bind_attempt_session("attempt-shadow", "session-shadow")
+            .unwrap();
+        task_store
+            .set_attempt_state("attempt-shadow", "completed")
+            .unwrap();
+        add_test_observation(
+            &database,
+            "shadow-checks-failed",
+            "runtime.execution",
+            &json!({
+                "attempt_id":"attempt-shadow","health":"healthy","turn_state":"completed"
+            }),
+        );
+        add_test_observation(
+            &database,
+            "shadow-checks-failed",
+            "delivery.head",
+            &json!({"sha":"2222222222222222222222222222222222222222"}),
+        );
+        add_test_observation(
+            &database,
+            "shadow-checks-failed",
+            "delivery.pull_request",
+            &json!({
+                "state":"open","review_state_known":true,"changes_requested":false,"merged":false
+            }),
+        );
+        add_test_observation(
+            &database,
+            "shadow-checks-failed",
+            "delivery.checks",
+            &json!({
+                "evaluation_sha":"2222222222222222222222222222222222222222",
+                "evaluation_kind":"head","required_policy_known":true,
+                "required_checks":[{"context":"CI","source":"check_run","state":"failing","evaluation_sha":"2222222222222222222222222222222222222222","failure_fingerprint":"lint-failure"}]
+            }),
+        );
+        assert_eq!(attempt["attempt_id"], "attempt-shadow");
+
+        run_shadow_reconciliation_tick(&state).unwrap();
+        let outbox = anvil_reconcile::outbox::SqliteDecisionStore::open(&database).unwrap();
+        let runnable = outbox
+            .decision_record("shadow-runnable", 1)
+            .unwrap()
+            .unwrap();
+        let failed = outbox
+            .decision_record("shadow-checks-failed", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(runnable.rule_id, "task_runnable");
+        assert_eq!(
+            runnable.canonical_snapshot_json["controller_mode"],
+            "shadow"
+        );
+        assert_eq!(runnable.canonical_actions_json[0]["kind"], "create_attempt");
+        assert!(
+            failed.canonical_snapshot_json["delivery"]["review_state_known"]
+                .as_bool()
+                .unwrap()
+        );
+        assert_eq!(failed.rule_id, "required_checks_failing");
+        assert_eq!(failed.canonical_snapshot_json["controller_mode"], "shadow");
+        assert_eq!(failed.canonical_actions_json[0]["kind"], "checks_failed");
+        assert_eq!(
+            failed.canonical_actions_json[0]["attempt_id"],
+            "attempt-shadow"
+        );
+        assert_eq!(outbox.generation("shadow-runnable").unwrap(), None);
+        assert_eq!(outbox.generation("shadow-checks-failed").unwrap(), None);
+        assert_eq!(
+            outbox
+                .action_state(
+                    "shadow-runnable",
+                    runnable.canonical_actions_json[0]["idempotency_key"]
+                        .as_str()
+                        .unwrap()
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            outbox
+                .action_state(
+                    "shadow-checks-failed",
+                    failed.canonical_actions_json[0]["idempotency_key"]
+                        .as_str()
+                        .unwrap()
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            task_store
+                .attempts_for_task("shadow-runnable")
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            task_store
+                .attempts_for_task("shadow-checks-failed")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        for stored in [&runnable, &failed] {
+            let (snapshot, logical_time) =
+                anvil_reconcile::frozen_v0::decode_snapshot(&stored.canonical_snapshot_json)
+                    .unwrap();
+            let replay =
+                anvil_reconcile::replay(&snapshot, logical_time, &stored.reconciler_version)
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(replay.desired_actions).unwrap(),
+                stored.canonical_actions_json
+            );
+        }
+        run_shadow_reconciliation_tick(&state).unwrap();
+        assert_eq!(outbox.decision_count("shadow-runnable").unwrap(), 1);
+        assert_eq!(outbox.decision_count("shadow-checks-failed").unwrap(), 1);
+
+        drop(outbox);
+        drop(state);
+        let restarted = AppState::new(config, FakeSandbox);
+        run_shadow_reconciliation_tick(&restarted).unwrap();
+        let recovered = anvil_reconcile::outbox::SqliteDecisionStore::open(&database).unwrap();
+        assert_eq!(recovered.decision_count("shadow-runnable").unwrap(), 1);
+        assert_eq!(recovered.decision_count("shadow-checks-failed").unwrap(), 1);
+        assert_eq!(
+            recovered
+                .action_state(
+                    "shadow-checks-failed",
+                    failed.canonical_actions_json[0]["idempotency_key"]
+                        .as_str()
+                        .unwrap()
+                )
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn decisions_api_distinguishes_missing_tasks_and_pages_with_exclusive_cursors() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("controller.sqlite3");
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = database.clone();
+        let task_store = store::ControllerStore::open(&database).unwrap();
+        for (task_id, outcome) in [
+            ("decision-page", "has history"),
+            ("decision-empty", "no history"),
+        ] {
+            task_store
+                .accept_task(
+                    &format!("{task_id}-key"),
+                    "decisions-api-test",
+                    &json!({"task_id":task_id}),
+                    task_id,
+                    &json!({"outcome":outcome}),
+                )
+                .unwrap();
+        }
+        let mut outbox = anvil_reconcile::outbox::SqliteDecisionStore::open(&database).unwrap();
+        for sequence in 1..=3 {
+            let mut record = anvil_reconcile::DecisionRecord {
+                schema_version: 1,
+                reconciler_version: anvil_reconcile::RECONCILER_VERSION.into(),
+                task_id: "decision-page".into(),
+                task_version: 1,
+                snapshot_reconcile_generation: 0,
+                decision_sequence: 0,
+                generation: 0,
+                logical_time_ms: sequence,
+                snapshot_hash: format!("snapshot-{sequence}"),
+                actions_hash: anvil_reconcile::actions_hash(&[]),
+                rule_id: "waiting".into(),
+                canonical_snapshot_json: json!({"task_id":"decision-page","logical_time_ms":sequence}),
+                canonical_actions_json: json!([]),
+            };
+            record.logical_time_ms = sequence;
+            outbox.commit("decision-page", 0, &record, &[]).unwrap();
+        }
+        let app = router(AppState::new(config, FakeSandbox));
+        let (status, missing) = get_json(&app, "/v1/tasks/not-a-task/decisions").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["error"]["message"], "task not found");
+
+        let (status, empty) = get_json(&app, "/v1/tasks/decision-empty/decisions").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(empty, json!({"decisions":[],"next_cursor":null}));
+
+        let (status, first) = get_json(&app, "/v1/tasks/decision-page/decisions?limit=2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first["decisions"].as_array().unwrap().len(), 2);
+        assert_eq!(first["decisions"][0]["decision_sequence"], 1);
+        assert_eq!(first["decisions"][1]["decision_sequence"], 2);
+        assert_eq!(first["next_cursor"], 2);
+        let (status, second) =
+            get_json(&app, "/v1/tasks/decision-page/decisions?cursor=2&limit=2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(second["decisions"].as_array().unwrap().len(), 1);
+        assert_eq!(second["decisions"][0]["decision_sequence"], 3);
+        assert_eq!(second["next_cursor"], Value::Null);
+        let (status, exhausted) =
+            get_json(&app, "/v1/tasks/decision-page/decisions?cursor=3&limit=2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(exhausted, json!({"decisions":[],"next_cursor":null}));
     }
 
     #[tokio::test]

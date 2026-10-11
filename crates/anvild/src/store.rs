@@ -1650,7 +1650,21 @@ impl ControllerStore {
         let blocker: Option<Value> = tx.query_row("SELECT json_object('id',blocker_id,'attempt_id',attempt_id,'question',question,'context',context,'version',version) FROM task_blockers WHERE task_id=?1 AND resolution_json IS NULL",[task_id],|row|row.get::<_,String>(0)).optional()?.map(|v|serde_json::from_str(&v)).transpose()?;
         let observations: Vec<Value> = {
             let mut stmt=tx.prepare("SELECT o.id,o.key,o.value_json,o.provenance,o.observed_at,o.recorded_at,o.version,o.collection_seq,o.expires_at FROM task_observation_current c JOIN task_observations o ON o.id=c.observation_id WHERE c.task_id=?1 ORDER BY o.key LIMIT 128")?;
-            let rows = stmt.query_map([task_id],|row|Ok(serde_json::json!({"id":row.get::<_,String>(0)?,"key":row.get::<_,String>(1)?,"value":serde_json::from_str::<Value>(&row.get::<_,String>(2)?).unwrap_or(Value::Null),"provenance":row.get::<_,String>(3)?,"observed_at":row.get::<_,String>(4)?,"recorded_at":row.get::<_,String>(5)?,"version":row.get::<_,i64>(6)?,"collection_seq":row.get::<_,i64>(7)?,"expires_at":row.get::<_,Option<String>>(8)?})))?.collect::<Result<_,_>>()?;
+            let rows = stmt.query_map([task_id], |row| {
+                let expires_at: Option<String> = row.get(8)?;
+                let fresh = match expires_at.as_deref() {
+                    None => true,
+                    Some(value) => chrono::DateTime::parse_from_rfc3339(value)
+                        .is_ok_and(|expiry| expiry.timestamp_millis() > logical_time),
+                };
+                Ok(serde_json::json!({
+                    "id":row.get::<_,String>(0)?,"key":row.get::<_,String>(1)?,
+                    "value":serde_json::from_str::<Value>(&row.get::<_,String>(2)?).unwrap_or(Value::Null),
+                    "provenance":row.get::<_,String>(3)?,"observed_at":row.get::<_,String>(4)?,
+                    "recorded_at":row.get::<_,String>(5)?,"version":row.get::<_,i64>(6)?,
+                    "collection_seq":row.get::<_,i64>(7)?,"expires_at":expires_at,"fresh":fresh
+                }))
+            })?.collect::<Result<_,_>>()?;
             rows
         };
         let attempt_count: i64 = tx.query_row(
@@ -1721,6 +1735,7 @@ impl ControllerStore {
         let pr_head_sha =
             observed_head.and_then(|value| value["sha"].as_str().or_else(|| value.as_str()));
         let checks = observation_value("delivery.checks");
+        let pull_request_facts = observation_value("delivery.pull_request");
         let pull_request = control
             .10
             .as_deref()
@@ -1763,6 +1778,7 @@ impl ControllerStore {
                             "source": check["source"].as_str().unwrap_or("check_run"),
                             "state": state,
                             "evaluation_sha": check["evaluation_sha"].as_str().or(evaluation_sha).unwrap_or_default(),
+                            "failure_fingerprint": check["failure_fingerprint"].as_str(),
                         })
                     })
                     .collect::<Vec<_>>()
@@ -1793,7 +1809,7 @@ impl ControllerStore {
             "schema_version":1,"task_id":task_id,"task_version":control.0,"logical_time_ms":logical_time,
             "lifecycle":lifecycle,"completion_policy":serde_json::from_str::<Value>(&control.4)?,
             "operator_hold":control.1,"controller_mode":controller_mode,"reconcile_generation":control.3,
-            "execution_target":execution_target,"delivery":{"work_branch":control.9,"pull_request":pull_request.clone(),"base_revision":control.11,"pr_head_sha":pr_head_sha,"evaluation_sha":evaluation_sha,"evaluation_kind":evaluation_kind,"pr_state":pull_request.as_ref().and_then(|value|value["state"].as_str()),"required_checks":required_checks},
+            "execution_target":execution_target,"delivery":{"work_branch":control.9,"pull_request":pull_request.clone(),"base_revision":control.11,"pr_head_sha":pr_head_sha,"evaluation_sha":evaluation_sha,"evaluation_kind":evaluation_kind,"pr_state":pull_request_facts.and_then(|value|value["state"].as_str()).or_else(||pull_request.as_ref().and_then(|value|value["state"].as_str())),"required_checks":required_checks,"required_check_policy_known":checks.and_then(|value|value["required_policy_known"].as_bool()).unwrap_or(false),"review_state_known":pull_request_facts.and_then(|value|value["review_state_known"].as_bool()).unwrap_or(false),"changes_requested":pull_request_facts.and_then(|value|value["changes_requested"].as_bool()).unwrap_or(false),"pr_merged":pull_request_facts.and_then(|value|value["merged"].as_bool()).unwrap_or(false)},
             "dependencies":{"all_completed":!dependencies_unresolved,"predecessors":dependencies},"children":{"total":children.len(),"completed":children.iter().filter(|c|c["state"]=="completed").count(),"terminal_noncompleted":children.iter().filter(|c|c["state"]!="completed"&&matches!(c["state"].as_str(),Some("canceled"|"obviated"|"superseded"|"failed_exhausted"))).count()},
             "attempts":attempts,"blocker":blocker,"observations":observations,
             "action_history":{"recent":[]},"budget_usage":{"attempt_count":attempt_count,"grants":serde_json::from_str::<Value>(&grants)?,"spec":serde_json::from_str::<Value>(&control.5)?},
