@@ -3557,10 +3557,7 @@ async fn refresh_github_pull_request(s: &AppState, id: &str) -> Result<(), Servi
                     .map(str::to_owned)
             })
     } else {
-        session
-            .current_branch
-            .clone()
-            .or_else(|| Some(session.work_branch.clone()))
+        session.current_branch.clone()
     }
     .filter(|branch| !branch.trim().is_empty());
     let Some(branch) = branch else {
