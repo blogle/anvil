@@ -1,4 +1,4 @@
-{ pkgs, craneLib, opencode, nix2containerPkgs, repoRoot }:
+{ pkgs, craneLib, opencodePackage, nix2containerPkgs, repoRoot }:
 
 let
   browserFontsConf = pkgs.makeFontsConf {
@@ -161,7 +161,7 @@ let
       pkgs.process-compose pkgs.watchexec nix2containerPkgs.skopeo-nix2container pkgs.umoci pkgs.crun pkgs.kind pkgs.util-linux
       opencode.packages.${pkgs.system}.default
     ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
-      pkgs.chromium pkgs.fontconfig pkgs.dejavu_fonts
+      pkgs.chromium
     ];
     shellHook = ''
       export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$PWD/target}"
