@@ -6257,7 +6257,7 @@ fn activity_redaction_patterns() -> &'static [Regex; 5] {
                 r#"(?i)((?:set-cookie|cookie)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,\"']+)"#,
             )
                 .expect("valid cookie-header redaction regex"),
-            Regex::new(r#"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@(?=[^/\s]+)"#)
+            Regex::new(r#"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@"#)
                 .expect("valid URL userinfo redaction regex"),
         ]
     })
@@ -10998,6 +10998,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut lifecycle = (0..600)
             .map(|index| LifecycleEvent {
+                id: format!("lifecycle:{index}"),
                 kind: "transition".into(),
                 at: format!("2026-01-01T00:{:02}:{:02}Z", index / 60, index % 60),
                 detail: Some(index.to_string()),
