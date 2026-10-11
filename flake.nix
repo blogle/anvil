@@ -10,9 +10,11 @@
     nix2container.url = "github:Dauliac/nix2container/8fd02c842686a528fd37508283853de0ed1462b1";
     nix2containerNixpkgs.follows = "nix2container/nixpkgs";
     opencode.url = "github:anomalyco/opencode/9b4ec5714d481559990db0a816d5dec19541a814";
+    sdlc.url = "github:blogle/sdlc/v1.2.4";
+    sdlc.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode }:
+  outputs = { self, nixpkgs, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode, sdlc }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
@@ -52,6 +54,9 @@
         images = import ./nix/images.nix {
           inherit pkgs rust frontend;
         };
+        ci = sdlc.lib.mkConsumer {
+          contract = import ./ci.nix { inherit self system; };
+        };
       in
       {
         packages.default = images.anvilImage;
@@ -82,7 +87,14 @@
         checks = rust.checks // {
           inherit frontend;
           crateFixtureSource = rust.fixtureSourceSmoke;
+          sdlc-stage-contract = pkgs.runCommand "anvil-sdlc-stage-contract" {
+            buildInputs = [ pkgs.jq ];
+          } ''
+            test "${sdlc.rev or "unknown"}" != ""
+            jq -n --arg sdlc "${sdlc.rev or "unknown"}" '{schema: 1, sdlc: $sdlc}' > "$out"
+          '';
         };
+        hydraJobs = ci.hydraJobs;
         devShells.default = rust.devShell;
         # Kind already validates Rust in the independent local-first job. This
         # shell keeps the shared-daemon contract focused on environment entry

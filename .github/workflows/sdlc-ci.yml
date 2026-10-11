@@ -1,0 +1,20 @@
+name: SDLC CI
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  pr-fast:
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
+    uses: blogle/sdlc/.github/workflows/pr-fast.yml@v1.2.4
+
+  candidate:
+    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    uses: blogle/sdlc/.github/workflows/candidate.yml@v1.2.4

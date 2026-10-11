@@ -120,3 +120,16 @@ ci:
     just check
     just nix-check
     just build-ci-release
+
+# The SDLC publisher supplies identity context and a JSON map of immutable
+# candidate digests. This hook never rebuilds or pushes images by itself.
+release-publish version:
+    test "{{version}}" = "${SDLC_RELEASE_VERSION}"
+    test "${SDLC_RELEASE_VERSION}" =~ '^[0-9]+\.[0-9]+\.[0-9]+$'
+    test -n "${SDLC_RELEASE_MERGED_SHA}"
+    test -n "${SDLC_RELEASE_SOURCE_SHA}"
+    test -n "${SDLC_RELEASE_RECEIPTS}"
+    test -f "${ANVIL_RELEASE_IMAGE_DIGESTS}"
+    jq -e 'type == "object" and (. as $digests | ["anvil", "anvil-sandbox", "anvil-nix-daemon"] | all(.[] as $name | ($digests[$name] | type == "string" and test("^sha256:[0-9a-f]{64}$"))))' "${ANVIL_RELEASE_IMAGE_DIGESTS}" >/dev/null
+    mkdir -p "$(dirname "${SDLC_RELEASE_RECEIPTS}")"
+    jq -n --arg version "${SDLC_RELEASE_VERSION}" --arg merged "${SDLC_RELEASE_MERGED_SHA}" --arg source "${SDLC_RELEASE_SOURCE_SHA}" --slurpfile digests "${ANVIL_RELEASE_IMAGE_DIGESTS}" '{schema: 1, artifacts: [{name: "anvil", image: "ghcr.io/blogle/anvil", digest: $digests[0].anvil, version: $version, merged_sha: $merged, source_main_sha: $source}, {name: "anvil-sandbox", image: "ghcr.io/blogle/anvil-sandbox", digest: $digests[0]."anvil-sandbox", version: $version, merged_sha: $merged, source_main_sha: $source}, {name: "anvil-nix-daemon", image: "ghcr.io/blogle/anvil-nix-daemon", digest: $digests[0]."anvil-nix-daemon", version: $version, merged_sha: $merged, source_main_sha: $source}]}' > "${SDLC_RELEASE_RECEIPTS}"

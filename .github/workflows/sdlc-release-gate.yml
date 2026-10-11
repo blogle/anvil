@@ -1,0 +1,21 @@
+name: SDLC release gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_run:
+    workflows: [SDLC CI]
+    types: [completed]
+
+permissions:
+  contents: read
+  checks: read
+  pull-requests: read
+
+jobs:
+  gate:
+    if: vars.SDLC_RELEASE_ACTIVATE == 'true'
+    uses: blogle/sdlc/.github/workflows/release-gate.yml@v1.2.4
+    with:
+      sdlc_ref: github:blogle/sdlc/v1.2.4
+    secrets: inherit

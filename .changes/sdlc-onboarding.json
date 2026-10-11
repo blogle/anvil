@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "Adopt policy-gated SDLC CI and rolling SemVer release contracts"
+}

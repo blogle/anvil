@@ -1,0 +1,40 @@
+name: SDLC policy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  policy:
+    uses: blogle/sdlc/.github/workflows/policy-check.yml@v1.2.4
+
+  gate:
+    name: sdlc / policy
+    if: always()
+    needs: policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require shared policy validation
+        env:
+          POLICY_RESULT: ${{ needs.policy.result }}
+        run: test "$POLICY_RESULT" = success
+      - name: Require the live canonical ruleset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          rulesets="$(gh api "repos/${REPOSITORY}/rulesets?includes_parents=true" --paginate)"
+          jq -e --arg repo "$REPOSITORY" '
+            [ .[] | select(.name == "SDLC default branch" and (.source // $repo) == $repo and .enforcement == "active") ] | length == 1
+          ' <<<"$rulesets" >/dev/null || {
+            echo 'canonical SDLC ruleset is absent; this intentional onboarding failure is read-only' >&2
+            echo 'user action: nix develop -c sdlc policy plan --repo '"$REPOSITORY" >&2
+            echo 'then: nix develop -c sdlc policy apply --repo '"$REPOSITORY" >&2
+            exit 1
+          }
