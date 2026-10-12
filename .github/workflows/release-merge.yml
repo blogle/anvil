@@ -7,9 +7,10 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  packages: write
   checks: read
-  pull-requests: read
+  pull-requests: write
 
 jobs:
   merge:
