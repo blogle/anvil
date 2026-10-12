@@ -4,6 +4,10 @@ metadata:
   name: anvild
 spec:
   replicas: 1
+  # anvild owns exclusive SQLite startup migrations/VACUUM on its PVC. A rolling
+  # surge could overlap old and new writers, so stop the old pod before starting one.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: anvild
@@ -30,6 +34,14 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          # The first startup compacts the legacy controller DB before binding HTTP.
+          # At the existing 500m CPU limit, allow one hour for pruning/VACUUM on the
+          # 26 GiB incident database; liveness/readiness start after /healthz succeeds.
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 360
           readinessProbe:
             httpGet: { path: /readyz, port: http }
           livenessProbe:

@@ -74,8 +74,34 @@ if [ "$(grep -Fc 'tests/nix-daemon-smoke.sh' "$repo_root/.github/workflows/image
 fi
 
 if command -v kustomize >/dev/null 2>&1; then
+  assert_migration_startup_probe() {
+    local rendered="$1"
+    local target="$2"
+    grep -Fq 'startupProbe:' <<<"$rendered" || {
+      printf 'manifest-security: %s is missing the migration startupProbe\n' "$target" >&2
+      exit 1
+    }
+    grep -Fq 'failureThreshold: 360' <<<"$rendered" || {
+      printf 'manifest-security: %s migration startupProbe budget changed\n' "$target" >&2
+      exit 1
+    }
+    grep -Fq 'periodSeconds: 10' <<<"$rendered"
+    grep -Fq 'timeoutSeconds: 5' <<<"$rendered"
+    grep -Fq 'livenessProbe:' <<<"$rendered" || {
+      printf 'manifest-security: %s lost livenessProbe while adding startupProbe\n' "$target" >&2
+      exit 1
+    }
+    grep -Fq 'readinessProbe:' <<<"$rendered" || {
+      printf 'manifest-security: %s lost readinessProbe while adding startupProbe\n' "$target" >&2
+      exit 1
+    }
+  }
+
+  base_rendered="$(kustomize build "$repo_root/k8s/base")"
+  assert_migration_startup_probe "$base_rendered" 'k8s/base'
   for overlay in dev kind; do
     rendered="$(kustomize build "$repo_root/k8s/overlays/$overlay")"
+    assert_migration_startup_probe "$rendered" "k8s/overlays/$overlay"
     pvc_count="$(grep -Ec '^  name: anvil-nix-shared$' <<<"$rendered" || true)"
     if [ "$pvc_count" -ne 1 ]; then
       printf 'manifest-security: %s must declare exactly one canonical Nix PVC (got %s)\n' "$overlay" "$pvc_count" >&2
