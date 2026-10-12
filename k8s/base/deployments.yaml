@@ -34,6 +34,14 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          # The first startup compacts the legacy controller DB before binding HTTP.
+          # At the existing 500m CPU limit, allow one hour for pruning/VACUUM on the
+          # 26 GiB incident database; liveness/readiness start after /healthz succeeds.
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 360
           readinessProbe:
             httpGet: { path: /readyz, port: http }
           livenessProbe:

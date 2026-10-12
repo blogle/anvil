@@ -19,6 +19,18 @@ the process stops after replacement but before the marker, the next startup vali
 capped database and records completion without repeating `VACUUM INTO`. No recurring
 compaction runs after the marker is committed.
 
+`main` constructs `AppState` (which synchronously opens/migrates the store), awaits
+`state.initialize()`, and only then binds the HTTP listener. The `anvild` Deployment's
+startupProbe polls `/healthz` every 10 seconds with a 5-second timeout and a 360-failure
+budget (60 minutes). Kubernetes suppresses the existing liveness and readiness probes
+until the startupProbe succeeds; those probes remain enabled afterward. The hour budget
+is intentionally generous for the 26 GiB legacy file on the existing 500m CPU limit: the
+measured 294.0 MiB synthetic fixture completed prune/checkpoint, staged `VACUUM INTO`, and
+verification in 1.501 seconds. Linear scaling by file size is about 2.3 minutes; scaling
+by row count (2.7M versus 24K fixture rows) is about 2.8 minutes, leaving more than 20x
+margin for slower storage, CPU throttling, and the larger production indexes. A timeout
+still restarts safely from committed prune batches and the atomic staged-file boundary.
+
 ## Capacity and expected size
 
 `VACUUM INTO` requires scratch space for the compacted live database; the source remains

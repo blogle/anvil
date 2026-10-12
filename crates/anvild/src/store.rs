@@ -183,20 +183,25 @@ impl ControllerStore {
             connection.execute_batch(
                 "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
             )?;
+            startup_compaction_stage_hook(CompactionStage::WalOpened)?;
         }
         if !completed_before_open || replaced {
-            if let Err(error) = validate_controller_database(&connection) {
+            if let Err(error) = validate_startup_database(&connection, replaced) {
                 let backup_path = compaction_backup_path(path);
                 if backup_path.exists() {
                     drop(connection);
                     fs::rename(&backup_path, path)?;
+                    sync_parent_directory(path)?;
+                    startup_compaction_stage_hook(CompactionStage::RollbackRestored)?;
                     return Err(error);
                 }
                 return Err(error);
             }
             mark_change_compaction_complete(&mut connection)?;
+            startup_compaction_stage_hook(CompactionStage::MarkerCommitted)?;
         }
         remove_compaction_backup(path)?;
+        startup_compaction_stage_hook(CompactionStage::BackupRemoved)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
@@ -2856,16 +2861,51 @@ fn read_change_high_watermark(connection: &Connection) -> Result<i64, rusqlite::
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompactionStage {
     PruneBatch,
-    VacuumComplete,
+    StagedFileSynced,
+    BackupLinked,
+    DatabaseRenamed,
+    DirectorySynced,
     Validated,
-    ReplacementInstalled,
+    WalOpened,
+    MarkerCommitted,
+    BackupRemoved,
+    RollbackRestored,
 }
 
 fn compact_change_history_once(
     connection: &mut Connection,
     database_path: &Path,
 ) -> Result<bool, StoreError> {
-    compact_change_history_once_with(connection, database_path, |_| Ok(()))
+    compact_change_history_once_with(connection, database_path, startup_compaction_stage_hook)
+}
+
+fn startup_compaction_stage_hook(stage: CompactionStage) -> Result<(), StoreError> {
+    #[cfg(test)]
+    if std::env::var("ANVIL_TEST_COMPACTION_CRASH_AT")
+        .ok()
+        .as_deref()
+        == Some(compaction_stage_name(stage))
+    {
+        std::process::exit(86);
+    }
+    let _ = stage;
+    Ok(())
+}
+
+#[cfg(test)]
+fn compaction_stage_name(stage: CompactionStage) -> &'static str {
+    match stage {
+        CompactionStage::PruneBatch => "prune_batch",
+        CompactionStage::StagedFileSynced => "staged_file_synced",
+        CompactionStage::BackupLinked => "backup_linked",
+        CompactionStage::DatabaseRenamed => "database_renamed",
+        CompactionStage::DirectorySynced => "directory_synced",
+        CompactionStage::Validated => "validated",
+        CompactionStage::WalOpened => "wal_opened",
+        CompactionStage::MarkerCommitted => "marker_committed",
+        CompactionStage::BackupRemoved => "backup_removed",
+        CompactionStage::RollbackRestored => "rollback_restored",
+    }
 }
 
 fn compact_change_history_once_with(
@@ -2962,7 +3002,7 @@ fn compact_change_history_once_with(
                 .read(true)
                 .open(&staging_path)?
                 .sync_all()?;
-            stage_hook(CompactionStage::VacuumComplete)?;
+            stage_hook(CompactionStage::StagedFileSynced)?;
             // Atomic replacement means the old database remains authoritative until the
             // fully verified compacted file is ready. A crash after rename is recovered on
             // next startup: the empty freelist and capped row count skip another VACUUM.
@@ -2971,15 +3011,17 @@ fn compact_change_history_once_with(
                 fs::remove_file(&backup_path)?;
             }
             fs::hard_link(database_path, &backup_path)?;
+            stage_hook(CompactionStage::BackupLinked)?;
             fs::rename(&staging_path, database_path)?;
+            stage_hook(CompactionStage::DatabaseRenamed)?;
             if let Some(parent) = database_path
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
             {
                 fs::File::open(parent)?.sync_all()?;
             }
+            stage_hook(CompactionStage::DirectorySynced)?;
             replaced = true;
-            stage_hook(CompactionStage::ReplacementInstalled)?;
         }
     }
 
@@ -2992,6 +3034,16 @@ fn compact_change_history_once_with(
     })?;
     stage_hook(CompactionStage::Validated)?;
     Ok(false)
+}
+
+fn validate_startup_database(connection: &Connection, _replaced: bool) -> Result<(), StoreError> {
+    #[cfg(test)]
+    if _replaced && std::env::var_os("ANVIL_TEST_COMPACTION_FAIL_VALIDATION").is_some() {
+        return Err(StoreError::Scheduler(
+            "injected post-replacement verification failure".into(),
+        ));
+    }
+    validate_controller_database(connection)
 }
 
 fn change_compaction_complete(connection: &Connection) -> Result<bool, rusqlite::Error> {
@@ -3061,6 +3113,16 @@ fn mark_change_compaction_complete(connection: &mut Connection) -> Result<(), St
         params![CHANGE_COMPACTION_MARKER, chrono::Utc::now().to_rfc3339()],
     )?;
     tx.commit()?;
+    Ok(())
+}
+
+fn sync_parent_directory(database_path: &Path) -> Result<(), StoreError> {
+    if let Some(parent) = database_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -5838,9 +5900,14 @@ mod tests {
             before > 250 * 1024 * 1024,
             "fixture too small: {before} bytes"
         );
+        let compaction_started = std::time::Instant::now();
         let compacted = ControllerStore::open(&path).unwrap();
+        let elapsed = compaction_started.elapsed();
         let after = fs::metadata(&path).unwrap().len();
-        println!("synthetic controller DB compaction: {before} -> {after} bytes");
+        println!(
+            "synthetic controller DB compaction: {before} -> {after} bytes in {:.3}s",
+            elapsed.as_secs_f64()
+        );
         assert!(
             after < 1024 * 1024 * 1024,
             "compacted DB exceeds 1 GiB: {after} bytes"
@@ -5976,7 +6043,7 @@ mod tests {
         }
         let interrupted_after_vacuum =
             compact_change_history_once_with(&mut connection, &path, |stage| {
-                if stage == CompactionStage::ReplacementInstalled {
+                if stage == CompactionStage::DatabaseRenamed {
                     Err(StoreError::Sqlite(rusqlite::Error::InvalidQuery))
                 } else {
                     Ok(())
@@ -6034,6 +6101,151 @@ mod tests {
                 .unwrap()
                 .reset_required
         );
+    }
+
+    #[test]
+    fn process_crash_child_for_startup_compaction() {
+        let Ok(_stage) = std::env::var("ANVIL_TEST_COMPACTION_CRASH_AT") else {
+            return;
+        };
+        let path = std::env::var("ANVIL_TEST_COMPACTION_DB").unwrap();
+        let _ = ControllerStore::open(path).unwrap();
+        panic!("configured compaction crash boundary was not reached");
+    }
+
+    fn add_compaction_freelist(path: &Path) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE compaction_test_pages(payload TEXT NOT NULL);")
+            .unwrap();
+        {
+            let tx = connection.unchecked_transaction().unwrap();
+            {
+                let mut insert = tx
+                    .prepare("INSERT INTO compaction_test_pages(payload) VALUES(?1)")
+                    .unwrap();
+                let payload = "x".repeat(16 * 1024);
+                for _ in 0..64 {
+                    insert.execute([&payload]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        connection
+            .execute_batch("DROP TABLE compaction_test_pages;")
+            .unwrap();
+        let freelist: i64 = connection
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .unwrap();
+        assert!(freelist > 0, "fixture must force a physical rebuild");
+    }
+
+    fn prepare_compaction_crash_fixture(path: &Path, initial: bool, add_freelist: bool) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute(
+                "DELETE FROM controller_maintenance WHERE maintenance_key=?1",
+                [CHANGE_COMPACTION_MARKER],
+            )
+            .unwrap();
+        if initial {
+            let tx = connection.unchecked_transaction().unwrap();
+            {
+                let mut insert = tx
+                    .prepare("INSERT INTO orchestration_changes(sequence,resource_type,resource_id,payload_json) VALUES(?1,'session','crash-fixture','{}')")
+                    .unwrap();
+                for sequence in 1..=CHANGE_RETENTION_LIMIT + 1 {
+                    insert.execute([sequence]).unwrap();
+                }
+            }
+            tx.execute(
+                "UPDATE orchestration_change_retention SET high_watermark=?1 WHERE singleton=1",
+                [CHANGE_RETENTION_LIMIT + 1],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        drop(connection);
+        if add_freelist {
+            add_compaction_freelist(path);
+        }
+    }
+
+    #[test]
+    fn process_crashes_at_each_compaction_filesystem_boundary_recover() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("compaction-crash.sqlite3");
+        drop(ControllerStore::open(&path).unwrap());
+
+        let stages = [
+            ("prune_batch", true, false, true),
+            ("staged_file_synced", false, false, true),
+            ("backup_linked", false, false, true),
+            ("database_renamed", false, false, true),
+            ("directory_synced", false, false, true),
+            ("wal_opened", false, false, true),
+            ("validated", false, false, false),
+            ("marker_committed", false, false, true),
+            ("backup_removed", false, false, true),
+            ("rollback_restored", false, true, true),
+        ];
+        for (stage, initial, force_rollback, add_freelist) in stages {
+            prepare_compaction_crash_fixture(&path, initial, add_freelist);
+            #[cfg(unix)]
+            let source_inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&path).unwrap());
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "store::tests::process_crash_child_for_startup_compaction",
+                ])
+                .env("ANVIL_TEST_COMPACTION_CRASH_AT", stage)
+                .env("ANVIL_TEST_COMPACTION_DB", &path);
+            if force_rollback {
+                command.env("ANVIL_TEST_COMPACTION_FAIL_VALIDATION", "1");
+            }
+            let status = command.status().unwrap();
+            assert_eq!(status.code(), Some(86), "crash boundary {stage}");
+            #[cfg(unix)]
+            if stage == "rollback_restored" {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(
+                    fs::metadata(&path).unwrap().ino(),
+                    source_inode,
+                    "rollback must restore the original database inode"
+                );
+            }
+
+            let recovered = ControllerStore::open(&path).unwrap();
+            let (cursor, _) = recovered.materialized_snapshot().unwrap();
+            assert_eq!(cursor, format!("anv1.{}", CHANGE_RETENTION_LIMIT + 1));
+            let rows: i64 = recovered
+                .connection
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM orchestration_changes", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, CHANGE_RETENTION_LIMIT, "recovered at {stage}");
+            assert!(
+                recovered
+                    .changes_after("anv1.0", 100)
+                    .unwrap()
+                    .reset_required,
+                "expired cursor must reset after {stage}"
+            );
+            assert!(
+                !compaction_staging_path(&path).exists(),
+                "staging file after {stage}"
+            );
+            assert!(
+                !compaction_backup_path(&path).exists(),
+                "backup file after {stage}"
+            );
+            validate_controller_database(&recovered.connection.lock().unwrap()).unwrap();
+            drop(recovered);
+        }
     }
 
     #[test]
