@@ -1587,11 +1587,48 @@ impl ControllerStore {
         task_id: &str,
         logical_time: i64,
     ) -> Result<Option<Value>, StoreError> {
+        self.build_task_snapshot(task_id, logical_time, false)
+    }
+
+    /// Build the canonical reconciler snapshot and its outbox history from the
+    /// same SQLite read transaction. A missing/unreadable outbox is an error, not
+    /// an authoritative empty action set.
+    pub fn task_reconciliation_snapshot(
+        &self,
+        task_id: &str,
+        logical_time: i64,
+    ) -> Result<Option<Value>, StoreError> {
+        self.build_task_snapshot(task_id, logical_time, true)
+    }
+
+    fn build_task_snapshot(
+        &self,
+        task_id: &str,
+        logical_time: i64,
+        include_action_history: bool,
+    ) -> Result<Option<Value>, StoreError> {
         let mut connection = self
             .connection
             .lock()
             .expect("controller store lock poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let snapshot = self.build_task_snapshot_in_transaction(
+            &tx,
+            task_id,
+            logical_time,
+            include_action_history,
+        )?;
+        tx.commit()?;
+        Ok(snapshot)
+    }
+
+    fn build_task_snapshot_in_transaction(
+        &self,
+        tx: &Transaction<'_>,
+        task_id: &str,
+        logical_time: i64,
+        include_action_history: bool,
+    ) -> Result<Option<Value>, StoreError> {
         let task: Option<String> = tx
             .query_row(
                 "SELECT payload_json FROM tasks WHERE task_id=?1",
@@ -1600,7 +1637,6 @@ impl ControllerStore {
             )
             .optional()?;
         let Some(task_json) = task else {
-            tx.commit()?;
             return Ok(None);
         };
         let task: Value = serde_json::from_str(&task_json)?;
@@ -1650,7 +1686,21 @@ impl ControllerStore {
         let blocker: Option<Value> = tx.query_row("SELECT json_object('id',blocker_id,'attempt_id',attempt_id,'question',question,'context',context,'version',version) FROM task_blockers WHERE task_id=?1 AND resolution_json IS NULL",[task_id],|row|row.get::<_,String>(0)).optional()?.map(|v|serde_json::from_str(&v)).transpose()?;
         let observations: Vec<Value> = {
             let mut stmt=tx.prepare("SELECT o.id,o.key,o.value_json,o.provenance,o.observed_at,o.recorded_at,o.version,o.collection_seq,o.expires_at FROM task_observation_current c JOIN task_observations o ON o.id=c.observation_id WHERE c.task_id=?1 ORDER BY o.key LIMIT 128")?;
-            let rows = stmt.query_map([task_id],|row|Ok(serde_json::json!({"id":row.get::<_,String>(0)?,"key":row.get::<_,String>(1)?,"value":serde_json::from_str::<Value>(&row.get::<_,String>(2)?).unwrap_or(Value::Null),"provenance":row.get::<_,String>(3)?,"observed_at":row.get::<_,String>(4)?,"recorded_at":row.get::<_,String>(5)?,"version":row.get::<_,i64>(6)?,"collection_seq":row.get::<_,i64>(7)?,"expires_at":row.get::<_,Option<String>>(8)?})))?.collect::<Result<_,_>>()?;
+            let rows = stmt.query_map([task_id], |row| {
+                let expires_at: Option<String> = row.get(8)?;
+                let fresh = match expires_at.as_deref() {
+                    None => true,
+                    Some(value) => chrono::DateTime::parse_from_rfc3339(value)
+                        .is_ok_and(|expiry| expiry.timestamp_millis() > logical_time),
+                };
+                Ok(serde_json::json!({
+                    "id":row.get::<_,String>(0)?,"key":row.get::<_,String>(1)?,
+                    "value":serde_json::from_str::<Value>(&row.get::<_,String>(2)?).unwrap_or(Value::Null),
+                    "provenance":row.get::<_,String>(3)?,"observed_at":row.get::<_,String>(4)?,
+                    "recorded_at":row.get::<_,String>(5)?,"version":row.get::<_,i64>(6)?,
+                    "collection_seq":row.get::<_,i64>(7)?,"expires_at":expires_at,"fresh":fresh
+                }))
+            })?.collect::<Result<_,_>>()?;
             rows
         };
         let attempt_count: i64 = tx.query_row(
@@ -1658,6 +1708,24 @@ impl ControllerStore {
             [task_id],
             |row| row.get(0),
         )?;
+        let unadopted_attempt_count: i64 = if include_action_history {
+            tx.query_row(
+                "SELECT COUNT(*) FROM attempts a
+                 WHERE a.task_id=?1 AND NOT EXISTS(
+                   SELECT 1 FROM attempt_submissions s
+                   JOIN reconcile_actions r ON r.task_id=s.task_id AND r.idempotency_key=s.idempotency_key
+                   WHERE s.task_id=a.task_id AND s.attempt_id=a.attempt_id
+                     AND r.state='succeeded'
+                     AND json_extract(r.action_json,'$.kind')='create_attempt'
+                     AND json_extract(r.action_json,'$.payload.ordinal')=a.ordinal
+                     AND json_extract(r.action_json,'$.payload.role')=json_extract(a.payload_json,'$.role')
+                 )",
+                [task_id],
+                |row| row.get(0),
+            )?
+        } else {
+            0
+        };
         let execution_ms: u64 = tx.query_row(
             "SELECT COALESCE(SUM(CASE WHEN json_extract(payload_json,'$.started_at') IS NULL THEN 0 ELSE MAX(0,CAST(ROUND((julianday(COALESCE(json_extract(payload_json,'$.ended_at'),datetime(?2/1000,'unixepoch'))) - julianday(json_extract(payload_json,'$.started_at')))*86400000) AS INTEGER)) END),0) FROM attempts WHERE task_id=?1",
             params![task_id, logical_time],
@@ -1721,6 +1789,7 @@ impl ControllerStore {
         let pr_head_sha =
             observed_head.and_then(|value| value["sha"].as_str().or_else(|| value.as_str()));
         let checks = observation_value("delivery.checks");
+        let pull_request_facts = observation_value("delivery.pull_request");
         let pull_request = control
             .10
             .as_deref()
@@ -1763,6 +1832,7 @@ impl ControllerStore {
                             "source": check["source"].as_str().unwrap_or("check_run"),
                             "state": state,
                             "evaluation_sha": check["evaluation_sha"].as_str().or(evaluation_sha).unwrap_or_default(),
+                            "failure_fingerprint": check["failure_fingerprint"].as_str(),
                         })
                     })
                     .collect::<Vec<_>>()
@@ -1793,7 +1863,7 @@ impl ControllerStore {
             "schema_version":1,"task_id":task_id,"task_version":control.0,"logical_time_ms":logical_time,
             "lifecycle":lifecycle,"completion_policy":serde_json::from_str::<Value>(&control.4)?,
             "operator_hold":control.1,"controller_mode":controller_mode,"reconcile_generation":control.3,
-            "execution_target":execution_target,"delivery":{"work_branch":control.9,"pull_request":pull_request.clone(),"base_revision":control.11,"pr_head_sha":pr_head_sha,"evaluation_sha":evaluation_sha,"evaluation_kind":evaluation_kind,"pr_state":pull_request.as_ref().and_then(|value|value["state"].as_str()),"required_checks":required_checks},
+            "execution_target":execution_target,"delivery":{"work_branch":control.9,"pull_request":pull_request.clone(),"base_revision":control.11,"pr_head_sha":pr_head_sha,"evaluation_sha":evaluation_sha,"evaluation_kind":evaluation_kind,"pr_state":pull_request_facts.and_then(|value|value["state"].as_str()).or_else(||pull_request.as_ref().and_then(|value|value["state"].as_str())),"required_checks":required_checks,"required_check_policy_known":checks.and_then(|value|value["required_policy_known"].as_bool()).unwrap_or(false),"review_state_known":pull_request_facts.and_then(|value|value["review_state_known"].as_bool()).unwrap_or(false),"changes_requested":pull_request_facts.and_then(|value|value["changes_requested"].as_bool()).unwrap_or(false),"pr_merged":pull_request_facts.and_then(|value|value["merged"].as_bool()).unwrap_or(false)},
             "dependencies":{"all_completed":!dependencies_unresolved,"predecessors":dependencies},"children":{"total":children.len(),"completed":children.iter().filter(|c|c["state"]=="completed").count(),"terminal_noncompleted":children.iter().filter(|c|c["state"]!="completed"&&matches!(c["state"].as_str(),Some("canceled"|"obviated"|"superseded"|"failed_exhausted"))).count()},
             "attempts":attempts,"blocker":blocker,"observations":observations,
             "action_history":{"recent":[]},"budget_usage":{"attempt_count":attempt_count,"grants":serde_json::from_str::<Value>(&grants)?,"spec":serde_json::from_str::<Value>(&control.5)?},
@@ -1805,6 +1875,20 @@ impl ControllerStore {
             "continuation_fingerprints_sent": [],
             "last_consumed_evidence": null
         });
+        if include_action_history {
+            let mut history =
+                anvil_reconcile::outbox::SqliteDecisionStore::action_history_json_from_connection(
+                    tx, task_id, 128,
+                )?;
+            history["attempt_origin_coverage"] =
+                serde_json::json!(if unadopted_attempt_count == 0 {
+                    "complete"
+                } else {
+                    "incomplete"
+                });
+            history["unadopted_attempt_count"] = serde_json::json!(unadopted_attempt_count);
+            snapshot["action_history"] = history;
+        }
         snapshot["budget_usage"] = serde_json::json!({
             "limits": effective_budget,
             "attempts": attempt_count,
@@ -1816,8 +1900,118 @@ impl ControllerStore {
         });
         snapshot["retry_schedule"]["cause"] = retry_cause.map(Value::String).unwrap_or(Value::Null);
         snapshot["merge_wait_due_at_ms"] = Value::Null;
-        tx.commit()?;
         Ok(Some(snapshot))
+    }
+
+    /// Revalidate and persist a decision with its outbox delta in one SQLite
+    /// write transaction. The evaluated snapshot is rebuilt on this transaction's
+    /// boundary; any Task fact, ownership, hold, or authoritative-history race
+    /// returns a CAS conflict for the scheduler to retry.
+    pub fn commit_reconcile_decision(
+        &self,
+        task_id: &str,
+        logical_time: i64,
+        evaluated_snapshot: &Value,
+        decision_record: &anvil_reconcile::DecisionRecord,
+        proposed_actions: &[anvil_reconcile::ProposedAction],
+    ) -> Result<anvil_reconcile::outbox::CommitResult, StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(current_snapshot) =
+            self.build_task_snapshot_in_transaction(&tx, task_id, logical_time, true)?
+        else {
+            return Err(StoreError::NotFound);
+        };
+        let (current, current_logical_time) =
+            anvil_reconcile::frozen_v0::decode_snapshot(&current_snapshot)
+                .map_err(StoreError::InvalidState)?;
+        let snapshot_matches = anvil_reconcile::snapshot_hash(&current_snapshot)
+            == anvil_reconcile::snapshot_hash(evaluated_snapshot)
+            && current_logical_time.0 == decision_record.logical_time_ms
+            && decision_record.task_id == task_id
+            && decision_record.task_version == current.task_version
+            && decision_record.snapshot_hash == anvil_reconcile::snapshot_hash(evaluated_snapshot)
+            && decision_record.canonical_snapshot_json
+                == anvil_reconcile::canonical_evaluated_snapshot(evaluated_snapshot)
+            && decision_record.actions_hash == anvil_reconcile::actions_hash(proposed_actions)
+            && decision_record.canonical_actions_json == serde_json::to_value(proposed_actions)?;
+        if !snapshot_matches {
+            return Ok(anvil_reconcile::outbox::CommitResult::Conflict {
+                actual_generation: current_snapshot
+                    .pointer("/action_history/generation")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            });
+        }
+        let history = &current_snapshot["action_history"];
+        let fence = anvil_reconcile::outbox::TaskCommitFence {
+            task_version: current.task_version,
+            controller_mode: current.controller_mode.clone(),
+            operator_hold: current.operator_hold,
+            reconcile_generation: current.reconcile_generation,
+            action_generation: history["generation"].as_u64().unwrap_or(0),
+            action_history_fingerprint: history["ledger_fingerprint"]
+                .as_str()
+                .ok_or_else(|| StoreError::InvalidState("missing action-history fence".into()))?
+                .to_owned(),
+        };
+        let mut persisted_decision = decision_record.clone();
+        let result = match current.controller_mode {
+            anvil_reconcile::ControllerMode::Legacy => {
+                return Ok(anvil_reconcile::outbox::CommitResult::Conflict {
+                    actual_generation: fence.action_generation,
+                });
+            }
+            anvil_reconcile::ControllerMode::Shadow => {
+                persisted_decision.authorization_blocked_reason = Some("shadow_mode".into());
+                anvil_reconcile::outbox::commit_shadow_decision_in_transaction(
+                    &tx,
+                    task_id,
+                    &fence,
+                    &persisted_decision,
+                )?
+            }
+            anvil_reconcile::ControllerMode::Reconciler => {
+                let authorization_block = if history["availability"] != "authoritative" {
+                    Some("action_history_unavailable")
+                } else if history["attempt_origin_coverage"] != "complete" {
+                    // Existing Attempts require an exact successful CreateAttempt
+                    // outbox/submission binding before their history can authorize
+                    // new executable intent.
+                    Some("legacy_history_not_adopted")
+                } else {
+                    None
+                };
+                if let Some(reason) = authorization_block {
+                    persisted_decision.authorization_blocked_reason = Some(reason.into());
+                    anvil_reconcile::outbox::commit_reconciler_decision_only_in_transaction(
+                        &tx,
+                        task_id,
+                        &fence,
+                        &persisted_decision,
+                    )?
+                } else {
+                    anvil_reconcile::outbox::commit_reconciler_decision_in_transaction(
+                        &tx,
+                        task_id,
+                        &fence,
+                        &persisted_decision,
+                        proposed_actions,
+                    )?
+                }
+            }
+        };
+        if matches!(
+            result,
+            anvil_reconcile::outbox::CommitResult::Conflict { .. }
+        ) {
+            return Ok(result);
+        }
+        tx.commit()?;
+        Ok(result)
     }
 
     /// Compare-and-swap the mutable controller fields. Immutable task intent is
