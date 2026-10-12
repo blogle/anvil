@@ -1,6 +1,5 @@
 //! HTTP control plane for Anvil Kubernetes sandboxes.
 
-mod git_diff;
 mod github;
 mod local;
 pub mod store;
@@ -112,7 +111,9 @@ fn sandbox_manifest(
     workspace_init: Value,
     env: Vec<Value>,
 ) -> Value {
-    let container = json!({"name":"sandbox","image":config.image,"ports":[{"name":"opencode","containerPort":config.opencode_port},{"name":"git-diff","containerPort":4097}],"env":env,"volumeMounts":[{"name":"workspace","mountPath":"/home/anvil"},{"name":"shared-profile","mountPath":"/anvil/profile"},shared_nix_store_mount(),shared_nix_socket_mount()]});
+    let mut env = env;
+    env.push(json!({"name":"OPENCODE_SERVER_PASSWORD","valueFrom":{"secretKeyRef":{"name":"github-app-credentials","key":"ANVIL_OPENCODE_SERVER_PASSWORD"}}}));
+    let container = json!({"name":"sandbox","image":config.image,"ports":[{"name":"opencode","containerPort":config.opencode_port}],"env":env,"volumeMounts":[{"name":"workspace","mountPath":"/home/anvil"},{"name":"shared-profile","mountPath":"/anvil/profile"},shared_nix_store_mount(),shared_nix_socket_mount()]});
     json!({"apiVersion":"agents.x-k8s.io/v1beta1","kind":"Sandbox","metadata":{"name":name,"namespace":config.namespace,"labels":labels,"annotations":annotations},"spec":{"service":true,"podTemplate":{"spec":{"initContainers":[workspace_init],"containers":[container],"volumes":[{"name":"shared-profile","persistentVolumeClaim":{"claimName":config.profile_pvc}},shared_nix_volume(&config.nix_pvc)]}},"volumeClaimTemplates":[{"metadata":{"name":"workspace"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":config.workspace_size}}}}]}})
 }
 
@@ -124,6 +125,7 @@ pub struct Config {
     pub image: String,
     pub workspace_size: String,
     pub opencode_port: u16,
+    pub opencode_server_password: String,
     pub request_timeout: Duration,
     pub preview_domain: String,
     pub annotation_prefix: String,
@@ -163,6 +165,20 @@ impl Config {
             }
         };
         let production = sandbox_backend == SandboxBackend::Kubernetes;
+        let configured_opencode_password = env::var("ANVIL_OPENCODE_SERVER_PASSWORD")
+            .ok()
+            .filter(|value| !value.is_empty());
+        if production
+            && configured_opencode_password
+                .as_ref()
+                .is_none_or(|value| value.len() < 32)
+        {
+            return Err(ServiceError::Config(
+                "ANVIL_OPENCODE_SERVER_PASSWORD must be at least 32 bytes".into(),
+            ));
+        }
+        let opencode_server_password = configured_opencode_password
+            .unwrap_or_else(|| "anvil-local-development-only-password".into());
         let session_signing_secret = env::var("ANVIL_SESSION_SIGNING_SECRET")
             .ok()
             .filter(|value| !value.is_empty());
@@ -248,6 +264,7 @@ impl Config {
             opencode_port: get("OPENCODE_PORT", "4096")
                 .parse()
                 .map_err(|_| ServiceError::Config("OPENCODE_PORT".into()))?,
+            opencode_server_password,
             request_timeout: Duration::from_secs(
                 get("ANVIL_PROVISION_TIMEOUT", "180")
                     .parse()
@@ -508,13 +525,17 @@ struct PendingLogin {
     created_at: std::time::Instant,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum PendingLoginMethod {
     OAuth(usize),
+    V2OAuth {
+        integration_id: String,
+        attempt_id: String,
+    },
     ApiKey,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct OpenCodeProvider {
     id: String,
     name: String,
@@ -532,7 +553,7 @@ struct OpenCodeProviderList {
     connected: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct OpenCodeModel {
     id: String,
     #[serde(rename = "providerID")]
@@ -567,6 +588,10 @@ struct OpenCodeAuthorization {
     user_code: Option<String>,
     #[serde(default)]
     prompts: Option<Vec<Value>>,
+    #[serde(default, rename = "attemptID")]
+    attempt_id: Option<String>,
+    #[serde(default)]
+    integration_id: Option<String>,
 }
 
 #[async_trait]
@@ -1582,30 +1607,11 @@ impl SandboxApi for KubeSandboxApi {
         } else {
             record.session.service
         };
-        let client = reqwest::Client::new();
-        let Some(expected_base) = record.session.base_revision.as_deref() else {
-            let helper_result = match client
-                .get(format!("http://{host}:4097/v1/base"))
-                .timeout(self.config.request_timeout)
-                .send()
-                .await
-            {
-                Ok(response) => response.json::<Value>().await.ok(),
-                Err(_) => None,
-            };
-            return Ok(files_response_without_recorded_base(helper_result.as_ref()));
-        };
-        let response = client
-            .get(format!("http://{host}:4097/v1/diff"))
-            .timeout(self.config.request_timeout)
-            .send()
-            .await
-            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
-        let result: Value = response
-            .json()
-            .await
-            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
-        Ok(validate_worker_diff_base(result, expected_base))
+        let opencode = OpenCode::new(
+            format!("http://{host}:{}", self.config.opencode_port),
+            self.config.request_timeout,
+        );
+        native_vcs_files_diff(&opencode, record.session.base_revision.as_deref()).await
     }
     async fn set_opencode_session(&self, id: &str, oc: &str) -> Result<(), ServiceError> {
         let mut annotations = serde_json::Map::new();
@@ -1632,13 +1638,7 @@ impl SandboxApi for KubeSandboxApi {
             Value::String(at.to_owned()),
         );
         let ready = self.patch(id, json!({"metadata":{"annotations":annotations}}));
-        let client = self.client.clone();
-        let config = self.config.clone();
-        let id = id.to_owned();
-        ready_then_spawn_base_capture(ready, async move {
-            capture_and_persist_worker_base_revision(client, config, id).await
-        })
-        .await
+        ready.await
     }
     async fn set_git_metadata(
         &self,
@@ -1722,199 +1722,81 @@ impl SandboxApi for KubeSandboxApi {
     async fn recover_startup(&self) -> Result<(), ServiceError> {
         if let Ok(records) = self.list().await {
             for record in records {
-                if record.session.ready_at.is_some() && record.session.base_revision.is_none() {
-                    let client = self.client.clone();
-                    let config = self.config.clone();
-                    let id = record.session.id;
-                    tokio::spawn(async move {
-                        capture_and_persist_worker_base_revision(client, config, id).await;
-                    });
-                }
+                let _ = record;
             }
         }
         Ok(())
     }
 }
 
-fn pending_files_diff() -> Value {
-    json!({
-        "status": "pending",
-        "message": "Waiting for the worker's exact base revision to be recorded."
-    })
-}
-
-fn files_response_without_recorded_base(helper_result: Option<&Value>) -> Value {
-    if helper_result.is_some_and(|result| {
-        result["status"] == "unavailable"
-            && result["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("does not match the pinned workspace base"))
-    }) {
-        json!({
-            "status": "unavailable",
-            "message": "The worker's recorded base does not match its pinned workspace base."
-        })
-    } else {
-        pending_files_diff()
+pub(crate) async fn native_vcs_files_diff(
+    opencode: &OpenCode,
+    expected_base: Option<&str>,
+) -> Result<Value, ServiceError> {
+    let Some(expected_base) = expected_base else {
+        return Ok(
+            json!({"status":"unavailable","message":"This runtime cannot provide an authoritative immutable checkout base."}),
+        );
+    };
+    if !opencode.is_v2().await {
+        return Ok(
+            json!({"status":"unavailable","message":"Files are unavailable for this legacy OpenCode runtime."}),
+        );
     }
-}
-
-fn validate_worker_diff_base(result: Value, expected_base: &str) -> Value {
-    if result["status"] == "ready"
-        && result
-            .pointer("/diff/base_revision")
-            .and_then(Value::as_str)
-            != Some(expected_base)
+    let vcs = opencode
+        .request("api/vcs", reqwest::Method::GET, None)
+        .await?;
+    let status = opencode
+        .request("api/vcs/status", reqwest::Method::GET, None)
+        .await?;
+    let native_base = opencode
+        .request("api/vcs/base", reqwest::Method::GET, None)
+        .await?;
+    if vcs.get("data").is_none()
+        || !status.pointer("/data").is_some_and(Value::is_array)
+        || native_base.pointer("/data/ref").and_then(Value::as_str) != Some(expected_base)
     {
-        json!({
-            "status": "unavailable",
-            "message": "The worker diff base does not match the session's recorded base revision."
-        })
-    } else {
-        result
+        return Ok(
+            json!({"status":"unavailable","message":"OpenCode's review base is not verified as this session's immutable checkout base."}),
+        );
     }
-}
-
-async fn ready_then_spawn_base_capture<Ready, Capture>(
-    ready: Ready,
-    capture: Capture,
-) -> Result<(), ServiceError>
-where
-    Ready: std::future::Future<Output = Result<(), ServiceError>>,
-    Capture: std::future::Future<Output = ()> + Send + 'static,
-{
-    ready.await?;
-    tokio::spawn(capture);
-    Ok(())
-}
-
-async fn capture_and_persist_worker_base_revision(client: Client, config: Config, id: String) {
-    let http_client = reqwest::Client::new();
-    let capture_client = client.clone();
-    let capture_config = config.clone();
-    let capture_id = id.clone();
-    let persist_client = client;
-    let persist_config = config;
-    let persist_id = id;
-    retry_worker_base_capture(
-        || async {
-            let record = kube_sandbox_record(&capture_client, &capture_config, &capture_id).await?;
-            if let Some(revision) = record.session.base_revision {
-                return Ok(revision);
-            }
-            let host = if record.session.service.is_empty() {
-                format!("anvil-{}", record.session.id)
-            } else {
-                record.session.service
-            };
-            capture_worker_base_revision(
-                &http_client,
-                &format!("http://{host}:4097/v1/base"),
-                1,
-                Duration::ZERO,
-            )
-            .await
-        },
-        |revision| async {
-            let api = Api::<DynamicObject>::namespaced_with(
-                persist_client.clone(),
-                &persist_config.namespace,
-                &sandbox_resource(),
-            );
-            let object = api
-                .get(&format!("anvil-{persist_id}"))
-                .await
-                .map_err(|error| error.to_string())?;
-            let record =
-                sandbox_record_from(&object, &persist_config).map_err(|error| error.to_string())?;
-            if record.session.base_revision.is_some() {
-                return Ok(());
-            }
-            let mut annotations = serde_json::Map::new();
-            annotations.insert(
-                annotation_key(&persist_config, "base-revision"),
-                Value::String(revision),
-            );
-            api.patch(
-                &format!("anvil-{persist_id}"),
-                &PatchParams::default(),
-                &Patch::Merge(json!({"metadata":{"annotations":annotations}})),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-        },
-        Duration::from_secs(5),
-    )
-    .await;
-}
-
-async fn kube_sandbox_record(
-    client: &Client,
-    config: &Config,
-    id: &str,
-) -> Result<SandboxRecord, String> {
-    Api::<DynamicObject>::namespaced_with(client.clone(), &config.namespace, &sandbox_resource())
-        .get(&format!("anvil-{id}"))
+    let mut url = opencode
+        .base
+        .join("api/vcs/diff")
+        .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+    url.query_pairs_mut()
+        .append_pair("mode", "branch")
+        .append_pair("base", expected_base);
+    let mut request = opencode.client.get(url);
+    if let Ok(password) = env::var("ANVIL_OPENCODE_SERVER_PASSWORD") {
+        request = request.basic_auth("opencode", Some(password));
+    }
+    let response = request
+        .send()
         .await
-        .map_err(|error| error.to_string())
-        .and_then(|object| sandbox_record_from(&object, config).map_err(|error| error.to_string()))
-}
-
-async fn retry_worker_base_capture<Capture, CaptureFuture, Persist, PersistFuture>(
-    mut capture: Capture,
-    mut persist: Persist,
-    retry_delay: Duration,
-) where
-    Capture: FnMut() -> CaptureFuture,
-    CaptureFuture: std::future::Future<Output = Result<String, String>>,
-    Persist: FnMut(String) -> PersistFuture,
-    PersistFuture: std::future::Future<Output = Result<(), String>>,
-{
-    let max_retry_delay = Duration::from_secs(60);
-    let mut retry_delay = retry_delay.max(Duration::from_millis(1));
-    loop {
-        if let Ok(revision) = capture().await {
-            if persist(revision).await.is_ok() {
-                return;
-            }
-        }
-        tokio::time::sleep(retry_delay).await;
-        retry_delay = retry_delay.saturating_mul(2).min(max_retry_delay);
+        .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+    let status = response.status();
+    let result: Value = response
+        .json()
+        .await
+        .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
+    if !status.is_success() {
+        return Err(ServiceError::OpenCode(format!(
+            "V2 VCS diff returned {status}"
+        )));
     }
-}
-
-async fn capture_worker_base_revision(
-    client: &reqwest::Client,
-    url: &str,
-    attempts: usize,
-    retry_delay: Duration,
-) -> Result<String, String> {
-    for attempt in 0..attempts {
-        if let Ok(response) = client.get(url).timeout(Duration::from_secs(2)).send().await {
-            if response.status().is_success() {
-                if let Ok(body) = response.json::<Value>().await {
-                    if body["status"] == "ready" {
-                        if let Some(revision) = body["base_revision"].as_str() {
-                            if matches!(revision.len(), 40 | 64)
-                                && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
-                            {
-                                return Ok(revision.to_ascii_lowercase());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if attempt + 1 < attempts {
-            tokio::time::sleep(retry_delay).await;
-        }
-    }
-    Err(
-        "worker became ready without publishing its recorded base revision after retries; refusing to mark the session as a legacy unknown-base session"
-            .into(),
+    let files = result.get("data").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(|file| json!({
+        "path":file.get("file").cloned().unwrap_or(Value::Null), "old_path":Value::Null,
+        "status":file.get("status").cloned().unwrap_or(Value::Null),
+        "additions":file.get("additions").cloned().unwrap_or(Value::Null),
+        "deletions":file.get("deletions").cloned().unwrap_or(Value::Null),
+        "binary":false, "too_large":false, "diff":file.get("patch").cloned().unwrap_or(Value::String(String::new()))
+    })).collect::<Vec<_>>();
+    Ok(
+        json!({"status":"ready","diff":{"base_revision":expected_base,"files":files,"truncated":false}}),
     )
 }
+
 impl KubeSandboxApi {
     async fn patch(&self, id: &str, v: Value) -> Result<(), ServiceError> {
         Api::<DynamicObject>::namespaced_with(
@@ -1997,10 +1879,12 @@ pub struct AppState {
     admission_lock: Arc<AsyncMutex<()>>,
     capability_signer: Option<github::CapabilitySigner>,
     github: Option<github::GithubBroker>,
+    #[allow(dead_code)]
     git_pr_checks: GitPrChecks,
 }
 
 type LifecycleWatchers = Arc<Mutex<HashMap<String, (uuid::Uuid, watch::Sender<bool>)>>>;
+#[allow(dead_code)]
 type GitPrChecks = Arc<Mutex<HashMap<String, (Option<String>, Instant)>>>;
 
 impl AppState {
@@ -2253,7 +2137,6 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
         .route("/v1/sessions/:id/resume", post(resume))
         .route("/v1/sessions/:id/previews/:port", get(preview))
         .route("/v1/sessions/:id/activity", get(activity))
-        .route("/v1/sessions/:id/git-metadata", post(report_git_metadata))
         .route("/v1/changes", get(changed_since))
         .route(
             "/v1/sessions/:id/credentials/github",
@@ -4357,11 +4240,6 @@ async fn create(
     ))
 }
 
-#[derive(Deserialize)]
-struct GitMetadataReport {
-    branch: Option<String>,
-}
-
 fn pull_request_from_github(items: Vec<Value>) -> Option<anvil_core::PullRequest> {
     items
         .into_iter()
@@ -4393,130 +4271,113 @@ fn pull_request_from_github(items: Vec<Value>) -> Option<anvil_core::PullRequest
         })
 }
 
-async fn report_git_metadata(
-    Path(id): Path<String>,
-    State(s): State<AppState>,
-    headers: HeaderMap,
-    Json(report): Json<GitMetadataReport>,
-) -> Result<StatusCode, ServiceError> {
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or(ServiceError::Unauthorized)?;
-    let signer = s
-        .capability_signer
-        .as_ref()
-        .ok_or(ServiceError::Unauthorized)?;
-    let claims = signer
-        .verify_for_refresh(token)
-        .map_err(|_| ServiceError::Unauthorized)?;
-    if claims.session_id != id || claims.capability != "github-repository" {
-        return Err(ServiceError::Forbidden(
-            "capability is not valid for this session".into(),
-        ));
-    }
-    let record = s.kube.get(&id).await?;
+async fn refresh_github_pull_request(s: &AppState, id: &str) -> Result<(), ServiceError> {
+    let record = s.kube.get(id).await?;
     let session = record.session;
-    if claims.repository != session.repository {
-        return Err(ServiceError::Forbidden(
-            "capability repository does not match session".into(),
-        ));
+    if session.environment_state != "ready" {
+        return Ok(());
     }
-    let branch = report.branch.filter(|branch| !branch.trim().is_empty());
-    let branch_changed = session.current_branch != branch;
+    let opencode = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
+    let branch = if opencode.is_v2().await {
+        opencode
+            .request("api/vcs", reqwest::Method::GET, None)
+            .await
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/data/branch/current")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+    } else {
+        session.current_branch.clone()
+    }
+    .filter(|branch| !branch.trim().is_empty());
+    let Some(branch) = branch else {
+        return Ok(());
+    };
+    let branch_changed = session.current_branch.as_deref() != Some(branch.as_str());
     if branch_changed {
-        s.kube
-            .set_git_metadata(&id, branch.as_deref(), None)
-            .await?;
+        s.kube.set_git_metadata(id, Some(&branch), None).await?;
     }
-    let should_lookup = if let Some(branch) = branch.as_deref() {
+    let should_lookup = {
         let mut checks = s
             .git_pr_checks
             .lock()
-            .map_err(|_| ServiceError::Config("Git metadata cache lock poisoned".into()))?;
-        let due = checks.get(&id).is_none_or(|(prior, checked)| {
-            prior.as_deref() != Some(branch) || checked.elapsed() >= Duration::from_secs(120)
+            .map_err(|_| ServiceError::Config("GitHub PR cache lock poisoned".into()))?;
+        let due = checks.get(id).is_none_or(|(prior, checked)| {
+            prior.as_deref() != Some(branch.as_str())
+                || checked.elapsed() >= Duration::from_secs(120)
         });
         if due {
-            checks.insert(id.clone(), (Some(branch.to_owned()), Instant::now()));
+            checks.insert(id.to_owned(), (Some(branch.clone()), Instant::now()));
         }
         due
-    } else {
-        s.git_pr_checks
-            .lock()
-            .map_err(|_| ServiceError::Config("Git metadata cache lock poisoned".into()))?
-            .remove(&id);
-        false
     };
-    if should_lookup {
-        let previous = if branch_changed {
-            None
-        } else {
-            session.pull_request.as_ref()
-        };
-        let lookup = async {
-            let broker = s.github.as_ref().ok_or_else(|| {
-                ServiceError::Config("GitHub App credentials are not configured".into())
-            })?;
-            let credential = broker
-                .credential(&session.repository, github::GithubCredentialPurpose::GhRead)
-                .await?;
-            let repo = Url::parse(&session.repository)
-                .map_err(|error| ServiceError::Config(error.to_string()))?;
-            let segments: Vec<_> = repo
-                .path_segments()
-                .into_iter()
-                .flatten()
-                .filter(|part| !part.is_empty())
-                .collect();
-            if segments.len() < 2 {
-                return Err(ServiceError::Config(
-                    "repository URL must include owner and repository".into(),
-                ));
-            }
-            let owner = segments[segments.len() - 2];
-            let repository = segments[segments.len() - 1].trim_end_matches(".git");
-            let url = format!(
-                "{}/repos/{owner}/{repository}/pulls",
-                s.config.github_api_url.trim_end_matches('/')
-            );
-            let head = format!("{owner}:{}", branch.as_deref().unwrap_or_default());
-            let response = reqwest::Client::new()
-                .get(url)
-                .bearer_auth(credential.token)
-                .query(&[
-                    ("state", "open"),
-                    ("head", head.as_str()),
-                    ("per_page", "100"),
-                ])
-                .send()
-                .await
-                .map_err(|error| ServiceError::Config(error.to_string()))?;
-            if !response.status().is_success() {
-                return Err(ServiceError::Config(format!(
-                    "GitHub PR lookup returned {}",
-                    response.status()
-                )));
-            }
-            let items: Vec<Value> = response
-                .json()
-                .await
-                .map_err(|error| ServiceError::Config(error.to_string()))?;
-            Ok::<_, ServiceError>(pull_request_from_github(items))
-        }
-        .await;
-        match lookup {
-            Ok(pr) => {
-                s.kube
-                    .set_git_metadata(&id, branch.as_deref(), pr.as_ref())
-                    .await?
-            }
-            Err(_) if previous.is_some() => {}
-            Err(error) => return Err(error),
-        }
+    if !should_lookup {
+        return Ok(());
     }
-    Ok(StatusCode::NO_CONTENT)
+    let lookup = async {
+        let broker = s.github.as_ref().ok_or_else(|| {
+            ServiceError::Config("GitHub App credentials are not configured".into())
+        })?;
+        let credential = broker
+            .credential(&session.repository, github::GithubCredentialPurpose::GhRead)
+            .await?;
+        let repo = Url::parse(&session.repository)
+            .map_err(|error| ServiceError::Config(error.to_string()))?;
+        let segments = repo
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if segments.len() < 2 {
+            return Err(ServiceError::Config(
+                "repository URL must include owner and repository".into(),
+            ));
+        }
+        let owner = segments[segments.len() - 2];
+        let repository = segments[segments.len() - 1].trim_end_matches(".git");
+        let url = format!(
+            "{}/repos/{owner}/{repository}/pulls",
+            s.config.github_api_url.trim_end_matches('/')
+        );
+        let head = format!("{owner}:{branch}");
+        let response = reqwest::Client::new()
+            .get(url)
+            .bearer_auth(credential.token)
+            .query(&[
+                ("state", "open"),
+                ("head", head.as_str()),
+                ("per_page", "100"),
+            ])
+            .send()
+            .await
+            .map_err(|error| ServiceError::Config(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(ServiceError::Config(format!(
+                "GitHub PR lookup returned {}",
+                response.status()
+            )));
+        }
+        let items = response
+            .json::<Vec<Value>>()
+            .await
+            .map_err(|error| ServiceError::Config(error.to_string()))?;
+        Ok::<_, ServiceError>(pull_request_from_github(items))
+    }
+    .await;
+    match lookup {
+        Ok(pull_request) => {
+            s.kube
+                .set_git_metadata(id, Some(&branch), pull_request.as_ref())
+                .await?
+        }
+        Err(_) if session.pull_request.is_some() && !branch_changed => {}
+        Err(_) => {}
+    }
+    Ok(())
 }
 
 async fn github_credentials(
@@ -4869,8 +4730,10 @@ async fn activity(
     Query(query): Query<ActivityQuery>,
     State(s): State<AppState>,
 ) -> Result<Json<SessionActivity>, ServiceError> {
+    reconcile_binding(&s, &id).await?;
+    let _ = refresh_github_pull_request(&s, &id).await;
     let object = s.kube.get(&id).await?;
-    let mut session = reconcile_binding(&s, &id).await?;
+    let mut session = object.session.clone();
     let operating_mode = Some(object.operating_mode.as_str());
     let status = if binding_is_usable(&session) {
         let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
@@ -5860,16 +5723,29 @@ async fn reconcile_lifecycle_from_opencode(
     );
     // Reconcile authoritative execution/current-session state before consuming
     // the stream. Transcript reads are reserved for active-run identity only.
-    let current_session_path = format!("session/{opencode_session_id}");
+    let v2 = op.is_v2().await;
+    let current_session_path = if v2 {
+        format!("api/session/{opencode_session_id}")
+    } else {
+        format!("session/{opencode_session_id}")
+    };
     let (status, current_session) = tokio::join!(
         op.status_snapshot(),
         op.request(&current_session_path, reqwest::Method::GET, None)
     );
     let status = status?;
-    current_session?;
+    let current_session = current_session?;
+    if v2 && current_session.get("data").is_none() {
+        return Err(ServiceError::OpenCode(
+            "V2 session response omitted data".into(),
+        ));
+    }
     let selected = status.get(opencode_session_id).cloned();
     let selected = selected.clone().unwrap_or(Value::Null);
-    let busy = selected.get("type").and_then(Value::as_str) == Some("busy");
+    let busy = selected
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "busy" || kind == "running");
     let error = selected
         .get("error")
         .and_then(|value| {
@@ -6004,6 +5880,11 @@ async fn lifecycle_watch_loop(
                                             }
                                             LifecycleObservation::SubmissionFailed { .. } => {}
                                             LifecycleObservation::Telemetry(event) => {
+                                                let terminal = matches!(
+                                                    &event.fact,
+                                                    TelemetryFact::Execution { state, .. }
+                                                        if state == "idle" || state == "error"
+                                                );
                                                 let _ = apply_lifecycle_observation(
                                                     &state,
                                                     &anvil_session_id,
@@ -6011,6 +5892,14 @@ async fn lifecycle_watch_loop(
                                                     LifecycleObservation::Telemetry(event),
                                                 )
                                                 .await;
+                                                if terminal {
+                                                    let _ = reconcile_lifecycle_from_opencode(
+                                                        &state,
+                                                        &anvil_session_id,
+                                                        &event_session,
+                                                    )
+                                                    .await;
+                                                }
                                             }
                                         }
                                     }
@@ -6105,22 +5994,30 @@ async fn proxy(
                 .unwrap_or_else(|| "exact OpenCode session recovery is unavailable".into()),
         ));
     }
-    Ok(Json(
-        OpenCode::new(service_url(&x, &s.config), s.config.request_timeout)
-            .request(
-                &format!(
-                    "session/{}/{}{}",
-                    x.opencode_session_id
-                        .as_deref()
-                        .ok_or(ServiceError::NotFound)?,
-                    op,
-                    query.map_or_else(String::new, |value| format!("?messageID={value}"))
-                ),
-                method,
-                None,
-            )
-            .await?,
-    ))
+    let client = OpenCode::new(service_url(&x, &s.config), s.config.request_timeout);
+    let session_id = x
+        .opencode_session_id
+        .as_deref()
+        .ok_or(ServiceError::NotFound)?;
+    let path = if client.is_v2().await {
+        match op {
+            "message" => format!("api/session/{session_id}/message"),
+            "abort" => format!("api/session/{session_id}/interrupt"),
+            other => format!("api/session/{session_id}/{other}"),
+        }
+    } else {
+        format!(
+            "session/{session_id}/{op}{}",
+            query.map_or_else(String::new, |value| format!("?messageID={value}"))
+        )
+    };
+    let response = client.request(&path, method, None).await?;
+    if client.is_v2().await && op == "message" {
+        return Ok(Json(normalize_v2_messages(
+            response.get("data").cloned().unwrap_or(response),
+        )));
+    }
+    Ok(Json(response))
 }
 async fn messages(p: Path<String>, s: State<AppState>) -> Result<Json<Value>, ServiceError> {
     proxy(p, s, "message", reqwest::Method::GET, None).await
@@ -6149,9 +6046,7 @@ async fn status(
         })));
     }
     let op = OpenCode::new(service_url(&x, &s.config), s.config.request_timeout);
-    let v = op
-        .request("session/status", reqwest::Method::GET, None)
-        .await?;
+    let v = op.status_snapshot().await?;
     let opencode_session_id = x
         .opencode_session_id
         .as_deref()
@@ -6160,7 +6055,26 @@ async fn status(
     // Execution state is authoritative in session/status. Do not replay the
     // transcript on a current-state read: the lifecycle observer reconciles
     // messages when it needs run identity, while this endpoint stays bounded.
-    let execution_state = execution_state(&v, Some(&opencode_session_id));
+    let execution_state = if op.is_v2().await {
+        if v.get(&opencode_session_id)
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            == Some("running")
+        {
+            "running"
+        } else {
+            "idle"
+        }
+    } else {
+        execution_state(&v, Some(&opencode_session_id))
+    };
+    if op.is_v2().await
+        && execution_state == "idle"
+        && record.run_record.user_message_id().is_some()
+    {
+        let messages = op.session_messages(&opencode_session_id).await?;
+        reconcile_lifecycle_messages(&s, &id, &opencode_session_id, &messages).await?;
+    }
     let selected = v.get(&opencode_session_id).cloned().unwrap_or(Value::Null);
     let error = selected
         .get("error")
@@ -6240,27 +6154,44 @@ async fn diff(
         .opencode_session_id
         .as_deref()
         .ok_or(ServiceError::NotFound)?;
-    let mut result = op
-        .request(
-            &format!(
-                "session/{opencode_session_id}/diff{}",
-                q.message_id
-                    .as_deref()
-                    .map(|id| format!("?messageID={id}"))
-                    .unwrap_or_default()
-            ),
-            reqwest::Method::GET,
-            None,
+    let v2 = op.is_v2().await;
+    let path = if v2 {
+        format!(
+            "api/session/{opencode_session_id}/diff{}",
+            q.message_id
+                .as_deref()
+                .map(|id| format!("?messageID={id}"))
+                .unwrap_or_default()
         )
-        .await?;
+    } else {
+        format!(
+            "session/{opencode_session_id}/diff{}",
+            q.message_id
+                .as_deref()
+                .map(|id| format!("?messageID={id}"))
+                .unwrap_or_default()
+        )
+    };
+    let mut result = op.request(&path, reqwest::Method::GET, None).await?;
+    if v2 {
+        result = result.get("data").cloned().unwrap_or(result);
+    }
     if result.as_array().is_some_and(Vec::is_empty) {
         let messages = op
             .request(
-                &format!("session/{opencode_session_id}/message"),
+                &format!(
+                    "{}session/{opencode_session_id}/message",
+                    if v2 { "api/" } else { "" }
+                ),
                 reqwest::Method::GET,
                 None,
             )
             .await?;
+        let messages = if v2 {
+            messages.get("data").cloned().unwrap_or(messages)
+        } else {
+            messages
+        };
         let diffs = message_items(messages)
             .into_iter()
             .filter_map(|message| {
@@ -7288,7 +7219,240 @@ impl ProfileClient {
         })
     }
 
+    async fn is_v2(&self) -> bool {
+        let mut request = self.client.get(self.base.join("api/info").unwrap());
+        if let Ok(password) = env::var("ANVIL_OPENCODE_SERVER_PASSWORD") {
+            request = request.basic_auth("opencode", Some(password));
+        }
+        request
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+    }
+
+    async fn v2_integration_id(&self, provider_id: &str) -> Result<String, ServiceError> {
+        let providers = self
+            .request_raw(reqwest::Method::GET, "api/provider", None)
+            .await?;
+        Ok(providers
+            .pointer("/data")
+            .and_then(Value::as_array)
+            .and_then(|providers| {
+                providers.iter().find(|provider| {
+                    provider.get("id").and_then(Value::as_str) == Some(provider_id)
+                })
+            })
+            .and_then(|provider| provider.get("integrationID"))
+            .and_then(Value::as_str)
+            .unwrap_or(provider_id)
+            .to_owned())
+    }
+
     async fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, ServiceError> {
+        let v2 = self.is_v2().await;
+        if v2 {
+            match (method.clone(), path) {
+                (reqwest::Method::GET, "provider") => {
+                    let providers = self
+                        .request_raw(reqwest::Method::GET, "api/provider", None)
+                        .await?;
+                    let integrations = self
+                        .request_raw(reqwest::Method::GET, "api/integration", None)
+                        .await?;
+                    let integrations = integrations
+                        .pointer("/data")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let all = providers.pointer("/data").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(|provider| {
+                        let integration_id = provider.get("integrationID").and_then(Value::as_str);
+                        let integration = integrations.iter().find(|item| item.get("id").and_then(Value::as_str) == integration_id);
+                        let methods = integration.and_then(|item| item.get("methods")).and_then(Value::as_array);
+                        json!({"id":provider["id"],"name":provider["name"],"env":if methods.is_some_and(|methods| methods.iter().any(|method| method["type"] == "key")) {json!(["key"])} else {json!([])},"models":{}})
+                    }).collect::<Vec<_>>();
+                    let connected_integrations = integrations
+                        .iter()
+                        .filter(|integration| {
+                            integration
+                                .get("connections")
+                                .and_then(Value::as_array)
+                                .is_some_and(|connections| !connections.is_empty())
+                        })
+                        .filter_map(|integration| integration.get("id").and_then(Value::as_str))
+                        .collect::<std::collections::HashSet<_>>();
+                    let connected = providers
+                        .pointer("/data")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|provider| {
+                            provider
+                                .get("integrationID")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| connected_integrations.contains(id))
+                        })
+                        .filter_map(|provider| {
+                            provider
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .collect::<Vec<_>>();
+                    return Ok(json!({"all":all,"connected":connected}));
+                }
+                (reqwest::Method::GET, "provider/auth") => {
+                    let integrations = self
+                        .request_raw(reqwest::Method::GET, "api/integration", None)
+                        .await?;
+                    let providers = self
+                        .request_raw(reqwest::Method::GET, "api/provider", None)
+                        .await?;
+                    let data = integrations
+                        .pointer("/data")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let providers = providers
+                        .pointer("/data")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut methods = serde_json::Map::new();
+                    for integration in data {
+                        let entries = integration.get("methods").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(|method| json!({
+                            "type": if method["type"] == "key" {"api_key"} else {method["type"].as_str().unwrap_or("unknown")},
+                            "label":method.get("label").cloned().unwrap_or(Value::String(String::new())),
+                            "prompts":Value::Null
+                        })).collect::<Vec<_>>();
+                        if let Some(id) = providers
+                            .iter()
+                            .find(|provider| {
+                                provider.get("integrationID").and_then(Value::as_str)
+                                    == integration.get("id").and_then(Value::as_str)
+                            })
+                            .and_then(|provider| provider.get("id"))
+                            .and_then(Value::as_str)
+                        {
+                            methods.insert(id.to_owned(), Value::Array(entries));
+                        }
+                    }
+                    return Ok(Value::Object(methods));
+                }
+                (reqwest::Method::GET, "config/providers") => {
+                    let models = self
+                        .request_raw(reqwest::Method::GET, "api/model", None)
+                        .await?;
+                    let values = models
+                        .pointer("/data")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut grouped: HashMap<String, OpenCodeProvider> = HashMap::new();
+                    for model in values {
+                        let (Some(provider), Some(id)) = (
+                            model.get("providerID").and_then(Value::as_str),
+                            model.get("modelID").and_then(Value::as_str),
+                        ) else {
+                            continue;
+                        };
+                        let entry = grouped.entry(provider.to_owned()).or_insert_with(|| {
+                            OpenCodeProvider {
+                                id: provider.to_owned(),
+                                name: provider.to_owned(),
+                                env: Vec::new(),
+                                models: HashMap::new(),
+                            }
+                        });
+                        entry.models.insert(
+                            id.to_owned(),
+                            OpenCodeModel {
+                                id: id.to_owned(),
+                                provider_id: provider.to_owned(),
+                            },
+                        );
+                    }
+                    return Ok(json!({"providers":grouped.into_values().collect::<Vec<_>>()}));
+                }
+                (reqwest::Method::GET, "config") => {
+                    return self
+                        .request_raw(reqwest::Method::GET, "api/config", None)
+                        .await
+                }
+                (reqwest::Method::PUT, path) if path.starts_with("auth/") => {
+                    let integration = self
+                        .v2_integration_id(path.trim_start_matches("auth/"))
+                        .await?;
+                    let key = body
+                        .as_ref()
+                        .and_then(|value| value.get("key"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    return self
+                        .request_raw(
+                            reqwest::Method::POST,
+                            &format!("api/integration/{integration}/connect/key"),
+                            Some(json!({"key":key})),
+                        )
+                        .await;
+                }
+                (reqwest::Method::POST, path)
+                    if path.starts_with("provider/") && path.ends_with("/oauth/authorize") =>
+                {
+                    let provider_id = path
+                        .trim_start_matches("provider/")
+                        .trim_end_matches("/oauth/authorize");
+                    let integration = self.v2_integration_id(provider_id).await?;
+                    let details = self
+                        .request_raw(
+                            reqwest::Method::GET,
+                            &format!("api/integration/{integration}"),
+                            None,
+                        )
+                        .await?;
+                    let method_index = body
+                        .as_ref()
+                        .and_then(|value| value.get("method"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
+                    let methods = details
+                        .pointer("/data/methods")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let method_id = methods
+                        .get(method_index)
+                        .and_then(|method| method.get("id"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let answer = body
+                        .as_ref()
+                        .and_then(|value| value.get("inputs"))
+                        .cloned()
+                        .unwrap_or(json!({}));
+                    let attempt = self
+                        .request_raw(
+                            reqwest::Method::POST,
+                            &format!("api/integration/{integration}/connect/oauth"),
+                            Some(json!({"methodID":method_id,"answer":answer})),
+                        )
+                        .await?;
+                    let data = attempt.get("data").cloned().unwrap_or(attempt);
+                    return Ok(
+                        json!({"url":data.get("url"),"method":"oauth","instructions":data.get("instructions"),"user_code":null,"prompts":null,"attemptID":data.get("attemptID"),"integration_id":integration}),
+                    );
+                }
+                _ => {}
+            }
+        }
+        self.request_raw(method, path, body).await
+    }
+
+    async fn request_raw(
         &self,
         method: reqwest::Method,
         path: &str,
@@ -7301,6 +7465,9 @@ impl ProfileClient {
         let mut request = self.client.request(method, url);
         if let Some(body) = body {
             request = request.json(&body);
+        }
+        if let Ok(password) = env::var("ANVIL_OPENCODE_SERVER_PASSWORD") {
+            request = request.basic_auth("opencode", Some(password));
         }
         let response = request
             .send()
@@ -7509,11 +7676,22 @@ async fn begin_provider_login(
     // OpenCode tracks one pending OAuth callback per provider. Invalidate an
     // older Anvil flow rather than letting two IDs race against that state.
     pending.retain(|_, flow| flow.provider != provider);
+    let pending_method = if let Some(attempt_id) = authorization.attempt_id.clone() {
+        PendingLoginMethod::V2OAuth {
+            integration_id: authorization
+                .integration_id
+                .clone()
+                .unwrap_or_else(|| provider.clone()),
+            attempt_id,
+        }
+    } else {
+        PendingLoginMethod::OAuth(method)
+    };
     pending.insert(
         login_id.clone(),
         PendingLogin {
             provider: provider.clone(),
-            method: PendingLoginMethod::OAuth(method),
+            method: pending_method,
             created_at: now,
         },
     );
@@ -7575,16 +7753,42 @@ async fn complete_provider_login(
                 .map(str::trim)
                 .filter(|key| !key.is_empty())
                 .ok_or_else(|| ServiceError::Invalid("API key is required".into()))?;
-            serde_json::from_value(
+            if s.profile.is_v2().await {
                 s.profile
                     .request(
                         reqwest::Method::PUT,
                         &format!("auth/{provider}"),
                         Some(json!({"type":"api","key":key})),
                     )
-                    .await?,
-            )
-            .map_err(|e| ServiceError::Profile(e.to_string()))?
+                    .await?;
+                true
+            } else {
+                serde_json::from_value(
+                    s.profile
+                        .request(
+                            reqwest::Method::PUT,
+                            &format!("auth/{provider}"),
+                            Some(json!({"type":"api","key":key})),
+                        )
+                        .await?,
+                )
+                .map_err(|e| ServiceError::Profile(e.to_string()))?
+            }
+        }
+        PendingLoginMethod::V2OAuth {
+            integration_id,
+            attempt_id,
+        } => {
+            s.profile
+                .request(
+                    reqwest::Method::POST,
+                    &format!(
+                        "api/integration/{integration_id}/connect/oauth/{attempt_id}/complete"
+                    ),
+                    Some(json!({"code":request.code})),
+                )
+                .await?;
+            true
         }
     };
     if !completed {
@@ -7689,13 +7893,45 @@ impl OpenCode {
             password,
         }
     }
-    async fn health(&self) -> Result<(), ServiceError> {
-        self.request("global/health", reqwest::Method::GET, None)
+    async fn is_v2(&self) -> bool {
+        let Ok(url) = self.base.join("api/info") else {
+            return false;
+        };
+        let mut request = self.client.get(url);
+        if let Some(password) = self.password.as_ref() {
+            request = request.basic_auth("opencode", Some(password));
+        }
+        let Ok(response) = request.send().await else {
+            return false;
+        };
+        if !response.status().is_success() {
+            return false;
+        }
+        response
+            .json::<Value>()
             .await
-            .map(|_| ())
+            .ok()
+            .and_then(|info| {
+                info.get("version")
+                    .and_then(Value::as_str)
+                    .and_then(|version| version.split('.').next())
+                    .and_then(|major| major.trim_start_matches('v').parse::<u32>().ok())
+            })
+            .is_some_and(|major| major >= 2)
+    }
+    async fn health(&self) -> Result<(), ServiceError> {
+        if self.is_v2().await {
+            self.request("api/info", reqwest::Method::GET, None)
+                .await
+                .map(|_| ())
+        } else {
+            self.request("global/health", reqwest::Method::GET, None)
+                .await
+                .map(|_| ())
+        }
     }
     async fn status_snapshot(&self) -> Result<Value, ServiceError> {
-        if self.is_v2().await? {
+        if self.is_v2().await {
             let response = self
                 .request("api/session/active", reqwest::Method::GET, None)
                 .await?;
@@ -7706,12 +7942,25 @@ impl OpenCode {
         }
     }
     async fn session_messages(&self, id: &str) -> Result<Value, ServiceError> {
-        self.request(
-            &format!("session/{id}/message?limit={ACTIVITY_MESSAGE_LIMIT}"),
-            reqwest::Method::GET,
-            None,
-        )
-        .await
+        if self.is_v2().await {
+            let response = self
+                .request(
+                    &format!("api/session/{id}/message?limit={ACTIVITY_MESSAGE_LIMIT}"),
+                    reqwest::Method::GET,
+                    None,
+                )
+                .await?;
+            Ok(normalize_v2_messages(
+                response.get("data").cloned().unwrap_or(response),
+            ))
+        } else {
+            self.request(
+                &format!("session/{id}/message?limit={ACTIVITY_MESSAGE_LIMIT}"),
+                reqwest::Method::GET,
+                None,
+            )
+            .await
+        }
     }
     async fn session_message_page(
         &self,
@@ -7722,7 +7971,7 @@ impl OpenCode {
             .base
             .join(&format!("session/{id}/message"))
             .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
-        let v2 = self.is_v2().await?;
+        let v2 = self.is_v2().await;
         if v2 {
             url = self
                 .base
@@ -7797,59 +8046,26 @@ impl OpenCode {
             Ok((messages, next_cursor))
         }
     }
-    async fn is_v2(&self) -> Result<bool, ServiceError> {
-        let url = self
-            .base
-            .join("api/info")
-            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
-        let mut request = self.client.get(url);
-        if let Some(password) = self.password.as_ref() {
-            request = request.basic_auth("opencode", Some(password));
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
-        match response.status() {
-            status if status.is_success() => {
-                if !response
-                    .headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .is_some_and(|content_type| content_type.starts_with("application/json"))
-                {
-                    // V1 serves its SPA fallback for unknown /api paths with HTTP 200.
-                    return Ok(false);
-                }
-                let info = response
-                    .json::<Value>()
-                    .await
-                    .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
-                let major = info
-                    .get("version")
-                    .and_then(Value::as_str)
-                    .and_then(|version| version.split('.').next())
-                    .and_then(|major| major.trim_start_matches('v').parse::<u32>().ok());
-                Ok(major.is_some_and(|major| major >= 2))
-            }
-            reqwest::StatusCode::NOT_FOUND => Ok(false),
-            status => Err(ServiceError::OpenCode(format!(
-                "HTTP {status} detecting OpenCode API version"
-            ))),
-        }
-    }
     async fn event_stream(&self) -> Result<reqwest::Response, ServiceError> {
         let url = self
             .base
-            .join("event")
+            .join(if self.is_v2().await {
+                "api/event"
+            } else {
+                "event"
+            })
             .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .build()
             .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
-        let response = client
+        let mut request = client
             .get(url)
-            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .header(reqwest::header::ACCEPT, "text/event-stream");
+        if let Ok(password) = env::var("ANVIL_OPENCODE_SERVER_PASSWORD") {
+            request = request.basic_auth("opencode", Some(password));
+        }
+        let response = request
             .send()
             .await
             .map_err(|error| ServiceError::OpenCode(error.to_string()))?;
@@ -7862,7 +8078,7 @@ impl OpenCode {
         Ok(response)
     }
     async fn session_exists(&self, id: &str) -> Result<bool, ServiceError> {
-        let path = if self.is_v2().await? {
+        let path = if self.is_v2().await {
             format!("api/session/{id}")
         } else {
             format!("session/{id}")
@@ -7874,6 +8090,19 @@ impl OpenCode {
         }
     }
     async fn create_session(&self) -> Result<String, ServiceError> {
+        if self.is_v2().await {
+            let v = self
+                .request("api/session", reqwest::Method::POST, Some(json!({})))
+                .await?;
+            return v
+                .pointer("/data/id")
+                .or_else(|| v.get("id"))
+                .and_then(Value::as_str)
+                .map(String::from)
+                .ok_or_else(|| {
+                    ServiceError::OpenCode("V2 session response has no data.id".into())
+                });
+        }
         let v = self
             .request("session", reqwest::Method::POST, Some(json!({})))
             .await?;
@@ -7885,11 +8114,51 @@ impl OpenCode {
     }
     async fn resolve_model(&self, requested: &str) -> Result<OpenCodeModel, ServiceError> {
         let requested = requested.trim();
-        let configured: OpenCodeConfiguredProviders = serde_json::from_value(
+        let configured_value = if self.is_v2().await {
+            let response = self
+                .request("api/model", reqwest::Method::GET, None)
+                .await?;
+            let models = response
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let models = models
+                .into_iter()
+                .filter(|model| model.get("enabled").and_then(Value::as_bool) == Some(true))
+                .filter_map(|model| {
+                    Some(OpenCodeModel {
+                        id: model.get("modelID")?.as_str()?.to_owned(),
+                        provider_id: model.get("providerID")?.as_str()?.to_owned(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let requested_id = if let Some((provider, model)) = requested.split_once('/') {
+                models
+                    .into_iter()
+                    .filter(|item| item.provider_id == provider && item.id == model)
+                    .collect::<Vec<_>>()
+            } else {
+                models
+                    .into_iter()
+                    .filter(|item| item.id == requested)
+                    .collect::<Vec<_>>()
+            };
+            return match requested_id.as_slice() {
+                [model] => Ok(model.clone()),
+                [] => Err(ServiceError::OpenCode(format!(
+                    "requested model is unavailable: {requested}"
+                ))),
+                _ => Err(ServiceError::OpenCode(format!(
+                    "requested model is ambiguous: {requested}"
+                ))),
+            };
+        } else {
             self.request("config/providers", reqwest::Method::GET, None)
-                .await?,
-        )
-        .map_err(|e| ServiceError::OpenCode(format!("invalid provider catalog: {e}")))?;
+                .await?
+        };
+        let configured: OpenCodeConfiguredProviders = serde_json::from_value(configured_value)
+            .map_err(|e| ServiceError::OpenCode(format!("invalid provider catalog: {e}")))?;
 
         let matches = if let Some((provider_id, model_id)) = requested.split_once('/') {
             configured
@@ -7927,6 +8196,23 @@ impl OpenCode {
         p: &str,
         model: Option<&OpenCodeModel>,
     ) -> Result<Value, ServiceError> {
+        if self.is_v2().await {
+            if let Some(model) = model {
+                self.request(
+                    &format!("api/session/{id}/model"),
+                    reqwest::Method::POST,
+                    Some(json!({"providerID":model.provider_id,"modelID":model.id})),
+                )
+                .await?;
+            }
+            return self
+                .request(
+                    &format!("api/session/{id}/prompt"),
+                    reqwest::Method::POST,
+                    Some(json!({"id":message_id.0,"text":p})),
+                )
+                .await;
+        }
         let mut body = json!({
             "messageID": message_id.0,
             "parts":[{"type":"text","text":p}]
@@ -7954,7 +8240,7 @@ impl OpenCode {
             .base
             .join(path)
             .map_err(|e| ServiceError::OpenCode(e.to_string()))?;
-        let mut q = self.client.request(m, u);
+        let mut q = self.client.request(m.clone(), u);
         if let Some(v) = b {
             q = q.json(&v)
         }
@@ -7976,7 +8262,7 @@ impl OpenCode {
             serde_json::from_slice(&bytes).map_err(|e| ServiceError::OpenCode(e.to_string()))?
         };
         if !st.is_success() {
-            warn!(%st,"OpenCode request failed");
+            warn!(%st, %path, "OpenCode request failed");
             return Err(ServiceError::OpenCode(format!("HTTP {st}: {v}")));
         }
         Ok(v)
@@ -10475,6 +10761,7 @@ mod tests {
             image: "sandbox:dev".into(),
             workspace_size: "1Gi".into(),
             opencode_port: 4096,
+            opencode_server_password: "anvil-local-development-only-password".into(),
             request_timeout: Duration::from_secs(5),
             preview_domain: "preview.example.test".into(),
             annotation_prefix: "anvil.example".into(),
@@ -10858,10 +11145,10 @@ mod tests {
             .values()
             .all(Value::is_string));
         let spec = &manifest["spec"]["podTemplate"]["spec"];
-        assert!(spec["containers"][0]["ports"]
-            .as_array()
-            .unwrap()
-            .contains(&json!({"name":"git-diff","containerPort":4097})));
+        assert_eq!(
+            spec["containers"][0]["ports"],
+            json!([{"name":"opencode","containerPort":4096}])
+        );
         assert_eq!(spec["volumes"][1], shared_nix_volume("configured-nix-pvc"));
         assert!(spec
             .get("securityContext")
@@ -12900,6 +13187,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_client_uses_native_session_model_and_prompt_contracts() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/info");
+            then.status(200).json_body(json!({"version":"2.0.26+test"}));
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/session")
+                .json_body(json!({}));
+            then.status(200).json_body(json!({"data":{"id":"ses_v2"}}));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/api/model");
+            then.status(200)
+                .json_body(json!({"location":{"directory":"/workspace"},"data":[
+                    {"modelID":"test-model","providerID":"test-provider","enabled":true}
+                ]}));
+        });
+        let switch = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/session/ses_v2/model")
+                .json_body(json!({"providerID":"test-provider","modelID":"test-model"}));
+            then.status(204);
+        });
+        let prompt = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/session/ses_v2/prompt")
+                .json_body(json!({"id":"msg_v2","text":"Use the native V2 API."}));
+            then.status(200).json_body(json!({"data":{"id":"msg_v2"}}));
+        });
+        let client = OpenCode::new(server.base_url(), Duration::from_secs(5));
+        assert_eq!(client.create_session().await.unwrap(), "ses_v2");
+        let model = client
+            .resolve_model("test-provider/test-model")
+            .await
+            .unwrap();
+        client
+            .prompt_async(
+                "ses_v2",
+                &OpenCodeMessageId("msg_v2".into()),
+                "Use the native V2 API.",
+                Some(&model),
+            )
+            .await
+            .unwrap();
+        switch.assert_async().await;
+        prompt.assert_async().await;
+    }
+
+    #[test]
+    fn v2_messages_adapt_flat_user_and_assistant_records_for_run_correlation() {
+        let messages = normalize_v2_messages(json!([
+            {"id":"msg_user","type":"user","text":"change the file","time":{"created":1}},
+            {"id":"msg_assistant","type":"assistant","time":{"created":2,"completed":3},"content":[{"type":"text","text":"done"}]}
+        ]));
+        let messages = messages.as_array().unwrap();
+        assert_eq!(messages[0]["info"]["role"], "user");
+        assert_eq!(messages[0]["parts"][0]["text"], "change the file");
+        assert_eq!(messages[1]["info"]["role"], "assistant");
+        assert_eq!(messages[1]["info"]["parentID"], "msg_user");
+        assert_eq!(
+            assistant_message_observation(&messages[1]["info"])
+                .unwrap()
+                .parent_id
+                .0,
+            "msg_user"
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_unavailable_explicit_models() {
         let server = MockServer::start();
         server.mock(|when, then| {
@@ -13188,143 +13546,5 @@ mod tests {
         assert_eq!(body["theme"], "dark");
         assert_eq!(body["provider"]["openai"]["api_key"], "[redacted]");
         assert_eq!(body["nested"][0]["access_token"], "[redacted]");
-    }
-
-    async fn base_available_after_startup(
-        State(attempts): State<Arc<std::sync::atomic::AtomicUsize>>,
-    ) -> Json<Value> {
-        let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if attempt < 2 {
-            Json(json!({"status":"unavailable","message":"worker startup"}))
-        } else {
-            Json(
-                json!({"status":"ready","base_revision":"0123456789012345678901234567890123456789"}),
-            )
-        }
-    }
-
-    #[tokio::test]
-    async fn worker_base_capture_retries_until_worker_endpoint_is_listening() {
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let app = Router::new()
-            .route("/v1/base", get(base_available_after_startup))
-            .with_state(attempts.clone());
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let revision = capture_worker_base_revision(
-            &reqwest::Client::new(),
-            &format!("http://{address}/v1/base"),
-            5,
-            Duration::from_millis(1),
-        )
-        .await
-        .unwrap();
-        assert_eq!(revision, "0123456789012345678901234567890123456789");
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn ready_session_stays_available_while_base_capture_retries_in_background() {
-        let ready = Arc::new(AtomicBool::new(false));
-        let base = Arc::new(Mutex::new(None::<String>));
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (unavailable_tx, unavailable_rx) = tokio::sync::oneshot::channel();
-        let (recover_tx, recover_rx) = tokio::sync::oneshot::channel();
-        let mut unavailable_tx = Some(unavailable_tx);
-        let mut recover_rx = Some(recover_rx);
-        let base_for_persist = base.clone();
-        let retry = retry_worker_base_capture(
-            move || {
-                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
-                let unavailable_tx = unavailable_tx.take();
-                let recover_rx = if attempt > 0 { recover_rx.take() } else { None };
-                async move {
-                    if attempt == 0 {
-                        let _ = unavailable_tx.expect("first attempt signal").send(());
-                        return Err("helper unavailable during startup".into());
-                    }
-                    if let Some(recover_rx) = recover_rx {
-                        let _ = recover_rx.await;
-                    }
-                    Ok("0123456789012345678901234567890123456789".into())
-                }
-            },
-            move |revision| {
-                let base = base_for_persist.clone();
-                async move {
-                    *base.lock().unwrap() = Some(revision);
-                    Ok(())
-                }
-            },
-            Duration::from_millis(1),
-        );
-        let ready_for_mark = ready.clone();
-        ready_then_spawn_base_capture(
-            async move {
-                ready_for_mark.store(true, Ordering::SeqCst);
-                Ok(())
-            },
-            retry,
-        )
-        .await
-        .unwrap();
-
-        assert!(ready.load(Ordering::SeqCst));
-        unavailable_rx.await.unwrap();
-        assert_eq!(pending_files_diff()["status"], "pending");
-        assert!(base.lock().unwrap().is_none());
-
-        recover_tx.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if base.lock().unwrap().is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("background retry should persist the recovered exact base");
-        assert_eq!(
-            base.lock().unwrap().as_deref(),
-            Some("0123456789012345678901234567890123456789")
-        );
-    }
-
-    #[test]
-    fn files_rejects_worker_diff_for_a_mismatched_pinned_base() {
-        assert_eq!(
-            files_response_without_recorded_base(None)["status"],
-            "pending"
-        );
-        assert_eq!(
-            files_response_without_recorded_base(Some(&json!({
-                "status": "unavailable",
-                "message": "Recorded worker base revision does not match the pinned workspace base."
-            })))["status"],
-            "unavailable"
-        );
-        let expected = "0123456789012345678901234567890123456789";
-        let wrong = "ffffffffffffffffffffffffffffffffffffffff";
-        let result = validate_worker_diff_base(
-            json!({"status":"ready","diff":{"base_revision":wrong,"files":[]}}),
-            expected,
-        );
-        assert_eq!(result["status"], "unavailable");
-        assert!(result["message"]
-            .as_str()
-            .unwrap()
-            .contains("does not match"));
-        assert_eq!(
-            validate_worker_diff_base(
-                json!({"status":"ready","diff":{"base_revision":expected,"files":[]}}),
-                expected
-            )["status"],
-            "ready"
-        );
     }
 }

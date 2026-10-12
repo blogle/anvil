@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "npm --prefix web test && node --test runtime/git-diff-server.test.mjs",
+    "test": "npm --prefix web test",
     "test:dom": "npm --prefix web test"
   }
 }

@@ -1,7 +1,7 @@
 { pkgs
 , nix2containerPkgs
 , nix2containerBuildPkgs
-, opencode
+, opencodePackage
 , credentialHelperSource
 , sessionCapabilityHelperSource
 , sandboxEntrypointSource
@@ -82,7 +82,6 @@ let
       anvil:x::
     '')
   ];
-  opencodePackage = opencode.packages.${pkgs.system}.default;
   chromiumForImage = pkgs.runCommand "anvil-chromium" {} ''
     mkdir -p "$out"
     cp -a ${pkgs.chromium}/. "$out/"
@@ -98,8 +97,6 @@ let
   '';
   sandboxEntrypoint = pkgs.writeShellScriptBin "sandbox-entrypoint"
     (builtins.readFile sandboxEntrypointSource);
-  gitDiffServer = pkgs.writeTextDir "bin/anvil-git-diff-server.mjs"
-    (builtins.readFile ./../runtime/git-diff-server.mjs);
   sandboxMutableHome = pkgs.runCommand "anvil-sandbox-home" {} ''
     mkdir -p "$out/home/anvil"
   '';
@@ -125,7 +122,7 @@ let
     pathsToLink = [ "/bin" ];
   };
   sandboxRuntimeFiles = [
-    nixConf credentialHelper sessionCapabilityHelper gitIdentity ghWrapper sandboxUsrBin sandboxBin gitDiffServer
+    nixConf credentialHelper sessionCapabilityHelper gitIdentity ghWrapper sandboxUsrBin sandboxBin
   ] ++ userFiles ++ [ sandboxMutableHome sandboxMutableTmp ];
   sandboxBaseLayer = nix2containerPkgs.nix2container.buildLayer {
     deps = sandboxBaseTools;

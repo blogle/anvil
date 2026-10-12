@@ -40,8 +40,14 @@ spec:
               if [ ! -e "$profile/config/opencode.jsonc" ]; then
                 printf '{"$schema":"https://opencode.ai/config.json","permission":"allow"}\n' > "$profile/config/opencode.jsonc"
               fi
+              export OPENCODE_SERVER_PASSWORD="$ANVIL_OPENCODE_SERVER_PASSWORD"
               exec opencode serve --hostname 0.0.0.0 --port 4096
           env:
+            - name: ANVIL_OPENCODE_SERVER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: github-app-credentials
+                  key: ANVIL_OPENCODE_SERVER_PASSWORD
             - name: HOME
               value: /home/anvil
             - name: OPENCODE_CONFIG
@@ -55,14 +61,12 @@ spec:
             - name: profile
               mountPath: /anvil/profile
           readinessProbe:
-            httpGet:
-              path: /global/health
-              port: opencode
+            exec:
+              command: ["/bin/bash", "-c", "curl -fsS -u \"opencode:$ANVIL_OPENCODE_SERVER_PASSWORD\" http://127.0.0.1:4096/api/info >/dev/null"]
             periodSeconds: 5
           livenessProbe:
-            httpGet:
-              path: /global/health
-              port: opencode
+            exec:
+              command: ["/bin/bash", "-c", "curl -fsS -u \"opencode:$ANVIL_OPENCODE_SERVER_PASSWORD\" http://127.0.0.1:4096/api/info >/dev/null"]
             initialDelaySeconds: 10
             periodSeconds: 10
           resources:

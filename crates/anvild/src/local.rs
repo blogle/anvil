@@ -284,6 +284,7 @@ impl LocalSandboxApi {
             .env("ANVIL_SESSION_ID", id)
             .env("OPENCODE_CONFIG", profile.join("config/opencode.jsonc"))
             .env("OPENCODE_CONFIG_DIR", profile.join("config"))
+            .env("OPENCODE_SERVER_PASSWORD", &self.config.opencode_server_password)
             .env("OPENCODE_DISABLE_CHANNEL_DB", "1")
             .env("ANVIL_GIT_IDENTITY_SCRIPT", &git_identity_script)
             .env("ANVIL_OPENCODE_BIN", &self.opencode_bin)
@@ -378,15 +379,19 @@ impl Drop for LocalSandboxApi {
 }
 
 async fn health(host: &str, port: u16) -> Result<(), ()> {
-    reqwest::Client::new()
-        .get(format!("http://{host}:{port}/global/health"))
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-        .map_err(|_| ())?
-        .error_for_status()
-        .map_err(|_| ())?;
-    Ok(())
+    let client = reqwest::Client::new();
+    for path in ["/api/info", "/global/health"] {
+        if client
+            .get(format!("http://{host}:{port}{path}"))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            return Ok(());
+        }
+    }
+    Err(())
 }
 
 async fn terminate_child(child: &mut Child) {
@@ -568,17 +573,11 @@ impl SandboxApi for LocalSandboxApi {
     async fn files_diff(&self, id: &str) -> Result<serde_json::Value, ServiceError> {
         let sessions = self.sessions.lock().await;
         let state = sessions.get(id).ok_or(ServiceError::NotFound)?;
-        let project = state
-            .directory
-            .join("home/workspace")
-            .join(&state.record.session.project);
-        match super::git_diff::working_tree_diff(
-            &project,
-            state.record.session.base_revision.as_deref(),
-        ) {
-            Ok(diff) => Ok(serde_json::json!({"status":"ready","diff":diff})),
-            Err(message) => Ok(serde_json::json!({"status":"unavailable","message":message})),
-        }
+        let opencode = super::OpenCode::new(
+            format!("http://127.0.0.1:{}", state.record.session.opencode_port),
+            self.config.request_timeout,
+        );
+        super::native_vcs_files_diff(&opencode, state.record.session.base_revision.as_deref()).await
     }
 
     async fn create(
@@ -969,6 +968,7 @@ mod tests {
             image: "unused".into(),
             workspace_size: "1Gi".into(),
             opencode_port: 4096,
+            opencode_server_password: "anvil-local-development-only-password".into(),
             request_timeout: Duration::from_secs(10),
             preview_domain: "localhost".into(),
             annotation_prefix: "anvil.local".into(),
@@ -1308,7 +1308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_diff_uses_recorded_checkout_after_upstream_moves_and_includes_worktree() {
+    async fn local_legacy_runtime_reports_files_as_unavailable_without_native_vcs() {
         let fixture = Fixture::new();
         let api = fixture.api();
         let session = api
@@ -1320,42 +1320,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let base = session
-            .base_revision
-            .clone()
-            .expect("creation records exact checkout SHA");
-        std::fs::write(fixture.repo.join("target.txt"), "upstream movement\n").unwrap();
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&fixture.repo)
-            .args(["add", "target.txt"])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&fixture.repo)
-            .args(["commit", "-m", "upstream movement"])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-
-        let project = fixture.runtime.join("diff-12345678/home/workspace/demo");
-        std::fs::write(project.join("target.txt"), "worker change\n").unwrap();
-        std::fs::write(project.join("uncommitted.txt"), "working tree\n").unwrap();
+        assert!(session.base_revision.is_some());
         let result = api.files_diff("diff-12345678").await.unwrap();
-        assert_eq!(result["status"], "ready");
-        assert_eq!(result["diff"]["base_revision"], base);
-        let files = result["diff"]["files"].as_array().unwrap();
-        assert!(files.iter().any(|file| file["path"] == "target.txt"
-            && file["diff"].as_str().unwrap().contains("worker change")));
-        assert!(files
-            .iter()
-            .any(|file| file["path"] == "uncommitted.txt" && file["status"] == "added"));
-        assert!(!files.iter().any(|file| file["diff"]
+        assert_eq!(result["status"], "unavailable");
+        assert!(result["message"]
             .as_str()
-            .unwrap_or_default()
-            .contains("upstream movement")));
+            .unwrap()
+            .contains("legacy OpenCode runtime"));
         api.delete("diff-12345678").await.unwrap();
         fixture.cleanup();
     }

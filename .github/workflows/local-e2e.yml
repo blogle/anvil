@@ -24,7 +24,7 @@ jobs:
       - name: Evaluate flake
         run: time nix flake check --no-build
       - name: Rust format
-        run: time nix develop --command cargo fmt --all --check
+        run: time nix develop .#kind-ci --command cargo fmt --all --check
 
   integration:
     name: Integration E2E
