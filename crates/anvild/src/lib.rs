@@ -2015,9 +2015,9 @@ impl AppState {
         });
     }
 
-    /// Schedule the same pure Task reconciliation pipeline for Shadow and
-    /// Reconciler-owned Tasks. This scheduler persists intent only; effects are
-    /// deliberately not claimed or dispatched in this increment.
+    /// Sweep Task decisions, then dispatch the currently supported durable
+    /// CreateAttempt effect. Shadow remains observation-only; SendTurn is not
+    /// dispatched until its ambiguous-outcome recovery is proven safe.
     fn start_task_reconciler(&self) {
         let state = self.clone();
         tokio::spawn(async move {
@@ -3374,12 +3374,53 @@ async fn run_reconciler_executor_tick(state: &AppState) -> Result<(), String> {
             continue;
         };
         let (typed, _) = anvil_reconcile::frozen_v0::decode_snapshot(&snapshot)?;
+        if typed.operator_hold {
+            continue;
+        }
         if typed.controller_mode != anvil_reconcile::ControllerMode::Reconciler
-            || typed.operator_hold
             || typed.lifecycle != anvil_reconcile::Lifecycle::Open
             || intent.action.task_id != intent.task_id
             || intent.action.idempotency_key != intent.action_key
         {
+            // Admission is the claim linearization point. If ownership is
+            // revoked before any Sandbox was bound, release that reserved slot
+            // rather than leaving a provisioning Attempt forever. A terminal
+            // Task stays terminal; a transfer back to Legacy gets its normal
+            // infrastructure retry state and remains Legacy-owned.
+            if intent.action_state == "executing" {
+                if let Some(attempt) = task_store
+                    .get_attempt_submission(&intent.action_key)
+                    .map_err(|error| error.to_string())?
+                    .filter(|attempt| {
+                        attempt["state"] == "provisioning" && attempt["session_id"].is_null()
+                    })
+                {
+                    let attempt_id = attempt["attempt_id"].as_str().unwrap_or_default();
+                    if typed.lifecycle == anvil_reconcile::Lifecycle::Terminal {
+                        task_store
+                            .set_attempt_state(attempt_id, "canceled")
+                            .map_err(|error| error.to_string())?;
+                    } else {
+                        task_store
+                            .record_attempt_failure(
+                                attempt_id,
+                                store::scheduler::FailureClass::Infrastructure,
+                                "Reconciler ownership was revoked before runtime binding",
+                                Utc::now().timestamp_millis(),
+                                state.config.provisioning_max_attempts,
+                                state.config.provisioning_retry_base.as_millis() as u64,
+                            )
+                            .map_err(|error| error.to_string())?;
+                    }
+                    let _ = outbox
+                        .record_result_after_side_effect(
+                            &intent.task_id,
+                            &intent.action_key,
+                            anvil_reconcile::ActionState::Failed,
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+            }
             continue;
         }
         let existing = task_store
@@ -3391,36 +3432,39 @@ async fn run_reconciler_executor_tick(state: &AppState) -> Result<(), String> {
             .map(str::to_owned)
             .unwrap_or_else(|| reconciler_attempt_id(&intent.action_key));
 
-        let _attempt = if intent.action_state == "pending" || existing.is_none() {
-            let admission = state.admission_lock.clone().lock_owned().await;
-            let capacity =
-                service_capacity_snapshot(state, task_store, Utc::now().timestamp_millis())
-                    .await
-                    .map_err(|error| error.to_string())?;
-            let non_batch_active = capacity
-                .non_batch_running
-                .saturating_add(capacity.non_batch_provisioning);
-            let admitted = match task_store.admit_reconciler_attempt(
-                &intent.task_id,
-                &intent.action_key,
-                &attempt_id,
-                typed.task_version,
-                typed.reconcile_generation,
-                intent.action_generation,
-                state.config.concurrency_limit,
-                non_batch_active,
-            ) {
-                Ok(admitted) => admitted,
-                Err(store::StoreError::Conflict) => continue,
-                Err(error) => return Err(error.to_string()),
-            };
-            drop(admission);
-            match admitted {
-                store::ReconcilerAttemptAdmission::DeferredCapacity => continue,
-                store::ReconcilerAttemptAdmission::Admitted(attempt) => attempt,
+        let _attempt = match (intent.action_state.as_str(), existing) {
+            ("executing", Some(attempt)) => attempt,
+            ("executing", None) => continue,
+            ("pending", _) => {
+                let admission = state.admission_lock.clone().lock_owned().await;
+                let capacity =
+                    service_capacity_snapshot(state, task_store, Utc::now().timestamp_millis())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                let non_batch_active = capacity
+                    .non_batch_running
+                    .saturating_add(capacity.non_batch_provisioning);
+                let admitted = match task_store.admit_reconciler_attempt(
+                    &intent.task_id,
+                    &intent.action_key,
+                    &attempt_id,
+                    typed.task_version,
+                    typed.reconcile_generation,
+                    intent.action_generation,
+                    state.config.concurrency_limit,
+                    non_batch_active,
+                ) {
+                    Ok(admitted) => admitted,
+                    Err(store::StoreError::Conflict) => continue,
+                    Err(error) => return Err(error.to_string()),
+                };
+                drop(admission);
+                match admitted {
+                    store::ReconcilerAttemptAdmission::DeferredCapacity => continue,
+                    store::ReconcilerAttemptAdmission::Admitted(attempt) => attempt,
+                }
             }
-        } else {
-            existing.expect("checked above")
+            _ => continue,
         };
 
         let project = task_store
@@ -3496,6 +3540,17 @@ async fn run_reconciler_executor_tick(state: &AppState) -> Result<(), String> {
             Err(error) => return Err(error.to_string()),
         };
         let Some(opencode_session_id) = runtime.opencode_session_id.as_deref() else {
+            // The V2 session-create request may have reached OpenCode even if
+            // its response did not reach Anvil. Without a durable returned ID
+            // there is no exact session to observe, so park rather than create
+            // another native session blindly on a later sweep.
+            let _ = outbox
+                .record_result_after_side_effect(
+                    &intent.task_id,
+                    &intent.action_key,
+                    anvil_reconcile::ActionState::UnknownOutcome,
+                )
+                .map_err(|error| error.to_string())?;
             continue;
         };
         let expected_repository = project["repository"]

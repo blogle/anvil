@@ -2350,10 +2350,10 @@ impl ControllerStore {
         let Some((version, held, mode, reconcile_generation, task_state)) = current else {
             return Err(StoreError::NotFound);
         };
-        if version as u64 != expected_task_version
+        if version != expected_task_version
             || held
             || mode != "reconciler"
-            || reconcile_generation as u64 != expected_reconcile_generation
+            || reconcile_generation != expected_reconcile_generation
             || matches!(
                 task_state.as_str(),
                 "completed" | "canceled" | "obviated" | "superseded" | "failed_exhausted"
@@ -3799,6 +3799,33 @@ mod tests {
         let action = &decision.desired_actions[0];
         let attempt_id = "attempt-reconciler-create";
 
+        assert!(matches!(
+            store.admit_reconciler_attempt(
+                "exec-task",
+                &action.idempotency_key,
+                attempt_id,
+                typed.task_version + 1,
+                typed.reconcile_generation,
+                1,
+                1,
+                0,
+            ),
+            Err(StoreError::Conflict)
+        ));
+        assert!(matches!(
+            store.admit_reconciler_attempt(
+                "exec-task",
+                &action.idempotency_key,
+                attempt_id,
+                typed.task_version,
+                typed.reconcile_generation,
+                0,
+                1,
+                0,
+            ),
+            Err(StoreError::Conflict)
+        ));
+
         assert_eq!(
             store
                 .admit_reconciler_attempt(
@@ -3822,14 +3849,67 @@ mod tests {
             Some(anvil_reconcile::ActionState::Pending)
         );
 
+        let held_version = store
+            .set_task_control("exec-task", typed.task_version, true, "reconciler")
+            .unwrap();
+        let held_snapshot = store
+            .task_reconciliation_snapshot("exec-task", now)
+            .unwrap()
+            .unwrap();
+        let (held_typed, _) = anvil_reconcile::frozen_v0::decode_snapshot(&held_snapshot).unwrap();
+        assert!(matches!(
+            store.admit_reconciler_attempt(
+                "exec-task",
+                &action.idempotency_key,
+                attempt_id,
+                held_typed.task_version,
+                held_typed.reconcile_generation,
+                1,
+                1,
+                0,
+            ),
+            Err(StoreError::Conflict)
+        ));
+        let unheld_version = store
+            .set_task_control("exec-task", held_version, false, "reconciler")
+            .unwrap();
+        let unheld_snapshot = store
+            .task_reconciliation_snapshot("exec-task", now)
+            .unwrap()
+            .unwrap();
+        let (admission_typed, _) =
+            anvil_reconcile::frozen_v0::decode_snapshot(&unheld_snapshot).unwrap();
+        assert_eq!(admission_typed.task_version, unheld_version);
+
+        arm_task_store_failpoint("reconciler.admission.before_commit");
+        assert!(store
+            .admit_reconciler_attempt(
+                "exec-task",
+                &action.idempotency_key,
+                attempt_id,
+                admission_typed.task_version,
+                admission_typed.reconcile_generation,
+                1,
+                1,
+                0,
+            )
+            .is_err());
+        assert!(store.attempts_for_task("exec-task").unwrap().is_empty());
+        assert_eq!(
+            outbox
+                .action_state("exec-task", &action.idempotency_key)
+                .unwrap(),
+            Some(anvil_reconcile::ActionState::Pending)
+        );
+
         arm_task_store_failpoint("reconciler.admission.after_commit");
         assert!(store
             .admit_reconciler_attempt(
                 "exec-task",
                 &action.idempotency_key,
                 attempt_id,
-                typed.task_version,
-                typed.reconcile_generation,
+                admission_typed.task_version,
+                admission_typed.reconcile_generation,
                 1,
                 1,
                 0,
@@ -3876,6 +3956,17 @@ mod tests {
         let sequence = reopened
             .reserve_observation_sequence("exec-task", "runtime.execution")
             .unwrap();
+        assert!(matches!(
+            reopened.record_attempt_runtime_observation(
+                "runtime-observation-wrong-binding",
+                "exec-task",
+                attempt_id,
+                "different-session",
+                &serde_json::json!({"attempt_id":attempt_id,"session_id":"different-session"}),
+                sequence,
+            ),
+            Err(StoreError::Conflict)
+        ));
         reopened.record_attempt_runtime_observation(
             "runtime-observation-1", "exec-task", attempt_id, "exec-task-1234abcd",
             &serde_json::json!({"attempt_id":attempt_id,"session_id":"exec-task-1234abcd","runtime_health":"healthy","turn_state":"not_submitted"}),
