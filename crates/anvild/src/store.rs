@@ -6214,6 +6214,20 @@ mod tests {
                     source_inode,
                     "rollback must restore the original database inode"
                 );
+            } else if matches!(
+                stage,
+                "database_renamed"
+                    | "directory_synced"
+                    | "wal_opened"
+                    | "marker_committed"
+                    | "backup_removed"
+            ) {
+                use std::os::unix::fs::MetadataExt;
+                assert_ne!(
+                    fs::metadata(&path).unwrap().ino(),
+                    source_inode,
+                    "replacement must install the staged database at {stage}"
+                );
             }
 
             let recovered = ControllerStore::open(&path).unwrap();
