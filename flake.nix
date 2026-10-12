@@ -11,7 +11,7 @@
     nix2containerNixpkgs.follows = "nix2container/nixpkgs";
     opencode.url = "github:anomalyco/opencode/9b4ec5714d481559990db0a816d5dec19541a814";
     # Temporary DRAFT integration pin for SDLC #80; replace with its reviewed release.
-    sdlc.url = "github:blogle/sdlc/1bd4d95a9253f09fa67e486f4b834a7ff8c20cd9";
+    sdlc.url = "github:blogle/sdlc/892bbbf6bc27dc2c21968e0f7b1d4feb25ad51db";
     sdlc.inputs.nixpkgs.follows = "nixpkgs";
   };
 

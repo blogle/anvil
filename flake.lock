@@ -201,17 +201,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1791836468,
-        "narHash": "sha256-pzAHreYM9DpwjrJohzt1arD4HxQ+cycWXwrzOHq9jus=",
+        "lastModified": 1791837099,
+        "narHash": "sha256-qyW+GXCzDvkx9jVjVJXq9md4gIzaUwyirzD6UwWq3yc=",
         "owner": "blogle",
         "repo": "sdlc",
-        "rev": "1bd4d95a9253f09fa67e486f4b834a7ff8c20cd9",
+        "rev": "892bbbf6bc27dc2c21968e0f7b1d4feb25ad51db",
         "type": "github"
       },
       "original": {
         "owner": "blogle",
         "repo": "sdlc",
-        "rev": "1bd4d95a9253f09fa67e486f4b834a7ff8c20cd9",
+        "rev": "892bbbf6bc27dc2c21968e0f7b1d4feb25ad51db",
         "type": "github"
       }
     },
