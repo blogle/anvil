@@ -409,6 +409,11 @@ pub struct CreateRequest {
     pub author_email: Option<String>,
     #[serde(skip)]
     session_id_override: Option<String>,
+    /// Provision a durable sandbox and OpenCode session without dispatching a
+    /// model turn. Reconciler CreateAttempt uses this until SendTurn recovery is
+    /// safe to automate for the pinned OpenCode contract.
+    #[serde(skip)]
+    runtime_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2022,6 +2027,9 @@ impl AppState {
                 if let Err(error) = run_task_reconciliation_tick(&state) {
                     warn!(%error, "Task reconciliation tick failed");
                 }
+                if let Err(error) = run_reconciler_executor_tick(&state).await {
+                    warn!(%error, "Reconciler executor tick failed");
+                }
             }
         });
     }
@@ -2994,6 +3002,7 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
             author_name: None,
             author_email: None,
             session_id_override: Some(session_id.clone()),
+            runtime_only: false,
         };
         match create(State(state.clone()), None, Json(request)).await {
             Ok((_, Json(session))) => {
@@ -3300,6 +3309,264 @@ fn run_task_reconciliation_tick(state: &AppState) -> Result<(), String> {
         after = cursor;
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct ReconcilerCreateIntent {
+    task_id: String,
+    action_key: String,
+    action_generation: u64,
+    action_state: String,
+    action: anvil_reconcile::ProposedAction,
+}
+
+fn pending_reconciler_create_intents(
+    path: &std::path::Path,
+) -> Result<Vec<ReconcilerCreateIntent>, String> {
+    let connection = rusqlite::Connection::open(path).map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare("SELECT task_id,idempotency_key,generation,state,action_json FROM reconcile_actions WHERE state IN ('pending','executing') AND json_extract(action_json,'$.kind')='create_attempt' ORDER BY rowid")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.map(|row| {
+        let (task_id, action_key, action_generation, action_state, raw) =
+            row.map_err(|error| error.to_string())?;
+        let action = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+        Ok(ReconcilerCreateIntent {
+            task_id,
+            action_key,
+            action_generation,
+            action_state,
+            action,
+        })
+    })
+    .collect()
+}
+
+/// Execute only durable CreateAttempt intents. Runtime creation uses the existing
+/// sandbox/OpenCode adapter in runtime-only mode; SendTurn is deliberately not
+/// dispatched until its ambiguous-outcome recovery contract is proven.
+async fn run_reconciler_executor_tick(state: &AppState) -> Result<(), String> {
+    let intents = pending_reconciler_create_intents(&state.config.store_path)?;
+    let task_store = state.store().map_err(str::to_owned)?;
+    let mut outbox = anvil_reconcile::outbox::SqliteDecisionStore::open(&state.config.store_path)
+        .map_err(|error| error.to_string())?;
+
+    for intent in intents {
+        if intent.action.kind != anvil_reconcile::ActionKind::CreateAttempt {
+            continue;
+        }
+        let now = Utc::now().timestamp_millis();
+        let Some(snapshot) = task_store
+            .task_reconciliation_snapshot(&intent.task_id, now)
+            .map_err(|error| error.to_string())?
+        else {
+            continue;
+        };
+        let (typed, _) = anvil_reconcile::frozen_v0::decode_snapshot(&snapshot)?;
+        if typed.controller_mode != anvil_reconcile::ControllerMode::Reconciler
+            || typed.operator_hold
+            || typed.lifecycle != anvil_reconcile::Lifecycle::Open
+            || intent.action.task_id != intent.task_id
+            || intent.action.idempotency_key != intent.action_key
+        {
+            continue;
+        }
+        let existing = task_store
+            .get_attempt_submission(&intent.action_key)
+            .map_err(|error| error.to_string())?;
+        let attempt_id = existing
+            .as_ref()
+            .and_then(|attempt| attempt["attempt_id"].as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| reconciler_attempt_id(&intent.action_key));
+
+        let _attempt = if intent.action_state == "pending" || existing.is_none() {
+            let admission = state.admission_lock.clone().lock_owned().await;
+            let capacity =
+                service_capacity_snapshot(state, task_store, Utc::now().timestamp_millis())
+                    .await
+                    .map_err(|error| error.to_string())?;
+            let non_batch_active = capacity
+                .non_batch_running
+                .saturating_add(capacity.non_batch_provisioning);
+            let admitted = match task_store.admit_reconciler_attempt(
+                &intent.task_id,
+                &intent.action_key,
+                &attempt_id,
+                typed.task_version,
+                typed.reconcile_generation,
+                intent.action_generation,
+                state.config.concurrency_limit,
+                non_batch_active,
+            ) {
+                Ok(admitted) => admitted,
+                Err(store::StoreError::Conflict) => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            drop(admission);
+            match admitted {
+                store::ReconcilerAttemptAdmission::DeferredCapacity => continue,
+                store::ReconcilerAttemptAdmission::Admitted(attempt) => attempt,
+            }
+        } else {
+            existing.expect("checked above")
+        };
+
+        let project = task_store
+            .get_resource("task", &intent.task_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("Task {} disappeared after admission", intent.task_id))?;
+        let target = &project["execution_target"];
+        let project_name = project["project"]
+            .as_str()
+            .or_else(|| target["project"].as_str())
+            .unwrap_or("task");
+        let session_id = deterministic_attempt_session_id(project_name, &attempt_id);
+        let runtime = match state.kube.get(&session_id).await {
+            Ok(record) => record.session,
+            Err(ServiceError::NotFound) => {
+                let request = CreateRequest {
+                    project: project_name.to_owned(),
+                    repository: project["repository"]
+                        .as_str()
+                        .or_else(|| target["repository"].as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    base_ref: project["base_commit"]
+                        .as_str()
+                        .or_else(|| project["requested_revision"].as_str())
+                        .or_else(|| target["base_ref"].as_str())
+                        .unwrap_or("main")
+                        .to_owned(),
+                    prompt: project["prompt"]
+                        .as_str()
+                        .or_else(|| project["outcome"].as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    model: project["model"]
+                        .as_str()
+                        .or_else(|| project["policy"]["model"].as_str())
+                        .map(str::to_owned),
+                    author_name: None,
+                    author_email: None,
+                    session_id_override: Some(session_id.clone()),
+                    runtime_only: true,
+                };
+                match create(State(state.clone()), None, Json(request)).await {
+                    Ok((_, Json(session))) => session,
+                    Err(error) => match state.kube.get(&session_id).await {
+                        // A timeout after durable Sandbox creation is recovered by
+                        // observing the deterministic exact session; no second turn
+                        // is sent by this executor.
+                        Ok(record) => record.session,
+                        Err(ServiceError::NotFound) => {
+                            let _ = task_store.record_attempt_failure(
+                                &attempt_id,
+                                store::scheduler::FailureClass::Infrastructure,
+                                &error.to_string(),
+                                Utc::now().timestamp_millis(),
+                                state.config.provisioning_max_attempts,
+                                state.config.provisioning_retry_base.as_millis() as u64,
+                            );
+                            let _ = outbox.record_result_after_side_effect(
+                                &intent.task_id,
+                                &intent.action_key,
+                                anvil_reconcile::ActionState::Failed,
+                            );
+                            continue;
+                        }
+                        // Runtime lookup uncertainty is not proof that provisioning
+                        // failed. Keep the same executing Action/Attempt and observe
+                        // again on the next sweep instead of allocating a replacement.
+                        Err(_) => continue,
+                    },
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let Some(opencode_session_id) = runtime.opencode_session_id.as_deref() else {
+            continue;
+        };
+        let expected_repository = project["repository"]
+            .as_str()
+            .or_else(|| target["repository"].as_str())
+            .unwrap_or_default();
+        if runtime.id != session_id
+            || runtime.project != project_name
+            || runtime.repository != expected_repository
+        {
+            return Err(format!(
+                "deterministic runtime identity mismatch for Task {} Attempt {attempt_id}",
+                intent.task_id
+            ));
+        }
+        let opencode = OpenCode::new(
+            service_url(&runtime, &state.config),
+            state.config.request_timeout,
+        );
+        let runtime_health = match opencode.session_exists(opencode_session_id).await {
+            Ok(true) => "healthy",
+            Ok(false) => "unknown",
+            Err(_) => "unknown",
+        };
+        task_store
+            .bind_attempt_session(&attempt_id, &session_id)
+            .and_then(|_| task_store.set_attempt_and_task_state(&attempt_id, "running", "running"))
+            .map_err(|error| error.to_string())?;
+        let observation_seq = task_store
+            .reserve_observation_sequence(&intent.task_id, "runtime.execution")
+            .map_err(|error| error.to_string())?;
+        task_store
+            .record_attempt_runtime_observation(
+                &uuid::Uuid::new_v4().to_string(),
+                &intent.task_id,
+                &attempt_id,
+                &session_id,
+                &json!({
+                    "attempt_id":attempt_id,
+                    "session_id":session_id,
+                    "opencode_session_id":opencode_session_id,
+                    "runtime_health":runtime_health,
+                    "turn_state":"not_submitted",
+                    "observed_at":Utc::now().to_rfc3339(),
+                }),
+                observation_seq,
+            )
+            .map_err(|error| error.to_string())?;
+        if runtime_health == "healthy" {
+            let _ = outbox
+                .record_result_after_side_effect(
+                    &intent.task_id,
+                    &intent.action_key,
+                    anvil_reconcile::ActionState::Succeeded,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn reconciler_attempt_id(action_key: &str) -> String {
+    let digest = Sha256::digest(action_key.as_bytes());
+    format!(
+        "attempt-{}",
+        digest
+            .iter()
+            .take(16)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 async fn create_task_graph(
@@ -4121,15 +4388,19 @@ async fn create(
         r.author_email.as_deref(),
     ));
     let started_at = chrono_like_now();
-    let initial_submission = RunSubmission {
+    let initial_submission = (!r.runtime_only).then(|| RunSubmission {
         run_id: RunId(new_run_id()),
         user_message_id: new_opencode_message_id(),
-    };
-    let initial_run = RunRecord::submitted(
-        initial_submission.run_id.clone(),
-        initial_submission.user_message_id.clone(),
-        started_at,
-    );
+    });
+    let initial_run = initial_submission
+        .as_ref()
+        .map_or_else(RunRecord::default, |submission| {
+            RunRecord::submitted(
+                submission.run_id.clone(),
+                submission.user_message_id.clone(),
+                started_at,
+            )
+        });
     s.kube.create(&id, &r, &sandbox_env, &initial_run).await?;
     record_history(
         &s,
@@ -4188,6 +4459,11 @@ async fn create(
                 .unwrap_or_else(|| "new OpenCode session could not be verified".into()),
         ));
     }
+    if r.runtime_only {
+        s.ensure_lifecycle_watcher(&id).await?;
+        obj = s.kube.get(&id).await?;
+        return Ok((StatusCode::CREATED, Json(obj.session)));
+    }
     materialize_request(
         &s,
         &id,
@@ -4212,6 +4488,8 @@ async fn create(
         model.as_ref().map(|model| model.qualified_id()),
     )
     .await;
+    let initial_submission =
+        initial_submission.expect("non-runtime-only creation has a submission");
     if let Err(error) = oc
         .prompt_async(
             &oc_id,
@@ -13276,6 +13554,44 @@ mod tests {
             .unwrap();
         switch.assert_async().await;
         prompt.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn v2_create_attempt_runtime_observation_uses_native_session_read_without_prompt() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/info");
+            then.status(200).json_body(json!({"version":"2.0.26+test"}));
+        });
+        let exact_session = server.mock(|when, then| {
+            when.method(GET).path("/api/session/ses_task_attempt");
+            then.status(200)
+                .json_body(json!({"data":{"id":"ses_task_attempt"}}));
+        });
+        let messages = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/session/ses_task_attempt/message");
+            then.status(200).json_body(json!({"data":[]}));
+        });
+        let prompt = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/session/ses_task_attempt/prompt");
+            then.status(500);
+        });
+
+        let client = OpenCode::new(server.base_url(), Duration::from_secs(5));
+        assert!(client.session_exists("ses_task_attempt").await.unwrap());
+        assert_eq!(
+            client.session_messages("ses_task_attempt").await.unwrap(),
+            json!([])
+        );
+        exact_session.assert_async().await;
+        messages.assert_async().await;
+        assert_eq!(
+            prompt.hits_async().await,
+            0,
+            "CreateAttempt must not send a turn"
+        );
     }
 
     #[test]

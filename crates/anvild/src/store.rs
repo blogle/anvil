@@ -129,6 +129,12 @@ pub struct AttemptAcceptance {
     pub created: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReconcilerAttemptAdmission {
+    DeferredCapacity,
+    Admitted(Value),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TaskListFilters {
     pub lifecycle: Option<String>,
@@ -1120,6 +1126,47 @@ impl ControllerStore {
         )?;
         tx.commit()?;
         Ok(next as u64)
+    }
+
+    /// Persist a runtime fact only when it is bound to the exact canonical
+    /// Attempt and Sandbox session. Runtime facts are not completion evidence.
+    pub fn record_attempt_runtime_observation(
+        &self,
+        observation_id: &str,
+        task_id: &str,
+        attempt_id: &str,
+        session_id: &str,
+        value: &Value,
+        collection_seq: u64,
+    ) -> Result<(), StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let bound: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE task_id=?1 AND attempt_id=?2 AND session_id=?3 AND json_extract(payload_json,'$.state') IN ('provisioning','running'))",
+            params![task_id, attempt_id, session_id],
+            |row| row.get(0),
+        )?;
+        if !bound || value["attempt_id"] != attempt_id || value["session_id"] != session_id {
+            return Err(StoreError::Conflict);
+        }
+        drop(connection);
+        self.record_observation_with_provenance(
+            observation_id,
+            task_id,
+            "runtime.execution",
+            value,
+            "runtime",
+            collection_seq,
+            Some(
+                &chrono::Utc::now()
+                    .checked_add_signed(chrono::Duration::minutes(5))
+                    .unwrap_or_else(chrono::Utc::now)
+                    .to_rfc3339(),
+            ),
+            false,
+        )
     }
 
     /// Persist an agent claim. Callers cannot select factual provenance through
@@ -2272,6 +2319,196 @@ impl ControllerStore {
         tx.commit()?;
         hit_task_store_failpoint("attempt.create.after_commit")?;
         Ok(acceptance)
+    }
+
+    /// Atomically claim an authorized CreateAttempt action and admit exactly one
+    /// canonical Attempt under the same global capacity fence used by the Legacy
+    /// scheduler. A capacity deferral leaves both the action and Attempt ledger
+    /// untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_reconciler_attempt(
+        &self,
+        task_id: &str,
+        action_key: &str,
+        attempt_id: &str,
+        expected_task_version: u64,
+        expected_reconcile_generation: u64,
+        expected_action_generation: u64,
+        global_limit: u32,
+        non_batch_active: u32,
+    ) -> Result<ReconcilerAttemptAdmission, StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(u64, bool, String, u64, String)> = tx.query_row(
+            "SELECT d.version,d.operator_hold,d.controller_mode,d.reconcile_generation,t.state FROM task_durable_state d JOIN tasks t USING(task_id) WHERE task_id=?1",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).optional()?;
+        let Some((version, held, mode, reconcile_generation, task_state)) = current else {
+            return Err(StoreError::NotFound);
+        };
+        if version as u64 != expected_task_version
+            || held
+            || mode != "reconciler"
+            || reconcile_generation as u64 != expected_reconcile_generation
+            || matches!(
+                task_state.as_str(),
+                "completed" | "canceled" | "obviated" | "superseded" | "failed_exhausted"
+            )
+        {
+            tx.rollback()?;
+            return Err(StoreError::Conflict);
+        }
+        let action: Option<(String, u64, String)> = tx.query_row(
+            "SELECT action_json,generation,state FROM reconcile_actions WHERE task_id=?1 AND idempotency_key=?2",
+            params![task_id, action_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?;
+        let Some((action_json, generation, action_state)) = action else {
+            tx.rollback()?;
+            return Err(StoreError::Conflict);
+        };
+        if generation != expected_action_generation
+            || !matches!(action_state.as_str(), "pending" | "executing")
+        {
+            tx.rollback()?;
+            return Err(StoreError::Conflict);
+        }
+        let action: Value = serde_json::from_str(&action_json)?;
+        if action["kind"] != "create_attempt"
+            || action["task_id"] != task_id
+            || action["idempotency_key"] != action_key
+        {
+            tx.rollback()?;
+            return Err(StoreError::Conflict);
+        }
+        let blocked_dependency: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_dependencies d JOIN tasks p ON p.task_id=d.predecessor_task_id WHERE d.successor_task_id=?1 AND p.state<>'completed')",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        let unresolved_blocker: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_blockers WHERE task_id=?1 AND resolution_json IS NULL)",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        if blocked_dependency || unresolved_blocker {
+            tx.rollback()?;
+            return Err(StoreError::Conflict);
+        }
+        let desired: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM reconcile_desired_actions WHERE task_id=?1 AND idempotency_key=?2 AND generation=?3)",
+            params![task_id, action_key, expected_action_generation],
+            |row| row.get(0),
+        )?;
+        // An executing action survives a reconciler wake that observes the
+        // admitted Attempt and removes the proposal from the desired set.
+        let existing: Option<(String, String)> = tx.query_row(
+            "SELECT a.attempt_id,json_extract(a.payload_json,'$.state') FROM attempt_submissions s JOIN attempts a USING(attempt_id) WHERE s.idempotency_key=?1 AND s.task_id=?2",
+            params![action_key, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let action_generation: Option<u64> = tx
+            .query_row(
+                "SELECT generation FROM reconcile_control WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if action_state == "pending"
+            && (action_generation != Some(expected_action_generation) || !desired)
+        {
+            tx.rollback()?;
+            return Err(StoreError::Conflict);
+        }
+        if action_state == "executing" && existing.is_none() {
+            tx.rollback()?;
+            return Err(StoreError::Conflict);
+        }
+        if action_state == "pending" && existing.is_none() {
+            let ordinal: u64 = tx.query_row(
+                "SELECT COUNT(*)+1 FROM attempts WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            let budget_max: Option<u32> = tx.query_row(
+                "SELECT json_extract(budget_json,'$.max_attempts') FROM task_durable_state WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            let grants: u32 = tx.query_row(
+                "SELECT COALESCE(SUM(additional_attempts),0) FROM task_budget_grants WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            if action["payload"]["ordinal"].as_u64() != Some(ordinal)
+                || budget_max.is_some_and(|max| ordinal > u64::from(max.saturating_add(grants)))
+            {
+                tx.rollback()?;
+                return Err(StoreError::Conflict);
+            }
+        }
+        if let Some((existing_id, attempt_state)) = &existing {
+            if attempt_state == "provisioning" || attempt_state == "running" {
+                if action_state == "pending" {
+                    let _ = tx.execute("UPDATE reconcile_actions SET state='executing' WHERE task_id=?1 AND idempotency_key=?2 AND state='pending'",params![task_id,action_key])?;
+                }
+                let raw: String = tx.query_row(
+                    "SELECT payload_json FROM attempts WHERE attempt_id=?1",
+                    [existing_id],
+                    |row| row.get(0),
+                )?;
+                tx.commit()?;
+                return Ok(ReconcilerAttemptAdmission::Admitted(serde_json::from_str(
+                    &raw,
+                )?));
+            }
+        }
+        let active: u32 = tx.query_row(
+            "SELECT COUNT(*) FROM attempts WHERE json_extract(payload_json,'$.state') IN ('provisioning','running')",
+            [],
+            |row| row.get(0),
+        )?;
+        if active.saturating_add(non_batch_active) >= global_limit {
+            tx.rollback()?;
+            return Ok(ReconcilerAttemptAdmission::DeferredCapacity);
+        }
+        let batch: Option<(Option<String>, u32)> = tx.query_row(
+            "SELECT t.batch_id,COALESCE(json_extract(b.payload_json,'$.requested_concurrency'),?2) FROM tasks t LEFT JOIN batches b USING(batch_id) WHERE t.task_id=?1",
+            params![task_id, global_limit],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        if let Some((Some(batch_id), ceiling)) = batch {
+            let batch_active: u32 = tx.query_row(
+                "SELECT COUNT(*) FROM attempts a JOIN tasks t USING(task_id) WHERE t.batch_id=?1 AND json_extract(a.payload_json,'$.state') IN ('provisioning','running')",
+                [batch_id],
+                |row| row.get(0),
+            )?;
+            if batch_active >= ceiling {
+                tx.rollback()?;
+                return Ok(ReconcilerAttemptAdmission::DeferredCapacity);
+            }
+        }
+        tx.execute(
+            "UPDATE reconcile_actions SET state='executing' WHERE task_id=?1 AND idempotency_key=?2 AND state='pending'",
+            params![task_id, action_key],
+        )?;
+        let accepted = create_attempt_tx(&tx, task_id, attempt_id, action_key)?;
+        let mut attempt = accepted.attempt;
+        let admitted_attempt_id = attempt["attempt_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        attempt["state"] = Value::String("provisioning".into());
+        scheduler::persist_attempt(&tx, &admitted_attempt_id, &attempt)?;
+        scheduler::set_task_state(&tx, task_id, "provisioning")?;
+        hit_task_store_failpoint("reconciler.admission.before_commit")?;
+        tx.commit()?;
+        hit_task_store_failpoint("reconciler.admission.after_commit")?;
+        Ok(ReconcilerAttemptAdmission::Admitted(attempt))
     }
 
     pub fn get_attempt_submission(&self, key: &str) -> Result<Option<Value>, StoreError> {
@@ -3512,6 +3749,163 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn reconciler_create_attempt_admission_is_capacity_fenced_and_restart_idempotent() {
+        let (directory, store) = store();
+        let path = directory.path().join("controller.sqlite3");
+        let spec = serde_json::json!({
+            "outcome":"autonomous task",
+            "execution_target":{
+                "kind":"git_repository",
+                "repository":"https://example.test/repo.git",
+                "base_ref":"main",
+                "delivery":"pull_request"
+            }
+        });
+        store
+            .accept_task("exec-key", "test", &spec, "exec-task", &spec)
+            .unwrap();
+        store
+            .set_task_control("exec-task", 1, false, "reconciler")
+            .unwrap();
+        let mut outbox = anvil_reconcile::outbox::SqliteDecisionStore::open(&path).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let snapshot = store
+            .task_reconciliation_snapshot("exec-task", now)
+            .unwrap()
+            .unwrap();
+        let (typed, logical_time) = anvil_reconcile::frozen_v0::decode_snapshot(&snapshot).unwrap();
+        let decision = anvil_reconcile::reconcile(&typed, logical_time);
+        assert_eq!(decision.rule_id, "task_runnable");
+        let record =
+            anvil_reconcile::DecisionRecord::new(&typed, logical_time, &snapshot, &decision);
+        assert!(matches!(
+            store
+                .commit_reconcile_decision(
+                    "exec-task",
+                    now,
+                    &snapshot,
+                    &record,
+                    &decision.desired_actions
+                )
+                .unwrap(),
+            anvil_reconcile::outbox::CommitResult::Applied {
+                generation: 1,
+                inserted: 1
+            }
+        ));
+        let action = &decision.desired_actions[0];
+        let attempt_id = "attempt-reconciler-create";
+
+        assert_eq!(
+            store
+                .admit_reconciler_attempt(
+                    "exec-task",
+                    &action.idempotency_key,
+                    attempt_id,
+                    typed.task_version,
+                    typed.reconcile_generation,
+                    1,
+                    1,
+                    1,
+                )
+                .unwrap(),
+            ReconcilerAttemptAdmission::DeferredCapacity,
+        );
+        assert!(store.attempts_for_task("exec-task").unwrap().is_empty());
+        assert_eq!(
+            outbox
+                .action_state("exec-task", &action.idempotency_key)
+                .unwrap(),
+            Some(anvil_reconcile::ActionState::Pending)
+        );
+
+        arm_task_store_failpoint("reconciler.admission.after_commit");
+        assert!(store
+            .admit_reconciler_attempt(
+                "exec-task",
+                &action.idempotency_key,
+                attempt_id,
+                typed.task_version,
+                typed.reconcile_generation,
+                1,
+                1,
+                0,
+            )
+            .is_err());
+        drop(store);
+
+        let reopened = ControllerStore::open(&path).unwrap();
+        let current = reopened
+            .task_reconciliation_snapshot("exec-task", now)
+            .unwrap()
+            .unwrap();
+        let (current_typed, _) = anvil_reconcile::frozen_v0::decode_snapshot(&current).unwrap();
+        let recovered = reopened
+            .admit_reconciler_attempt(
+                "exec-task",
+                &action.idempotency_key,
+                attempt_id,
+                current_typed.task_version,
+                current_typed.reconcile_generation,
+                1,
+                1,
+                0,
+            )
+            .unwrap();
+        let ReconcilerAttemptAdmission::Admitted(attempt) = recovered else {
+            panic!("admitted Attempt was not recovered")
+        };
+        assert_eq!(attempt["attempt_id"], attempt_id);
+        assert_eq!(reopened.attempts_for_task("exec-task").unwrap().len(), 1);
+        assert_eq!(
+            outbox
+                .action_state("exec-task", &action.idempotency_key)
+                .unwrap(),
+            Some(anvil_reconcile::ActionState::Executing)
+        );
+
+        reopened
+            .bind_attempt_session(attempt_id, "exec-task-1234abcd")
+            .unwrap();
+        reopened
+            .set_attempt_and_task_state(attempt_id, "running", "running")
+            .unwrap();
+        let sequence = reopened
+            .reserve_observation_sequence("exec-task", "runtime.execution")
+            .unwrap();
+        reopened.record_attempt_runtime_observation(
+            "runtime-observation-1", "exec-task", attempt_id, "exec-task-1234abcd",
+            &serde_json::json!({"attempt_id":attempt_id,"session_id":"exec-task-1234abcd","runtime_health":"healthy","turn_state":"not_submitted"}),
+            sequence,
+        ).unwrap();
+        outbox
+            .record_result_after_side_effect(
+                "exec-task",
+                &action.idempotency_key,
+                anvil_reconcile::ActionState::Succeeded,
+            )
+            .unwrap();
+        let observed = reopened
+            .task_reconciliation_snapshot("exec-task", now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed["observations"][0]["value"]["attempt_id"],
+            attempt_id
+        );
+        assert_eq!(
+            observed["observations"][0]["value"]["turn_state"],
+            "not_submitted"
+        );
+        assert_eq!(
+            outbox
+                .action_state("exec-task", &action.idempotency_key)
+                .unwrap(),
+            Some(anvil_reconcile::ActionState::Succeeded)
+        );
     }
     fn accept_batch(
         store: &ControllerStore,
