@@ -227,7 +227,8 @@ jobs:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Isolated Agent Sandbox Kubernetes lane
         run: |
-          time ANVIL_KIND_ARTIFACT_DIR="$GITHUB_WORKSPACE/image-artifacts" \
+          time ANVIL_KIND_SOURCE_REF="${GITHUB_BASE_REF:-main}" \
+            ANVIL_KIND_ARTIFACT_DIR="$GITHUB_WORKSPACE/image-artifacts" \
             nix develop .#kind-ci --command just e2e-k8s
       - name: Upload bounded Kind lifecycle diagnostics
         if: always()
