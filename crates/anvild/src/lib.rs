@@ -2078,7 +2078,18 @@ impl AppState {
 }
 
 fn normalized_sandbox_value(record: &SandboxRecord) -> Value {
-    json!({"session":record.session,"run_record":record.run_record,"binding_state":record.binding_state,"operating_mode":record.operating_mode,"created_at":record.created_at,"telemetry":record.telemetry})
+    let mut session = serde_json::to_value(&record.session).expect("session serializes");
+    let mut binding_state =
+        serde_json::to_value(&record.binding_state).expect("binding state serializes");
+    // These values describe when the projection was sampled, not a change in session state.
+    // Keep stable values in the durable snapshot so read-driven polling coalesces.
+    if let Some(object) = session.as_object_mut() {
+        object.remove("session_binding_checked_at");
+    }
+    if let Some(object) = binding_state.as_object_mut() {
+        object.remove("checked_at");
+    }
+    json!({"session":session,"run_record":record.run_record,"binding_state":binding_state,"operating_mode":record.operating_mode,"created_at":record.created_at,"telemetry":record.telemetry})
 }
 pub fn router(state: AppState) -> Router {
     let web_root = env::var_os("ANVIL_WEB_DIR")
@@ -4485,6 +4496,14 @@ fn binding_is_usable(session: &Session) -> bool {
     )
 }
 
+fn binding_state_matches(left: &BindingStateRecord, right: &BindingStateRecord) -> bool {
+    left.state == right.state
+        && left.continuity == right.continuity
+        && left.error == right.error
+        && left.previous_session_id == right.previous_session_id
+        && left.recovery_event == right.recovery_event
+}
+
 async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceError> {
     let lock = s.binding_lock(id);
     let _guard = lock.lock().await;
@@ -4496,19 +4515,6 @@ async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceErr
     let previous = record.binding_state;
     let original_session_id = Some(opencode_id.to_owned());
     let checked_at = chrono_like_now();
-    s.kube
-        .set_binding_state(
-            id,
-            &BindingStateRecord {
-                state: "recovering".into(),
-                continuity: previous.continuity.clone(),
-                checked_at: checked_at.clone(),
-                error: None,
-                previous_session_id: previous.previous_session_id.clone(),
-                recovery_event: previous.recovery_event.clone(),
-            },
-        )
-        .await?;
     let op = OpenCode::new(service_url(&session, &s.config), s.config.request_timeout);
     let mut rebound_session_id = None;
     match op.session_exists(opencode_id).await {
@@ -4518,23 +4524,21 @@ async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceErr
             } else {
                 "available"
             };
-            s.kube
-                .set_binding_state(
-                    id,
-                    &BindingStateRecord {
-                        state: state.into(),
-                        continuity: if previous.continuity == "lost" {
-                            "lost".into()
-                        } else {
-                            "exact".into()
-                        },
-                        checked_at,
-                        error: None,
-                        previous_session_id: previous.previous_session_id,
-                        recovery_event: previous.recovery_event,
-                    },
-                )
-                .await?;
+            let next = BindingStateRecord {
+                state: state.into(),
+                continuity: if previous.continuity == "lost" {
+                    "lost".into()
+                } else {
+                    "exact".into()
+                },
+                checked_at,
+                error: None,
+                previous_session_id: previous.previous_session_id.clone(),
+                recovery_event: previous.recovery_event.clone(),
+            };
+            if !binding_state_matches(&previous, &next) {
+                s.kube.set_binding_state(id, &next).await?;
+            }
         }
         Ok(false) => {
             let new_id = op.create_session().await?;
@@ -4571,19 +4575,17 @@ async fn reconcile_binding(s: &AppState, id: &str) -> Result<Session, ServiceErr
             .await;
         }
         Err(error) => {
-            s.kube
-                .set_binding_state(
-                    id,
-                    &BindingStateRecord {
-                        state: "recovering".into(),
-                        continuity: previous.continuity,
-                        checked_at,
-                        error: Some(error.to_string()),
-                        previous_session_id: previous.previous_session_id,
-                        recovery_event: previous.recovery_event,
-                    },
-                )
-                .await?;
+            let next = BindingStateRecord {
+                state: "recovering".into(),
+                continuity: previous.continuity.clone(),
+                checked_at,
+                error: Some(error.to_string()),
+                previous_session_id: previous.previous_session_id.clone(),
+                recovery_event: previous.recovery_event.clone(),
+            };
+            if !binding_state_matches(&previous, &next) {
+                s.kube.set_binding_state(id, &next).await?;
+            }
         }
     }
     let mut session = s.kube.get(id).await?.session;
@@ -10226,6 +10228,7 @@ mod tests {
     struct BindingSandbox {
         object: Arc<Mutex<DynamicObject>>,
         opencode_port: u16,
+        binding_writes: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     struct ActivitySandbox {
@@ -10598,6 +10601,8 @@ mod tests {
             _id: &str,
             state: &BindingStateRecord,
         ) -> Result<(), ServiceError> {
+            self.binding_writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut object = self
                 .object
                 .lock()
@@ -11384,6 +11389,42 @@ mod tests {
         let public = serde_json::to_string(&value).unwrap();
         assert!(!public.contains("message.part.updated"));
         assert!(!public.contains("tool_call"));
+    }
+
+    #[test]
+    fn sampled_binding_times_do_not_change_session_materialization() {
+        let mut first = active_run_record(activity_session());
+        first.session.session_binding_checked_at = Some("2026-01-01T10:00:00Z".into());
+        first.binding_state.checked_at = "2026-01-01T10:00:00Z".into();
+        let mut polled = first.clone();
+        polled.session.session_binding_checked_at = Some("2026-01-01T10:01:00Z".into());
+        polled.binding_state.checked_at = "2026-01-01T10:01:00Z".into();
+        assert_eq!(
+            normalized_sandbox_value(&first),
+            normalized_sandbox_value(&polled)
+        );
+        polled.telemetry.execution = "busy".into();
+        assert_ne!(
+            normalized_sandbox_value(&first),
+            normalized_sandbox_value(&polled)
+        );
+    }
+
+    #[test]
+    fn binding_observation_time_alone_is_not_a_binding_transition() {
+        let previous = BindingStateRecord {
+            state: "available".into(),
+            continuity: "exact".into(),
+            checked_at: "2026-01-01T10:00:00Z".into(),
+            error: None,
+            previous_session_id: None,
+            recovery_event: None,
+        };
+        let mut next = previous.clone();
+        next.checked_at = "2026-01-01T10:01:00Z".into();
+        assert!(binding_state_matches(&previous, &next));
+        next.state = "rebound".into();
+        assert!(!binding_state_matches(&previous, &next));
     }
 
     fn assistant_observation(
@@ -13326,6 +13367,7 @@ mod tests {
         }))
         .unwrap();
         let object = Arc::new(Mutex::new(object));
+        let binding_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut test_config = config(format!("{}/", server.base_url()));
         test_config.opencode_port = server_url.port().unwrap();
         let state = AppState::new(
@@ -13333,6 +13375,7 @@ mod tests {
             BindingSandbox {
                 object: object.clone(),
                 opencode_port: server_url.port().unwrap(),
+                binding_writes: binding_writes.clone(),
             },
         );
 
@@ -13346,6 +13389,7 @@ mod tests {
         assert_eq!(second.opencode_session_id.as_deref(), Some("ses_new"));
         assert_eq!(first.session_binding_state, "rebound");
         assert_eq!(first.session_binding_continuity, "lost");
+        assert_eq!(binding_writes.load(std::sync::atomic::Ordering::SeqCst), 1);
         missing.assert_hits(1);
         replacement.assert_hits(1);
         let annotations = object.lock().unwrap().annotations().clone();
