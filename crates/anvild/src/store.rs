@@ -156,6 +156,11 @@ pub struct ChangePage {
     pub reset_required: bool,
 }
 
+// Cursor clients can recover by fetching a full snapshot. Retain enough recent events for
+// reconnects while keeping the largest controller table bounded.
+const CHANGE_RETENTION_LIMIT: i64 = 10_000;
+const CHANGE_PRUNE_BATCH: i64 = 512;
+
 impl ControllerStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
@@ -202,6 +207,7 @@ impl ControllerStore {
         tx.execute("INSERT INTO orchestration_changes(resource_type, resource_id, payload_json) VALUES (?1,?2,?3)", params![resource_type, resource_id, serde_json::to_string(&change)?])?;
         let seq = tx.last_insert_rowid();
         tx.execute("INSERT INTO orchestration_materializations(resource_type,resource_id,payload_json,last_sequence) VALUES (?1,?2,?3,?4) ON CONFLICT(resource_type,resource_id) DO UPDATE SET payload_json=excluded.payload_json,last_sequence=excluded.last_sequence", params![resource_type, resource_id, payload, seq])?;
+        prune_change_history(&tx)?;
         tx.commit()?;
         Ok(encode_cursor(seq))
     }
@@ -319,8 +325,7 @@ impl ControllerStore {
     }
 
     /// Read a full materialized snapshot and its boundary from a single SQLite read transaction.
-    /// The change log is intentionally unbounded in this version; pruning must advance an
-    /// explicit retention floor before old cursors can be considered expired.
+    /// The change log is bounded; its cursor remains the monotonic AUTOINCREMENT high-water mark.
     pub fn materialized_snapshot(&self) -> Result<(String, Vec<Value>), StoreError> {
         self.materialized_snapshot_with(|| {})
     }
@@ -360,7 +365,7 @@ impl ControllerStore {
 
     /// Read strictly after an opaque cursor. Reusing it is deterministic and exclusive;
     /// cursors beyond the stream or crossing a retained-history gap require a full reset.
-    /// History is currently unbounded, so the gap path protects against manual/partial loss.
+    /// A cursor older than the retained floor must be reset from a full snapshot.
     pub fn changes_after(&self, cursor: &str, limit: usize) -> Result<ChangePage, StoreError> {
         let Some(after) = decode_cursor(cursor) else {
             return Ok(ChangePage {
@@ -383,6 +388,14 @@ impl ControllerStore {
             [],
             |row| row.get(0),
         )?;
+        let floor: Option<i64> = connection
+            .query_row(
+                "SELECT floor_sequence FROM orchestration_change_retention WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let floor = floor.unwrap_or(0);
         let next: Option<i64> = connection.query_row(
             "SELECT MIN(sequence) FROM orchestration_changes WHERE sequence>?1",
             [after],
@@ -390,6 +403,7 @@ impl ControllerStore {
         )?;
         if after > latest
             || (earliest > 0 && after < earliest.saturating_sub(1))
+            || after < floor
             || next.is_some_and(|next| next > after.saturating_add(1))
         {
             return Ok(ChangePage {
@@ -2781,6 +2795,33 @@ fn append_resource_change(
          ON CONFLICT(resource_type,resource_id) DO UPDATE SET payload_json=excluded.payload_json,last_sequence=excluded.last_sequence",
         params![resource_type, resource_id, serde_json::to_string(record)?, sequence],
     )?;
+    prune_change_history(tx)?;
+    Ok(())
+}
+
+fn prune_change_history(tx: &rusqlite::Transaction<'_>) -> Result<(), rusqlite::Error> {
+    let excess: i64 = tx.query_row(
+        "SELECT MAX(0, COUNT(*) - ?1) FROM orchestration_changes",
+        [CHANGE_RETENTION_LIMIT],
+        |row| row.get(0),
+    )?;
+    let count = excess.min(CHANGE_PRUNE_BATCH);
+    if count == 0 {
+        return Ok(());
+    }
+    let through: i64 = tx.query_row(
+        "SELECT sequence FROM orchestration_changes ORDER BY sequence LIMIT 1 OFFSET ?1",
+        [count - 1],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "DELETE FROM orchestration_changes WHERE sequence<=?1",
+        [through],
+    )?;
+    tx.execute(
+        "UPDATE orchestration_change_retention SET floor_sequence=MAX(floor_sequence,?1) WHERE singleton=1",
+        [through],
+    )?;
     Ok(())
 }
 
@@ -3036,6 +3077,19 @@ fn migrate_until(connection: &Connection, target_version: i64) -> Result<(), rus
     )?;
     if latest < 12 && target_version >= 12 {
         tx.execute_batch("CREATE TABLE attempt_state_migration_map(legacy_state TEXT PRIMARY KEY,lifecycle TEXT NOT NULL,exit_reason TEXT); INSERT INTO attempt_state_migration_map VALUES ('queued','queued',NULL),('provisioning','provisioning',NULL),('running','running',NULL),('completed','ended','completed_turn'),('succeeded','ended','completed_turn'),('failed','ended','failed'),('retry_wait','ended','failed'),('exhausted','ended','failed'),('canceled','ended','canceled'),('cancelled','ended','canceled'),('abandoned','ended','abandoned'),('orphaned','ended','orphaned'),('replaced','ended','replaced'); UPDATE attempts SET payload_json=json_set(payload_json,'$.lifecycle',CASE WHEN json_extract(payload_json,'$.state') IN ('queued','provisioning','running') THEN json_extract(payload_json,'$.state') ELSE 'ended' END,'$.exit_reason',CASE json_extract(payload_json,'$.state') WHEN 'completed' THEN 'completed_turn' WHEN 'succeeded' THEN 'completed_turn' WHEN 'failed' THEN 'failed' WHEN 'retry_wait' THEN 'failed' WHEN 'exhausted' THEN 'failed' WHEN 'canceled' THEN 'canceled' WHEN 'cancelled' THEN 'canceled' WHEN 'abandoned' THEN 'abandoned' WHEN 'orphaned' THEN 'orphaned' WHEN 'replaced' THEN 'replaced' ELSE NULL END) WHERE json_type(payload_json,'$.lifecycle') IS NULL; UPDATE attempts SET payload_json=json_set(payload_json,'$.failure',json_object('domain',CASE json_extract(payload_json,'$.failure_class') WHEN 'infrastructure' THEN 'platform' WHEN 'execution' THEN 'work' ELSE 'unknown' END,'code','legacy_'||COALESCE(json_extract(payload_json,'$.failure_class'),'unclassified'),'summary',substr(COALESCE(json_extract(payload_json,'$.failure_reason'),''),1,512),'artifact_refs',json('[]'))) WHERE json_type(payload_json,'$.failure_class') IS NOT NULL; INSERT INTO schema_migrations(version,applied_at) VALUES(12,datetime('now'));")?;
+    }
+    let latest: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if latest < 13 && target_version >= 13 {
+        tx.execute_batch("CREATE TABLE orchestration_change_retention (singleton INTEGER PRIMARY KEY CHECK(singleton=1), floor_sequence INTEGER NOT NULL);
+            INSERT INTO orchestration_change_retention(singleton,floor_sequence) VALUES(1,0);")?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (13, ?1)",
+            [chrono::Utc::now().to_rfc3339()],
+        )?;
     }
     tx.commit()?;
     connection.execute_batch("PRAGMA foreign_keys=ON;")?;
@@ -3349,7 +3403,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
     }
 
     #[test]
@@ -3491,7 +3545,7 @@ mod tests {
 
     #[test]
     fn every_historical_schema_migration_target_can_restart_and_continue() {
-        for target in 1..=12 {
+        for target in 1..=13 {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("historical.sqlite3");
             let connection = Connection::open(&path).unwrap();
@@ -3513,7 +3567,7 @@ mod tests {
                     row.get(0)
                 })
                 .unwrap();
-            assert_eq!(latest, 12, "restored schema version {target}");
+            assert_eq!(latest, 13, "restored schema version {target}");
         }
     }
 
@@ -4045,7 +4099,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(latest, 12);
+        assert_eq!(latest, 13);
         let index: i64=connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='orchestration_by_attempt'",[],|row|row.get(0)).unwrap();
         assert_eq!(index, 1);
         let state_mappings: i64 = connection
@@ -5378,6 +5432,53 @@ mod tests {
                 .filter(|change| change["resource_id"] == "s1")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn idle_session_poll_cycles_do_not_advance_stream() {
+        let (_dir, store) = store();
+        let idle = serde_json::json!({"state":"idle","telemetry":{"execution":"idle"}});
+        for session in 0..100 {
+            let id = format!("session-{session}");
+            let cursor = store.materialize("session", &id, Some(&idle)).unwrap();
+            for _ in 0..20 {
+                assert_eq!(
+                    store.materialize("session", &id, Some(&idle)).unwrap(),
+                    cursor
+                );
+            }
+        }
+        let page = store.changes_after("anv1.0", 2000).unwrap();
+        assert_eq!(page.changes.len(), 100);
+    }
+
+    #[test]
+    fn retained_change_limit_resets_expired_cursors_across_restart() {
+        let (dir, store) = store();
+        for transition in 0..=CHANGE_RETENTION_LIMIT {
+            store
+                .materialize("session", "s", Some(&serde_json::json!({"n":transition})))
+                .unwrap();
+        }
+        let recent = store.changes_after("anv1.0", 10).unwrap();
+        assert!(recent.reset_required);
+        let before_restart = store
+            .materialize(
+                "session",
+                "s",
+                Some(&serde_json::json!({"n":CHANGE_RETENTION_LIMIT + 1})),
+            )
+            .unwrap();
+        drop(store);
+        let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
+        assert!(reopened.changes_after("anv1.0", 10).unwrap().reset_required);
+        assert_eq!(reopened.materialized_snapshot().unwrap().0, before_restart);
+        assert!(
+            !reopened
+                .changes_after(&before_restart, 10)
+                .unwrap()
+                .reset_required
         );
     }
 

@@ -2078,7 +2078,18 @@ impl AppState {
 }
 
 fn normalized_sandbox_value(record: &SandboxRecord) -> Value {
-    json!({"session":record.session,"run_record":record.run_record,"binding_state":record.binding_state,"operating_mode":record.operating_mode,"created_at":record.created_at,"telemetry":record.telemetry})
+    let mut session = serde_json::to_value(&record.session).expect("session serializes");
+    let mut binding_state =
+        serde_json::to_value(&record.binding_state).expect("binding state serializes");
+    // These values describe when the projection was sampled, not a change in session state.
+    // Keep stable values in the durable snapshot so read-driven polling coalesces.
+    if let Some(object) = session.as_object_mut() {
+        object.remove("session_binding_checked_at");
+    }
+    if let Some(object) = binding_state.as_object_mut() {
+        object.remove("checked_at");
+    }
+    json!({"session":session,"run_record":record.run_record,"binding_state":binding_state,"operating_mode":record.operating_mode,"created_at":record.created_at,"telemetry":record.telemetry})
 }
 pub fn router(state: AppState) -> Router {
     let web_root = env::var_os("ANVIL_WEB_DIR")
@@ -11384,6 +11395,25 @@ mod tests {
         let public = serde_json::to_string(&value).unwrap();
         assert!(!public.contains("message.part.updated"));
         assert!(!public.contains("tool_call"));
+    }
+
+    #[test]
+    fn sampled_binding_times_do_not_change_session_materialization() {
+        let mut first = active_run_record(activity_session());
+        first.session.session_binding_checked_at = Some("2026-01-01T10:00:00Z".into());
+        first.binding_state.checked_at = "2026-01-01T10:00:00Z".into();
+        let mut polled = first.clone();
+        polled.session.session_binding_checked_at = Some("2026-01-01T10:01:00Z".into());
+        polled.binding_state.checked_at = "2026-01-01T10:01:00Z".into();
+        assert_eq!(
+            normalized_sandbox_value(&first),
+            normalized_sandbox_value(&polled)
+        );
+        polled.telemetry.execution = "busy".into();
+        assert_ne!(
+            normalized_sandbox_value(&first),
+            normalized_sandbox_value(&polled)
+        );
     }
 
     fn assistant_observation(
