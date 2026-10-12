@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 use thiserror::Error;
@@ -159,7 +159,8 @@ pub struct ChangePage {
 // Cursor clients can recover by fetching a full snapshot. Retain enough recent events for
 // reconnects while keeping the largest controller table bounded.
 const CHANGE_RETENTION_LIMIT: i64 = 10_000;
-const CHANGE_PRUNE_BATCH: i64 = 512;
+const CHANGE_PRUNE_BATCH: i64 = 10_000;
+const CHANGE_COMPACTION_MARKER: &str = "orchestration_changes_compacted_v1";
 
 impl ControllerStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -167,12 +168,35 @@ impl ControllerStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(10))?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
         )?;
         migrate(&connection)?;
+        let completed_before_open = change_compaction_complete(&connection)?;
+        let replaced = compact_change_history_once(&mut connection, path)?;
+        if replaced {
+            drop(connection);
+            connection = Connection::open(path)?;
+            connection.busy_timeout(std::time::Duration::from_secs(10))?;
+            connection.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
+            )?;
+        }
+        if !completed_before_open || replaced {
+            if let Err(error) = validate_controller_database(&connection) {
+                let backup_path = compaction_backup_path(path);
+                if backup_path.exists() {
+                    drop(connection);
+                    fs::rename(&backup_path, path)?;
+                    return Err(error);
+                }
+                return Err(error);
+            }
+            mark_change_compaction_complete(&mut connection)?;
+        }
+        remove_compaction_backup(path)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
@@ -206,6 +230,10 @@ impl ControllerStore {
             .unwrap_or_else(|| serde_json::json!({"deleted":true}));
         tx.execute("INSERT INTO orchestration_changes(resource_type, resource_id, payload_json) VALUES (?1,?2,?3)", params![resource_type, resource_id, serde_json::to_string(&change)?])?;
         let seq = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE orchestration_change_retention SET high_watermark=MAX(high_watermark,?1) WHERE singleton=1",
+            [seq],
+        )?;
         tx.execute("INSERT INTO orchestration_materializations(resource_type,resource_id,payload_json,last_sequence) VALUES (?1,?2,?3,?4) ON CONFLICT(resource_type,resource_id) DO UPDATE SET payload_json=excluded.payload_json,last_sequence=excluded.last_sequence", params![resource_type, resource_id, payload, seq])?;
         prune_change_history(&tx)?;
         tx.commit()?;
@@ -219,11 +247,7 @@ impl ControllerStore {
             .lock()
             .expect("controller store lock poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let cursor = tx.query_row(
-            "SELECT COALESCE(MAX(sequence),0) FROM orchestration_changes",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
+        let cursor = read_change_high_watermark(&tx)?;
         let mut statement = tx.prepare(
             "SELECT resource_type,resource_id,payload_json FROM orchestration_resources
              WHERE batch_id=?1 ORDER BY CASE resource_type WHEN 'batch' THEN 0 WHEN 'task' THEN 1 ELSE 2 END, resource_id",
@@ -339,11 +363,7 @@ impl ControllerStore {
             .lock()
             .expect("controller store lock poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let cursor = tx.query_row(
-            "SELECT COALESCE(MAX(sequence),0) FROM orchestration_changes",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
+        let cursor = read_change_high_watermark(&tx)?;
         after_cursor_read();
         let mut statement = tx.prepare("SELECT resource_type, resource_id, payload_json FROM orchestration_materializations WHERE payload_json IS NOT NULL ORDER BY resource_type, resource_id")?;
         let rows = statement.query_map([], |row| {
@@ -378,11 +398,7 @@ impl ControllerStore {
             .connection
             .lock()
             .expect("controller store lock poisoned");
-        let latest: i64 = connection.query_row(
-            "SELECT COALESCE(MAX(sequence),0) FROM orchestration_changes",
-            [],
-            |row| row.get(0),
-        )?;
+        let latest = read_change_high_watermark(&connection)?;
         let earliest: i64 = connection.query_row(
             "SELECT COALESCE(MIN(sequence),0) FROM orchestration_changes",
             [],
@@ -2790,6 +2806,10 @@ fn append_resource_change(
     )?;
     let sequence = tx.last_insert_rowid();
     tx.execute(
+        "UPDATE orchestration_change_retention SET high_watermark=MAX(high_watermark,?1) WHERE singleton=1",
+        [sequence],
+    )?;
+    tx.execute(
         "INSERT INTO orchestration_materializations(resource_type,resource_id,payload_json,last_sequence)
          VALUES(?1,?2,?3,?4)
          ON CONFLICT(resource_type,resource_id) DO UPDATE SET payload_json=excluded.payload_json,last_sequence=excluded.last_sequence",
@@ -2822,6 +2842,249 @@ fn prune_change_history(tx: &rusqlite::Transaction<'_>) -> Result<(), rusqlite::
         "UPDATE orchestration_change_retention SET floor_sequence=MAX(floor_sequence,?1) WHERE singleton=1",
         [through],
     )?;
+    Ok(())
+}
+
+fn read_change_high_watermark(connection: &Connection) -> Result<i64, rusqlite::Error> {
+    connection.query_row(
+        "SELECT high_watermark FROM orchestration_change_retention WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionStage {
+    PruneBatch,
+    VacuumComplete,
+    Validated,
+    ReplacementInstalled,
+}
+
+fn compact_change_history_once(
+    connection: &mut Connection,
+    database_path: &Path,
+) -> Result<bool, StoreError> {
+    compact_change_history_once_with(connection, database_path, |_| Ok(()))
+}
+
+fn compact_change_history_once_with(
+    connection: &mut Connection,
+    database_path: &Path,
+    mut stage_hook: impl FnMut(CompactionStage) -> Result<(), StoreError>,
+) -> Result<bool, StoreError> {
+    if change_compaction_complete(connection)? {
+        return Ok(false);
+    }
+
+    let starting_freelist: i64 =
+        connection.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+    let mut removed_rows = false;
+    loop {
+        let count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM orchestration_changes", [], |row| {
+                row.get(0)
+            })?;
+        let excess = count - CHANGE_RETENTION_LIMIT;
+        if excess <= 0 {
+            break;
+        }
+        let batch = excess.min(CHANGE_PRUNE_BATCH);
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let through: i64 = tx.query_row(
+            "SELECT sequence FROM orchestration_changes ORDER BY sequence LIMIT 1 OFFSET ?1",
+            [batch - 1],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "DELETE FROM orchestration_changes WHERE sequence<=?1",
+            [through],
+        )?;
+        tx.execute(
+            "UPDATE orchestration_change_retention SET floor_sequence=MAX(floor_sequence,?1) WHERE singleton=1",
+            [through],
+        )?;
+        tx.commit()?;
+        removed_rows = true;
+        checkpoint_wal(connection).map_err(|error| {
+            StoreError::Scheduler(format!(
+                "checkpointing WAL after change-log prune batch failed: {error}"
+            ))
+        })?;
+        stage_hook(CompactionStage::PruneBatch)?;
+    }
+
+    // Build and validate a compact staged file before one atomic same-filesystem replacement.
+    // VACUUM INTO scratch is bounded by the live database size after the stream prune.
+    let freelist_after_prune: i64 =
+        connection.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+    let mut replaced = false;
+    if removed_rows || starting_freelist > 0 {
+        checkpoint_wal(connection).map_err(|error| {
+            StoreError::Scheduler(format!(
+                "checkpointing WAL before compaction failed: {error}"
+            ))
+        })?;
+        set_journal_mode(connection, "DELETE").map_err(|error| {
+            StoreError::Scheduler(format!(
+                "switching journal mode for compaction failed: {error}"
+            ))
+        })?;
+        if freelist_after_prune > 0 {
+            let staging_path = compaction_staging_path(database_path);
+            if staging_path.exists() {
+                fs::remove_file(&staging_path)?;
+            }
+            connection
+                .execute("VACUUM INTO ?1", [staging_path.to_string_lossy().as_ref()])
+                .map_err(|error| {
+                    StoreError::Scheduler(format!(
+                        "controller database VACUUM INTO failed: {error}"
+                    ))
+                })?;
+            let staged = Connection::open(&staging_path)?;
+            validate_controller_database(&staged)?;
+            let staged_count: i64 =
+                staged.query_row("SELECT COUNT(*) FROM orchestration_changes", [], |row| {
+                    row.get(0)
+                })?;
+            let staged_high_watermark = read_change_high_watermark(&staged)?;
+            let source_high_watermark = read_change_high_watermark(connection)?;
+            if staged_count > CHANGE_RETENTION_LIMIT
+                || staged_high_watermark != source_high_watermark
+            {
+                return Err(StoreError::Scheduler(format!(
+                    "staged controller database verification failed (change rows={staged_count}, source high-water={source_high_watermark}, staged high-water={staged_high_watermark})"
+                )));
+            }
+            drop(staged);
+            fs::OpenOptions::new()
+                .read(true)
+                .open(&staging_path)?
+                .sync_all()?;
+            stage_hook(CompactionStage::VacuumComplete)?;
+            // Atomic replacement means the old database remains authoritative until the
+            // fully verified compacted file is ready. A crash after rename is recovered on
+            // next startup: the empty freelist and capped row count skip another VACUUM.
+            let backup_path = compaction_backup_path(database_path);
+            if backup_path.exists() {
+                fs::remove_file(&backup_path)?;
+            }
+            fs::hard_link(database_path, &backup_path)?;
+            fs::rename(&staging_path, database_path)?;
+            if let Some(parent) = database_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs::File::open(parent)?.sync_all()?;
+            }
+            replaced = true;
+            stage_hook(CompactionStage::ReplacementInstalled)?;
+        }
+    }
+
+    if replaced {
+        return Ok(true);
+    }
+    validate_controller_database(connection)?;
+    set_journal_mode(connection, "WAL").map_err(|error| {
+        StoreError::Scheduler(format!("restoring WAL journal mode failed: {error}"))
+    })?;
+    stage_hook(CompactionStage::Validated)?;
+    Ok(false)
+}
+
+fn change_compaction_complete(connection: &Connection) -> Result<bool, rusqlite::Error> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM controller_maintenance WHERE maintenance_key=?1)",
+        [CHANGE_COMPACTION_MARKER],
+        |row| row.get(0),
+    )
+}
+
+fn compaction_staging_path(database_path: &Path) -> PathBuf {
+    let mut name = database_path.as_os_str().to_owned();
+    name.push(".compact.tmp");
+    PathBuf::from(name)
+}
+
+fn compaction_backup_path(database_path: &Path) -> PathBuf {
+    let mut name = database_path.as_os_str().to_owned();
+    name.push(".precompact");
+    PathBuf::from(name)
+}
+
+fn remove_compaction_backup(database_path: &Path) -> Result<(), StoreError> {
+    let backup_path = compaction_backup_path(database_path);
+    if backup_path.exists() {
+        fs::remove_file(backup_path)?;
+        if let Some(parent) = database_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::File::open(parent)?.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_controller_database(connection: &Connection) -> Result<(), StoreError> {
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|error| {
+            StoreError::Scheduler(format!(
+                "controller database integrity check failed: {error}"
+            ))
+        })?;
+    if integrity != "ok" {
+        return Err(StoreError::Scheduler(format!(
+            "controller database integrity check failed: {integrity}"
+        )));
+    }
+    let foreign_key_violation = {
+        let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+        let violation = statement.query([])?.next()?.is_some();
+        violation
+    };
+    if foreign_key_violation {
+        return Err(StoreError::Scheduler(
+            "controller database foreign-key check failed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn mark_change_compaction_complete(connection: &mut Connection) -> Result<(), StoreError> {
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO controller_maintenance(maintenance_key,completed_at) VALUES(?1,?2)",
+        params![CHANGE_COMPACTION_MARKER, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn checkpoint_wal(connection: &Connection) -> Result<(), StoreError> {
+    let (busy, _, _): (i64, i64, i64) =
+        connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    if busy != 0 {
+        return Err(StoreError::Scheduler(
+            "controller WAL checkpoint was busy during offline compaction".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn set_journal_mode(connection: &Connection, mode: &str) -> Result<(), StoreError> {
+    let actual: String =
+        connection.query_row(&format!("PRAGMA journal_mode={mode}"), [], |row| row.get(0))?;
+    if !actual.eq_ignore_ascii_case(mode) {
+        return Err(StoreError::Scheduler(format!(
+            "could not switch controller journal mode to {mode}; SQLite returned {actual}"
+        )));
+    }
     Ok(())
 }
 
@@ -3088,6 +3351,22 @@ fn migrate_until(connection: &Connection, target_version: i64) -> Result<(), rus
             INSERT INTO orchestration_change_retention(singleton,floor_sequence) VALUES(1,0);")?;
         tx.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (13, ?1)",
+            [chrono::Utc::now().to_rfc3339()],
+        )?;
+    }
+    let latest: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if latest < 14 && target_version >= 14 {
+        tx.execute_batch(
+            "ALTER TABLE orchestration_change_retention ADD COLUMN high_watermark INTEGER NOT NULL DEFAULT 0;
+             UPDATE orchestration_change_retention SET high_watermark=(SELECT COALESCE(MAX(sequence),0) FROM orchestration_changes) WHERE singleton=1;
+             CREATE TABLE controller_maintenance (maintenance_key TEXT PRIMARY KEY, completed_at TEXT NOT NULL);",
+        )?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (14, ?1)",
             [chrono::Utc::now().to_rfc3339()],
         )?;
     }
@@ -3403,7 +3682,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
     }
 
     #[test]
@@ -3545,7 +3824,7 @@ mod tests {
 
     #[test]
     fn every_historical_schema_migration_target_can_restart_and_continue() {
-        for target in 1..=13 {
+        for target in 1..=14 {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("historical.sqlite3");
             let connection = Connection::open(&path).unwrap();
@@ -3567,7 +3846,7 @@ mod tests {
                     row.get(0)
                 })
                 .unwrap();
-            assert_eq!(latest, 13, "restored schema version {target}");
+            assert_eq!(latest, 14, "restored schema version {target}");
         }
     }
 
@@ -4099,7 +4378,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(latest, 13);
+        assert_eq!(latest, 14);
         let index: i64=connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='orchestration_by_attempt'",[],|row|row.get(0)).unwrap();
         assert_eq!(index, 1);
         let state_mappings: i64 = connection
@@ -5451,6 +5730,15 @@ mod tests {
         }
         let page = store.changes_after("anv1.0", 2000).unwrap();
         assert_eq!(page.changes.len(), 100);
+        let row_count: i64 = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM orchestration_changes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(row_count, 100);
     }
 
     #[test]
@@ -5477,6 +5765,272 @@ mod tests {
         assert!(
             !reopened
                 .changes_after(&before_restart, 10)
+                .unwrap()
+                .reset_required
+        );
+    }
+
+    #[test]
+    fn startup_compaction_reclaims_large_duplicate_log_and_preserves_other_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("controller.sqlite3");
+        let store = ControllerStore::open(&path).unwrap();
+        store
+            .materialize(
+                "session",
+                "retained-session",
+                Some(&serde_json::json!({"state":"idle"})),
+            )
+            .unwrap();
+        store
+            .accept(
+                "keep-key",
+                "operation",
+                "scope",
+                &serde_json::json!({"request":1}),
+                "keep-resource",
+                &serde_json::json!({"id":"keep-resource"}),
+            )
+            .unwrap();
+        drop(store);
+
+        // Model the production shape: many large historical snapshots, small live state.
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "DELETE FROM controller_maintenance WHERE maintenance_key=?1",
+                [CHANGE_COMPACTION_MARKER],
+            )
+            .unwrap();
+        let snapshot =
+            serde_json::json!({"deleted":false,"record":{"payload":"x".repeat(12 * 1024)}})
+                .to_string();
+        let tx = connection.unchecked_transaction().unwrap();
+        tx.execute(
+            "INSERT INTO orchestration_resources(resource_type,resource_id,payload_json,created_at,updated_at) VALUES('task','durable-task','{\"task_id\":\"durable-task\",\"state\":\"open\"}','now','now')",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO tasks(task_id,batch_id,client_task_id,project,repository,prompt,state,payload_json,created_at) VALUES('durable-task',NULL,'durable-task','demo','demo/repo','keep prompt','open','{\"task_id\":\"durable-task\",\"state\":\"open\"}','now')",
+            [],
+        )
+        .unwrap();
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO orchestration_changes(sequence,resource_type,resource_id,payload_json) VALUES(?1,'session','historical',?2)")
+                .unwrap();
+            for sequence in 2..24_000_i64 {
+                insert.execute(params![sequence, snapshot]).unwrap();
+            }
+            insert.execute(params![2_711_880_i64, snapshot]).unwrap();
+        }
+        tx.execute(
+            "UPDATE orchestration_change_retention SET high_watermark=2711880 WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(connection);
+
+        let before = fs::metadata(&path).unwrap().len();
+        assert!(
+            before > 250 * 1024 * 1024,
+            "fixture too small: {before} bytes"
+        );
+        let compacted = ControllerStore::open(&path).unwrap();
+        let after = fs::metadata(&path).unwrap().len();
+        println!("synthetic controller DB compaction: {before} -> {after} bytes");
+        assert!(
+            after < 1024 * 1024 * 1024,
+            "compacted DB exceeds 1 GiB: {after} bytes"
+        );
+        assert!(
+            after * 2 < before,
+            "compaction failed to shrink materially: {before} -> {after}"
+        );
+        let count: i64 = compacted
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM orchestration_changes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, CHANGE_RETENTION_LIMIT);
+        assert_eq!(
+            compacted
+                .get_resource("task", "durable-task")
+                .unwrap()
+                .unwrap()["task_id"],
+            "durable-task"
+        );
+        assert_eq!(
+            compacted.get("keep-key").unwrap().unwrap().result_reference,
+            "keep-resource"
+        );
+        assert_eq!(compacted.materialized_snapshot().unwrap().0, "anv1.2711880");
+        assert_eq!(
+            compacted
+                .materialize(
+                    "session",
+                    "retained-session",
+                    Some(&serde_json::json!({"state":"running"}))
+                )
+                .unwrap(),
+            "anv1.2711881"
+        );
+        let marker: String = compacted
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT completed_at FROM controller_maintenance WHERE maintenance_key=?1",
+                [CHANGE_COMPACTION_MARKER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(compacted);
+        let restarted = ControllerStore::open(&path).unwrap();
+        let marker_after_restart: String = restarted
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT completed_at FROM controller_maintenance WHERE maintenance_key=?1",
+                [CHANGE_COMPACTION_MARKER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, marker_after_restart);
+    }
+
+    #[test]
+    fn interrupted_compaction_resumes_and_vacuum_success_is_not_repeated() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("controller.sqlite3");
+        let store = ControllerStore::open(&path).unwrap();
+        drop(store);
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute(
+                    "DELETE FROM controller_maintenance WHERE maintenance_key=?1",
+                    [CHANGE_COMPACTION_MARKER],
+                )
+                .unwrap();
+            let tx = connection.unchecked_transaction().unwrap();
+            {
+                let mut insert = tx
+                    .prepare("INSERT INTO orchestration_changes(sequence,resource_type,resource_id,payload_json) VALUES(?1,'session','s','{}')")
+                    .unwrap();
+                for sequence in 1..=(CHANGE_RETENTION_LIMIT + 20) {
+                    insert.execute([sequence]).unwrap();
+                }
+            }
+            tx.execute(
+                "UPDATE orchestration_change_retention SET high_watermark=?1 WHERE singleton=1",
+                [CHANGE_RETENTION_LIMIT + 20],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let mut connection = Connection::open(&path).unwrap();
+        let failed = compact_change_history_once_with(&mut connection, &path, |stage| {
+            if stage == CompactionStage::PruneBatch {
+                Err(StoreError::Sqlite(rusqlite::Error::InvalidQuery))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(failed.is_err());
+        drop(connection);
+
+        let resumed = ControllerStore::open(&path).unwrap();
+        assert!(resumed.changes_after("anv1.0", 10).unwrap().reset_required);
+        drop(resumed);
+
+        let mut connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "DELETE FROM controller_maintenance WHERE maintenance_key=?1",
+                [CHANGE_COMPACTION_MARKER],
+            )
+            .unwrap();
+        {
+            let tx = connection.unchecked_transaction().unwrap();
+            {
+                let mut insert = tx
+                    .prepare("INSERT INTO orchestration_changes(sequence,resource_type,resource_id,payload_json) VALUES(?1,'session','s','{}')")
+                    .unwrap();
+                for sequence in (CHANGE_RETENTION_LIMIT + 21)..=(CHANGE_RETENTION_LIMIT * 2 + 20) {
+                    insert.execute([sequence]).unwrap();
+                }
+            }
+            tx.execute(
+                "UPDATE orchestration_change_retention SET high_watermark=?1 WHERE singleton=1",
+                [CHANGE_RETENTION_LIMIT * 2 + 20],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let interrupted_after_vacuum =
+            compact_change_history_once_with(&mut connection, &path, |stage| {
+                if stage == CompactionStage::ReplacementInstalled {
+                    Err(StoreError::Sqlite(rusqlite::Error::InvalidQuery))
+                } else {
+                    Ok(())
+                }
+            });
+        assert!(interrupted_after_vacuum.is_err());
+        drop(connection);
+        let recovered = ControllerStore::open(&path).unwrap();
+        let marker: String = recovered
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT completed_at FROM controller_maintenance WHERE maintenance_key=?1",
+                [CHANGE_COMPACTION_MARKER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(recovered);
+        let recovered_again = ControllerStore::open(&path).unwrap();
+        let marker_again: String = recovered_again
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT completed_at FROM controller_maintenance WHERE maintenance_key=?1",
+                [CHANGE_COMPACTION_MARKER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, marker_again);
+        drop(recovered_again);
+
+        let mut connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "DELETE FROM controller_maintenance WHERE maintenance_key=?1",
+                [CHANGE_COMPACTION_MARKER],
+            )
+            .unwrap();
+        let interrupted_before_marker =
+            compact_change_history_once_with(&mut connection, &path, |stage| {
+                if stage == CompactionStage::Validated {
+                    Err(StoreError::Sqlite(rusqlite::Error::InvalidQuery))
+                } else {
+                    Ok(())
+                }
+            });
+        assert!(interrupted_before_marker.is_err());
+        drop(connection);
+        let final_recovery = ControllerStore::open(&path).unwrap();
+        assert!(
+            final_recovery
+                .changes_after("anv1.0", 10)
                 .unwrap()
                 .reset_required
         );
