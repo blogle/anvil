@@ -378,7 +378,8 @@ agent_exec "$api_b_pod" nix path-info "$shared_path" >/dev/null
 assert_nix_metadata
 fresh_sandbox_build "$api_b_pod" "anvil-lifecycle-after-remove-${cluster}"
 opencode_session="$(kubectl --kubeconfig "$kubeconfig" -n "$namespace" exec "$pod_name" -- \
-  curl -fsS -X POST http://127.0.0.1:4096/session -H 'content-type: application/json' -d '{}' | jq -r .id)"
+  curl -fsS -u opencode:kind-only-opencode-password-0123456789abcdef \
+    -X POST http://127.0.0.1:4096/api/session -H 'content-type: application/json' -d '{}' | jq -r .data.id)"
 test -n "$opencode_session"
 kubectl --kubeconfig "$kubeconfig" -n "$namespace" annotate sandbox "$sandbox_name" \
   "anvil.example/opencode-session-id=$opencode_session" \
