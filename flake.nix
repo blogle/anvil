@@ -9,16 +9,22 @@
     # Remove this fork pin after the upstream fix lands in nlewo/nix2container.
     nix2container.url = "github:Dauliac/nix2container/8fd02c842686a528fd37508283853de0ed1462b1";
     nix2containerNixpkgs.follows = "nix2container/nixpkgs";
-    opencode.url = "github:anomalyco/opencode/v1.18.30";
+    opencode.url = "github:anomalyco/opencode/9b4ec5714d481559990db0a816d5dec19541a814";
   };
 
   outputs = { self, nixpkgs, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
+        # The upstream V2 package's install check invokes `opencode --version`
+        # in a context where its runtime creates /tmp and fails under Nix's
+        # install-check sandbox. Keep the upstream default build unchanged and
+        # disable only that non-hermetic runtime check.
+        opencodePackage = opencode.packages.${system}.default.overrideAttrs (_: { doInstallCheck = false; });
         craneLib = crane.mkLib pkgs;
         rust = import ./nix/rust.nix {
-          inherit pkgs craneLib opencode;
+          inherit pkgs craneLib;
+          inherit opencodePackage;
           nix2containerPkgs = nix2container.packages.${system};
           repoRoot = ./.;
         };
@@ -34,7 +40,8 @@
           '';
         };
         sandbox = import ./nix/sandbox.nix {
-          inherit pkgs opencode;
+          inherit pkgs;
+          inherit opencodePackage;
           nix2containerPkgs = nix2container.packages.${system};
           nix2containerBuildPkgs = nix2containerNixpkgs.legacyPackages.${system};
           credentialHelperSource = ./runtime/anvil-credential;
@@ -91,8 +98,9 @@
         # artifact set before the acceptance script can start.
         devShells.kind-ci = pkgs.mkShell {
           packages = [
-            pkgs.bash pkgs.curl pkgs.gitMinimal pkgs.jq pkgs.just pkgs.kind
+            pkgs.bash pkgs.cargo pkgs.curl pkgs.gitMinimal pkgs.jq pkgs.just pkgs.kind
             pkgs.kubectl pkgs.kustomize pkgs.nix pkgs.util-linux
+            pkgs.rustfmt
             nix2container.packages.${system}.skopeo-nix2container
           ];
         };
