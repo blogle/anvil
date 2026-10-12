@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   policy:
-    uses: blogle/sdlc/.github/workflows/policy-check.yml@v1.3.0
+    uses: blogle/sdlc/.github/workflows/policy-check.yml@1bd4d95a9253f09fa67e486f4b834a7ff8c20cd9
 
   gate:
     name: sdlc / policy
@@ -19,7 +19,7 @@ jobs:
     needs: policy
     runs-on: ubuntu-latest
     steps:
-      - uses: blogle/sdlc/actions/status-gate@v1.3.0
+      - uses: blogle/sdlc/actions/status-gate@1bd4d95a9253f09fa67e486f4b834a7ff8c20cd9
         with:
           result: ${{ needs.policy.result }}
           stage: policy
