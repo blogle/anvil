@@ -98,8 +98,9 @@
         # artifact set before the acceptance script can start.
         devShells.kind-ci = pkgs.mkShell {
           packages = [
-            pkgs.bash pkgs.curl pkgs.gitMinimal pkgs.jq pkgs.just pkgs.kind
+            pkgs.bash pkgs.cargo pkgs.curl pkgs.gitMinimal pkgs.jq pkgs.just pkgs.kind
             pkgs.kubectl pkgs.kustomize pkgs.nix pkgs.util-linux
+            pkgs.rustfmt
             nix2container.packages.${system}.skopeo-nix2container
           ];
         };
