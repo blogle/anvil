@@ -11627,6 +11627,17 @@ mod tests {
         }
         assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
         assert!(record.lock().unwrap().run_record.current_run().is_none());
+        let observer_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if record.lock().unwrap().telemetry.observer == "degraded" {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < observer_deadline,
+                "closed event stream did not update observer health"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         {
             let record_guard = record.lock().unwrap();
             let telemetry = &record_guard.telemetry;
