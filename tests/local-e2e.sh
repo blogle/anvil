@@ -10,7 +10,7 @@ tmp="$(mktemp -d "${TMPDIR:-/tmp}/anvil-local-e2e.XXXXXX")"
 runtime="$tmp/runtime"
 profile="$tmp/profile"
 fixture="$tmp/fixture"
-model_pid="" profile_pid="" api_pid=""
+model_pid="" profile_pid="" api_pid="" git_http_pid=""
 start_time=$SECONDS
 
 cleanup() {
@@ -39,7 +39,7 @@ cleanup() {
       [ -n "$id" ] && curl -fsS -X DELETE "http://127.0.0.1:8080/v1/sessions/$id" >/dev/null 2>&1 || true
     done <<<"$sessions"
   fi
-  for pid in "$api_pid" "$profile_pid" "$model_pid"; do
+  for pid in "$api_pid" "$profile_pid" "$model_pid" "$git_http_pid"; do
     if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi
   done
   if [ "$status" -ne 0 ] && [ "${ANVIL_E2E_KEEP:-0}" = 1 ]; then
@@ -65,6 +65,7 @@ export OPENCODE_SERVER_PASSWORD="$ANVIL_OPENCODE_SERVER_PASSWORD"
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
 opencode serve --hostname 127.0.0.1 --port 4097 >"$tmp/profile.log" 2>&1 & profile_pid=$!
 export ANVIL_SANDBOX_BACKEND=local ANVIL_BIND_PORT=8080 ANVIL_LOCAL_RUNTIME_ROOT="$runtime"
+export GIT_SSL_NO_VERIFY=true
 export ANVIL_LOCAL_PROFILE_DIR="$profile" ANVIL_OPENCODE_BIN="$(command -v opencode)"
 export ANVIL_PREVIEW_DOMAIN=localhost ANVIL_ANNOTATION_PREFIX=anvil.local
 export ANVIL_PROFILE_OPENCODE_URL=http://127.0.0.1:4097 ANVIL_CREDENTIAL_URL=http://127.0.0.1:8080
@@ -111,6 +112,49 @@ create_session() {
     http://127.0.0.1:8080/v1/sessions
 }
 
+create_reconciler_task() {
+  curl --max-time 10 -fsS -H 'content-type: application/json' -H 'idempotency-key: local-e2e-reconciler-task' \
+    -d "$(jq -n --arg repository "$task_repository" '{outcome:"ANVIL-E2E:do-not-submit-this-turn",execution_target:{kind:"git_repository",project:"fixture",repository:$repository,base_ref:"main",delivery:"pull_request"},completion_policy:{kind:"evidence",required_kinds:["delivery_complete"]}}')" \
+    http://127.0.0.1:8080/v1/tasks
+}
+
+wait_for_reconciler_runtime() {
+  local task_id="$1" deadline=$((SECONDS + 120)) snapshot="" session_id="" opencode_id=""
+  while (( SECONDS < deadline )); do
+    snapshot="$(curl --max-time 3 -fsS "http://127.0.0.1:8080/v1/tasks/$task_id/snapshot")" || true
+    session_id="$(jq -r '.attempts[0].session_id // empty' <<<"$snapshot" 2>/dev/null || true)"
+    opencode_id="$(jq -r '(.observations | map(select(.key == "runtime.execution")) | first | .value.opencode_session_id) // empty' <<<"$snapshot" 2>/dev/null || true)"
+    if [ -n "$session_id" ] && [ -n "$opencode_id" ]; then
+      local session service port status messages
+      session="$(curl --max-time 3 -fsS "http://127.0.0.1:8080/v1/sessions/$session_id")" || { printf 'bound Sandbox %s was not readable\n' "$session_id" >&2; return 1; }
+      service="$(jq -r .service <<<"$session")"
+      port="$(jq -r .opencode_port <<<"$session")"
+      status="$(curl --max-time 3 -fsS "http://$service:$port/api/session/$opencode_id" --user "opencode:$ANVIL_OPENCODE_SERVER_PASSWORD")" || { printf 'native V2 session read failed for %s\n' "$opencode_id" >&2; return 1; }
+      messages="$(curl --max-time 3 -fsS "http://$service:$port/api/session/$opencode_id/message" --user "opencode:$ANVIL_OPENCODE_SERVER_PASSWORD")" || { printf 'native V2 message observation failed for %s\n' "$opencode_id" >&2; return 1; }
+      jq -e --arg id "$opencode_id" '.data.id == $id' <<<"$status" >/dev/null || { printf 'native V2 response was not bound to %s: %s\n' "$opencode_id" "$status" >&2; return 1; }
+      jq -e '(.data // []) | length == 0' <<<"$messages" >/dev/null || { printf 'CreateAttempt unexpectedly has OpenCode messages: %s\n' "$messages" >&2; return 1; }
+      jq -e 'any(.observations[]?; .key == "runtime.execution" and .value.runtime_health == "healthy" and .value.turn_state == "not_submitted")' <<<"$snapshot" >/dev/null
+      return 0
+    fi
+    sleep 0.5
+  done
+  printf 'timed out waiting for Reconciler-owned Attempt runtime; last snapshot: %s\n' "$snapshot" >&2
+  return 1
+}
+
+wait_for_reconciler_decision() {
+  local task_id="$1" deadline=$((SECONDS + 20)) decisions=""
+  while (( SECONDS < deadline )); do
+    decisions="$(curl --max-time 3 -fsS "http://127.0.0.1:8080/v1/tasks/$task_id/decisions")" || true
+    if jq -e 'any(.decisions[]?; .rule_id == "active_turn" or .rule_id == "attempt_starting")' <<<"$decisions" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  printf 'next reconciler decision did not consume runtime observation: %s\n' "$decisions" >&2
+  return 1
+}
+
 worker_health() {
   local session="$1"
   poll "http://$(jq -r .service <<<"$session"):$(jq -r .opencode_port <<<"$session")/api/info"
@@ -127,6 +171,30 @@ git -C "$fixture" config user.email fixture@example.invalid
 printf 'before\n' >"$fixture/target.txt"
 git -C "$fixture" add target.txt && git -C "$fixture" commit -m fixture >/dev/null
 repository="file://$fixture"
+git_http_root="$tmp/git-http"
+mkdir -p "$git_http_root"
+git clone --bare "$fixture" "$git_http_root/repo.git" >/dev/null 2>&1
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$tmp/git-http.key" -out "$tmp/git-http.crt" -days 1 -subj /CN=127.0.0.1 >/dev/null 2>&1
+task_repository="https://127.0.0.1:8443/repo.git"
+node "$root/tests/git-http-fixture.mjs" "$git_http_root" "$tmp/git-http.crt" "$tmp/git-http.key" 8443 >"$tmp/git-http.log" 2>&1 & git_http_pid=$!
+deadline=$((SECONDS + 10))
+until curl --max-time 1 -kfsS 'https://127.0.0.1:8443/repo.git/info/refs?service=git-upload-pack' >/dev/null 2>&1; do
+  if (( SECONDS >= deadline )); then printf 'timed out waiting for local HTTPS Git fixture\n' >&2; exit 1; fi
+  sleep 0.1
+done
+
+scenario_start=$SECONDS
+task="$(create_reconciler_task)"
+task_id="$(jq -r .task_id <<<"$task")"
+test -n "$task_id" && test "$task_id" != null
+curl --max-time 10 -fsS -H 'content-type: application/json' \
+  -d "$(jq -n --argjson version "$(jq -r .version <<<"$task")" '{expected_version:$version,operator_hold:false,controller_mode:"reconciler"}')" \
+  "http://127.0.0.1:8080/v1/tasks/$task_id/controller-mode" >/dev/null
+wait_for_reconciler_runtime "$task_id"
+wait_for_reconciler_decision "$task_id"
+attempt_count="$(curl -fsS "http://127.0.0.1:8080/v1/tasks/$task_id/attempts" | jq '.attempts | length')"
+test "$attempt_count" = 1
+printf 'Reconciler CreateAttempt admission, native V2 binding and no SendTurn: %ds\n' "$((SECONDS - scenario_start))"
 
 assert_http_smoke() {
   local index asset_paths asset_path=

@@ -446,7 +446,11 @@ fn dependencies_satisfied(tx: &Connection, task: &Value) -> Result<bool, StoreEr
     }
     Ok(true)
 }
-fn set_task_state(tx: &Transaction<'_>, task_id: &str, state: &str) -> Result<(), StoreError> {
+pub(super) fn set_task_state(
+    tx: &Transaction<'_>,
+    task_id: &str,
+    state: &str,
+) -> Result<(), StoreError> {
     let raw: String = tx.query_row(
         "SELECT payload_json FROM tasks WHERE task_id=?1",
         [task_id],
@@ -470,7 +474,7 @@ fn set_task_state(tx: &Transaction<'_>, task_id: &str, state: &str) -> Result<()
     super::append_resource_change(tx, "task", task_id, &payload)?;
     Ok(())
 }
-fn persist_attempt(
+pub(super) fn persist_attempt(
     tx: &Transaction<'_>,
     attempt_id: &str,
     attempt: &Value,
