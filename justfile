@@ -116,53 +116,7 @@ smoke:
 smoke-clean:
     kubectl delete sandbox -n anvil -l app.kubernetes.io/managed-by=anvil
 
-# Install the official SDLC and Mergify skills through Vercel's pinned CLI.
-skills:
-    skills add https://github.com/blogle/sdlc/tree/v1.3.0/skills/sdlc --skill sdlc --agent opencode --yes
-    skills add https://github.com/Mergifyio/mergify-cli --skill '*' --agent opencode --yes
-
-skills-update:
-    skills update -p -y
-
 ci:
     just check
     just nix-check
     just build-ci-release
-
-# The SDLC publisher supplies the exact source identity. Promote the existing
-# sha-tagged images; never rebuild them in the release hook.
-release-publish version:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    version="{{version}}"
-    test "$version" = "${SDLC_RELEASE_VERSION}"
-    case "$version" in
-      ''|*[!0-9.]*|.*|*.) exit 1 ;;
-    esac
-    test -n "${SDLC_RELEASE_MERGED_SHA}"
-    test "${SDLC_RELEASE_MERGED_SHA}" = "$(git rev-parse --verify "${SDLC_RELEASE_MERGED_SHA}^{commit}")"
-    test "${SDLC_RELEASE_MERGED_SHA}" = "$(git rev-parse HEAD)"
-    test "${SDLC_RELEASE_SOURCE_SHA}" = "$(git rev-parse "${SDLC_RELEASE_MERGED_SHA}^1")"
-    test -n "${SDLC_RELEASE_RECEIPTS}"
-    test -n "${GH_TOKEN:-}"
-    command -v skopeo >/dev/null
-    username="${GHCR_USERNAME:-github-actions[bot]}"
-    receipts="$(mktemp)"
-    trap 'rm -f "$receipts"' EXIT
-    for spec in \
-      'anvil|ghcr.io/blogle/anvil' \
-      'anvil-sandbox|ghcr.io/blogle/anvil-sandbox' \
-      'anvil-nix-daemon|ghcr.io/blogle/anvil-nix-daemon'; do
-      name="${spec%%|*}"
-      image="${spec#*|}"
-      source="docker://${image}:sha-${SDLC_RELEASE_SOURCE_SHA}"
-      digest="$(skopeo inspect --creds "${username}:${GH_TOKEN}" "$source" | jq -er .Digest)"
-      [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-      immutable="docker://${image}@${digest}"
-      for tag in "$version" "v${version}"; do
-        skopeo copy --all --src-creds "${username}:${GH_TOKEN}" --dest-creds "${username}:${GH_TOKEN}" "$immutable" "docker://${image}:${tag}"
-      done
-      jq -n --arg name "$name" --arg image "$image" --arg digest "$digest" --arg version "$version" --arg merged "${SDLC_RELEASE_MERGED_SHA}" --arg source "${SDLC_RELEASE_SOURCE_SHA}" '{name: $name, image: $image, digest: $digest, tags: [$version, ("v" + $version)], version: $version, merged_sha: $merged, source_main_sha: $source}' >> "$receipts"
-    done
-    mkdir -p "$(dirname "${SDLC_RELEASE_RECEIPTS}")"
-    jq -s --arg version "$version" --arg merged "${SDLC_RELEASE_MERGED_SHA}" --arg source "${SDLC_RELEASE_SOURCE_SHA}" '{schema: 1, version: $version, merged_sha: $merged, source_main_sha: $source, artifacts: .}' "$receipts" > "${SDLC_RELEASE_RECEIPTS}"

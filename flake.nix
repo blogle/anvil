@@ -10,15 +10,12 @@
     nix2container.url = "github:Dauliac/nix2container/8fd02c842686a528fd37508283853de0ed1462b1";
     nix2containerNixpkgs.follows = "nix2container/nixpkgs";
     opencode.url = "github:anomalyco/opencode/9b4ec5714d481559990db0a816d5dec19541a814";
-    # Temporary DRAFT integration pin for SDLC #80; replace with its reviewed release.
-    sdlc.url = "github:blogle/sdlc/892bbbf6bc27dc2c21968e0f7b1d4feb25ad51db";
+    sdlc.url = "github:blogle/sdlc/main";
     sdlc.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs = { self, nixpkgs, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode, sdlc }:
-    # Production CI and OCI images are Linux-only; avoid evaluating the
-    # unsupported x86_64-darwin platform in current nixpkgs.
-    flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
+    flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
         # The upstream V2 package's install check invokes `opencode --version`
@@ -28,8 +25,8 @@
         opencodePackage = opencode.packages.${system}.default.overrideAttrs (_: { doInstallCheck = false; });
         craneLib = crane.mkLib pkgs;
         rust = import ./nix/rust.nix {
-          inherit pkgs craneLib opencodePackage;
-          sdlcCli = sdlc.packages.${system}.sdlc;
+          inherit pkgs craneLib;
+          inherit opencodePackage;
           nix2containerPkgs = nix2container.packages.${system};
           repoRoot = ./.;
         };
@@ -57,11 +54,14 @@
         images = import ./nix/images.nix {
           inherit pkgs rust frontend;
         };
-        ci = sdlc.lib.mkConsumer {
-          contract = import ./ci.nix { inherit self system; };
+        publishImages = pkgs.writeShellApplication {
+          name = "anvil-sdlc-publish";
+          runtimeInputs = [ pkgs.coreutils pkgs.docker pkgs.jq pkgs.nix nix2container.packages.${system}.skopeo-nix2container ];
+          text = builtins.readFile ./scripts/release-publish.sh;
         };
       in
       {
+        packages.sdlc = sdlc.packages.${system}.sdlc;
         packages.default = images.anvilImage;
         packages.anvild = rust.releaseBinaries.anvild;
         packages.frontend = frontend;
@@ -75,8 +75,6 @@
         packages.anvil-nix-daemon-image = sandbox.daemonImage;
         packages.anvil-nix-daemon-upgrade-test-image = sandbox.daemonUpgradeImage;
         packages.anvil-nix-daemon-upgrade-test-canary = sandbox.daemonUpgradeCanary;
-        packages.sdlc = sdlc.packages.${system}.sdlc;
-        packages.nix-eval-jobs = sdlc.packages.${system}.nix-eval-jobs;
         packages.shared-nix-directory-source-smoke = pkgs.stdenv.mkDerivation {
           pname = "anvil-shared-nix-directory-source-smoke";
           version = "1";
@@ -92,14 +90,11 @@
         checks = rust.checks // {
           inherit frontend;
           crateFixtureSource = rust.fixtureSourceSmoke;
-          sdlc-stage-contract = pkgs.runCommand "anvil-sdlc-stage-contract" {
-            buildInputs = [ pkgs.jq ];
-          } ''
-            test "${sdlc.rev or "unknown"}" != ""
-            jq -n --arg sdlc "${sdlc.rev or "unknown"}" '{schema: 1, sdlc: $sdlc}' > "$out"
-          '';
+          sdlc-fast = pkgs.runCommand "anvil-sdlc-fast" { buildInputs = [ rust.checks.fmt ]; } ''mkdir -p "$out"'';
+          sdlc-verify = pkgs.runCommand "anvil-sdlc-verify" { buildInputs = [ rust.checks.clippy rust.checks.tests frontend ]; } ''mkdir -p "$out"'';
         };
-        hydraJobs = ci.hydraJobs;
+        apps.sdlc = { type = "app"; program = "${sdlc.packages.${system}.sdlc}/bin/sdlc"; };
+        apps.sdlc-publish = { type = "app"; program = "${publishImages}/bin/anvil-sdlc-publish"; };
         devShells.default = rust.devShell;
         # Kind already validates Rust in the independent local-first job. This
         # shell keeps the shared-daemon contract focused on environment entry

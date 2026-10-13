@@ -1,4 +1,4 @@
-{ pkgs, craneLib, opencodePackage, nix2containerPkgs, repoRoot, sdlcCli }:
+{ pkgs, craneLib, opencodePackage, nix2containerPkgs, repoRoot }:
 
 let
   browserFontsConf = pkgs.makeFontsConf {
@@ -159,7 +159,7 @@ let
       pkgs.cargo pkgs.rust-analyzer pkgs.cargo-nextest pkgs.just pkgs.git
       pkgs.gh pkgs.curl pkgs.jq pkgs.kubectl pkgs.kustomize pkgs.nix pkgs.nodejs
       pkgs.process-compose pkgs.watchexec nix2containerPkgs.skopeo-nix2container pkgs.umoci pkgs.crun pkgs.kind pkgs.util-linux
-      opencodePackage sdlcCli pkgs.skills
+      opencodePackage
     ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
       pkgs.chromium
     ];

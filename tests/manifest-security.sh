@@ -68,8 +68,8 @@ smoke_script="$repo_root/tests/nix-daemon-smoke.sh"
 require_text 'daemon executable smoke' 'test -x /bin/anvil-nix-daemon' "$smoke_script"
 require_text 'daemon RPC smoke' 'NIX_REMOTE=daemon nix store info' "$smoke_script"
 require_text 'bootstrap smoke' '--bootstrap' "$smoke_script"
-if [ "$(grep -Fc 'tests/nix-daemon-smoke.sh' "$repo_root/.github/workflows/images.yaml")" -ne 2 ]; then
-  printf 'manifest-security: expected smoke in merge-queue and publish jobs\n' >&2
+if ! grep -Fq 'tests/nix-daemon-smoke.sh' "$repo_root/scripts/release-publish.sh"; then
+  printf 'manifest-security: release hook must smoke-test the Nix daemon image\n' >&2
   exit 1
 fi
 
