@@ -168,20 +168,6 @@ struct TaskDecisions {
     limit: Option<usize>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
-struct TaskControllerMode {
-    task_id: String,
-    expected_version: u64,
-    operator_hold: bool,
-    controller_mode: TaskControllerModeValue,
-}
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum TaskControllerModeValue {
-    Legacy,
-    Shadow,
-    Reconciler,
-}
-#[derive(Debug, Deserialize, JsonSchema)]
 struct BatchDigestRequest {
     batch_id: String,
     after: Option<String>,
@@ -347,7 +333,6 @@ const CONTROLLER_OPERATIONS: &[&str] = &[
     "anvil_get_task_snapshot",
     "anvil_list_task_attempts",
     "anvil_get_task_decisions",
-    "anvil_set_task_controller_mode",
     "anvil_get_attempt",
     "anvil_create_attempt",
     "anvil_get_batch_digest",
@@ -608,19 +593,6 @@ impl AnvilMcp {
         Ok(Json(serde_json::from_slice(&bytes).map_err(|e| {
             ErrorData::internal_error(e.to_string(), None)
         })?))
-    }
-    #[rmcp::tool(
-        description = "OPERATOR-ONLY: explicitly set controller ownership/hold for a durable Task using expected_version CAS. This never auto-promotes a Task. Reconciler mode authorizes controller ownership; use it only when explicitly intended. Stale versions and forbidden downgrades are rejected by Anvil."
-    )]
-    async fn anvil_set_task_controller_mode(
-        &self,
-        Parameters(p): Parameters<TaskControllerMode>,
-    ) -> Result<Json<Value>, ErrorData> {
-        Ok(Json(self.call(
-            Method::POST,
-            &format!("v1/tasks/{}/controller-mode", p.task_id),
-            Some(json!({"expected_version":p.expected_version,"operator_hold":p.operator_hold,"controller_mode":p.controller_mode})),
-        ).await?))
     }
     #[rmcp::tool(
         description = "List persisted Task decision records with a bounded page size (maximum 100), using the numeric cursor returned as next_cursor. Decisions are an audit/read model, not completion evidence or authority to execute."
@@ -948,8 +920,8 @@ mod tests {
     use super::{
         AnvilMcp, BatchDigestRequest, BatchSubmission, BatchTask, CompletionPolicy,
         CreateDurableTask, DeliveryKind, EvidenceKind, MutationRecovery, ResourceId, TaskAttempts,
-        TaskBudget, TaskControllerMode, TaskControllerModeValue, TaskDecisions,
-        TaskExecutionTarget, TaskList, TaskResourceId, CONTROLLER_OPERATIONS,
+        TaskBudget, TaskDecisions, TaskExecutionTarget, TaskList, TaskResourceId,
+        CONTROLLER_OPERATIONS,
     };
     use httpmock::{Method::GET, MockServer};
     use rmcp::handler::server::wrapper::Parameters;
@@ -1251,51 +1223,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn controller_mode_tool_forwards_explicit_operator_cas_and_surfaces_conflicts() {
-        let server = MockServer::start_async().await;
-        let accepted = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/v1/tasks/task-1/controller-mode")
-                .json_body(json!({"expected_version":0,"operator_hold":true,"controller_mode":"shadow"}));
-            then.status(200).json_body(json!({"task_id":"task-1","version":1,"operator_hold":true,"controller_mode":"shadow"}));
-        });
-        server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/v1/tasks/task-1/controller-mode")
-                .json_body(json!({"expected_version":0,"operator_hold":false,"controller_mode":"reconciler"}));
-            then.status(409).json_body(json!({"message":"Task version conflict"}));
-        });
-        let mcp = AnvilMcp::new(reqwest::Url::parse(&format!("{}/", server.base_url())).unwrap())
-            .unwrap();
-        let held = mcp
-            .anvil_set_task_controller_mode(Parameters(TaskControllerMode {
-                task_id: "task-1".into(),
-                expected_version: 0,
-                operator_hold: true,
-                controller_mode: TaskControllerModeValue::Shadow,
-            }))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(held["operator_hold"], true);
-        assert_eq!(held["controller_mode"], "shadow");
-        accepted.assert();
-        let result = mcp
-            .anvil_set_task_controller_mode(Parameters(TaskControllerMode {
-                task_id: "task-1".into(),
-                expected_version: 0,
-                operator_hold: false,
-                controller_mode: TaskControllerModeValue::Reconciler,
-            }))
-            .await;
-        let Err(conflict) = result else {
-            panic!("stale CAS must fail")
-        };
-        assert_eq!(conflict.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-        assert_eq!(conflict.data.unwrap()["http_status"], 409);
-    }
-
-    #[tokio::test]
     async fn task_decisions_tool_forwards_bounded_cursor_page() {
         let server = MockServer::start_async().await;
         server.mock(|when, then| {
@@ -1444,7 +1371,6 @@ mod tests {
             "anvil_create_session",
             "anvil_create_task",
             "anvil_get_task_decisions",
-            "anvil_set_task_controller_mode",
             "anvil_create_attempt",
             "anvil_send_message",
             "anvil_suspend",
@@ -1545,29 +1471,7 @@ mod tests {
                 "{mutation} schema lacks idempotency_key"
             );
         }
-        let mode_tool = tools
-            .iter()
-            .find(|tool| tool["name"] == "anvil_set_task_controller_mode")
-            .unwrap();
-        for required in [
-            "task_id",
-            "expected_version",
-            "operator_hold",
-            "controller_mode",
-        ] {
-            assert!(mode_tool["inputSchema"]["properties"]
-                .get(required)
-                .is_some());
-            assert!(mode_tool["inputSchema"]["required"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == required));
-        }
-        assert!(mode_tool["description"]
-            .as_str()
-            .unwrap()
-            .contains("OPERATOR-ONLY"));
+        assert!(!names.contains("anvil_set_task_controller_mode"));
         for readonly in [
             "anvil_get_session",
             "anvil_get_messages",
