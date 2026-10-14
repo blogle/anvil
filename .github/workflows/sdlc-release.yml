@@ -13,5 +13,5 @@ permissions:
   pull-requests: read
 jobs:
   release:
-    uses: blogle/sdlc/.github/workflows/release.yml@08428aad227922dcc12f67ae1ca4616f1a56c7ba
+    uses: blogle/sdlc/.github/workflows/release.yml@15804e1275dd7801457a541bf5382d9e0b9c3859
     secrets: inherit
