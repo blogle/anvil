@@ -10,7 +10,7 @@
     nix2container.url = "github:Dauliac/nix2container/8fd02c842686a528fd37508283853de0ed1462b1";
     nix2containerNixpkgs.follows = "nix2container/nixpkgs";
     opencode.url = "github:anomalyco/opencode/9b4ec5714d481559990db0a816d5dec19541a814";
-    sdlc.url = "github:blogle/sdlc/d46dfae45032950ea147ce9148b7fc4015885c84";
+    sdlc.url = "github:blogle/sdlc/3a8197fa5cd20b82521f0f68966f0e6e3b83d643";
   };
 
   outputs = { self, nixpkgs, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode, sdlc }:
@@ -94,7 +94,6 @@
         checks = ciContract.checks // {
           crateFixtureSource = rust.fixtureSourceSmoke;
         };
-        apps.sdlc-publish = ci.publish;
         devShells.default = rust.devShell;
         # The release workflow smoke-tests the built daemon image with Docker.
         # Keep this shell minimal so release validation does not seed Cargo.

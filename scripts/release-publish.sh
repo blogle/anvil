@@ -38,8 +38,8 @@ while IFS='|' read -r source target; do
     if [[ "$tag" == "$SDLC_RELEASE_VERSION" || "$tag" == "sha-$SDLC_RELEASE_MERGED_SHA" ]]; then
       jq --arg name "$target:$tag" --arg digest "sha256:$actual" \
         --arg version "$SDLC_RELEASE_VERSION" --arg merged "$SDLC_RELEASE_MERGED_SHA" \
-        --arg source "$(jq -r .source_sha .sdlc/release.json)" \
-        '.artifacts += [{name:$name,digest:$digest,version:$version,merged_sha:$merged,source_sha:$source}]' \
+        --arg source "$(jq -r .source_main_sha .sdlc/release.json)" \
+        '.artifacts += [{name:$name,digest:$digest,version:$version,merged_sha:$merged,source_main_sha:$source}]' \
         "$receipt_tmp" > "$receipt_tmp.next"
       mv "$receipt_tmp.next" "$receipt_tmp"
     fi

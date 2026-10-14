@@ -202,17 +202,17 @@
         "nixpkgs": "nixpkgs_3"
       },
       "locked": {
-        "lastModified": 1792004850,
-        "narHash": "sha256-dLt6BfcSlTN+T8KgZrPz811Z1SRqw/gA7LfYJEqUQaM=",
+        "lastModified": 1792012400,
+        "narHash": "sha256-/HFgOHuTQYrZQOI6+TOvC82JRqSLK2L7AEoW2Nrm0tI=",
         "owner": "blogle",
         "repo": "sdlc",
-        "rev": "d46dfae45032950ea147ce9148b7fc4015885c84",
+        "rev": "3a8197fa5cd20b82521f0f68966f0e6e3b83d643",
         "type": "github"
       },
       "original": {
         "owner": "blogle",
-        "ref": "d46dfae45032950ea147ce9148b7fc4015885c84",
         "repo": "sdlc",
+        "rev": "3a8197fa5cd20b82521f0f68966f0e6e3b83d643",
         "type": "github"
       }
     },

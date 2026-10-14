@@ -4,7 +4,7 @@ pull_request_rules:
       - base ~= ^(main|master)$
       - head != sdlc/release-next
       - label != release
-      - check-success = "sdlc / check"
+      - check-success = @github-actions/sdlc / check
       - or:
           - and:
               - label = integration:auto
@@ -23,7 +23,7 @@ queue_rules:
       - base ~= ^(main|master)$
       - head != sdlc/release-next
       - label != release
-      - check-success = "sdlc / check"
+      - check-success = @github-actions/sdlc / check
       - or:
           - and:
               - label = integration:auto
@@ -33,7 +33,7 @@ queue_rules:
               - label != integration:auto
               - "#approved-reviews-by >= 1"
     merge_conditions:
-      - check-success = "sdlc / verify"
+      - check-success = @github-actions/sdlc / verify
     batch_size: 5
     batch_max_wait_time: 2 minutes
     merge_method: squash

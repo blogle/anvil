@@ -69,6 +69,15 @@ if ! grep -Fq 'tests/nix-daemon-smoke.sh' "$repo_root/scripts/release-publish.sh
   printf 'manifest-security: release hook must smoke-test the Nix daemon image\n' >&2
   exit 1
 fi
+if grep -Fq 'apps.sdlc-publish' "$repo_root/flake.nix"; then
+  printf 'manifest-security: publication must be exposed only as ci.publish\n' >&2
+  exit 1
+fi
+require_text 'release receipt source identity' 'source_main_sha:$source' "$repo_root/scripts/release-publish.sh"
+if grep -Fq '.source_sha .sdlc/release.json' "$repo_root/scripts/release-publish.sh"; then
+  printf 'manifest-security: release receipts must use source_main_sha\n' >&2
+  exit 1
+fi
 
 if command -v kustomize >/dev/null 2>&1; then
   assert_migration_startup_probe() {
