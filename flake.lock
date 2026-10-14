@@ -108,22 +108,6 @@
     },
     "nixpkgs_2": {
       "locked": {
-        "lastModified": 1789286504,
-        "narHash": "sha256-eiEK7cKZORNEvX0GeF3RtNEF/JXhgf2RqSp3230q13E=",
-        "owner": "NixOS",
-        "repo": "nixpkgs",
-        "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
-        "type": "github"
-      },
-      "original": {
-        "owner": "NixOS",
-        "ref": "nixos-unstable",
-        "repo": "nixpkgs",
-        "type": "github"
-      }
-    },
-    "nixpkgs_3": {
-      "locked": {
         "lastModified": 1790510107,
         "narHash": "sha256-EVMNYv7hYDDD9TGVT/hIyTYgpiXA8y3m5xIEIxuGNU0=",
         "owner": "NixOS",
@@ -138,9 +122,25 @@
         "type": "github"
       }
     },
+    "nixpkgs_3": {
+      "locked": {
+        "lastModified": 1790822859,
+        "narHash": "sha256-69xHQhAeMAD2wDXO7T2pcOZIF9Sga2W+JkmY2a11Ops=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "c59305bab2065cfecc4944690d9eedbb56f3a9fa",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "opencode": {
       "inputs": {
-        "nixpkgs": "nixpkgs_3"
+        "nixpkgs": "nixpkgs_2"
       },
       "locked": {
         "lastModified": 1791488743,
@@ -166,7 +166,10 @@
           "nix2container",
           "nixpkgs"
         ],
-        "nixpkgs": "nixpkgs_2",
+        "nixpkgs": [
+          "sdlc",
+          "nixpkgs"
+        ],
         "opencode": "opencode",
         "sdlc": "sdlc"
       }
@@ -196,21 +199,19 @@
     "sdlc": {
       "inputs": {
         "mergify-nix": "mergify-nix",
-        "nixpkgs": [
-          "nixpkgs"
-        ]
+        "nixpkgs": "nixpkgs_3"
       },
       "locked": {
-        "lastModified": 1791857388,
-        "narHash": "sha256-4SSRjWzjYAsLP8jC4/4/hDeiWF4SUmTIaiBYR80Fr5Q=",
+        "lastModified": 1791969410,
+        "narHash": "sha256-Jnbwazm0HIv3AYQ6emrVolWGJJNLGbGNGlbChHHRJfw=",
         "owner": "blogle",
         "repo": "sdlc",
-        "rev": "e9075f95a6ee206e53df76becdb5dda835e96b9a",
+        "rev": "08428aad227922dcc12f67ae1ca4616f1a56c7ba",
         "type": "github"
       },
       "original": {
         "owner": "blogle",
-        "ref": "main",
+        "ref": "08428aad227922dcc12f67ae1ca4616f1a56c7ba",
         "repo": "sdlc",
         "type": "github"
       }

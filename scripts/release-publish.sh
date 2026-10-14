@@ -10,7 +10,7 @@ registry="ghcr.io/${GITHUB_REPOSITORY,,}"
 docker load < "$(nix build --no-link --print-out-paths .#anvil-image)"
 nix run .#anvil-sandbox-image.copyToDockerDaemon
 nix run .#anvil-nix-daemon-image.copyToDockerDaemon
-nix develop .#kind-ci --command bash tests/nix-daemon-smoke.sh ghcr.io/blogle/anvil-nix-daemon:main
+nix develop .#release-smoke --command bash tests/nix-daemon-smoke.sh ghcr.io/blogle/anvil-nix-daemon:main
 
 receipts="${SDLC_RELEASE_RECEIPTS:-.sdlc/publication-receipts.json}"
 mkdir -p "$(dirname "$receipts")"

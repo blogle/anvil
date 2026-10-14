@@ -7,6 +7,9 @@ on:
     branches: [main, master]
 permissions:
   contents: read
+  actions: read
 jobs:
   sdlc:
-    uses: blogle/sdlc/.github/workflows/ci.yml@e9075f95a6ee206e53df76becdb5dda835e96b9a
+    uses: blogle/sdlc/.github/workflows/ci.yml@08428aad227922dcc12f67ae1ca4616f1a56c7ba
+    with:
+      sdlc_ref: 08428aad227922dcc12f67ae1ca4616f1a56c7ba
