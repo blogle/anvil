@@ -1602,7 +1602,12 @@ impl SandboxApi for KubeSandboxApi {
         )
         .get(&format!("anvil-{id}"))
         .await
-        .map_err(|e| ServiceError::Kubernetes(e.to_string()))
+        .map_err(|error| match error {
+            // A removed sandbox is an expected terminal observation for a bound
+            // Attempt, not a reason to abort the entire batch scheduler tick.
+            kube::Error::Api(response) if response.code == 404 => ServiceError::NotFound,
+            other => ServiceError::Kubernetes(other.to_string()),
+        })
         .and_then(|object| sandbox_record_from(&object, &self.config))
     }
     async fn files_diff(&self, id: &str) -> Result<Value, ServiceError> {
