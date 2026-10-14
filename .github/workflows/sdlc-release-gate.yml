@@ -18,7 +18,7 @@ jobs:
       (github.event_name == 'pull_request_target' && github.event.pull_request.head.ref == 'sdlc/release-next') ||
       github.event_name == 'push' ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'sdlc/release-next')
-    uses: blogle/sdlc/.github/workflows/release-gate.yml@3a8197fa5cd20b82521f0f68966f0e6e3b83d643
+    uses: blogle/sdlc/.github/workflows/release-gate.yml@69be9a3a4a6d1991b7f33cad9b278b493540a7e7
     with:
-      sdlc_ref: 3a8197fa5cd20b82521f0f68966f0e6e3b83d643
+      sdlc_ref: 69be9a3a4a6d1991b7f33cad9b278b493540a7e7
     secrets: inherit

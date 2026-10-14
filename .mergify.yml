@@ -1,3 +1,7 @@
+merge_protections_settings:
+  reporting_method: check-runs
+  post_comment: false
+
 pull_request_rules:
   - name: queue validated feature PRs
     conditions:
@@ -38,3 +42,19 @@ queue_rules:
     batch_max_wait_time: 2 minutes
     merge_method: squash
     update_method: merge
+
+merge_protections:
+  - name: Feature PRs merge only after queue verification
+    if:
+      - base ~= ^(main|master)$
+      - head != sdlc/release-next
+    success_conditions:
+      - queue-name = validated candidates
+      - check-success = @mergify/Mergify Merge Queue
+  - name: Release candidate needs trusted SDLC gate
+    if:
+      - base ~= ^(main|master)$
+      - head = sdlc/release-next
+    success_conditions:
+      - check-success = @sdlc-release/sdlc / release-gate
+      - "#commits-behind = 0"
