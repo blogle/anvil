@@ -62,8 +62,7 @@ stored operation, scope, reference, result, accepted/completed state, and
 timestamps for reconciliation. The
 GitHub credential endpoint is excluded because its short-lived credential
 response must never be persisted; repeated credential reads do not transition
-controller state. The MCP facade has no separate operator-query tool shape, so
-reconciliation remains available through the HTTP lookup endpoint.
+controller state. The MCP facade exposes durable Task intake and inspection through `anvil_create_task`, `anvil_list_tasks`, `anvil_get_task`, `anvil_get_task_snapshot`, `anvil_list_task_attempts`, `anvil_get_attempt`, and `anvil_get_task_decisions`. Task creation forwards the caller's idempotency key and immutable specification to `POST /v1/tasks`; absent optional specification fields are omitted so the API applies its documented defaults. Listing forwards native cursor and lifecycle/parent/runnable/external-reference filters to `GET /v1/tasks`. Snapshot, Attempt, and decisions reads use their canonical Task routes; decisions use the numeric `cursor`/`next_cursor` and bounded `limit` pagination. Fresh Tasks remain in backend-default Legacy mode; mode escalation is deferred until a trusted caller identity and gateway authorization boundary are available. Idle runtime state or empty/unknown attention is never represented as Task completion: callers must inspect explicit lifecycle and trusted completion policy/evidence.
 
 Provider login is a relay to the singleton profile OpenCode server. OpenCode
 1.18.30 supplies `GET /provider`, `GET /provider/auth`,
