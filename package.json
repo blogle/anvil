@@ -1,9 +1,0 @@
-{
-  "name": "anvil-frontend-tests",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "test": "npm --prefix web test",
-    "test:dom": "npm --prefix web test"
-  }
-}

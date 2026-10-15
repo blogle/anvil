@@ -1,104 +1,61 @@
 {
-  description = "Anvil development environment and reproducible Rust builds";
+  description = "Minimal Rust development environment for Anvil v2";
 
   inputs = {
-    flake-utils.url = "github:numtide/flake-utils";
+    sdlc.url = "github:blogle/sdlc/v1.3.0";
+    nixpkgs.follows = "sdlc/nixpkgs";
     crane.url = "github:ipetkov/crane";
-    # Temporary pin for nlewo/nix2container#199 / issue #192.
-    # Remove this fork pin after the upstream fix lands in nlewo/nix2container.
-    nix2container.url = "github:Dauliac/nix2container/8fd02c842686a528fd37508283853de0ed1462b1";
-    nix2containerNixpkgs.follows = "nix2container/nixpkgs";
-    opencode.url = "github:anomalyco/opencode/9b4ec5714d481559990db0a816d5dec19541a814";
-    sdlc.url = "github:blogle/sdlc/v2";
   };
 
-  outputs = { self, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode, sdlc }:
-    flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
-      let
-        packageSets = sdlc.lib.importPackages { inherit system; };
-        pkgs = packageSets.latest;
-        # The upstream V2 package's install check invokes `opencode --version`
-        # in a context where its runtime creates /tmp and fails under Nix's
-        # install-check sandbox. Keep the upstream default build unchanged and
-        # disable only that non-hermetic runtime check.
-        opencodePackage = opencode.packages.${system}.default.overrideAttrs (_: { doInstallCheck = false; });
-        craneLib = crane.mkLib pkgs;
-        rust = import ./nix/rust.nix {
-          inherit pkgs craneLib;
-          inherit opencodePackage;
-          nix2containerPkgs = nix2container.packages.${system};
-          repoRoot = ./.;
-        };
-        frontend = pkgs.buildNpmPackage {
-          pname = "anvil-web";
-          version = "0.1.0";
-          src = ./web;
-          npmDepsHash = "sha256-jSbL4XIRQbOg6DGmouNpFpiVHE9MNKLJn3Wxzfn0yfk=";
-          npmBuildScript = "build";
-          installPhase = ''
-            mkdir -p $out
-            cp -r dist/. $out/
-          '';
-        };
-        sandbox = import ./nix/sandbox.nix {
-          inherit pkgs;
-          inherit opencodePackage;
-          nix2containerPkgs = nix2container.packages.${system};
-          nix2containerBuildPkgs = nix2containerNixpkgs.legacyPackages.${system};
-          credentialHelperSource = ./runtime/anvil-credential;
-          sessionCapabilityHelperSource = ./runtime/anvil-session-capability;
-          sandboxEntrypointSource = ./runtime/sandbox-entrypoint;
-          importSandboxImageK3sSource = ./scripts/import-sandbox-image-k3s.sh;
-        };
-        images = import ./nix/images.nix {
-          inherit pkgs rust frontend;
-        };
-        publishImages = pkgs.writeShellApplication {
-          name = "anvil-sdlc-publish";
-          runtimeInputs = [ pkgs.coreutils pkgs.docker pkgs.jq pkgs.nix nix2container.packages.${system}.skopeo-nix2container ];
-          text = builtins.readFile ./scripts/release-publish.sh;
-        };
-        ciContract = import ./ci.nix {
-          inherit pkgs craneLib rust frontend images sandbox;
-          repoRoot = ./.;
-          opencodePackage = rust.opencodePackage;
-          publish = {
-            type = "app";
-            program = "${publishImages}/bin/anvil-sdlc-publish";
+  outputs = { self, nixpkgs, sdlc, crane }:
+    let
+      systems = [ "x86_64-linux" ];
+      forAllSystems = nixpkgs.lib.genAttrs systems;
+    in {
+      checks = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          craneLib = crane.mkLib pkgs;
+          src = craneLib.cleanCargoSource ./.;
+          cargoArtifacts = craneLib.buildDepsOnly { inherit src; };
+          package = craneLib.buildPackage {
+            inherit src cargoArtifacts;
+            doCheck = true;
           };
-        };
-        ci = sdlc.lib.mkConsumer {
-          inherit (ciContract) check verify publish;
-        };
-      in
-      {
-        packages.sdlc = sdlc.packages.${system}.sdlc;
-        packages.default = images.anvilImage;
-        packages.anvild = rust.releaseBinaries.anvild;
-        packages.frontend = frontend;
-        packages.anvil-mcp = rust.releaseBinaries.anvilMcp;
-        packages.anvil-router = rust.releaseBinaries.anvilRouter;
-        packages.anvilctl = rust.releaseBinaries.anvilCtl;
-        packages.anvil-image = images.anvilImage;
-        packages.anvil-image-ci = images.anvilImageCi;
-        packages.anvil-ci-release-cargo-artifacts = rust.ciReleaseCargoArtifacts;
-        packages.anvil-sandbox-image = sandbox.sandboxImage;
-        packages.anvil-nix-daemon-image = sandbox.daemonImage;
-        packages.anvil-nix-daemon-upgrade-test-image = sandbox.daemonUpgradeImage;
-        packages.anvil-nix-daemon-upgrade-test-canary = sandbox.daemonUpgradeCanary;
-        packages.anvil-nix-daemon-image-push = sandbox.daemonImagePush;
-        packages.anvil-sandbox-image-push = sandbox.sandboxImagePush;
-        packages.import-sandbox-image-k3s = sandbox.importSandboxImageK3s;
+        in {
+          build = package;
+          test = package;
+          fmt = craneLib.cargoFmt { inherit src; };
+          clippy = craneLib.cargoClippy {
+            inherit src cargoArtifacts;
+            cargoClippyExtraArgs = "--all-targets -- -D warnings";
+          };
+          flake = pkgs.runCommand "anvil-v2-flake-check" { } ''
+            test -f ${./flake.nix}
+            test -f ${./flake.lock}
+            touch $out
+          '';
+        });
 
-        ci = ci;
-        checks = ciContract.checks // {
-          crateFixtureSource = rust.fixtureSourceSmoke;
-        };
-        devShells.default = rust.devShell;
-        # The release workflow smoke-tests the built daemon image with Docker.
-        # Keep this shell minimal so release validation does not seed Cargo.
-        devShells.release-smoke = pkgs.mkShell {
-          packages = [ pkgs.bash pkgs.coreutils pkgs.docker pkgs.findutils pkgs.nix pkgs.util-linux ];
-        };
+      packages = forAllSystems (system: {
+        default = self.checks.${system}.build;
       });
+
+      ci = forAllSystems (system:
+        sdlc.lib.mkConsumer {
+          contract = import ./ci.nix { inherit self system; };
+        });
+
+      hydraJobs = forAllSystems (system: self.ci.${system}.hydraJobs);
+
+      devShells = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          craneLib = crane.mkLib pkgs;
+        in {
+          default = craneLib.devShell {
+            packages = [ pkgs.just pkgs.nix pkgs.rustfmt ];
+          };
+        });
+    };
 }
