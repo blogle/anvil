@@ -2,7 +2,7 @@
   description = "Anvil development environment and reproducible Rust builds";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.follows = "sdlc/nixpkgs";
     flake-utils.url = "github:numtide/flake-utils";
     crane.url = "github:ipetkov/crane";
     # Temporary pin for nlewo/nix2container#199 / issue #192.
@@ -10,10 +10,11 @@
     nix2container.url = "github:Dauliac/nix2container/8fd02c842686a528fd37508283853de0ed1462b1";
     nix2containerNixpkgs.follows = "nix2container/nixpkgs";
     opencode.url = "github:anomalyco/opencode/9b4ec5714d481559990db0a816d5dec19541a814";
+    sdlc.url = "github:blogle/sdlc/de40fc00bc632b7acd0b0ba5de1242f1af827a9f";
   };
 
-  outputs = { self, nixpkgs, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs = { self, nixpkgs, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode, sdlc }:
+    flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
         pkgs = import nixpkgs { inherit system; };
         # The upstream V2 package's install check invokes `opencode --version`
@@ -52,8 +53,26 @@
         images = import ./nix/images.nix {
           inherit pkgs rust frontend;
         };
+        publishImages = pkgs.writeShellApplication {
+          name = "anvil-sdlc-publish";
+          runtimeInputs = [ pkgs.coreutils pkgs.docker pkgs.jq pkgs.nix nix2container.packages.${system}.skopeo-nix2container ];
+          text = builtins.readFile ./scripts/release-publish.sh;
+        };
+        ciContract = import ./ci.nix {
+          inherit pkgs craneLib rust frontend images sandbox;
+          repoRoot = ./.;
+          opencodePackage = rust.opencodePackage;
+          publish = {
+            type = "app";
+            program = "${publishImages}/bin/anvil-sdlc-publish";
+          };
+        };
+        ci = sdlc.lib.mkConsumer {
+          inherit (ciContract) fast verify publish;
+        };
       in
       {
+        packages.sdlc = sdlc.packages.${system}.sdlc;
         packages.default = images.anvilImage;
         packages.anvild = rust.releaseBinaries.anvild;
         packages.frontend = frontend;
@@ -67,42 +86,19 @@
         packages.anvil-nix-daemon-image = sandbox.daemonImage;
         packages.anvil-nix-daemon-upgrade-test-image = sandbox.daemonUpgradeImage;
         packages.anvil-nix-daemon-upgrade-test-canary = sandbox.daemonUpgradeCanary;
-        packages.shared-nix-directory-source-smoke = pkgs.stdenv.mkDerivation {
-          pname = "anvil-shared-nix-directory-source-smoke";
-          version = "1";
-          src = ./tests/nix-directory-source;
-          installPhase = ''
-            install -Dm644 fixture.txt "$out/fixture.txt"
-          '';
-        };
         packages.anvil-nix-daemon-image-push = sandbox.daemonImagePush;
         packages.anvil-sandbox-image-push = sandbox.sandboxImagePush;
         packages.import-sandbox-image-k3s = sandbox.importSandboxImageK3s;
 
-        checks = rust.checks // {
-          inherit frontend;
+        ci = ci;
+        checks = ciContract.checks // {
           crateFixtureSource = rust.fixtureSourceSmoke;
         };
         devShells.default = rust.devShell;
-        # Kind already validates Rust in the independent local-first job. This
-        # shell keeps the shared-daemon contract focused on environment entry
-        # instead of triggering the full Cargo artifact seed.
-        devShells.shared-nix-smoke = pkgs.mkShell {
-          packages = [ pkgs.bash pkgs.just pkgs.nix ];
-          shellHook = ''
-            export ANVIL_SHARED_NIX_SMOKE=1
-          '';
-        };
-        # Kind owns Kubernetes/image/runtime fidelity, not Cargo validation.
-        # Do not enter rust.devShell here: its hook seeds the full dependency
-        # artifact set before the acceptance script can start.
-        devShells.kind-ci = pkgs.mkShell {
-          packages = [
-            pkgs.bash pkgs.cargo pkgs.curl pkgs.gitMinimal pkgs.jq pkgs.just pkgs.kind
-            pkgs.kubectl pkgs.kustomize pkgs.nix pkgs.util-linux
-            pkgs.rustfmt
-            nix2container.packages.${system}.skopeo-nix2container
-          ];
+        # The release workflow smoke-tests the built daemon image with Docker.
+        # Keep this shell minimal so release validation does not seed Cargo.
+        devShells.release-smoke = pkgs.mkShell {
+          packages = [ pkgs.bash pkgs.coreutils pkgs.docker pkgs.findutils pkgs.nix pkgs.util-linux ];
         };
       });
 }

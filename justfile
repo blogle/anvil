@@ -10,15 +10,16 @@ check:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo nextest run --workspace
     just security-check
+    just e2e
 
 frontend-build:
     cd web && npm ci && npm run build
 
 frontend-test:
-    cd web && npm ci && npm test
+    cd web && npm ci && npm run test:unit
 
 frontend-check:
-    cd web && npm ci && npm test && npm run build
+    cd web && npm ci && npm run test:unit && npm run build
 
 security-check:
     bash tests/credential-helper.sh
@@ -63,12 +64,6 @@ e2e:
 
 e2e-ui:
     bash tests/local-e2e.sh --ui
-
-e2e-sandbox-image:
-    bash tests/sandbox-oci-acceptance.sh
-
-e2e-k8s:
-    bash tests/kind-acceptance.sh
 
 image:
     nix build .#anvil-image -o result-anvil
