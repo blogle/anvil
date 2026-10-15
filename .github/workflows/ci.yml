@@ -11,7 +11,26 @@ permissions:
   actions: read
 
 jobs:
-  sdlc:
-    uses: blogle/sdlc/.github/workflows/ci.yml@c7bd6449c322f51ef057445c4de35655cc41cfb1
-    with:
-      sdlc_ref: github:blogle/sdlc/v1.3.0
+  pr-fast:
+    uses: blogle/sdlc/.github/workflows/pr-fast.yml@c7bd6449c322f51ef057445c4de35655cc41cfb1
+  candidate:
+    uses: blogle/sdlc/.github/workflows/candidate.yml@c7bd6449c322f51ef057445c4de35655cc41cfb1
+  policy:
+    if: >-
+      (github.event_name == 'pull_request' &&
+      github.base_ref == github.event.repository.default_branch) ||
+      (github.event_name == 'push' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    uses: blogle/sdlc/.github/workflows/policy-check.yml@c7bd6449c322f51ef057445c4de35655cc41cfb1
+  sdlc-policy:
+    name: sdlc / policy
+    needs: policy
+    if: >-
+      always() &&
+      (((github.event_name == 'pull_request') &&
+      (github.base_ref == github.event.repository.default_branch)) ||
+      ((github.event_name == 'push') &&
+      (github.ref == format('refs/heads/{0}', github.event.repository.default_branch))))
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.policy.result }}" = success
