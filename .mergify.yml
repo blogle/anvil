@@ -5,10 +5,10 @@ merge_protections_settings:
 pull_request_rules:
   - name: queue validated feature PRs
     conditions:
-      - base = v2
+      - base = main
       - head != sdlc/release-next
       - label != release
-      - check-success = @github-actions/sdlc / check
+      - check-success = @github-actions/sdlc / pr-fast
       - or:
           - and:
               - label = integration:auto
@@ -24,10 +24,10 @@ pull_request_rules:
 queue_rules:
   - name: validated candidates
     queue_conditions:
-      - base = v2
+      - base = main
       - head != sdlc/release-next
       - label != release
-      - check-success = @github-actions/sdlc / check
+      - check-success = @github-actions/sdlc / pr-fast
       - or:
           - and:
               - label = integration:auto
@@ -37,7 +37,7 @@ queue_rules:
               - label != integration:auto
               - "#approved-reviews-by >= 1"
     merge_conditions:
-      - check-success = @github-actions/sdlc / verify
+      - check-success = @github-actions/sdlc / candidate
     batch_size: 5
     batch_max_wait_time: 2 minutes
     merge_method: squash

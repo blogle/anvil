@@ -4,7 +4,7 @@ on:
   pull_request:
   merge_group:
   push:
-    branches: [v2]
+    branches: [main, v2]
 
 permissions:
   contents: read
