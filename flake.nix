@@ -39,6 +39,8 @@
 
       packages = forAllSystems (system: {
         default = self.checks.${system}.build;
+        sdlc = sdlc.packages.${system}.sdlc;
+        nix-eval-jobs = sdlc.packages.${system}.nix-eval-jobs;
       });
 
       ci = forAllSystems (system:
