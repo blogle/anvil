@@ -25,5 +25,11 @@ check:
     just test
     just nix-check
 
+ci-fast:
+    nix build --no-link .#ci.x86_64-linux.fast.fmt .#ci.x86_64-linux.fast.clippy
+
+ci-verify:
+    nix build --no-link .#ci.x86_64-linux.verify.build .#ci.x86_64-linux.verify.tests
+
 fmt-check:
     cargo fmt --all -- --check

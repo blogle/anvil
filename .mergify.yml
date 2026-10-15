@@ -5,10 +5,10 @@ merge_protections_settings:
 pull_request_rules:
   - name: queue validated feature PRs
     conditions:
-      - base = main
+      - base ~= ^(main|master)$
       - head != sdlc/release-next
       - label != release
-      - check-success = @github-actions/sdlc / pr-fast
+      - check-success = @github-actions/sdlc / check
       - or:
           - and:
               - label = integration:auto
@@ -24,10 +24,10 @@ pull_request_rules:
 queue_rules:
   - name: validated candidates
     queue_conditions:
-      - base = main
+      - base ~= ^(main|master)$
       - head != sdlc/release-next
       - label != release
-      - check-success = @github-actions/sdlc / pr-fast
+      - check-success = @github-actions/sdlc / check
       - or:
           - and:
               - label = integration:auto
@@ -37,8 +37,24 @@ queue_rules:
               - label != integration:auto
               - "#approved-reviews-by >= 1"
     merge_conditions:
-      - check-success = @github-actions/sdlc / candidate
+      - check-success = @github-actions/sdlc / verify
     batch_size: 5
     batch_max_wait_time: 2 minutes
     merge_method: squash
     update_method: merge
+
+merge_protections:
+  - name: Feature PRs merge only after queue verification
+    if:
+      - base ~= ^(main|master)$
+      - head != sdlc/release-next
+    success_conditions:
+      - queue-name = validated candidates
+      - check-success = @mergify/Mergify Merge Queue
+  - name: Release candidate needs trusted SDLC gate
+    if:
+      - base ~= ^(main|master)$
+      - head = sdlc/release-next
+    success_conditions:
+      - check-success = @sdlc-release/sdlc / release-gate
+      - "#commits-behind = 0"

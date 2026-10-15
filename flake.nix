@@ -2,7 +2,9 @@
   description = "Minimal Rust development environment for Anvil v2";
 
   inputs = {
-    sdlc.url = "github:blogle/sdlc/v1.3.0";
+    # TODO: replace this pre-release evaluation pin with a tagged SDLC release
+    # whose API matches main before promoting this branch to anvil-v2/main.
+    sdlc.url = "github:blogle/sdlc/de40fc00bc632b7acd0b0ba5de1242f1af827a9f";
     nixpkgs.follows = "sdlc/nixpkgs";
     crane.url = "github:ipetkov/crane";
   };
@@ -20,35 +22,32 @@
           cargoArtifacts = craneLib.buildDepsOnly { inherit src; };
           package = craneLib.buildPackage {
             inherit src cargoArtifacts;
+            doCheck = false;
+          };
+          tests = craneLib.buildPackage {
+            inherit src cargoArtifacts;
             doCheck = true;
           };
         in {
           build = package;
-          test = package;
+          inherit tests;
           fmt = craneLib.cargoFmt { inherit src; };
           clippy = craneLib.cargoClippy {
             inherit src cargoArtifacts;
             cargoClippyExtraArgs = "--all-targets -- -D warnings";
           };
-          flake = pkgs.runCommand "anvil-v2-flake-check" { } ''
-            test -f ${./flake.nix}
-            test -f ${./flake.lock}
-            touch $out
-          '';
         });
 
       packages = forAllSystems (system: {
         default = self.checks.${system}.build;
         sdlc = sdlc.packages.${system}.sdlc;
-        nix-eval-jobs = sdlc.packages.${system}.nix-eval-jobs;
       });
 
       ci = forAllSystems (system:
-        sdlc.lib.mkConsumer {
-          contract = import ./ci.nix { inherit self system; };
-        });
-
-      hydraJobs = forAllSystems (system: self.ci.${system}.hydraJobs);
+        sdlc.lib.mkConsumer (import ./ci.nix {
+          inherit self system;
+          pkgs = nixpkgs.legacyPackages.${system};
+        }));
 
       devShells = forAllSystems (system:
         let
@@ -56,7 +55,10 @@
           craneLib = crane.mkLib pkgs;
         in {
           default = craneLib.devShell {
-            packages = [ pkgs.just pkgs.nix pkgs.rustfmt ];
+            packages = sdlc.lib.devTools {
+              inherit pkgs;
+              sdlcCli = sdlc.packages.${system}.sdlc;
+            } ++ [ pkgs.just pkgs.gh ];
           };
         });
     };
