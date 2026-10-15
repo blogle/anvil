@@ -2,11 +2,11 @@
   "nodes": {
     "crane": {
       "locked": {
-        "lastModified": 1788465171,
-        "narHash": "sha256-Y1/TTVXjYXGF068IThQH9fPSZ0SIE74PABlUxnWTUH0=",
+        "lastModified": 1791754810,
+        "narHash": "sha256-cN0Mgk+sQtCJcGWs9H4M0CnLRAuC4I8aCwiBTcBJs6E=",
         "owner": "ipetkov",
         "repo": "crane",
-        "rev": "eb35abda9f232cc6610b1d1e3200d15c49b7ac54",
+        "rev": "bd63bf1d0a0f6dcacd7549c714a671ee63b0db6a",
         "type": "github"
       },
       "original": {
@@ -15,65 +15,52 @@
         "type": "github"
       }
     },
-    "flake-utils": {
-      "inputs": {
-        "systems": "systems"
-      },
+    "mergify-cli": {
+      "flake": false,
       "locked": {
-        "lastModified": 1731533236,
-        "narHash": "sha256-l0KFg5HjrsfsO/JpG+r7fRrqm12kzFHyUHqHCVpMMbI=",
-        "owner": "numtide",
-        "repo": "flake-utils",
-        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
+        "lastModified": 1790892210,
+        "narHash": "sha256-fABNLDon0DMgXXxgEiLivKCbBb1QStRbgfKw5F/E4pE=",
+        "owner": "Mergifyio",
+        "repo": "mergify-cli",
+        "rev": "b24e8f2aa67dfceff9401b39450fb7bb91f5573e",
         "type": "github"
       },
       "original": {
-        "owner": "numtide",
-        "repo": "flake-utils",
+        "owner": "Mergifyio",
+        "repo": "mergify-cli",
         "type": "github"
       }
     },
-    "nix2container": {
+    "mergify-nix": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "mergify-cli": "mergify-cli",
+        "nixpkgs": [
+          "sdlc",
+          "nixpkgs"
+        ],
+        "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1780987858,
-        "narHash": "sha256-uSu2Txmm3F0jattUSzuUoRcvA8CxBf3j9WkH538Tq24=",
-        "owner": "Dauliac",
-        "repo": "nix2container",
-        "rev": "8fd02c842686a528fd37508283853de0ed1462b1",
+        "lastModified": 1790892723,
+        "narHash": "sha256-CWkesgHBDNTS8z2sgapF/yJPAefDUNrCP0ba+f6moNY=",
+        "owner": "blogle",
+        "repo": "mergify-nix",
+        "rev": "89a679f80be2a1faddd6778b6a5098280e7a5ac8",
         "type": "github"
       },
       "original": {
-        "owner": "Dauliac",
-        "repo": "nix2container",
-        "rev": "8fd02c842686a528fd37508283853de0ed1462b1",
+        "owner": "blogle",
+        "repo": "mergify-nix",
         "type": "github"
       }
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1767028467,
-        "narHash": "sha256-7G+2aXClSMaTY1ogpX14CAxjRsvyVzpE0GRwL71WO7g=",
+        "lastModified": 1790822859,
+        "narHash": "sha256-69xHQhAeMAD2wDXO7T2pcOZIF9Sga2W+JkmY2a11Ops=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "1cabc318c11299f07ca53e3cb719854682fe6eb3",
-        "type": "github"
-      },
-      "original": {
-        "owner": "NixOS",
-        "repo": "nixpkgs",
-        "type": "github"
-      }
-    },
-    "nixpkgs_2": {
-      "locked": {
-        "lastModified": 1789286504,
-        "narHash": "sha256-eiEK7cKZORNEvX0GeF3RtNEF/JXhgf2RqSp3230q13E=",
-        "owner": "NixOS",
-        "repo": "nixpkgs",
-        "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+        "rev": "c59305bab2065cfecc4944690d9eedbb56f3a9fa",
         "type": "github"
       },
       "original": {
@@ -83,66 +70,55 @@
         "type": "github"
       }
     },
-    "nixpkgs_3": {
-      "locked": {
-        "lastModified": 1790510107,
-        "narHash": "sha256-EVMNYv7hYDDD9TGVT/hIyTYgpiXA8y3m5xIEIxuGNU0=",
-        "owner": "NixOS",
-        "repo": "nixpkgs",
-        "rev": "3181085bfd08663b6b9e60bc7a8395c2aaa741bd",
-        "type": "github"
-      },
-      "original": {
-        "owner": "NixOS",
-        "ref": "nixpkgs-unstable",
-        "repo": "nixpkgs",
-        "type": "github"
-      }
-    },
-    "opencode": {
-      "inputs": {
-        "nixpkgs": "nixpkgs_3"
-      },
-      "locked": {
-        "lastModified": 1791488743,
-        "narHash": "sha256-umhEz5um90EiBHvVZzQw+HoBFO088ZI1g7Ost9BUxhM=",
-        "owner": "anomalyco",
-        "repo": "opencode",
-        "rev": "9b4ec5714d481559990db0a816d5dec19541a814",
-        "type": "github"
-      },
-      "original": {
-        "owner": "anomalyco",
-        "repo": "opencode",
-        "rev": "9b4ec5714d481559990db0a816d5dec19541a814",
-        "type": "github"
-      }
-    },
     "root": {
       "inputs": {
         "crane": "crane",
-        "flake-utils": "flake-utils",
-        "nix2container": "nix2container",
-        "nix2containerNixpkgs": [
-          "nix2container",
+        "nixpkgs": [
+          "sdlc",
           "nixpkgs"
         ],
-        "nixpkgs": "nixpkgs_2",
-        "opencode": "opencode"
+        "sdlc": "sdlc"
       }
     },
-    "systems": {
+    "rust-overlay": {
+      "inputs": {
+        "nixpkgs": [
+          "sdlc",
+          "mergify-nix",
+          "nixpkgs"
+        ]
+      },
       "locked": {
-        "lastModified": 1681028828,
-        "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
-        "owner": "nix-systems",
-        "repo": "default",
-        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
+        "lastModified": 1790882220,
+        "narHash": "sha256-n+rcrZkqos6/HY2iSJsVsJw3Q4mB9XEquYpus97iOi4=",
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "rev": "dcee1adabb61484343af863501d2e3d91ef51f72",
         "type": "github"
       },
       "original": {
-        "owner": "nix-systems",
-        "repo": "default",
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "type": "github"
+      }
+    },
+    "sdlc": {
+      "inputs": {
+        "mergify-nix": "mergify-nix",
+        "nixpkgs": "nixpkgs"
+      },
+      "locked": {
+        "lastModified": 1791686693,
+        "narHash": "sha256-VuDMFo3i0Y664FCPmYffLUDM14tUswBfScSL3yfBiXs=",
+        "owner": "blogle",
+        "repo": "sdlc",
+        "rev": "c7bd6449c322f51ef057445c4de35655cc41cfb1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "blogle",
+        "ref": "v1.3.0",
+        "repo": "sdlc",
         "type": "github"
       }
     }

@@ -1,0 +1,3 @@
+{
+  "extends": ["github>blogle/sdlc#v1"]
+}
