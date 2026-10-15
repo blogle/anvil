@@ -1,41 +1,44 @@
-merge_queue:
-  max_parallel_checks: 2
-
-queue_rules:
-  - name: main
-    batch_size:
-      min: 1
-      max: 5
-    batch_max_wait_time: 2 min
-    queue_conditions:
-      - base = main
-      - -draft
-      - -conflict
-      - '#commits-behind = 0'
-      - linear-history
-      - "#approved-reviews-by >= 1"
-      - check-success = PR admission
-      - check-success = Render Kubernetes manifests
-    merge_conditions:
-      - "#approved-reviews-by >= 1"
-      - check-success = Integration E2E
-      - check-success = Batch image and Kind
+merge_protections_settings:
+  reporting_method: check-runs
+  post_comment: false
 
 pull_request_rules:
-  - name: Keep pull requests rebased on main
+  - name: queue validated feature PRs
     conditions:
-      - base = main
-      - -conflict
-    actions:
-      rebase:
-        bot_account: blogle
-
-  - name: Queue approved ready pull requests
-    conditions:
-      - base = main
-      - -draft
-      - -conflict
-      - "#approved-reviews-by >= 1"
+      - base = v2
+      - head != sdlc/release-next
+      - label != release
+      - check-success = @github-actions/sdlc / check
+      - or:
+          - and:
+              - label = integration:auto
+              - label != integration:review
+          - and:
+              - label = integration:review
+              - label != integration:auto
+              - "#approved-reviews-by >= 1"
     actions:
       queue:
-        name: main
+        name: validated candidates
+
+queue_rules:
+  - name: validated candidates
+    queue_conditions:
+      - base = v2
+      - head != sdlc/release-next
+      - label != release
+      - check-success = @github-actions/sdlc / check
+      - or:
+          - and:
+              - label = integration:auto
+              - label != integration:review
+          - and:
+              - label = integration:review
+              - label != integration:auto
+              - "#approved-reviews-by >= 1"
+    merge_conditions:
+      - check-success = @github-actions/sdlc / verify
+    batch_size: 5
+    batch_max_wait_time: 2 minutes
+    merge_method: squash
+    update_method: merge

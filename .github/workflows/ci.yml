@@ -1,0 +1,17 @@
+name: SDLC CI
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [v2]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  sdlc:
+    uses: blogle/sdlc/.github/workflows/ci.yml@c7bd6449c322f51ef057445c4de35655cc41cfb1
+    with:
+      sdlc_ref: github:blogle/sdlc/v1.3.0

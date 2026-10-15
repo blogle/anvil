@@ -1,10 +1,4 @@
-/target/
+/result
+/target
 .direnv/
-.env
-.env.*
-!.env.example
-result
-result-*
-*.swp
-/web/node_modules/
-/web/dist/
+.envrc
