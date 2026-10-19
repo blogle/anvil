@@ -1,84 +1,92 @@
-# Anvil v2 research ledger
+# Anvil v2 — research provenance
 
-**Status:** dated working notes, not a bibliography of claims. **Last reviewed:** 2026-10-18. Links below point to primary or first-party material where possible; a link is not evidence that Anvil has adopted a technology.
+**Status:** supporting design evidence. **Scope:** external mechanisms relevant to unattended agent execution, context reconstruction, reconciliation, recovery, and delivery. Sources do not establish Anvil's implementation choices by themselves.
 
-## Adopted lessons
+## Reference register
 
-### 2026-10-18 · Kubernetes controller pattern
+### R-01 — Reconciliation from observed state
+- **Source:** [Kubernetes controller concepts](https://kubernetes.io/docs/concepts/architecture/controller/)
+- **Mechanism:** Control loops compare desired state to current observed state and act to reduce the difference.
+- **Application:** Anvil treats events and callbacks as reconciliation triggers; it re-reads OpenCode, Git, CI, and integration state before selecting decisions.
+- **Limit:** Kubernetes' controller pattern does not supply an agent strategy-selection algorithm, remote exactly-once effects, or a semantic acceptance oracle.
+- **Design links:** `spec.html#invariants`, `architecture.html#loop`, OD-02.
 
-**Reference:** [Kubernetes controller concepts](https://kubernetes.io/docs/concepts/architecture/controller/)
+### R-02 — Ralph-style external agent repetition
+- **Source:** [Geoffrey Huntley — Ralph](https://ghuntley.com/ralph/)
+- **Mechanism:** Repeated bounded agent execution against persistent project artifacts and the current repository state.
+- **Application:** OpenCode remains the inner model/tool loop. Anvil's outer controller selects when another bounded instruction is warranted, when to wait, and when to stop.
+- **Limit:** Blind iteration does not establish progress, authority, budget safety, or external integration outcomes.
+- **Design links:** `architecture.html#control`, OD-01.
 
-The useful lesson is the control shape: observe current state, compare it with desired state, and reconcile. Anvil borrows that shape, not Kubernetes API machinery as an architectural prescription. This supports “events trigger reconciliation; world state is authoritative” and makes retry/recovery an explicit design concern.
+### R-03 — External worker orchestration
+- **Source:** [OpenAI Symphony specification](https://github.com/openai/symphony/blob/main/SPEC.md)
+- **Mechanism:** Worker execution and continuation informed by external work state; bounded retry and thread/session continuity are explicit operational concerns.
+- **Application:** Agent idleness is a checkpoint opportunity, not a completion criterion. Anvil may continue an existing context with a delta or reconstruct a fresh session.
+- **Limit:** Anvil additionally requires Candidate-bound verification, integration recovery, Campaign dependencies, and authority-aware command delivery.
+- **Design links:** `architecture.html#loop`, `architecture.html#context`.
 
-**Implication:** a callback or session event must not directly decide that a Commission is complete. It should wake a reconciliation that reads the world again.
+### R-04 — Context continuity across agent sessions
+- **Source:** [Anthropic — Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
+- **Mechanism:** Explicit progress artifacts and repository state help a fresh context recover work without inheriting the entire preceding trajectory.
+- **Application:** Anvil reconstructs Campaign, Commission, Assignment, Attempt, previous strategy outcomes, Candidate state, and current Findings from durable records. OpenCode retains repository-owned development instructions.
+- **Limit:** A proposed context occupancy target below approximately 50% is an initial tunable heuristic, not a published universal optimum.
+- **Design links:** `architecture.html#context`, OD-01.
 
-### 2026-10-18 · Ralph-style external loop
+### R-05 — OpenCode execution and instrumentation
+- **Sources:** [OpenCode documentation](https://opencode.ai/docs/), [OpenCode repository](https://github.com/anomalyco/opencode)
+- **Mechanism:** OpenCode provides coding sessions, tool outcomes, session todos, and extensibility; concrete API guarantees are version-dependent.
+- **Application:** Observe the existing todos and execution messages before adding an Anvil-specific reporting tool or plugin. Structured reports remain implementer claims.
+- **Limit:** Precise endpoint semantics, token accounting, and safe steering/interrupt capabilities must be verified against the pinned OpenCode version.
+- **Design links:** `architecture.html#watchdog`, `architecture.html#evidence`.
 
-**Reference:** [Geoffrey Huntley, Ralph](https://ghuntley.com/ralph/)
+### R-06 — Repository-owned development instructions
+- **Sources:** [AGENTS.md](https://agents.md/), [OpenCode documentation](https://opencode.ai/docs/)
+- **Mechanism:** Project-level instructions and skills reside with the repository and its harness configuration.
+- **Application:** Anvil supplies operational authority, reporting protocol, current objective hierarchy, and Findings. It does not duplicate or supersede repository development conventions.
+- **Limit:** Repository-provided instructions are not authorization to exceed controller budgets or change protected delivery gates.
+- **Design links:** `architecture.html#context`.
 
-Ralph is the inspiration for an outer loop that repeatedly gives an agent bounded work and evaluates the result. Anvil’s proposed distinction is important: the loop supervises and reconciles; OpenCode remains the worker environment. The reference does not settle Anvil’s persistence, safety, or acceptance policy.
+### R-07 — Sandbox runtime boundary
+- **Source:** [Kubernetes agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox)
+- **Mechanism:** Kubernetes-managed isolated agent workspaces and associated lifecycle.
+- **Application:** Real Kubernetes tests are needed for provisioning, readiness, persistence, isolation and cleanup. Domain policy and failure scenarios should run without Kubernetes.
+- **Limit:** Local test doubles do not prove production isolation, volume persistence, or rollout behavior.
+- **Design links:** `spec.html#acceptance`, OD-06.
 
-**Implication:** Attempts need explicit bounds and outcomes. “The agent is still talking” is not equivalent to progress.
+### R-08 — Pull request integration and stacks
+- **Source:** [Mergify documentation](https://docs.mergify.com/)
+- **Mechanism:** Provider-managed merge queues and stacked-change workflows.
+- **Application:** Observe authoritative PR/check/merge state; isolate integration semantics behind explicit operations rather than assuming branch pushes imply delivery.
+- **Limit:** Branch-based dependency graphs and Mergify stack mechanisms must not be conflated. Candidate validity after rebases and dependency updates remains unresolved.
+- **Design links:** `architecture.html#campaign`, OD-04.
 
-### 2026-10-18 · Context engineering for coding agents
+### R-09 — External coding benchmarks
+- **Source:** [SWE-bench](https://www.swebench.com/)
+- **Mechanism:** Independent grading of software-repair patches against benchmark tasks.
+- **Application:** Run an affordable, pinned subset periodically to compare OpenCode alone against Anvil-assisted execution under comparable model, repository, and budget settings.
+- **Limit:** Benchmark patch success does not measure controller recovery, cross-repository integration, or unattended delivery reliability. Held-out benchmark grading must not leak into in-run repair prompts.
+- **Design links:** `spec.html#acceptance`.
 
-**Reference:** [Claude Code: Using Claude Code, the unreasonable effectiveness of HTML](https://claude.dev/blog/using-claude-code-the-unreasonable-effectiveness-of-html/)
+### R-10 — HTML as a technical documentation medium
+- **Source:** [Claude — Using Claude Code, the unreasonable effectiveness of HTML](https://claude.dev/blog/using-claude-code-the-unreasonable-effectiveness-of-html/)
+- **Mechanism:** Navigable static HTML can make diagrams, cross-references, and architecture decisions accessible without a document-processing pipeline.
+- **Application:** HTML is the rendering medium for the normative specification and architecture; this is not marketing collateral.
+- **Limit:** The presentation medium does not determine the correctness of domain claims.
 
-The practical lesson adopted here is to make durable, navigable artifacts do explanatory work instead of relying on an enormous prompt or transcript. It is a presentation and workflow reference, not an independent claim about model quality.
+## Unverified propositions
 
-**Implication:** fresh sessions should receive a compact context packet assembled from repository instructions, durable artifacts, current findings, and observable state. The “under ~50% context” target is a tunable heuristic, not a measured law.
+| Proposition | Evaluation criterion |
+| --- | --- |
+| Fresh-session hierarchical context improves recovery compared with long same-session continuation | Compare matched task attempts, Candidate correctness, cost and total elapsed time under fixed budgets |
+| In-flight watchdog intervention reduces wasted model execution | Measure excessive repeated failure cycles avoided and rate of useful work incorrectly interrupted |
+| Agent-maintained todos improve continuation prompts | Compare objective completion and repair accuracy when agent-plan state is included versus omitted |
+| Small independent check profiles improve convergence without frequent CI pushes | Measure local diagnostic time/cost and downstream CI results for the same Candidate revision |
+| A separate reviewer improves assurance enough to justify cost | Compare independent defect detection, false rejections, and additional inference cost |
 
-### 2026-10-18 · Repository-local instructions
+## Current design limitations
 
-**References:** [OpenCode repository](https://github.com/anomalyco/opencode), [AGENTS.md convention](https://agents.md/)
-
-The design direction keeps repository-owned instructions and skills in their repository boundary. Anvil supplies operational/reporting protocol and current work hierarchy; it should not silently override local instructions.
-
-**Implication:** provenance must identify whether a rule came from the repository, Anvil’s protocol, a Commission amendment, or a worker claim.
-
-### 2026-10-18 · Stacked change workflows
-
-**Reference:** [Mergify stacked PRs](https://docs.mergify.com/stacked-prs/)
-
-Stack workflows demonstrate that dependent changes can be useful, but this reference does not answer Anvil’s graph semantics, Candidate identity, or failure policy. It is a candidate integration constraint only.
-
-**Implication:** Git stacks and dependent branches remain an open decision, not a hidden assumption in Campaign design.
-
-### 2026-10-18 · Benchmarking agentic software work
-
-**Reference:** [SWE-bench paper and benchmark](https://www.swebench.com/)
-
-SWE-bench can provide an occasional, affordable comparison of an OpenCode baseline and Anvil’s supervision on a subset. It cannot serve as a general semantic correctness oracle or validate Kubernetes operations.
-
-**Implication:** benchmark results belong in research evidence, not in a universal acceptance gate.
-
-## Uncertain claims to test
-
-| Claim | Why uncertain | Cheap discriminating test |
-| --- | --- | --- |
-| A compact context packet outperforms transcript continuation | Depends on task, model, and repository | Paired scenario runs with identical revisions and fixed budgets |
-| Watchdog intervention before idle improves convergence | Intervention may interrupt useful reasoning | Fault-injected idle/active sessions with outcome and cost traces |
-| Selective history is enough for recovery | Missing history may hide causal context | Kill/restart scenarios using only durable artifacts and journal |
-| Independent semantic review catches useful errors | Reviewer may agree with the implementer or add noise | Held-out executable checks plus blinded reviewer comparisons |
-| A graph of Commissions is clearer than one giant task | Depends on dependency frequency and integration cost | Model the same cross-repo change both ways and compare recovery paths |
-
-## Primary references to keep watching
-
-- [Kubernetes API conventions](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md) — useful vocabulary for conditions and observed state; not a requirement to copy its API.
-- [OpenCode documentation](https://opencode.ai/docs/) — worker/session behavior must be checked against the version actually used; do not infer guarantees from a name.
-- [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) — relevant to isolated agent execution and Kubernetes integration; Anvil should confirm lifecycle and security properties before depending on it.
-- [Mergify documentation](https://docs.mergify.com/) — first-party integration behavior for queues and stacks.
-- [Model Context Protocol specification](https://modelcontextprotocol.io/specification/latest) — relevant if external steering or tool exposure uses MCP; it does not define Anvil’s authorization policy.
-
-## Not researched / do not infer
-
-- No runtime, database, or workflow engine has been selected. Rust, Go, TypeScript, Temporal, and DBOS are all outside the current decision boundary.
-- No general semantic correctness oracle exists in this design. Repository checks, CI, optional independent review, and held-out executable checks have different authority and failure modes.
-- “Lific issue” is an external integration object in the vocabulary, not a researched Anvil primitive here. Its contract and API should be documented from its own primary source before integration design.
-
-## Questions for the next research pass
-
-1. What is the smallest Commission acceptance contract that can be tested without a semantic oracle?
-2. Which operation identities and leases make a one-writer workspace recoverable after controller failure?
-3. How should Campaign dependency edges behave when an upstream Candidate is revised after downstream work starts?
-4. What evidence can a human or external ChatGPT steering client inspect without exposing full transcripts?
+- Anvil cannot deterministically infer whether arbitrary UI or architectural requirements are satisfied solely by inspecting source code.
+- An agent's self-reported plan and completion disposition are not independent evidence.
+- Kubernetes runtime correctness, remote operation recovery, and integration provider contracts require direct tests against pinned versions.
+- A periodic SWE-bench subset and deterministic scenario tests are sufficient initial evaluation scope; large benchmark campaigns and learned progress scoring are deferred.
+- Runtime, database, command deduplication policy, dependency semantics, and Git stack topology are unresolved. See the specification's open decision register.
