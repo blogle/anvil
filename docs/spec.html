@@ -55,6 +55,51 @@ type Decision =
 <li>Attempt limits and Commission budgets persist across context refreshes, agent restarts, and controller process restarts.</li>
 <li>Current status, observations, their freshness, pending actions, decision rationale, and permitted interventions are available through the application API and MCP.</li>
 </ol></section>
+
+<section id="consistency"><h2>Controller ownership and recovery</h2>
+<p><span class="status provisional">Design direction adopted · #4</span> Anvil persists authoritative intent and external identities. Operational status is reconstructed from the systems that own execution and integration state. A second event history of OpenCode, Kubernetes, GitHub, or Mergify is not required.</p>
+<h3>Exclusive controller authority</h3>
+<ol>
+<li>Anvil coordinates active Commission ownership using namespaced Kubernetes <code>coordination.k8s.io/v1</code> <code>Lease</code> resources. Lease acquisition and renewal use Kubernetes resource-version compare-and-swap semantics. A controller may authorize a Commission mutation only while it holds a valid Lease.</li>
+<li>The holder must stop authorizing additional operations when renewal or ownership is lost. A successor acquires the Lease and re-observes state before making decisions. An Assignment or Attempt does not receive an independent Lease by default; a Workspace requires separate coordination only if it is independently shareable.</li>
+<li>A Lease is an ownership signal, not remote-operation fencing. An instruction submitted immediately before Lease expiry may still execute. <code>metadata.resourceVersion</code> is not a fencing token that OpenCode or GitHub accepts. Consequential operations also require stable identities, current authorization checks, and remote-result reconciliation.</li>
+</ol>
+<h3>Persistent state</h3>
+<table><thead><tr><th>Category</th><th>Retained by Anvil</th></tr></thead><tbody>
+<tr><td>Authoritative intent</td><td>Campaign/Commission specifications and generations, dependencies, acceptance policy, budgets, intervention and authorization decisions.</td></tr>
+<tr><td>Execution identity</td><td>Assignment and Attempt identity, external resource references, recoverable workspace/checkpoint references, and the current instruction identity or sequence.</td></tr>
+<tr><td>Unresolved mutations</td><td>Operation identity, target, authorized generation, precondition, known dispatch/result status, and the information required to re-observe its postcondition.</td></tr>
+<tr><td>Derived observations</td><td>Fetched again from OpenCode, Kubernetes, Git, GitHub/CI, and Mergify. Important externally ephemeral evidence must be retained or referenced durably when its provider retention is insufficient.</td></tr>
+</tbody></table>
+<h3>Operation outcome and recovery</h3>
+<pre><code>type OperationOutcome =
+  | { kind: 'prepared' }
+  | { kind: 'submitted'; remoteRef?: ExternalRef }
+  | { kind: 'observed'; result: ExternalOutcome }
+  | { kind: 'rejected'; reason: ExternalFailure }
+  | { kind: 'ambiguous'; lastKnown: ExternalObservation };
+
+recover(commission):
+  acquire Commission Lease
+  read persisted intent and unresolved Operations
+  observe referenced external systems
+  reconcile each Operation by remote identity or postcondition
+  if outcome is ambiguous and retry cannot be proven safe:
+    wait for further observation or require intervention
+  else:
+    recompute the next authorized Decision
+</code></pre>
+<p>Recovery uses ordinary reconciliation rather than a separate controller state machine. When an external API supports caller-supplied idempotency keys, Anvil reuses the original identity. When the desired result is observable, Anvil compares actual and desired state. Absence of a resource is not proof that a previously submitted request cannot still complete; non-idempotent operations without reliable observation must not be retried blindly.</p>
+<h3>Required failure scenarios</h3>
+<ul>
+<li>Controller exits before operation submission, after submission, and after the remote side effect but before local acknowledgement.</li>
+<li>A Lease expires during an active OpenCode turn; replacement controller must not issue a duplicate logical instruction.</li>
+<li>Two controller replicas contend to acquire an expired Lease; only the holder may authorize a new mutation.</li>
+<li>A remote API is unavailable or its observation is stale; Anvil reports unknown/pending rather than claiming failure or success.</li>
+<li>A sandbox disappears while Git or PR state survives; Anvil determines which artifacts are recoverable and does not assume the former session is still executing.</li>
+</ul>
+</section>
+
 <section id="lifecycle"><h2>Commission execution sequence</h2><div class="panel"><ol>
 <li>Admit the Commission when Campaign execution dependencies, authorization, resource availability, and budget permit execution.</li>
 <li>Create an Assignment and Attempt, provision its Sandbox and Workspace, and deliver the objective with an Anvil operational/reporting contract. Repository conventions remain in repository <code>AGENTS.md</code> and skills.</li>
@@ -80,9 +125,9 @@ type Decision =
 </ul></div></div></section>
 <section id="decisions"><h2>Open decision register</h2><table><thead><tr><th>ID / topic</th><th>Contract to finalize</th><th>Status</th></tr></thead><tbody>
 <tr><td><strong>OD-01</strong> Corrective policy</td><td>Define watchdog thresholds, safe interruption, context-refresh criteria, and bounded strategy changes.</td><td><span class="status provisional">Provisional</span></td></tr>
-<tr><td><strong>OD-02</strong> Mutation ownership</td><td>Specify controller fencing, operation identity, ambiguous-outcome recovery, and rollout handoff.</td><td><span class="status open">Open</span></td></tr>
+<tr><td><strong>OD-02</strong> Operation implementation</td><td>Adopt per-Commission Kubernetes Leases, stable operation identity, and external re-observation. Validate pinned OpenCode idempotency and provider-specific safe retry/fencing behavior through restart and ownership-transfer tests.</td><td><span class="status provisional">Direction settled; adapter tests pending</span></td></tr>
 <tr><td><strong>OD-03</strong> Campaign dependencies</td><td>Distinguish execution from delivery prerequisites, upstream revision changes, and cross-repository release conditions.</td><td><span class="status open">Open</span></td></tr>
 <tr><td><strong>OD-04</strong> Git delivery</td><td>Select independent branch/PR and stacked-change behavior; define Mergify and GitHub authority.</td><td><span class="status open">Open</span></td></tr>
 <tr><td><strong>OD-05</strong> Check contracts</td><td>Define repository check profiles, environment/test capabilities, and optional review/held-out gates.</td><td><span class="status provisional">Provisional</span></td></tr>
 <tr><td><strong>OD-06</strong> Storage and runtime</td><td>Select deployable architecture and persistence after transaction and recovery contracts are established.</td><td><span class="status open">Open</span></td></tr>
-</tbody></table></section></article><aside class="toc" aria-label="On this page"><strong>Specification</strong><a href="#nouns">Canonical nouns</a><a href="#model">Typed state</a><a href="#invariants">Invariants</a><a href="#lifecycle">Lifecycle</a><a href="#acceptance">Acceptance</a><a href="#decisions">Open register</a></aside></div></main><footer class="footer"><div class="shell">Anvil v2 · Technical design · Draft</div></footer></body></html>
+</tbody></table></section></article><aside class="toc" aria-label="On this page"><strong>Specification</strong><a href="#nouns">Canonical nouns</a><a href="#model">Typed state</a><a href="#invariants">Invariants</a><a href="#consistency">Recovery</a><a href="#lifecycle">Lifecycle</a><a href="#acceptance">Acceptance</a><a href="#decisions">Open register</a></aside></div></main><footer class="footer"><div class="shell">Anvil v2 · Technical design · Draft</div></footer></body></html>
