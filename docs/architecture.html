@@ -66,7 +66,38 @@
 <li>On ambiguous acknowledgement, inspect the remote system before retrying</li>
 <li>Re-observe external postconditions before advancing lifecycle state</li>
 </ul></div></div>
-<p>Anvil-owned intent and policy are authoritative for what should happen. Each external provider is authoritative for what actually happened within its domain. This design does not require durable replay of every OpenCode event; it requires enough persisted intent and evidence to reconcile after process loss.</p>
+<p>Controller ownership uses per-Commission Kubernetes Leases. External mutation deduplication and ambiguous-result recovery require operation identities and provider-specific evidence; implementation validation remains OD-02.</p>
+</section>
+
+
+<section id="consistency"><h2>Commission ownership and operation recovery</h2>
+<p>Kubernetes <code>coordination.k8s.io/v1</code> Leases coordinate which controller instance can authorize mutations for a Commission. Lease renewal and acquisition use Kubernetes optimistic concurrency. Losing the Lease stops new command authorization, but cannot cancel operations already accepted by another service.</p>
+<div class="grid-2">
+<div class="panel"><h3>Persist</h3><ul>
+<li>Approved Commission objective, current specification generation, dependencies, budgets, and acceptance rules</li>
+<li>Assignment/Attempt IDs, external resource references, and workspace/checkpoint IDs</li>
+<li>Authorized Operation ID, target, preconditions, dispatch status, and unresolved outcome</li>
+</ul></div>
+<div class="panel"><h3>Reconstruct</h3><ul>
+<li>OpenCode session, message, tool, and todo state</li>
+<li>Kubernetes sandbox lifecycle and associated resources</li>
+<li>Git revisions, branches, CI runs, GitHub PRs, and Mergify queue/merge state</li>
+<li>Current Commission assessment and next Decision from those observations</li>
+</ul></div>
+</div>
+<pre><code>onReconcile(commission):
+  lease = acquireOrConfirmCommissionLease(commission)
+  if lease is unavailable: observeOnly()
+  else:
+    state = loadDurableIntentAndUnresolvedOperations(commission)
+    actual = observeExternalAuthorities(state.references)
+    outcomes = resolveOperations(state.operations, actual)
+    next = decide(state.intent, actual, outcomes)
+    authorizeAndPersist(next, lease, state.generation)
+    dispatchOnlyWhenSafe(next)
+</code></pre>
+<p>Caller-supplied remote idempotency identities are preferred when supported. Otherwise an Operation is reconciled against a provider's observable postcondition; ambiguous outcomes are not blindly replayed. A Kubernetes Lease does not fence an already-running external mutation, and <code>resourceVersion</code> is not a universal fencing token. Each adapter must document its own safe-retry conditions.</p>
+<p>Every state query exposes the owner when known, most recent authoritative observation, outstanding Operations, and whether the next action is waiting for external state or intervention. Provider retention limitations are considered when selecting which evidence to retain durably.</p>
 </section>
 
 <section id="api"><h2>Observability and intervention API</h2>
@@ -80,4 +111,4 @@
 <tr><td><code>hold_commission</code> / <code>resume_commission</code></td><td>Explicit operator control of autonomous execution with recorded authority and preconditions</td></tr>
 </tbody></table>
 <p>A status such as “required CI checks pass; awaiting Mergify” is a projection of observed check and integration state, not a generated claim of delivery. The API must also expose when that observation is stale or unavailable.</p>
-</section></article><aside class="toc" aria-label="On this page"><strong>Architecture</strong><a href="#loop">Outer reconciler</a><a href="#watchdog">Watchdog</a><a href="#context">Context refresh</a><a href="#control">Decisions</a><a href="#evidence">Evidence</a><a href="#campaign">Campaign graph</a><a href="#safety">Operations</a><a href="#api">API</a></aside></div></main><footer class="footer"><div class="shell">Anvil v2 · Technical design · Draft</div></footer></body></html>
+</section></article><aside class="toc" aria-label="On this page"><strong>Architecture</strong><a href="#loop">Outer reconciler</a><a href="#watchdog">Watchdog</a><a href="#context">Context refresh</a><a href="#control">Decisions</a><a href="#evidence">Evidence</a><a href="#campaign">Campaign graph</a><a href="#safety">Operations</a><a href="#consistency">Recovery</a><a href="#api">API</a></aside></div></main><footer class="footer"><div class="shell">Anvil v2 · Technical design · Draft</div></footer></body></html>
