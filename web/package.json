@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "build": "vite build",
-    "test": "npm run build && tsx --test *.test.js"
+    "test": "npm run build && tsx --test *.test.js",
+    "test:unit": "tsx --test files-state.test.js state.test.js",
+    "test:browser": "tsx --test browser.test.js"
   },
   "dependencies": {
     "@preact/signals": "^2.0.1",

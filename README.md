@@ -13,8 +13,10 @@ Certificate, storage-class selection, or other platform-specific resources;
 those belong in an environment repository's overlay. `k8s/overlays/dev`
 renders the base with portable placeholder runtime values.
 The normal deployment pulls public images from `ghcr.io/blogle/anvil` and
-`ghcr.io/blogle/anvil-sandbox`. The GitHub Actions workflow publishes immutable
-SHA tags plus the `main` and `latest` tags.
+`ghcr.io/blogle/anvil-sandbox`. The pinned SDLC contract owns CI and rolling
+releases; Anvil exports fast/verify Nix checks and one image publication app.
+That app publishes version and merged-SHA tags plus `main`/`latest`, and refuses
+to replace an immutable tag with different image content.
 
 The pinned, unmodified Agent Sandbox v1.0.2 core release asset is vendored at
 `k8s/vendor/agent-sandbox/v1.0.2/sandbox.yaml`. It is not a Kustomize resource:

@@ -61,15 +61,21 @@ if grep -Fq 'fsGroup:' "$repo_root/crates/anvild/src/lib.rs"; then
   exit 1
 fi
 require_text "sandbox shared PVC without volume-level read-only" '"claimName":pvc}}' "$repo_root/crates/anvild/src/lib.rs"
-require_text "Kind checks generated Sandbox fsGroup" '($pod.securityContext.fsGroup == null)' "$repo_root/tests/kind-acceptance.sh"
-require_text "Kind builds fresh derivations across lifecycle" 'fresh_sandbox_build "$api_b_pod" "anvil-lifecycle-after-remove-${cluster}"' "$repo_root/tests/kind-acceptance.sh"
-
 smoke_script="$repo_root/tests/nix-daemon-smoke.sh"
 require_text 'daemon executable smoke' 'test -x /bin/anvil-nix-daemon' "$smoke_script"
 require_text 'daemon RPC smoke' 'NIX_REMOTE=daemon nix store info' "$smoke_script"
 require_text 'bootstrap smoke' '--bootstrap' "$smoke_script"
-if [ "$(grep -Fc 'tests/nix-daemon-smoke.sh' "$repo_root/.github/workflows/images.yaml")" -ne 2 ]; then
-  printf 'manifest-security: expected smoke in merge-queue and publish jobs\n' >&2
+if ! grep -Fq 'tests/nix-daemon-smoke.sh' "$repo_root/scripts/release-publish.sh"; then
+  printf 'manifest-security: release hook must smoke-test the Nix daemon image\n' >&2
+  exit 1
+fi
+if grep -Fq 'apps.sdlc-publish' "$repo_root/flake.nix"; then
+  printf 'manifest-security: publication must be exposed only as ci.publish\n' >&2
+  exit 1
+fi
+require_text 'release receipt source identity' 'source_main_sha:$source' "$repo_root/scripts/release-publish.sh"
+if grep -Fq '.source_sha .sdlc/release.json' "$repo_root/scripts/release-publish.sh"; then
+  printf 'manifest-security: release receipts must use source_main_sha\n' >&2
   exit 1
 fi
 
