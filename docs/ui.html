@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Anvil v2 — UI reference screens</title>
+<link rel="stylesheet" href="style.css">
+<style>
+/* Self-contained Ledger UI reference. All selectors are scoped to ui-reference. */
+body.ui-reference { margin:0; background:#201b17; color:#d0c7b9; font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+.ui-reference * { box-sizing:border-box; }
+.ui-reference a { color:inherit; }
+.ui-reference button { font:inherit; }
+.ui-reference .shell { max-width:1500px; margin:auto; min-height:100vh; }
+.ui-reference .topbar { display:flex; align-items:center; justify-content:space-between; gap:1rem; padding:1rem 2rem; border-bottom:1px solid #4c4034; background:#241e19; }
+.ui-reference .brand { text-transform:uppercase; letter-spacing:.16em; font-weight:750; color:#ead5a0; text-decoration:none; font-size:.96rem; }
+.ui-reference .toplinks { display:flex; align-items:center; flex-wrap:wrap; gap:1rem; color:#a99f90; font-size:.82rem; }
+.ui-reference .toplinks a:hover,.ui-reference .sidebar a:hover { color:#e3ce9b; }
+.ui-reference .tagline { font-size:.67rem; letter-spacing:.11em; color:#b6a27b; text-transform:uppercase; }
+.ui-reference .columns { display:grid; grid-template-columns:210px minmax(0,1fr); min-height:calc(100vh - 67px); }
+.ui-reference .sidebar { border-right:1px solid #4c4034; padding:1.7rem 1rem; background:#25201b; }
+.ui-reference .sidebar .label { font-size:.68rem; letter-spacing:.13em; color:#a79b89; font-weight:700; padding:.5rem .7rem; text-transform:uppercase; }
+.ui-reference .sidebar a { display:flex; gap:.65rem; align-items:center; padding:.68rem .8rem; text-decoration:none; color:#bdb2a4; border-radius:5px; font-size:.88rem; }
+.ui-reference .sidebar a[aria-current="page"] { background:#3c3329; border-left:2px solid #d0b77e; color:#ead5a0; }
+.ui-reference .sidebar a .num { margin-left:auto; font-size:.72rem; color:#9b907f; font-variant-numeric:tabular-nums; }
+.ui-reference .main { min-width:0; padding:2rem clamp(1rem,3vw,3rem) 4rem; }
+.ui-reference .screen[hidden] { display:none; }
+.ui-reference .eyebrow { letter-spacing:.13em; color:#b9a477; font-weight:750; font-size:.68rem; text-transform:uppercase; margin:0 0 .5rem; }
+.ui-reference h1 { color:#eadcc6; font-family:Georgia,serif; font-weight:500; font-size:clamp(1.7rem,2.8vw,2.6rem); line-height:1.15; margin:.2rem 0 .55rem; }
+.ui-reference h2 { font:500 1.23rem/1.3 Georgia,serif; color:#e0cfad; margin:0 0 .8rem; }
+.ui-reference h3 { font-size:.85rem; letter-spacing:.02em; color:#dfd0b7; margin:0 0 .6rem; }
+.ui-reference .lead { color:#aca194; max-width:70ch; margin:.2rem 0 1.7rem; }
+.ui-reference .head { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; margin-bottom:1.55rem; }
+.ui-reference .muted { color:#a99d8e; font-size:.82rem; }
+.ui-reference .subtle { color:#908677; font-size:.74rem; }
+.ui-reference .pill { display:inline-flex; white-space:nowrap; border:1px solid #6e5e44; border-radius:99px; padding:.16rem .55rem; color:#d1b982; font-size:.71rem; font-weight:650; background:#393124; }
+.ui-reference .pill.stone { border-color:#52493d; color:#b9aea0; background:#312b24; }
+.ui-reference .pill.warn { border-color:#8b6243; color:#e0aa82; background:#402a22; }
+.ui-reference .panel { min-width:0; background:#29231e; border:1px solid #473c32; border-radius:8px; padding:1.2rem; }
+.ui-reference .grid3 { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.9rem; }
+.ui-reference .stat .big { font:500 2rem/1.1 Georgia,serif; color:#e8d4a2; }
+.ui-reference .stat .desc { font-size:.78rem; color:#a89c8d; padding-top:.4rem; }
+.ui-reference .two { display:grid; grid-template-columns:minmax(0,1.65fr) minmax(280px,.85fr); gap:1rem; align-items:start; }
+.ui-reference .three { display:grid; grid-template-columns:240px minmax(0,1fr) 255px; gap:1rem; align-items:start; }
+.ui-reference .stack { display:grid; gap:1rem; }
+.ui-reference .item { display:flex; gap:1rem; justify-content:space-between; align-items:center; padding:.95rem .1rem; border-bottom:1px solid #42382e; }
+.ui-reference .item:last-child { border-bottom:0; }
+.ui-reference .item strong,.ui-reference .inboxitem strong { color:#e1d3bd; font-size:.88rem; }
+.ui-reference .item p,.ui-reference .inboxitem p { color:#a69b8d; font-size:.76rem; margin:.25rem 0 0; }
+.ui-reference .meta { display:flex; gap:.55rem; align-items:center; flex-wrap:wrap; margin-top:.4rem; color:#998e81; font-size:.75rem; }
+.ui-reference .smallcaps { color:#aa9e8b; text-transform:uppercase; letter-spacing:.095em; font-size:.66rem; font-weight:750; margin:0 0 .8rem; }
+.ui-reference .evidence { display:grid; grid-template-columns:25px minmax(0,1fr) auto; gap:.7rem; align-items:start; padding:.8rem 0; border-bottom:1px solid #453b31; }
+.ui-reference .evidence:last-child { border:0; }
+.ui-reference .evidence .glyph { color:#d4bb7f; font-size:1rem; }
+.ui-reference .evidence .what { color:#e0d1ba; font-size:.86rem; }
+.ui-reference .evidence .why { color:#a69a89; font-size:.75rem; margin-top:.2rem; }
+.ui-reference .evidence .scope { color:#978c7c; font-size:.7rem; }
+.ui-reference .divider { border:0; border-top:1px solid #473d33; margin:1.15rem 0; }
+.ui-reference .action { display:inline-block; border:1px solid #8d7956; background:#a98e5f; color:#201912; border-radius:5px; padding:.55rem .85rem; font-size:.78rem; font-weight:700; text-decoration:none; }
+.ui-reference .action.ghost { background:transparent; color:#d3c0a0; }
+.ui-reference button.action:disabled { cursor:not-allowed; opacity:.8; }
+.ui-reference .actionbar { display:flex; flex-wrap:wrap; gap:.5rem; }
+.ui-reference .timeline { display:grid; gap:1rem; }
+.ui-reference .event { border-left:2px solid #6e5e46; padding-left:1rem; }
+.ui-reference .event strong { color:#d8c6a5; display:block; font-size:.82rem; }
+.ui-reference .event p { color:#a89b89; font-size:.77rem; margin:.2rem 0 0; }
+.ui-reference .inboxitem { padding:1rem .7rem; border-bottom:1px solid #46392d; }
+.ui-reference .inboxitem.selected { background:#3b3026; border-left:2px solid #d5bd82; padding-left:calc(.7rem - 2px); }
+.ui-reference .inboxitem .between { display:flex; justify-content:space-between; gap:.5rem; align-items:center; }
+.ui-reference .preview { border:1px solid #6a5b46; border-radius:7px; overflow:hidden; background:#eee5d9; color:#463d34; }
+.ui-reference .previewbar { background:#bcb1a2; color:#4b4034; padding:.4rem .65rem; font-size:.68rem; display:flex; justify-content:space-between; }
+.ui-reference .previewbody { padding:1.3rem; font-size:.72rem; }
+.ui-reference .previewform { display:grid; grid-template-columns:1fr 1fr; gap:.55rem; }
+.ui-reference .fakefield { background:#fffaf3; border:1px solid #cbbcac; border-radius:4px; padding:.5rem; }
+.ui-reference .fakebutton { background:#3e483f; color:white; display:inline-block; padding:.4rem .8rem; margin-top:.65rem; border-radius:4px; }
+.ui-reference .compacttable { width:100%; border-collapse:collapse; font-size:.8rem; }
+.ui-reference .compacttable th { text-align:left; color:#af9d7c; font-size:.65rem; text-transform:uppercase; letter-spacing:.07em; padding:.55rem .4rem; }
+.ui-reference .compacttable td { border-top:1px solid #4c4032; padding:.72rem .4rem; vertical-align:top; }
+.ui-reference .compacttable td:first-child { color:#e6d8c0; }
+.ui-reference .branch { margin:.65rem 0 1rem; display:grid; gap:.6rem; }
+.ui-reference .node { border:1px solid #695840; background:#342b22; border-radius:6px; padding:.9rem; }
+.ui-reference .node .ntitle { color:#e8d4aa; font-weight:650; }
+.ui-reference .node small { display:block; color:#b0a28c; margin-top:.35rem; }
+.ui-reference .splitnodes { display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
+.ui-reference .arrow { text-align:center; color:#b29c73; font-size:1.1rem; }
+.ui-reference .hint { padding:.7rem .9rem; background:#30291f; color:#c5b597; border-left:2px solid #aa925d; font-size:.8rem; }
+.ui-reference .note { margin-top:1.4rem; padding:.8rem 1rem; color:#9f9382; font-size:.75rem; border-top:1px solid #473c32; }
+@media(max-width:1150px) {.ui-reference .three { grid-template-columns:1fr 1.5fr; } .ui-reference .three > :last-child { grid-column:1/-1; } .ui-reference .two { grid-template-columns:1fr; }}
+@media(max-width:770px) {.ui-reference .topbar { padding:1rem; align-items:flex-start; flex-direction:column; } .ui-reference .columns { display:block; } .ui-reference .sidebar { display:flex; overflow:auto; padding:.4rem; border-right:0; border-bottom:1px solid #4c4034; } .ui-reference .sidebar .label { display:none; } .ui-reference .sidebar a { white-space:nowrap; } .ui-reference .main { padding:1.4rem .9rem 3rem; } .ui-reference .head { display:block; } .ui-reference .head .actionbar { margin-top:1rem; } .ui-reference .three,.ui-reference .two,.ui-reference .grid3 { grid-template-columns:1fr; } .ui-reference .three > :last-child { grid-column:auto; } .ui-reference .splitnodes { grid-template-columns:1fr; } .ui-reference .evidence { grid-template-columns:22px minmax(0,1fr); } .ui-reference .evidence .scope { grid-column:2; } .ui-reference .previewform { grid-template-columns:1fr; }}
+</style>
+</head>
+<body class="ui-reference"><div class="shell">
+<header class="topbar"><a class="brand" href="index.html">Anvil <span style="font-size:.62em;letter-spacing:.11em;color:#a99b86">/ v2 documentation</span></a><div class="toplinks"><span class="tagline">INTERACTIVE SPECIFICATION MOCKUP</span><a href="spec.html">Product spec</a><a href="architecture.html">Architecture</a><a href="index.html">Documentation hub</a></div></header>
+<div class="columns">
+<nav class="sidebar" aria-label="Mockup screen navigation">
+<div class="label">WORKSPACE</div>
+<a data-link="fleet" href="#fleet">▦ &nbsp; Fleet overview <span class="num">01</span></a>
+<a data-link="commission" href="#commission">◈ &nbsp; Commission <span class="num">02</span></a>
+<a data-link="review" href="#review">↗ &nbsp; Review inbox <span class="num">03</span></a>
+<a data-link="campaign" href="#campaign">◇ &nbsp; Campaign <span class="num">04</span></a>
+<div class="label" style="margin-top:1.6rem">REFERENCE</div>
+<a href="spec.html#acceptance-obligations">Acceptance contract</a>
+<a href="architecture.html#convergence-review-ux">Convergence flow</a>
+</nav>
+<main class="main">
+<section class="screen" data-screen="fleet" id="fleet">
+<p class="eyebrow">01 / Factory overview</p><div class="head"><div><h1>Work across the factory</h1><p class="lead">Campaigns and Commissions are the primary units. Sessions are execution details, not the top-level navigation.</p></div><div class="actionbar"><button class="action" disabled>New Campaign · mockup</button></div></div>
+<div class="grid3" style="margin-bottom:1rem"><div class="panel stat"><div class="smallcaps">Active commissions</div><div class="big">12</div><div class="desc">8 implementing · 4 waiting on external checks</div></div><div class="panel stat"><div class="smallcaps">Requires attention</div><div class="big">3</div><div class="desc">2 reviews · 1 intervention</div></div><div class="panel stat"><div class="smallcaps">Delivered this week</div><div class="big">7</div><div class="desc">Authoritative merges observed</div></div></div>
+<div class="two"><article class="panel"><h2>Commissions</h2><div class="item"><div><strong>Responsive transaction entry</strong><p>Dojo · Billing improvements</p><div class="meta"><span>PR #248</span><span>·</span><span>Evidence 6/6</span></div></div><span class="pill">Ready for review</span></div><div class="item"><div><strong>Recover interrupted Sandbox upgrades</strong><p>Anvil · Reliable execution</p><div class="meta"><span>Attempt 2</span><span>·</span><span>3/5 criteria evidenced</span></div></div><span class="pill stone">Implementing</span></div><div class="item"><div><strong>Rework GitHub token broker</strong><p>Anvil · Integration security</p><div class="meta"><span>Waiting for CI</span><span>·</span><span>PR #251</span></div></div><span class="pill stone">Waiting</span></div><div class="item"><div><strong>Fix Nix test environment</strong><p>SDLC · Developer velocity</p><div class="meta"><span>Budget exhausted</span><span>·</span><span>Finding F-08</span></div></div><span class="pill warn">Intervention</span></div></article>
+<aside class="stack"><div class="panel"><h2>Attention queue</h2><div class="item"><div><strong>2 reviews available</strong><p>Specs, diffs, CI and preview links ready</p></div><span class="pill">Review</span></div><div class="item"><div><strong>1 strategy decision</strong><p>Repeated integration test failures</p></div><span class="pill warn">Blocked</span></div><div class="actionbar" style="margin-top:.8rem"><a class="action ghost" href="#review">Inspect inbox →</a></div></div><div class="panel"><h2>Runtime</h2><div class="item"><strong>11 sandbox pods</strong><span class="pill stone">Healthy</span></div><div class="item"><strong>Shared Nix daemon</strong><span class="pill stone">Healthy</span></div><div class="item"><strong>Pending upgrades</strong><span class="pill">2 deferred</span></div></div></aside></div>
+<div class="note">DESIGN INTENT — One operational home for Campaigns, Commissions, attention, delivery progress and runtime. Counts, PR identifiers and states are illustrative only.</div>
+</section>
+
+<section class="screen" data-screen="commission" id="commission" hidden>
+<p class="eyebrow">02 / Campaign: Dojo reliability / Commission C-14</p><div class="head"><div><h1>Responsive transaction entry</h1><p class="lead">Implement the approved form behavior across viewport changes without regressing transaction submission.</p><div class="meta"><span class="pill stone">Implementing</span><span>Revision: 7f21a8c</span><span>·</span><span>Specification generation 3</span></div></div><div class="actionbar"><button class="action ghost" disabled>Hold · mockup</button><button class="action" disabled>Steer worker · mockup</button></div></div>
+<div class="two"><div class="stack"><article class="panel"><div style="display:flex;justify-content:space-between;gap:1rem;align-items:center"><h2>Acceptance and evidence</h2><span class="pill">4 of 6 evidenced</span></div><div class="evidence"><span class="glyph">✓</span><div><div class="what">A1 · Required fields stay visible</div><div class="why">Responsive browser test and agent report</div></div><span class="scope">Candidate 7f21a8c</span></div><div class="evidence"><span class="glyph">✓</span><div><div class="what">A2 · Submit remains reachable</div><div class="why">Targeted interaction check passed locally</div></div><span class="scope">Candidate 7f21a8c</span></div><div class="evidence"><span class="glyph">○</span><div><div class="what">A3 · Intermediate widths remain usable</div><div class="why">Missing supporting evidence</div></div><span class="scope">Open</span></div><div class="evidence"><span class="glyph">○</span><div><div class="what">A4 · Keyboard flow remains usable</div><div class="why">Introduced by authorized spec amendment · generation 3</div></div><span class="scope">Open</span></div><div class="evidence"><span class="glyph">✓</span><div><div class="what">A5 · No horizontal clipping</div><div class="why">Viewport test result attached</div></div><span class="scope">Candidate 7f21a8c</span></div><div class="evidence"><span class="glyph">✓</span><div><div class="what">A6 · Existing transaction submission works</div><div class="why">Regression coverage linked</div></div><span class="scope">Candidate 7f21a8c</span></div></article>
+<div class="panel"><h2>Worker execution</h2><p class="muted">OpenCode Assignment: Implementation · Attempt 2 · Session active</p><div class="hint">Next directive: Continue toward A3 and A4 while preserving satisfied criteria. CI is pending. Do not interpret Lific plan completion as acceptance.</div><hr class="divider"><div class="smallcaps">Agent progress · Lific Plan</div><div class="item"><div><strong>4 of 6 steps complete</strong><p>Mutable agent-owned strategy · not acceptance authority</p></div><span class="pill stone">In progress</span></div><div class="actionbar"><button class="action ghost" disabled>Open Session · mockup</button><button class="action ghost" disabled>Inspect plan · mockup</button></div></div></div>
+<aside class="stack"><div class="panel"><h2>Live preview</h2><div class="preview" role="img" aria-label="Illustrative narrow transaction form preview"><div class="previewbar"><span>Example app / transaction</span><span>↗</span></div><div class="previewbody"><strong>New transaction</strong><p style="color:#75695d">A narrow viewport implementation preview</p><div class="previewform"><div class="fakefield">Amount</div><div class="fakefield">Payee</div><div class="fakefield">Category</div><div class="fakefield">Date</div></div><span class="fakebutton">Save transaction</span></div></div><p class="subtle">Production uses an authenticated, stable sandbox preview URL with live HTTP/WebSocket traffic.</p><div class="actionbar"><button class="action ghost" disabled>Open live preview · mockup</button></div></div><div class="panel"><h2>Delivery status</h2><div class="item"><strong>GitHub PR</strong><span class="pill stone">Draft</span></div><div class="item"><strong>CI</strong><span class="pill stone">Pending</span></div><div class="item"><strong>Review authorization</strong><span class="pill stone">Not requested</span></div><div class="item"><strong>Runtime revision</strong><span class="pill stone">Current</span></div></div></aside></div>
+<div class="note">DESIGN INTENT — Evidence and approved criteria are separate from mutable implementation progress; steering can add obligations only through explicit, attributed amendments.</div>
+</section>
+
+<section class="screen" data-screen="review" id="review" hidden>
+<p class="eyebrow">03 / Review and intervention queue</p><div class="head"><div><h1>Needs your attention</h1><p class="lead">A focused inbox with actionable work. Healthy waits remain visible in the fleet but should not create review noise.</p></div></div>
+<div class="three"><aside class="panel"><div class="smallcaps">Needs review · 2</div><div class="inboxitem selected"><div class="between"><strong>Transaction form</strong><span class="pill">Review</span></div><p>Dojo · 6/6 obligations · PR ready</p></div><div class="inboxitem"><div class="between"><strong>OAuth fallback</strong><span class="pill">Review</span></div><p>Dojo · 4/4 obligations · CI passing</p></div><div class="smallcaps" style="margin-top:1.2rem">Interventions · 1</div><div class="inboxitem"><div class="between"><strong>Nix integration tests</strong><span class="pill warn">Blocked</span></div><p>Budget exhausted; change strategy</p></div></aside>
+<article class="panel"><div class="smallcaps">REVIEW PACKET / DOJO / C-14</div><h2>Responsive transaction entry</h2><p class="muted">Specification generation 3 · Candidate 9d531bf · PR #248 · reviewer: operator</p><div class="hint">Anvil has reached review readiness. Integration is held pending review authorization; the worker is not being reprompted.</div><hr class="divider"><h3>Acceptance and provenance</h3><table class="compacttable"><thead><tr><th>Criterion</th><th>Evidence</th><th>Disposition</th></tr></thead><tbody><tr><td>Viewport behavior</td><td>Browser regression; screenshots</td><td>Evidence reviewed</td></tr><tr><td>Keyboard navigation</td><td>Targeted test + recorded walkthrough</td><td>Evidence reviewed</td></tr><tr><td>Submission intact</td><td>Integration test / CI</td><td>Passing</td></tr></tbody></table><hr class="divider"><h3>Review findings</h3><p class="muted">No unresolved blocking Findings. Last manual steering introduced criterion A4 (keyboard flow); evidence has been updated for the current Candidate.</p><div class="actionbar"><button class="action ghost" disabled>View diff · mockup</button><button class="action ghost" disabled>Open preview · mockup</button></div></article>
+<aside class="stack"><div class="panel"><h2>Integration health</h2><div class="item"><strong>CI</strong><span class="pill">Passing</span></div><div class="item"><strong>Merge conflicts</strong><span class="pill">None</span></div><div class="item"><strong>Review gate</strong><span class="pill stone">Pending</span></div><div class="item"><strong>SDLC policy</strong><span class="pill stone">integration:review</span></div><hr class="divider"><h3>Review decision</h3><p class="muted">Approval is tied to specification generation and Candidate. New changes require re-assessment.</p><div class="actionbar"><button class="action" disabled>Approve · mockup</button><button class="action ghost" disabled>Request changes · mockup</button></div></div><div class="panel"><div class="smallcaps">REVIEW ASSISTANCE</div><p class="muted">ChatGPT reads one computed review packet: spec, evidence, diff, CI, Findings and preview—not the complete worker trajectory.</p></div></aside></div>
+<div class="note">DESIGN INTENT — Operator/ChatGPT review is an additive policy; ready for review is a healthy waiting condition, not Commission completion.</div>
+</section>
+
+<section class="screen" data-screen="campaign" id="campaign" hidden>
+<p class="eyebrow">04 / Campaign orchestration</p><div class="head"><div><h1>Reliable sandbox recovery</h1><p class="lead">A Campaign expresses approved outcomes and delivery dependencies. Execution gates allow limited parallel work without inventing a second Git integration system.</p></div><div class="actionbar"><button class="action ghost" disabled>Amend Campaign · mockup</button></div></div>
+<div class="two"><article class="panel"><h2>Dependency graph</h2><div class="branch"><div class="node"><span class="pill">Delivered</span><div class="ntitle" style="margin-top:.5rem">A · Establish Sandbox runtime contract</div><small>Contract checkpoint: Git revision 4d38c91 · interface approved</small></div><div class="arrow">↓  AfterCheckpoint</div><div class="splitnodes"><div class="node"><span class="pill stone">Implementing</span><div class="ntitle" style="margin-top:.5rem">B · Reconcile sandbox upgrades</div><small>Consumes A@4d38c91 · may implement in parallel</small></div><div class="node"><span class="pill stone">Waiting CI</span><div class="ntitle" style="margin-top:.5rem">C · Restore preview routing</div><small>Consumes A@4d38c91 · CI pending</small></div></div><div class="arrow">↓  Delivery order enforced</div><div class="node"><span class="pill stone">Blocked by dependency</span><div class="ntitle" style="margin-top:.5rem">D · End-to-end recovery acceptance</div><small>AfterDelivery on B and C · cannot integrate early</small></div></div></article>
+<aside class="stack"><div class="panel"><h2>Campaign outcome</h2><div class="item"><strong>Required Commissions</strong><span>4</span></div><div class="item"><strong>Delivered</strong><span>1</span></div><div class="item"><strong>Ready for review</strong><span>0</span></div><div class="item"><strong>Blocked</strong><span>1</span></div><div class="item"><strong>Campaign-level check</strong><span class="pill stone">Pending</span></div></div><div class="panel"><h2>Coordination</h2><div class="item"><div><strong>Handoff from A</strong><p>Revision and approved contract supplied to B and C</p></div><span class="pill">Delivered</span></div><div class="item"><div><strong>Question for B</strong><p>Verify runtime API behavior after restarting a Sandbox</p></div><span class="pill stone">Pending</span></div><p class="muted">Messages are directed to Commissions and survive Session replacement; they cannot amend approved requirements.</p></div></aside></div>
+<div class="note">DESIGN INTENT — Execution and integration readiness are separate. Campaign status is computed from Commission outcomes and explicit Campaign acceptance, not individual agent todo completion.</div>
+</section>
+</main></div></div>
+<script>
+(function(){
+ const names=new Set(["fleet","commission","review","campaign"]);
+ function render(){
+  const selected=names.has(location.hash.slice(1))?location.hash.slice(1):"fleet";
+  document.querySelectorAll("[data-screen]").forEach(e=>e.hidden=e.dataset.screen!==selected);
+  document.querySelectorAll("[data-link]").forEach(e=>e.dataset.link===selected?e.setAttribute("aria-current","page"):e.removeAttribute("aria-current"));
+  document.title="Anvil v2 — "+({fleet:"Factory overview",commission:"Commission",review:"Review inbox",campaign:"Campaign"}[selected])+" (reference)";
+ }
+ window.addEventListener("hashchange",render);render();
+})();
+</script>
+</body></html>
