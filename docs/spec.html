@@ -100,6 +100,28 @@ recover(commission):
 </ul>
 </section>
 
+<section id="campaign-dependencies"><h2>Campaign dependency contract</h2>
+<p><span class="status provisional">Provisional direction adopted · #5</span></p>
+<p>A Campaign contains a directed acyclic graph of Commissions. Dependency edges MAY span repositories. Anvil SHALL reject cycles and references to nonexistent Commissions at admission and on governed Campaign amendment. A Campaign dependency SHALL constrain delivery ordering independently of any allowance for speculative implementation: the required upstream delivery outcome SHALL be established before a downstream Commission enters integration.</p>
+<p>Each dependency SHALL specify exactly one execution gate: <code>AfterDelivery</code>, <code>AfterCheckpoint(CheckpointId)</code>, or <code>Unrestricted</code>. <code>AfterDelivery</code> is the default and prevents downstream implementation until the upstream required outcome is delivered. <code>AfterCheckpoint</code> permits downstream implementation only after the identified upstream immutable artifact/revision is durably available and approved as an execution input. <code>Unrestricted</code> permits immediate concurrent implementation but does not relax delivery ordering. The execution gate SHALL NOT be inferred merely from the presence of a dependency edge.</p>
+<p>An upstream checkpoint reference SHALL bind a stable artifact revision, not a moving branch name. A downstream Commission SHALL retain the identity of the actual upstream revision or artifact consumed. An upstream push SHALL NOT automatically interrupt downstream execution. If the pinned checkpoint is superseded, Anvil SHALL record that the downstream binding may be stale; an applicable contract change or integration outcome SHALL trigger dependency reassessment at an appropriate execution boundary. The controller MAY hold downstream execution when continuing would clearly violate an approved contract or waste an exhausted budget.</p>
+<p>Execution readiness and delivery readiness SHALL be separately evaluated. Downstream integration SHALL require applicable verification against the actual delivered upstream result; a previous check against a speculative checkpoint does not by itself establish compatibility with a changed delivered result. A dependency transition SHALL NOT silently rewrite downstream requirements, integration targets, or acceptance policy.</p>
+<p>Anvil MAY autonomously create or replace Assignments, Attempts, verification work, and temporary working strategies within an approved Commission and authorized budget. Creating a new independently integrable Commission, adding or removing Campaign dependency edges, or changing approved requirements SHALL require a governed Campaign amendment. Contract-first decomposition MAY establish an approved durable interface artifact; it SHALL be a separate Commission only when the interface work has an independent integration and acceptance boundary.</p>
+<p>A Campaign SHALL report success only when all required Commissions have met their individual authoritative delivery contracts and any Campaign-level acceptance conditions have passed. Failed, cancelled, unavailable, or superseded upstream results SHALL be represented as explicit dependency blockers or recovery decisions; Anvil SHALL NOT silently omit or waive dependency edges.</p>
+<pre><code>enum ExecutionGate {
+    AfterDelivery,
+    AfterCheckpoint(CheckpointId),
+    Unrestricted,
+}
+
+struct Dependency {
+    upstream: CommissionId,
+    execution: ExecutionGate,
+}
+</code></pre>
+<p>The dependency policy does not require automatic stacked pull requests or a distinct dependency controller. Coordination and dependency evaluation remain subordinate to the Campaign/Commission reconciliation machinery.</p>
+</section>
+
 <section id="git-publication"><h2>Commission Git publication and collaboration</h2>
 <p><span class="status provisional">Provisional decision</span></p>
 <p>Anvil SHALL provision or register a Commission's repository, nominal delivery branch, intended integration target, and pull request identity. A pull request MAY be created after a bootstrap empty commit; a bootstrap commit SHALL NOT constitute implementation progress or acceptance evidence.</p>
@@ -141,8 +163,8 @@ recover(commission):
 <section id="decisions"><h2>Open decision register</h2><table><thead><tr><th>ID / topic</th><th>Contract to finalize</th><th>Status</th></tr></thead><tbody>
 <tr><td><strong>OD-01</strong> Corrective policy</td><td>Define watchdog thresholds, safe interruption, context-refresh criteria, and bounded strategy changes.</td><td><span class="status provisional">Provisional</span></td></tr>
 <tr><td><strong>OD-02</strong> Operation implementation</td><td>Adopt per-Commission Kubernetes Leases, stable operation identity, and external re-observation. Validate pinned OpenCode idempotency and provider-specific safe retry/fencing behavior through restart and ownership-transfer tests.</td><td><span class="status provisional">Direction settled; adapter tests pending</span></td></tr>
-<tr><td><strong>OD-03</strong> Campaign dependencies</td><td>Distinguish execution from delivery prerequisites, upstream revision changes, and cross-repository release conditions.</td><td><span class="status open">Open</span></td></tr>
+<tr><td><strong>OD-03</strong> Campaign coordination implementation</td><td>Dependency execution gates, integration ordering, and governed graph changes are provisionally settled. Validate stale checkpoint handling, adapter-specific delivery readiness, and coordination message delivery during implementation.</td><td><span class="status provisional">Direction settled; adapter details open</span></td></tr>
 <tr><td><strong>OD-04</strong> Git delivery</td><td>Select independent branch/PR and stacked-change behavior; define Mergify and GitHub authority.</td><td><span class="status open">Open</span></td></tr>
 <tr><td><strong>OD-05</strong> Check contracts</td><td>Define repository check profiles, environment/test capabilities, and optional review/held-out gates.</td><td><span class="status provisional">Provisional</span></td></tr>
 <tr><td><strong>OD-06</strong> Storage and runtime</td><td>Select deployable architecture and persistence after transaction and recovery contracts are established.</td><td><span class="status open">Open</span></td></tr>
-</tbody></table></section></article><aside class="toc" aria-label="On this page"><strong>Specification</strong><a href="#nouns">Canonical nouns</a><a href="#model">Typed state</a><a href="#invariants">Invariants</a><a href="#consistency">Recovery</a><a href="#git-publication">Git publication</a><a href="#worker-credentials">Worker credentials</a><a href="#lifecycle">Lifecycle</a><a href="#acceptance">Acceptance</a><a href="#decisions">Open register</a></aside></div></main><footer class="footer"><div class="shell">Anvil v2 · Technical design · Draft</div></footer></body></html>
+</tbody></table></section></article><aside class="toc" aria-label="On this page"><strong>Specification</strong><a href="#nouns">Canonical nouns</a><a href="#model">Typed state</a><a href="#invariants">Invariants</a><a href="#consistency">Recovery</a><a href="#campaign-dependencies">Campaign dependencies</a><a href="#git-publication">Git publication</a><a href="#worker-credentials">Worker credentials</a><a href="#lifecycle">Lifecycle</a><a href="#acceptance">Acceptance</a><a href="#decisions">Open register</a></aside></div></main><footer class="footer"><div class="shell">Anvil v2 · Technical design · Draft</div></footer></body></html>

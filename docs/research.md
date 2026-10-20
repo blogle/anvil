@@ -89,7 +89,7 @@
 - An agent's self-reported plan and completion disposition are not independent evidence.
 - Kubernetes runtime correctness, remote operation recovery, and integration provider contracts require direct tests against pinned versions.
 - A periodic SWE-bench subset and deterministic scenario tests are sufficient initial evaluation scope; large benchmark campaigns and learned progress scoring are deferred.
-- Runtime, database, command deduplication policy, dependency semantics, and Git stack topology are unresolved. See the specification's open decision register.
+- Runtime, database, command deduplication policy, and Git stack topology remain unresolved. Dependency execution gates, integration ordering, and governed Campaign amendments are provisionally specified; adapter-specific verification and delivery semantics remain to be implemented. See the specification's open decision register.
 
 ## Loop engineering, coordination, and OpenCode extension interfaces (2026-10-20)
 
