@@ -125,3 +125,33 @@ summary { cursor: pointer; font-weight: 750; }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
 }
+/* #8 illustrative convergence flow and review projections */
+.acceptance-demo { margin-block: 1.25rem 1.75rem; display: grid; gap: 1.1rem; }
+.acceptance-demo figure { margin: 0; }
+.acceptance-demo figcaption { font-size: .88rem; font-weight: 650; letter-spacing: .015em; margin-bottom: .8rem; }
+.acceptance-demo-flow, .acceptance-demo-panel { border: 1px solid rgba(194,177,146,.28); border-radius: 10px; padding: 1.05rem; background: rgba(207,191,156,.035); min-width: 0; }
+.acceptance-demo-flowsteps { display: grid; gap: .7rem; justify-items: stretch; }
+.acceptance-demo-step { display: grid; gap: .2rem; background: rgba(207,191,156,.06); border: 1px solid rgba(194,177,146,.18); border-radius: 7px; padding: .7rem .85rem; }
+.acceptance-demo-step strong, .acceptance-demo-panelhead strong { font-weight: 650; }
+.acceptance-demo-step span, .acceptance-demo-branches span, .acceptance-demo-muted, .acceptance-demo-line small, .acceptance-demo-inboxrow small, .acceptance-demo-next span { color: #b2a99d; font-size: .84rem; line-height: 1.5; }
+.acceptance-demo-step.emphasis { border-color: rgba(211,179,111,.7); background: rgba(211,179,111,.10); }
+.acceptance-demo-branches { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: .55rem; }
+.acceptance-demo-branches > div { display: grid; align-content: start; gap: .2rem; border-left: 2px solid rgba(211,179,111,.48); background: rgba(207,191,156,.035); padding: .55rem .65rem; min-width: 0; }
+.acceptance-demo-branches b { font-size: .83rem; }
+.acceptance-demo-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 1.1rem; align-items: start; }
+.acceptance-demo-kicker { color: #b7a37b; letter-spacing: .075em; font-size: .68rem; font-weight: 700; margin-bottom: .55rem; }
+.acceptance-demo-panelhead, .acceptance-demo-line, .acceptance-demo-inboxrow { display: flex; gap: .55rem; align-items: start; justify-content: space-between; }
+.acceptance-demo-panelhead { margin-bottom: .35rem; }
+.acceptance-demo-tag { border: 1px solid rgba(211,179,111,.35); color: #d9c398; border-radius: 99px; white-space: nowrap; font-size: .7rem; padding: .18rem .5rem; }
+.acceptance-demo-progress { background: rgba(207,191,156,.13); border-radius: 99px; overflow: hidden; height: 6px; margin: .7rem 0 1rem; }
+.acceptance-demo-progress > span { display: block; height: 100%; background: #b6a37d; border-radius: inherit; }
+.acceptance-demo-subhead { font-size: .76rem; letter-spacing: .06em; font-weight: 700; text-transform: uppercase; margin: .85rem 0 .35rem; }
+.acceptance-demo-line { padding: .35rem 0; border-bottom: 1px solid rgba(194,177,146,.15); font-size: .88rem; }
+.acceptance-demo-line small { text-align: right; }
+.acceptance-demo-next { margin-top: 1rem; padding: .7rem; background: rgba(211,179,111,.08); display: grid; gap: .2rem; border-left: 2px solid #b6a37d; font-size: .83rem; }
+.acceptance-demo-inboxrow { padding: .8rem 0; border-bottom: 1px solid rgba(194,177,146,.17); }
+.acceptance-demo-inboxrow > div { flex: 1; min-width: 0; display: grid; gap: .2rem; }
+.acceptance-demo-inboxrow strong { font-size: .86rem; }
+.acceptance-demo-inboxrow small { display: block; }
+.acceptance-demo-mark { font-size: 1.1rem; color: #d9c398; line-height: 1; }
+@media (max-width: 760px) { .acceptance-demo-grid { grid-template-columns: 1fr; } .acceptance-demo-branches { grid-template-columns: 1fr; } .acceptance-demo-panelhead, .acceptance-demo-line { flex-wrap: wrap; } .acceptance-demo-line small { text-align: left; } }
