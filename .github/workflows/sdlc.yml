@@ -10,6 +10,6 @@ permissions:
   actions: read
 jobs:
   sdlc:
-    uses: blogle/sdlc/.github/workflows/ci.yml@8612409be6db920fc1c13f26893cf7d6f9f538f7
+    uses: blogle/sdlc/.github/workflows/ci.yml@b5c3d52602a4153bdb62d3502e248a589762abdf
     with:
-      sdlc_ref: 8612409be6db920fc1c13f26893cf7d6f9f538f7
+      sdlc_ref: b5c3d52602a4153bdb62d3502e248a589762abdf

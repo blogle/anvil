@@ -10,7 +10,7 @@
     nix2container.url = "github:Dauliac/nix2container/8fd02c842686a528fd37508283853de0ed1462b1";
     nix2containerNixpkgs.follows = "nix2container/nixpkgs";
     opencode.url = "github:anomalyco/opencode/9b4ec5714d481559990db0a816d5dec19541a814";
-    sdlc.url = "github:blogle/sdlc/8612409be6db920fc1c13f26893cf7d6f9f538f7";
+    sdlc.url = "github:blogle/sdlc/b5c3d52602a4153bdb62d3502e248a589762abdf";
   };
 
   outputs = { self, nixpkgs, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode, sdlc }:

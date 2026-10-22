@@ -14,6 +14,6 @@ permissions:
   actions: write
 jobs:
   garbage-collect:
-    uses: blogle/sdlc/.github/workflows/hestia-gc.yml@8612409be6db920fc1c13f26893cf7d6f9f538f7
+    uses: blogle/sdlc/.github/workflows/hestia-gc.yml@b5c3d52602a4153bdb62d3502e248a589762abdf
     with:
       dry_run: ${{ inputs.dry_run == true }}
