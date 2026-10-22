@@ -30,7 +30,7 @@
 <div><p class="eyebrow">Specification</p><h3><a href="spec.html#nouns">Domain and requirements</a></h3><p class="small">Definitions, authority boundaries, lifecycle, invariants, acceptance rules, and unresolved product decisions.</p></div>
 <div><p class="eyebrow">Architecture</p><h3><a href="architecture.html#loop">Control mechanics</a></h3><p class="small">Observation, the in-flight watchdog, continuation prompts, revision-bound evidence, command execution, and integration.</p></div>
 <div><p class="eyebrow">Research</p><h3><a href="research.md">Evidence and provenance</a></h3><p class="small">Primary-source findings, applicability to Anvil, limitations, and claims awaiting empirical confirmation.</p></div>
-<div><a href="ui.html">UI reference screens</a></div>
+<div><p class="eyebrow">Interactive UI</p><h3><a href="ui.html">Inbox, Campaign, Operations and Settings mockup</a></h3><p class="small">Responsive sample screens with shared Commission context.</p></div>
 <div><a href="adr-001-typescript-stack.md">Technology decision — TypeScript stack</a></div>
 </div>
 </section>
@@ -50,7 +50,7 @@
 <li>Duplicating repository-owned <code>AGENTS.md</code>, skills, test definitions, or developer conventions in Anvil's Campaign specification.</li>
 <li>Claiming semantic correctness of arbitrary changes from source diffs, model reports, or general-purpose CI alone.</li>
 <li>Requiring independent LLM verification, a learned progress scorer, or a large benchmark run for ordinary delivery.</li>
-<li>Selecting a programming language, persistence engine, or workflow framework before consistency requirements have been resolved.</li>
+<li>Treating language selection as open: ADR-001 accepts TypeScript end-to-end and a Bun-first runtime with bounded Node.js fallback.</li>
 </ul>
 </section></article><aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#thesis">The thesis</a><a href="#status">Decision status</a><a href="#map">Three useful cuts</a><a href="#reading">Reading order</a><a href="#non-goals">Non-goals</a></aside></div></main>
 <footer class="footer"><div class="shell">Anvil v2 · Technical design · Draft</div></footer>
