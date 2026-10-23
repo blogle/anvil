@@ -1,25 +1,20 @@
 merge_protections_settings:
   reporting_method: check-runs
   post_comment: false
-
-pull_request_rules:
-  - name: queue validated feature PRs
-    conditions:
-      - base ~= ^(main|master)$
-      - head != sdlc/release-next
-      - label != release
-      - check-success = @github-actions/sdlc / check
-      - or:
-          - and:
-              - label = integration:auto
-              - label != integration:review
-          - and:
-              - label = integration:review
-              - label != integration:auto
-              - "#approved-reviews-by >= 1"
-    actions:
-      queue:
-        name: validated candidates
+  auto_merge_conditions:
+    - base ~= ^(main|master)$
+    - head != sdlc/release-next
+    - label != release
+    - check-success = @github-actions/sdlc / check
+    - check-success = @github-actions/sdlc / policy
+    - or:
+        - and:
+            - label = integration:auto
+            - label != integration:review
+        - and:
+            - label = integration:review
+            - label != integration:auto
+            - "#approved-reviews-by >= 1"
 
 queue_rules:
   - name: validated candidates
@@ -28,6 +23,7 @@ queue_rules:
       - head != sdlc/release-next
       - label != release
       - check-success = @github-actions/sdlc / check
+      - check-success = @github-actions/sdlc / policy
       - or:
           - and:
               - label = integration:auto
@@ -44,13 +40,21 @@ queue_rules:
     update_method: merge
 
 merge_protections:
-  - name: Feature PRs merge only after queue verification
+  - name: Feature PR admission
     if:
       - base ~= ^(main|master)$
       - head != sdlc/release-next
     success_conditions:
-      - queue-name = validated candidates
-      - check-success = @mergify/Mergify Merge Queue
+      - check-success = @github-actions/sdlc / check
+      - check-success = @github-actions/sdlc / policy
+      - or:
+          - and:
+              - label = integration:auto
+              - label != integration:review
+          - and:
+              - label = integration:review
+              - label != integration:auto
+              - "#approved-reviews-by >= 1"
   - name: Release candidate needs trusted SDLC gate
     if:
       - base ~= ^(main|master)$
