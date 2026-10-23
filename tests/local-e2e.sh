@@ -3,7 +3,7 @@ set -euo pipefail
 
 ui_only=0
 if [ "${1:-}" = --ui ]; then ui_only=1; fi
-root="$(git rev-parse --show-toplevel)"
+root="${ANVIL_REPO_ROOT:-$(git rev-parse --show-toplevel)}"
 target_dir="${CARGO_TARGET_DIR:-$root/target}"
 export TMPDIR="${ANVIL_E2E_TMPDIR:-/tmp}"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/anvil-local-e2e.XXXXXX")"
@@ -51,11 +51,19 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-cargo build -p anvild -p anvil-test-model
+if [ -n "${ANVIL_PREBUILT_BIN_DIR:-}" ]; then
+  anvild_bin="$ANVIL_PREBUILT_BIN_DIR/anvild"
+  model_bin="$ANVIL_PREBUILT_BIN_DIR/anvil-test-model"
+  test -x "$anvild_bin" && test -x "$model_bin"
+else
+  cargo build -p anvild -p anvil-test-model
+  anvild_bin="$target_dir/debug/anvild"
+  model_bin="$target_dir/debug/anvil-test-model"
+fi
 mkdir -p "$tmp" "$runtime" "$profile/config" "$fixture"
 cp "$root/dev/opencode-e2e.jsonc" "$profile/config/opencode.jsonc"
 export ANVIL_TEST_MODEL_PORT=4098 ANVIL_TEST_MODEL_GATE=1
-"$target_dir/debug/anvil-test-model" >"$tmp/model.log" 2>&1 & model_pid=$!
+"$model_bin" >"$tmp/model.log" 2>&1 & model_pid=$!
 export OPENCODE_CONFIG="$profile/config/opencode.jsonc" OPENCODE_CONFIG_DIR="$profile/config"
 export HOME="$profile/home" XDG_CONFIG_HOME="$profile/home/.config" XDG_CACHE_HOME="$profile/home/.cache"
 export XDG_DATA_HOME="$profile/home/.local/share" XDG_STATE_HOME="$profile/home/.local/state"
@@ -71,8 +79,9 @@ export ANVIL_PREVIEW_DOMAIN=localhost ANVIL_ANNOTATION_PREFIX=anvil.local
 export ANVIL_PROFILE_OPENCODE_URL=http://127.0.0.1:4097 ANVIL_CREDENTIAL_URL=http://127.0.0.1:8080
 export ANVIL_SESSION_SIGNING_SECRET=anvil-local-development-only-signing-secret
 export ANVIL_HISTORY_PATH="$tmp/history.jsonl"
+export ANVIL_WEB_DIR="${ANVIL_WEB_DIR:-$root/web/dist}"
 unset ANVIL_STORE_PATH
-"$target_dir/debug/anvild" >"$tmp/anvild.log" 2>&1 & api_pid=$!
+"$anvild_bin" >"$tmp/anvild.log" 2>&1 & api_pid=$!
 
 poll() {
   local url="$1" deadline=$((SECONDS + 90))
@@ -305,7 +314,7 @@ printf 'suspend/resume workspace, OpenCode binding, watcher reconciliation: %ds\
 scenario_start=$SECONDS
 kill "$api_pid"
 wait "$api_pid" 2>/dev/null || true
-"$target_dir/debug/anvild" >"$tmp/anvild-restarted.log" 2>&1 & api_pid=$!
+"$anvild_bin" >"$tmp/anvild-restarted.log" 2>&1 & api_pid=$!
 poll http://127.0.0.1:8080/readyz
 wait_for_state "$id" completed_run
 curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/activity" | jq -e '.telemetry.schema_version == 1 and any(.telemetry.requests[]; .prompt | contains("ANVIL-E2E:edit-file"))' >/dev/null

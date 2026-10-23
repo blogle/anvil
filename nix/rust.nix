@@ -31,7 +31,20 @@ let
       || pkgs.lib.hasSuffix "/runtime" (toString path)
       || pkgs.lib.hasSuffix "/runtime/git-identity" (toString path);
   };
-
+  runtimeSrc = pkgs.lib.cleanSourceWith {
+    src = repoRoot;
+    filter = path: type:
+      let
+        p = toString path;
+        isAnvilCtlLibrary = pkgs.lib.hasSuffix "/crates/anvilctl/src/lib.rs" p;
+      in (craneLib.filterCargoSources path type || crateFixturePathFilter path type)
+        && !isAnvilCtlLibrary
+        || pkgs.lib.hasSuffix "/crates/anvilctl/src" p
+        || pkgs.lib.hasSuffix "/web" p
+        || pkgs.lib.hasInfix "/web/" p
+        || pkgs.lib.hasSuffix "/runtime" p
+        || pkgs.lib.hasSuffix "/runtime/git-identity" p;
+  };
   fixtureSourceSmoke =
     assert crateFixturePathFilter "/repo/crates/anvild/tests/fixtures/controller-v8-sanitized.json" "regular";
     assert crateFixturePathFilter "/repo/crates/anvil-core/tests/fixtures/task-snapshot-v1/fresh-open-executable.json" "regular";
@@ -58,19 +71,21 @@ let
     strictDeps = true;
     nativeBuildInputs = [ pkgs.pkg-config pkgs.git ];
   };
-  cargoVendorDir = craneLib.vendorCargoDeps baseArgs;
+  runtimeBaseArgs = baseArgs // { src = runtimeSrc; };
+  cargoVendorDir = craneLib.vendorCargoDeps runtimeBaseArgs;
   commonArgs = baseArgs // { inherit cargoVendorDir; };
+  runtimeCommonArgs = runtimeBaseArgs // { inherit cargoVendorDir; };
 
   # Dependency artifacts are profile-specific because Cargo profile metadata
   # is part of the fingerprint used when deciding whether an artifact is fresh.
-  mkCargoArtifacts = profile: extraArgs:
+  mkCargoArtifacts = profile: args: extraArgs:
     craneLib.buildDepsOnly (
-      commonArgs
+      args
       // { CARGO_PROFILE = profile; }
       // extraArgs
     );
 
-  devCargoArtifacts = mkCargoArtifacts "dev" {
+  devCargoArtifacts = mkCargoArtifacts "dev" commonArgs {
     # Match the interactive dev profile instead of Crane's non-incremental
     # default, so seeded dependencies remain reusable by ordinary Cargo.
     CARGO_INCREMENTAL = "1";
@@ -78,17 +93,25 @@ let
     # benchmark features into the fingerprints used by normal cargo build.
     doCheck = false;
   };
-  ciCargoArtifacts = mkCargoArtifacts "ci" { };
-  ciReleaseCargoArtifacts = mkCargoArtifacts "ci-release" { };
-  releaseCargoArtifacts = mkCargoArtifacts "release" { };
+  ciCargoArtifacts = mkCargoArtifacts "ci" commonArgs { };
+  runtimeBuildArgs = { cargoExtraArgs = "--locked -p anvild -p anvil-mcp -p anvil-router -p anvil-test-model"; };
+  ciReleaseCargoArtifacts = mkCargoArtifacts "ci-release" commonArgs { doCheck = false; };
+  ciReleaseRuntimeCargoArtifacts = mkCargoArtifacts "ci-release" runtimeCommonArgs (runtimeBuildArgs // { doCheck = false; });
+  releaseCargoArtifacts = mkCargoArtifacts "release" runtimeCommonArgs (runtimeBuildArgs // { doCheck = false; });
+  anvilCtlReleaseCargoArtifacts = mkCargoArtifacts "release" commonArgs { doCheck = false; cargoExtraArgs = "--locked -p anvilctl"; };
+  anvilCtlCiReleaseCargoArtifacts = mkCargoArtifacts "ci-release" commonArgs { doCheck = false; cargoExtraArgs = "--locked -p anvilctl"; };
 
   mkBinary = {
     package,
     profile,
     cargoArtifacts,
+    doCheck ? false,
+    src ? commonArgs.src,
   }:
-    craneLib.buildPackage (commonArgs // {
+    craneLib.buildPackage ((if src == runtimeSrc then runtimeCommonArgs else commonArgs) // {
+      inherit src;
       inherit cargoArtifacts;
+      inherit doCheck;
       CARGO_PROFILE = profile;
       cargoExtraArgs = "-p ${package}";
     });
@@ -98,21 +121,24 @@ let
       package = "anvild";
       profile = "release";
       cargoArtifacts = releaseCargoArtifacts;
+      src = runtimeSrc;
     };
     anvilMcp = mkBinary {
       package = "anvil-mcp";
       profile = "release";
       cargoArtifacts = releaseCargoArtifacts;
+      src = runtimeSrc;
     };
     anvilRouter = mkBinary {
       package = "anvil-router";
       profile = "release";
       cargoArtifacts = releaseCargoArtifacts;
+      src = runtimeSrc;
     };
     anvilCtl = mkBinary {
       package = "anvilctl";
       profile = "release";
-      cargoArtifacts = releaseCargoArtifacts;
+      cargoArtifacts = anvilCtlReleaseCargoArtifacts;
     };
   };
 
@@ -120,37 +146,32 @@ let
     anvild = mkBinary {
       package = "anvild";
       profile = "ci-release";
-      cargoArtifacts = ciReleaseCargoArtifacts;
+      cargoArtifacts = ciReleaseRuntimeCargoArtifacts;
+      src = runtimeSrc;
     };
     anvilMcp = mkBinary {
       package = "anvil-mcp";
       profile = "ci-release";
-      cargoArtifacts = ciReleaseCargoArtifacts;
+      cargoArtifacts = ciReleaseRuntimeCargoArtifacts;
+      src = runtimeSrc;
     };
     anvilRouter = mkBinary {
       package = "anvil-router";
       profile = "ci-release";
-      cargoArtifacts = ciReleaseCargoArtifacts;
+      cargoArtifacts = ciReleaseRuntimeCargoArtifacts;
+      src = runtimeSrc;
     };
     anvilCtl = mkBinary {
       package = "anvilctl";
       profile = "ci-release";
-      cargoArtifacts = ciReleaseCargoArtifacts;
+      cargoArtifacts = anvilCtlCiReleaseCargoArtifacts;
     };
-  };
-
-  checks = {
-    fmt = craneLib.cargoFmt (commonArgs // { cargoFmtExtraArgs = "--all"; });
-    clippy = craneLib.cargoClippy (commonArgs // {
-      cargoArtifacts = ciCargoArtifacts;
-      CARGO_PROFILE = "ci";
-      cargoClippyExtraArgs = "--workspace --all-targets --all-features -- -D warnings";
-    });
-    tests = craneLib.cargoTest (commonArgs // {
-      cargoArtifacts = ciCargoArtifacts;
-      CARGO_PROFILE = "ci";
-      cargoExtraArgs = "--workspace";
-    });
+    anvilTestModel = mkBinary {
+      package = "anvil-test-model";
+      profile = "ci-release";
+      cargoArtifacts = ciReleaseRuntimeCargoArtifacts;
+      src = runtimeSrc;
+    };
   };
 
   devShell = craneLib.devShell {
@@ -158,7 +179,7 @@ let
       craneLib.inheritCargoArtifactsHook
       pkgs.cargo pkgs.rust-analyzer pkgs.cargo-nextest pkgs.just pkgs.git
       pkgs.gh pkgs.curl pkgs.jq pkgs.kubectl pkgs.kustomize pkgs.nix pkgs.nodejs
-      pkgs.process-compose pkgs.watchexec nix2containerPkgs.skopeo-nix2container pkgs.umoci pkgs.crun pkgs.kind pkgs.util-linux
+      pkgs.process-compose pkgs.watchexec nix2containerPkgs.skopeo-nix2container pkgs.util-linux
       opencodePackage
     ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
       pkgs.chromium
@@ -200,13 +221,18 @@ in
 {
   inherit
     commonArgs
+    cargoVendorDir
     devCargoArtifacts
     ciCargoArtifacts
     ciReleaseCargoArtifacts
+    ciReleaseRuntimeCargoArtifacts
+    anvilCtlReleaseCargoArtifacts
+    anvilCtlCiReleaseCargoArtifacts
     releaseCargoArtifacts
     releaseBinaries
     ciReleaseBinaries
-    checks
+    opencodePackage
+    craneLib
     devShell
     fixtureSourceSmoke
     mkBinary

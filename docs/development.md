@@ -1,6 +1,6 @@
 # Development Deployment
 
-## Local-first development and validation ladder
+## Local-first development and validation
 
 The normal local edit loop runs without Kubernetes, an image build, registry,
 or external model credentials:
@@ -19,54 +19,39 @@ directories under `.anvil/dev/sessions`. `ANVIL_LOCAL_RUNTIME_ROOT` and
 an Anvil sandbox; local model requests are served by `anvil-test-model` and
 never fall through to a hosted provider.
 
-The validation ownership ladder is:
+The regular validation set stays local-first:
 
 ```text
 Rust unit/integration
         |
         v
-local process E2E                process-compose + LocalSandboxApi
+frontend tests and build
         |
         v
-nested actual OCI artifact        nix2container + skopeo + umoci + crun probe
+local process E2E                LocalSandboxApi + deterministic local model
         |
         v
-isolated Kind Kubernetes fidelity Agent Sandbox/controller/RBAC/router
-        |
-        v
-production deployment smoke      platform-owned real-cluster rollout
+static manifest/workflow checks
 ```
 
-Run the explicit tiers with `just e2e`, `just e2e-sandbox-image`, and
-`just e2e-k8s`. `just e2e-ui` is the local embedded-frontend/API smoke. The
-fast E2E prints total and per-scenario elapsed seconds for cold/warm comparison;
-there are no timing gates. The nested OCI test reports whether the current
-kernel supports the exact root-to-agent UID mapping; static image checks still
-run when that execution mapping is unavailable. The Kind lane owns a temporary
-kubeconfig and cluster and is intentionally absent from `just check`, `just
-dev`, and `just e2e`.
+Run the full local set with `just check`; run the process E2E alone with
+`just e2e`. `just e2e-ui` limits that test to the embedded frontend/API smoke.
+The E2E reports total and per-scenario duration for diagnosis, with no timing
+gates. It exercises LocalSandboxApi, real OpenCode workers, and a deterministic
+local model without requiring a VM, Kubernetes cluster, registry, or hosted
+model credentials.
 
-Ownership boundaries are explicit: process-compose and LocalSandboxApi own
-normal development; nested OCI acceptance owns sandbox image/runtime
-construction; isolated Kind owns Kubernetes-only fidelity. The production k3s
-cluster is not a development harness.
+`just dev` and `just dev-full` use process-compose for interactive development;
+the E2E harness starts its local test processes directly so it can control their
+fixtures and lifecycle. Production Kubernetes manifests and deployment commands
+remain available for deployment work; the production cluster is not a test
+harness.
 
-CI's pre-merge lanes run Rust checks, deterministic local E2E, actual sandbox
-image acceptance, and isolated Kind fidelity as independent jobs. A Kind pass
-in CI or on a developer laptop is still required before merge; this Anvil
-sandbox must not run Kind nested.
-
-Kind fidelity starts with an empty Nix PVC, bootstraps the shared daemon, and
-starts two sandboxes from the freshly built image. It builds a new derivation in
-sandbox A, checks that B sees the exact path after A is suspended and after the
-daemon restarts, and enters the dedicated `shared-nix-smoke` environment through
-that daemon from B. The full Rust check remains owned by the local-first CI
-lane; this smoke verifies the shared Nix development-environment contract
-without reseeding its Cargo artifacts. CI enters a minimal `kind-ci` shell for
-this lane so the Rust devShell's Cargo artifact hook cannot run before Kind.
-On pull requests, the image workflow builds the Anvil, sandbox, baseline
-daemon, and upgrade daemon archives once; PR inspection and Kind download and
-verify those same archives before consuming them.
+SDLC pre-merge checks run Rust formatting, clippy, unit/integration tests,
+frontend tests/build, static configuration checks, process E2E, and product
+artifact builds. VM, Kind, and K3s acceptance tests are not required for SDLC
+onboarding. Their experiments and findings are preserved on the
+`experiment/higher-fidelity-testing` branch and tracked by [ANVIL-70](https://lific.thejeffer.net/ANVIL/issues/ANVIL-70).
 
 ## Production deployment
 

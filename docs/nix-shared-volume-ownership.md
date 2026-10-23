@@ -28,12 +28,11 @@ During investigation, a temporary PVC on that OpenEBS StorageClass reproduced
 the same transition: `fsGroup: 1000` changed the PVC from `0:0 0755` to
 `0:1000 2775`, and a fresh derivation failed when GNU `chmod 0700 source`
 attempted to change an inherited-`2755` directory. That live-cluster experiment
-is not kept as a repository test. The persistent CI guard is the existing Kind
-acceptance: it creates Sandboxes through Anvil's API, asserts their generated
-Pod templates omit fsGroup, and runs fresh derivations across Sandbox lifecycle
-transitions. Kind's local-path storage does not reproduce the OpenEBS ownership
-pass; the explicit manifest assertion makes reintroducing fsGroup fail CI,
-while the uncached builds ensure the corrected configuration remains usable.
+is not kept as a repository test. The current repository guard is the static
+manifest-security check, which verifies that generated Sandbox templates do not
+set `fsGroup`. It does not reproduce the OpenEBS ownership pass or exercise a
+Sandbox lifecycle. Higher-fidelity reproduction is tracked separately in
+[ANVIL-70](https://lific.thejeffer.net/ANVIL/issues/ANVIL-70).
 
 Kubernetes documents that fsGroup volume ownership changes happen during
 volume setup, and that CSI may take responsibility when it advertises the
