@@ -11,8 +11,8 @@ export XDG_STATE_HOME="$tmp_dir/state"
 
 mock_curl="$tmp_dir/curl"
 curl_log="$tmp_dir/curl.log"
-cat >"$mock_curl" <<'EOF'
-#!/usr/bin/env bash
+printf '#!%s\n' "$(command -v bash)" >"$mock_curl"
+cat >>"$mock_curl" <<'EOF'
 set -euo pipefail
 
 config=''
@@ -47,7 +47,7 @@ run_helper() {
     ANVIL_SESSION_CREDENTIAL=session-secret \
     CURL="$mock_curl" \
     CREDENTIAL_CURL_LOG="$curl_log" \
-    "$helper"
+    bash "$helper"
 }
 
 output="$(run_helper $'protocol=https\nhost=github.com\n')"
@@ -73,7 +73,7 @@ if printf '%s' $'protocol=http\nhost=github.com\n' | env \
   ANVIL_SESSION_CREDENTIAL=session-secret \
   CURL="$mock_curl" \
   CREDENTIAL_CURL_LOG="$curl_log" \
-  "$helper" >/dev/null 2>"$tmp_dir/rejection.log"; then
+  bash "$helper" >/dev/null 2>"$tmp_dir/rejection.log"; then
   echo 'credential helper accepted a non-HTTPS request' >&2
   exit 1
 fi
@@ -85,7 +85,7 @@ if printf '%s' $'protocol=https\nhost=github.example\n' | env \
   ANVIL_SESSION_CREDENTIAL=session-secret \
   CURL="$mock_curl" \
   CREDENTIAL_CURL_LOG="$curl_log" \
-  "$helper" >/dev/null 2>"$tmp_dir/rejection.log"; then
+  bash "$helper" >/dev/null 2>"$tmp_dir/rejection.log"; then
   echo 'credential helper accepted a non-GitHub host' >&2
   exit 1
 fi
@@ -98,7 +98,7 @@ if printf '%s' $'protocol=https\nhost=github.com\n' | env \
   CURL="$mock_curl" \
   CREDENTIAL_CURL_LOG="$curl_log" \
   CREDENTIAL_CURL_EXIT=1 \
-  "$helper" >/dev/null 2>"$tmp_dir/broker-error.log"; then
+  bash "$helper" >/dev/null 2>"$tmp_dir/broker-error.log"; then
   echo 'credential helper accepted a failed broker request' >&2
   exit 1
 fi
@@ -112,7 +112,7 @@ if printf '%s' $'protocol=https\nhost=github.com\n' | env \
   CREDENTIAL_CURL_LOG="$curl_log" \
   CREDENTIAL_CURL_RESPONSE='{"error":{"code":"github_token_scope_rejected","message":"GitHub rejected the requested permissions","upstream_status":422,"github_request_id":"safe-request-id"}}' \
   CREDENTIAL_CURL_STATUS=502 \
-  "$helper" >/dev/null 2>"$tmp_dir/empty-response.log"; then
+  bash "$helper" >/dev/null 2>"$tmp_dir/empty-response.log"; then
   echo 'credential helper accepted a structured broker failure' >&2
   exit 1
 fi
@@ -130,7 +130,7 @@ if printf '%s' $'protocol=https\nhost=github.com\n' | env \
   CREDENTIAL_CURL_LOG="$curl_log" \
   CREDENTIAL_CURL_RESPONSE='{}' \
   CREDENTIAL_CURL_STATUS=200 \
-  "$helper" >/dev/null 2>"$tmp_dir/empty-token.log"; then
+  bash "$helper" >/dev/null 2>"$tmp_dir/empty-token.log"; then
   echo 'credential helper accepted a broker response without a token' >&2
   exit 1
 fi
