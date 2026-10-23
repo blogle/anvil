@@ -1,7 +1,7 @@
 {
   inputs = {
     root.url = "..";
-    nixpkgs.follows = "root/nixpkgs";
+    nixpkgs.follows = "root/sdlc/nixpkgs-latest";
     flake-utils.follows = "root/flake-utils";
     nix2container.follows = "root/nix2container";
     nix2containerNixpkgs.follows = "root/nix2containerNixpkgs";

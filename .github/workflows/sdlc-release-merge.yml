@@ -12,7 +12,7 @@ permissions:
 jobs:
   merge:
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
-    uses: blogle/sdlc/.github/workflows/release-merge.yml@fa8b1cd2b03513318a9b6343a98e0ad0a30533e5
+    uses: blogle/sdlc/.github/workflows/release-merge.yml@c4bd995541304dbdef6a981ae4b7a3786cfeaca3
     with:
-      sdlc_ref: fa8b1cd2b03513318a9b6343a98e0ad0a30533e5
+      sdlc_ref: c4bd995541304dbdef6a981ae4b7a3786cfeaca3
     secrets: inherit

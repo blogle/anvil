@@ -115,9 +115,9 @@ let
     nix-daemon-image = sandbox.daemonImage;
     nix-daemon-upgrade-image = sandbox.daemonUpgradeImage;
   };
-  fast = { inherit fmt clippy static; };
+  check = { inherit fmt clippy static; };
 in
 {
-  inherit fast verify publish;
-  checks = fast // verify;
+  inherit check verify publish;
+  checks = check // verify;
 }
