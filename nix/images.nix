@@ -41,4 +41,5 @@ in
     binaries = rust.ciReleaseBinaries;
     webAssets = frontend;
   };
+
 }
