@@ -14,7 +14,7 @@ use rmcp::{
     ErrorData, ServerHandler,
 };
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
 
@@ -88,6 +88,84 @@ struct ResourceId {
 struct TaskResourceId {
     task_id: String,
     idempotency_key: Option<String>,
+}
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct CreateDurableTask {
+    outcome: String,
+    #[serde(default)]
+    acceptance_criteria: Vec<String>,
+    execution_target: Option<TaskExecutionTarget>,
+    completion_policy: Option<CompletionPolicy>,
+    verification_spec: Option<VerificationSpec>,
+    budget: Option<TaskBudget>,
+    idempotency_key: String,
+}
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TaskExecutionTarget {
+    GitRepository {
+        project: Option<String>,
+        repository: String,
+        base_ref: String,
+        delivery: DeliveryKind,
+    },
+}
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum DeliveryKind {
+    PullRequest,
+    LocalBranch,
+}
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CompletionPolicy {
+    Evidence { required_kinds: Vec<EvidenceKind> },
+    AllChildrenCompleted,
+    Manual,
+}
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum EvidenceKind {
+    LegacySchedulerExit,
+    DeliveryComplete,
+    DeterministicVerification,
+    ManualCompletion,
+}
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct VerificationSpec {
+    #[serde(default)]
+    holdout_scenarios: Vec<Value>,
+}
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct TaskBudget {
+    max_attempts: u32,
+    max_continuations_per_reason: u32,
+    max_verifier_cycles: u32,
+    max_ci_retries: u32,
+    max_execution_seconds: u64,
+    max_model_cost: Option<String>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TaskList {
+    after: Option<String>,
+    limit: Option<usize>,
+    lifecycle: Option<String>,
+    parent: Option<String>,
+    runnable: Option<bool>,
+    external_provider: Option<String>,
+    external_id: Option<String>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TaskAttempts {
+    task_id: String,
+    after: Option<String>,
+    limit: Option<usize>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TaskDecisions {
+    task_id: String,
+    cursor: Option<u64>,
+    limit: Option<usize>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 struct BatchDigestRequest {
@@ -214,6 +292,24 @@ fn session_id_from_path(path: &str) -> String {
         .to_owned()
 }
 
+fn durable_task_specification(p: CreateDurableTask) -> Result<Value, serde_json::Error> {
+    let mut specification = serde_json::Map::new();
+    specification.insert("outcome".into(), json!(p.outcome));
+    specification.insert("acceptance_criteria".into(), json!(p.acceptance_criteria));
+    macro_rules! insert_optional {
+        ($key:literal, $value:expr) => {
+            if let Some(value) = $value {
+                specification.insert($key.into(), serde_json::to_value(value)?);
+            }
+        };
+    }
+    insert_optional!("execution_target", p.execution_target);
+    insert_optional!("completion_policy", p.completion_policy);
+    insert_optional!("verification_spec", p.verification_spec);
+    insert_optional!("budget", p.budget);
+    Ok(Value::Object(specification))
+}
+
 fn api_error(status: reqwest::StatusCode, detail: Value) -> ErrorData {
     let data = Some(json!({"http_status":status.as_u16(),"error":detail}));
     if status == reqwest::StatusCode::CONFLICT {
@@ -232,6 +328,11 @@ const CONTROLLER_OPERATIONS: &[&str] = &[
     "anvil_submit_batch",
     "anvil_get_batch",
     "anvil_get_task",
+    "anvil_create_task",
+    "anvil_list_tasks",
+    "anvil_get_task_snapshot",
+    "anvil_list_task_attempts",
+    "anvil_get_task_decisions",
     "anvil_get_attempt",
     "anvil_create_attempt",
     "anvil_get_batch_digest",
@@ -370,6 +471,168 @@ impl AnvilMcp {
             self.call(Method::GET, &format!("v1/tasks/{}", p.id), None)
                 .await?,
         ))
+    }
+    #[rmcp::tool(
+        description = "Create a durable Task for an immutable outcome. Specify acceptance criteria, execution target, completion policy, and budget. Reuse idempotency_key to safely replay acceptance. Idle or unknown attention is not completion; Task completion requires its explicit policy and trusted evidence."
+    )]
+    async fn anvil_create_task(
+        &self,
+        Parameters(p): Parameters<CreateDurableTask>,
+    ) -> Result<Json<Value>, ErrorData> {
+        let key = p.idempotency_key.clone();
+        let body = durable_task_specification(p)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(Json(
+            self.call_with_key(Method::POST, "v1/tasks", Some(body), Some(&key))
+                .await?,
+        ))
+    }
+    #[rmcp::tool(
+        description = "List durable Tasks with cursor pagination and lifecycle/parent/runnable/external-reference filters. Open or idle Tasks are not necessarily complete; inspect each Task's lifecycle and snapshot."
+    )]
+    async fn anvil_list_tasks(
+        &self,
+        Parameters(p): Parameters<TaskList>,
+    ) -> Result<Json<Value>, ErrorData> {
+        let mut url = self
+            .base
+            .join("v1/tasks")
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        {
+            let mut q = url.query_pairs_mut();
+            if let Some(v) = p.after {
+                q.append_pair("after", &v);
+            }
+            if let Some(v) = p.limit {
+                q.append_pair("limit", &v.to_string());
+            }
+            if let Some(v) = p.lifecycle {
+                q.append_pair("lifecycle", &v);
+            }
+            if let Some(v) = p.parent {
+                q.append_pair("parent", &v);
+            }
+            if let Some(v) = p.runnable {
+                q.append_pair("runnable", if v { "true" } else { "false" });
+            }
+            if let Some(v) = p.external_provider {
+                q.append_pair("external_provider", &v);
+            }
+            if let Some(v) = p.external_id {
+                q.append_pair("external_id", &v);
+            }
+        }
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        if !status.is_success() {
+            let body = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| json!({"message":String::from_utf8_lossy(&bytes)}));
+            return Err(api_error(status, body));
+        }
+        Ok(Json(serde_json::from_slice(&bytes).map_err(|e| {
+            ErrorData::internal_error(e.to_string(), None)
+        })?))
+    }
+    #[rmcp::tool(
+        description = "Get the canonical durable Task decision snapshot. This is a read, not a refresh. Idle runtime state, empty attention, or unknown attention never means the Task is complete."
+    )]
+    async fn anvil_get_task_snapshot(
+        &self,
+        Parameters(p): Parameters<ResourceId>,
+    ) -> Result<Json<Value>, ErrorData> {
+        Ok(Json(
+            self.call(Method::GET, &format!("v1/tasks/{}/snapshot", p.id), None)
+                .await?,
+        ))
+    }
+    #[rmcp::tool(
+        description = "List durable execution Attempts for a Task using cursor pagination. Attempt lifecycle is factual runtime history, not Task completion."
+    )]
+    async fn anvil_list_task_attempts(
+        &self,
+        Parameters(p): Parameters<TaskAttempts>,
+    ) -> Result<Json<Value>, ErrorData> {
+        let mut url = self
+            .base
+            .join(&format!("v1/tasks/{}/attempts", p.task_id))
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        {
+            let mut q = url.query_pairs_mut();
+            if let Some(v) = p.after {
+                q.append_pair("after", &v);
+            }
+            if let Some(v) = p.limit {
+                q.append_pair("limit", &v.to_string());
+            }
+        }
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        if !status.is_success() {
+            let body = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| json!({"message":String::from_utf8_lossy(&bytes)}));
+            return Err(api_error(status, body));
+        }
+        Ok(Json(serde_json::from_slice(&bytes).map_err(|e| {
+            ErrorData::internal_error(e.to_string(), None)
+        })?))
+    }
+    #[rmcp::tool(
+        description = "List persisted Task decision records with a bounded page size (maximum 100), using the numeric cursor returned as next_cursor. Decisions are an audit/read model, not completion evidence or authority to execute."
+    )]
+    async fn anvil_get_task_decisions(
+        &self,
+        Parameters(p): Parameters<TaskDecisions>,
+    ) -> Result<Json<Value>, ErrorData> {
+        let mut url = self
+            .base
+            .join(&format!("v1/tasks/{}/decisions", p.task_id))
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(cursor) = p.cursor {
+                query.append_pair("cursor", &cursor.to_string());
+            }
+            if let Some(limit) = p.limit {
+                query.append_pair("limit", &limit.min(100).to_string());
+            }
+        }
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        if !status.is_success() {
+            let detail = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| json!({"message":String::from_utf8_lossy(&bytes)}));
+            return Err(api_error(status, detail));
+        }
+        Ok(Json(serde_json::from_slice(&bytes).map_err(|e| {
+            ErrorData::internal_error(e.to_string(), None)
+        })?))
     }
     #[rmcp::tool(description = "Get a durable execution attempt by ID.")]
     async fn anvil_get_attempt(
@@ -655,8 +918,10 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnvilMcp, BatchDigestRequest, BatchSubmission, BatchTask, MutationRecovery, ResourceId,
-        TaskResourceId, CONTROLLER_OPERATIONS,
+        AnvilMcp, BatchDigestRequest, BatchSubmission, BatchTask, CompletionPolicy,
+        CreateDurableTask, DeliveryKind, EvidenceKind, MutationRecovery, ResourceId, TaskAttempts,
+        TaskBudget, TaskDecisions, TaskExecutionTarget, TaskList, TaskResourceId,
+        CONTROLLER_OPERATIONS,
     };
     use httpmock::{Method::GET, MockServer};
     use rmcp::handler::server::wrapper::Parameters;
@@ -751,6 +1016,236 @@ mod tests {
         assert!(error.message.contains("409"));
         assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert_eq!(error.data.unwrap()["http_status"], 409);
+    }
+
+    #[tokio::test]
+    async fn durable_task_tools_create_replay_and_inspect_canonical_resources() {
+        let server = MockServer::start_async().await;
+        let created =
+            json!({"task_id":"task-new","outcome":"ship it","lifecycle":{"state":"open"}});
+        let create = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/tasks")
+                .header("idempotency-key", "intake-1");
+            then.status(201).json_body(created.clone());
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/tasks")
+                .query_param("lifecycle", "open")
+                .query_param("runnable", "true");
+            then.status(200)
+                .json_body(json!({"tasks":[created.clone()],"next_cursor":"task1.2"}));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/tasks/task-new/snapshot");
+            then.status(200)
+                .json_body(json!({"task_id":"task-new","phase":"waiting"}));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/tasks/task-new/attempts")
+                .query_param("limit", "20");
+            then.status(200)
+                .json_body(json!({"attempts":[{"attempt_id":"attempt-1"}],"next_cursor":null}));
+        });
+        let mcp = AnvilMcp::new(reqwest::Url::parse(&format!("{}/", server.base_url())).unwrap())
+            .unwrap();
+        let input = || CreateDurableTask {
+            outcome: "ship it".into(),
+            acceptance_criteria: vec!["works".into()],
+            execution_target: Some(TaskExecutionTarget::GitRepository {
+                project: Some("demo".into()),
+                repository: "https://example.test/demo".into(),
+                base_ref: "main".into(),
+                delivery: DeliveryKind::LocalBranch,
+            }),
+            completion_policy: Some(CompletionPolicy::Evidence {
+                required_kinds: vec![EvidenceKind::DeliveryComplete],
+            }),
+            verification_spec: None,
+            budget: Some(TaskBudget {
+                max_attempts: 3,
+                max_continuations_per_reason: 2,
+                max_verifier_cycles: 0,
+                max_ci_retries: 1,
+                max_execution_seconds: 1200,
+                max_model_cost: None,
+            }),
+            idempotency_key: "intake-1".into(),
+        };
+        let first = mcp.anvil_create_task(Parameters(input())).await.unwrap().0;
+        let replay = mcp.anvil_create_task(Parameters(input())).await.unwrap().0;
+        assert_eq!(first, replay);
+        create.assert_hits(2);
+        let list = mcp
+            .anvil_list_tasks(Parameters(TaskList {
+                after: None,
+                limit: Some(10),
+                lifecycle: Some("open".into()),
+                parent: None,
+                runnable: Some(true),
+                external_provider: None,
+                external_id: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(list["tasks"][0]["task_id"], "task-new");
+        assert_eq!(
+            mcp.anvil_get_task_snapshot(Parameters(ResourceId {
+                id: "task-new".into()
+            }))
+            .await
+            .unwrap()
+            .0["phase"],
+            "waiting"
+        );
+        let attempts = mcp
+            .anvil_list_task_attempts(Parameters(TaskAttempts {
+                task_id: "task-new".into(),
+                after: None,
+                limit: Some(20),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(attempts["attempts"][0]["attempt_id"], "attempt-1");
+    }
+
+    #[tokio::test]
+    async fn task_create_omits_optional_fields_and_uses_real_validator_defaults_and_idempotency() {
+        use axum::{extract::State, routing::post, Json, Router};
+        use std::{
+            collections::HashMap,
+            sync::{Arc, Mutex},
+        };
+
+        type Accepted = Arc<Mutex<HashMap<String, (serde_json::Value, serde_json::Value)>>>;
+        async fn create_endpoint(
+            State(accepted): State<Accepted>,
+            headers: axum::http::HeaderMap,
+            Json(specification): Json<serde_json::Value>,
+        ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+            let key = headers
+                .get("idempotency-key")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert!(specification["execution_target"].is_object());
+            assert!(specification.get("controller_mode").is_none());
+            for optional in ["completion_policy", "verification_spec", "budget"] {
+                assert!(
+                    specification.get(optional).is_none(),
+                    "{optional} must be omitted when absent"
+                );
+            }
+            let validated = match anvil_core::validate_task_spec(&specification) {
+                Ok(validated) => validated,
+                Err(error) => {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(json!({"error":error.to_string()})),
+                    )
+                }
+            };
+            let policy = serde_json::to_value(validated.completion_policy).unwrap();
+            let result = json!({"task_id":"task-canonical","outcome":specification["outcome"],"completion_policy":policy,"controller_mode":"legacy"});
+            let mut accepted = accepted.lock().unwrap();
+            if let Some((prior_specification, prior_result)) = accepted.get(&key) {
+                return if prior_specification == &specification {
+                    (axum::http::StatusCode::OK, Json(prior_result.clone()))
+                } else {
+                    (
+                        axum::http::StatusCode::CONFLICT,
+                        Json(json!({"message":"idempotency key conflict"})),
+                    )
+                };
+            }
+            accepted.insert(key, (specification, result.clone()));
+            (axum::http::StatusCode::CREATED, Json(result))
+        }
+
+        let accepted: Accepted = Arc::new(Mutex::new(HashMap::new()));
+        let app = Router::new()
+            .route("/v1/tasks", post(create_endpoint))
+            .with_state(accepted);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mcp =
+            AnvilMcp::new(reqwest::Url::parse(&format!("http://{address}/")).unwrap()).unwrap();
+        let input = |outcome: &str| CreateDurableTask {
+            outcome: outcome.into(),
+            acceptance_criteria: vec!["works".into()],
+            execution_target: Some(TaskExecutionTarget::GitRepository {
+                project: Some("demo".into()),
+                repository: "https://example.test/demo".into(),
+                base_ref: "main".into(),
+                delivery: DeliveryKind::LocalBranch,
+            }),
+            completion_policy: None,
+            verification_spec: None,
+            budget: None,
+            idempotency_key: "same-key".into(),
+        };
+        let first = mcp
+            .anvil_create_task(Parameters(input("deliver outcome")))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            first["completion_policy"],
+            json!({"kind":"evidence","required_kinds":["delivery_complete"]})
+        );
+        assert_eq!(first["controller_mode"], "legacy");
+        let replay = mcp
+            .anvil_create_task(Parameters(input("deliver outcome")))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(replay, first);
+        let result = mcp
+            .anvil_create_task(Parameters(input("different outcome")))
+            .await;
+        let Err(conflict) = result else {
+            panic!("conflicting create must fail")
+        };
+        assert_eq!(conflict.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(conflict.data.unwrap()["http_status"], 409);
+
+        let aggregate = anvil_core::validate_task_spec(&json!({"outcome":"aggregate"})).unwrap();
+        assert_eq!(
+            aggregate.completion_policy,
+            anvil_core::CompletionPolicy::AllChildrenCompleted
+        );
+    }
+
+    #[tokio::test]
+    async fn task_decisions_tool_forwards_bounded_cursor_page() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/tasks/task-1/decisions")
+                .query_param("cursor", "7")
+                .query_param("limit", "100");
+            then.status(200)
+                .json_body(json!({"decisions":[{"decision_sequence":8}],"next_cursor":8}));
+        });
+        let mcp = AnvilMcp::new(reqwest::Url::parse(&format!("{}/", server.base_url())).unwrap())
+            .unwrap();
+        let page = mcp
+            .anvil_get_task_decisions(Parameters(TaskDecisions {
+                task_id: "task-1".into(),
+                cursor: Some(7),
+                limit: Some(1_000),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(page["decisions"][0]["decision_sequence"], 8);
+        assert_eq!(page["next_cursor"], 8);
     }
 
     #[tokio::test]
@@ -874,6 +1369,8 @@ mod tests {
             "anvil_get_activity",
             "anvil_get_status",
             "anvil_create_session",
+            "anvil_create_task",
+            "anvil_get_task_decisions",
             "anvil_create_attempt",
             "anvil_send_message",
             "anvil_suspend",
@@ -956,6 +1453,7 @@ mod tests {
         }
         for mutation in [
             "anvil_create_session",
+            "anvil_create_task",
             "anvil_submit_batch",
             "anvil_create_attempt",
             "anvil_send_message",
@@ -973,6 +1471,7 @@ mod tests {
                 "{mutation} schema lacks idempotency_key"
             );
         }
+        assert!(!names.contains("anvil_set_task_controller_mode"));
         for readonly in [
             "anvil_get_session",
             "anvil_get_messages",
@@ -980,6 +1479,10 @@ mod tests {
             "anvil_get_diff",
             "anvil_get_batch",
             "anvil_get_task",
+            "anvil_get_task_snapshot",
+            "anvil_list_tasks",
+            "anvil_list_task_attempts",
+            "anvil_get_task_decisions",
             "anvil_get_attempt",
         ] {
             let tool = tools.iter().find(|tool| tool["name"] == readonly).unwrap();
