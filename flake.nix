@@ -2,7 +2,6 @@
   description = "Anvil development environment and reproducible Rust builds";
 
   inputs = {
-    nixpkgs.follows = "sdlc/nixpkgs";
     flake-utils.url = "github:numtide/flake-utils";
     crane.url = "github:ipetkov/crane";
     # Temporary pin for nlewo/nix2container#199 / issue #192.
@@ -10,13 +9,14 @@
     nix2container.url = "github:Dauliac/nix2container/8fd02c842686a528fd37508283853de0ed1462b1";
     nix2containerNixpkgs.follows = "nix2container/nixpkgs";
     opencode.url = "github:anomalyco/opencode/9b4ec5714d481559990db0a816d5dec19541a814";
-    sdlc.url = "github:blogle/sdlc/v1.4.2";
+    sdlc.url = "github:blogle/sdlc/v2";
   };
 
-  outputs = { self, nixpkgs, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode, sdlc }:
+  outputs = { self, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode, sdlc }:
     flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        packageSets = sdlc.lib.importPackages { inherit system; };
+        pkgs = packageSets.latest;
         # The upstream V2 package's install check invokes `opencode --version`
         # in a context where its runtime creates /tmp and fails under Nix's
         # install-check sandbox. Keep the upstream default build unchanged and
@@ -68,7 +68,7 @@
           };
         };
         ci = sdlc.lib.mkConsumer {
-          inherit (ciContract) fast verify publish;
+          inherit (ciContract) check verify publish;
         };
       in
       {
