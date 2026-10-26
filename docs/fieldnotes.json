@@ -1,0 +1,11 @@
+{
+  "title": "Anvil engineering documentation",
+  "entry": "index.html",
+  "navigation": [
+    { "label": "Overview", "href": "index.html" },
+    { "label": "Specification", "href": "spec.html" },
+    { "label": "Architecture", "href": "architecture.html" },
+    { "label": "UI mockup", "href": "ui.html" },
+    { "label": "Research", "href": "research.md" }
+  ]
+}
