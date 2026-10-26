@@ -1,7 +1,7 @@
 # ADR-001: TypeScript end-to-end and Bun-first implementation
 
 Status: Accepted architecture direction, 2026-10-20.
-Scope: Anvil v2 implementation. Approved Campaign, Commission, evidence and authority semantics are unchanged.
+Scope: Anvil implementation. Approved Campaign, Commission, evidence and authority semantics are unchanged.
 Priority: Short development feedback loops and rapid convergence over premature runtime optimization.
 
 ## Decision

@@ -2,12 +2,12 @@
 <html lang="en">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Anvil v2 / design dossier</title><meta name="description" content="Anvil v2 technical documentation: domain specification and control architecture.">
+  <title>Anvil / design dossier</title><meta name="description" content="Anvil technical documentation: domain specification and control architecture.">
   <link rel="stylesheet" href="style.css"><script defer src="site.js"></script>
 </head>
 <body data-page="index">
 <a class="skip" href="#main">Skip to content</a>
-<header class="masthead"><div class="shell masthead-inner"><a class="wordmark" href="index.html"><span class="mark">A</span>Anvil v2 <span class="kicker">/ docs</span></a><nav aria-label="Primary"><a data-page="index" href="index.html">Overview</a><a data-page="spec" href="spec.html">Spec</a><a data-page="architecture" href="architecture.html">Architecture</a><a data-page="research" href="research.md">Research ledger</a></nav></div></header>
+<header class="masthead"><div class="shell masthead-inner"><a class="wordmark" href="index.html"><span class="mark">A</span>Anvil <span class="kicker">/ docs</span></a><nav aria-label="Primary"><a data-page="index" href="index.html">Overview</a><a data-page="spec" href="spec.html">Spec</a><a data-page="architecture" href="architecture.html">Architecture</a><a data-page="research" href="research.md">Research ledger</a></nav></div></header>
 <section class="hero"><div class="shell hero-grid"><div><p class="eyebrow">Design documentation · draft</p><h1>System overview</h1><p class="lede">Anvil supervises remote coding agents and reconciles their execution, verification, and integration state against approved engineering objectives.</p><div class="status-row"><span class="status provisional">Draft specification</span><span class="status open">Runtime direction selected; persistence validation pending</span></div></div><aside class="hero-aside"><p class="eyebrow">Document status</p><p>This draft records required contracts, provisional mechanisms, and unresolved design decisions. It does not authorize implementation choices that remain open.</p><p class="kicker">Design base branch: <code>v2</code></p></aside></div></section>
 <main id="main" class="main"><div class="shell columns"><article>
 <section id="thesis">
@@ -18,6 +18,7 @@
 </section>
 <section id="status">
 <h2>Design status</h2>
+<p class="small">Anvil remains pre-1.0. The historical <code>v2</code> branch names the rewrite track, not a major release. Use SDLC changelogs and 0.x versions until a stable 1.0 release is explicitly authorized.</p>
 <div class="grid-3">
 <div class="panel"><span class="status agreed">Direction</span><h3>Externally supervised execution</h3><p class="small">Anvil reconciles durable intent against observed world state. Session events trigger observation but do not by themselves authorize action or establish completion.</p></div>
 <div class="panel"><span class="status provisional">Provisional</span><h3>Bounded continuation</h3><p class="small">OpenCode runs bounded Attempts. Anvil observes in-flight behavior, reconstitutes context from durable artifacts, and applies configurable recovery and escalation limits.</p></div>
@@ -53,5 +54,5 @@
 <li>Treating language selection as open: ADR-001 accepts TypeScript end-to-end and a Bun-first runtime with bounded Node.js fallback.</li>
 </ul>
 </section></article><aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#thesis">The thesis</a><a href="#status">Decision status</a><a href="#map">Three useful cuts</a><a href="#reading">Reading order</a><a href="#non-goals">Non-goals</a></aside></div></main>
-<footer class="footer"><div class="shell">Anvil v2 · Technical design · Draft</div></footer>
+<footer class="footer"><div class="shell">Anvil · Technical design · Draft</div></footer>
 </body></html>
