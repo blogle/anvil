@@ -18,6 +18,9 @@ lint:
 nix-check:
     nix flake check
 
+docs port="8765" host="127.0.0.1":
+    nix run .#docs -- --root docs --project . --port "{{port}}" --host "{{host}}"
+
 check:
     just fmt-check
     just build

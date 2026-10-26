@@ -1,15 +1,12 @@
 { self, system }:
 {
-  schemaVersion = 1;
-  stages = {
-    pr-fast = {
+  check = {
       flake = self.checks.${system}.flake;
       format = self.checks.${system}.fmt;
       clippy = self.checks.${system}.clippy;
-    };
-    candidate = {
+  };
+  verify = {
       build = self.checks.${system}.build;
       test = self.checks.${system}.test;
-    };
   };
 }

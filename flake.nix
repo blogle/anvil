@@ -1,20 +1,26 @@
 {
-  description = "Minimal Rust development environment for Anvil v2";
+  description = "Minimal Rust development environment for the Anvil pre-1.0 rewrite";
 
   inputs = {
-    sdlc.url = "github:blogle/sdlc/v1.3.0";
-    nixpkgs.follows = "sdlc/nixpkgs";
+    sdlc.url = "github:blogle/sdlc/v2";
     crane.url = "github:ipetkov/crane";
+    fieldnotes = {
+      url = "github:blogle/fieldnotes";
+      inputs.sdlc.follows = "sdlc";
+    };
   };
 
-  outputs = { self, nixpkgs, sdlc, crane }:
+  outputs = { self, sdlc, crane, fieldnotes }:
     let
       systems = [ "x86_64-linux" ];
-      forAllSystems = nixpkgs.lib.genAttrs systems;
+      forAllSystems = f: builtins.listToAttrs (map (system: {
+        name = system;
+        value = f system;
+      }) systems);
     in {
       checks = forAllSystems (system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = (sdlc.lib.importPackages { inherit system; }).latest;
           craneLib = crane.mkLib pkgs;
           src = craneLib.cleanCargoSource ./.;
           cargoArtifacts = craneLib.buildDepsOnly { inherit src; };
@@ -43,16 +49,32 @@
         nix-eval-jobs = sdlc.packages.${system}.nix-eval-jobs;
       });
 
-      ci = forAllSystems (system:
-        sdlc.lib.mkConsumer {
-          contract = import ./ci.nix { inherit self system; };
+      apps = forAllSystems (system: {
+        docs = {
+          type = "app";
+          program = "${fieldnotes.packages.${system}.default}/bin/fieldnotes";
+        };
+      });
+
+      publish = forAllSystems (system:
+        let pkgs = (sdlc.lib.importPackages { inherit system; }).latest;
+        in {
+          type = "app";
+          program = "${pkgs.writeShellScript "anvil-sdlc-publish" ''
+            echo "Anvil's pre-1.0 rewrite scaffold has no deployment artifacts."
+            exit 1
+          ''}";
         });
 
-      hydraJobs = forAllSystems (system: self.ci.${system}.hydraJobs);
+      ci = forAllSystems (system:
+        sdlc.lib.mkConsumer {
+          inherit (import ./ci.nix { inherit self system; }) check verify;
+          publish = self.publish.${system};
+        });
 
       devShells = forAllSystems (system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = (sdlc.lib.importPackages { inherit system; }).latest;
           craneLib = crane.mkLib pkgs;
         in {
           default = craneLib.devShell {

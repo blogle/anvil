@@ -15,6 +15,31 @@
         "type": "github"
       }
     },
+    "fieldnotes": {
+      "inputs": {
+        "nixpkgs": [
+          "fieldnotes",
+          "sdlc",
+          "nixpkgs-latest"
+        ],
+        "sdlc": [
+          "sdlc"
+        ]
+      },
+      "locked": {
+        "lastModified": 1793040979,
+        "narHash": "sha256-V+7TWa124+ie6ICkrgXL10IlqzcE6YWCyVZ/aT2QJTg=",
+        "owner": "blogle",
+        "repo": "fieldnotes",
+        "rev": "60f863bc41820fffda1ad8e950438a19b1dbdc2b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "blogle",
+        "repo": "fieldnotes",
+        "type": "github"
+      }
+    },
     "mergify-cli": {
       "flake": false,
       "locked": {
@@ -36,7 +61,7 @@
         "mergify-cli": "mergify-cli",
         "nixpkgs": [
           "sdlc",
-          "nixpkgs"
+          "nixpkgs-latest"
         ],
         "rust-overlay": "rust-overlay"
       },
@@ -54,13 +79,13 @@
         "type": "github"
       }
     },
-    "nixpkgs": {
+    "nixpkgs-latest": {
       "locked": {
-        "lastModified": 1790822859,
-        "narHash": "sha256-69xHQhAeMAD2wDXO7T2pcOZIF9Sga2W+JkmY2a11Ops=",
+        "lastModified": 1792502884,
+        "narHash": "sha256-IoNisKcGbUjdd45qCqywGMCYmZ5EnkxezvLII0FWwNA=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "c59305bab2065cfecc4944690d9eedbb56f3a9fa",
+        "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
         "type": "github"
       },
       "original": {
@@ -70,13 +95,26 @@
         "type": "github"
       }
     },
+    "nixpkgs-stable": {
+      "locked": {
+        "lastModified": 1792615934,
+        "narHash": "sha256-MlvRfa1O5Cqc2/a+gG+l9TSuowEoCKCmrJ1d9oAVm0I=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "da6dc0e7b26060f2f71ce3ef7088fb56ee44fa36",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-26.05",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "crane": "crane",
-        "nixpkgs": [
-          "sdlc",
-          "nixpkgs"
-        ],
+        "fieldnotes": "fieldnotes",
         "sdlc": "sdlc"
       }
     },
@@ -105,19 +143,20 @@
     "sdlc": {
       "inputs": {
         "mergify-nix": "mergify-nix",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs-latest": "nixpkgs-latest",
+        "nixpkgs-stable": "nixpkgs-stable"
       },
       "locked": {
-        "lastModified": 1791686693,
-        "narHash": "sha256-VuDMFo3i0Y664FCPmYffLUDM14tUswBfScSL3yfBiXs=",
+        "lastModified": 1792810233,
+        "narHash": "sha256-3I8kukKM2rLKbokbOll/wBAsNHE9M21TJhVaoH/4FKI=",
         "owner": "blogle",
         "repo": "sdlc",
-        "rev": "c7bd6449c322f51ef057445c4de35655cc41cfb1",
+        "rev": "21ae48a50a3a39a9e45dc84c6f244ce038bb166f",
         "type": "github"
       },
       "original": {
         "owner": "blogle",
-        "ref": "v1.3.0",
+        "ref": "v2",
         "repo": "sdlc",
         "type": "github"
       }
