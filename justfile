@@ -5,12 +5,15 @@ default:
 
 fmt:
     cargo fmt --all
+    bun run fmt
 
 build:
     cargo build
+    bun run typecheck
 
 test:
     cargo test
+    bun run test
 
 lint:
     cargo clippy --all-targets -- -D warnings
@@ -22,6 +25,7 @@ docs port="8765" host="127.0.0.1":
     nix run .#docs -- --root docs --project . --port "{{port}}" --host "{{host}}"
 
 check:
+    just deps
     just fmt-check
     just build
     just lint
@@ -30,3 +34,7 @@ check:
 
 fmt-check:
     cargo fmt --all -- --check
+    bun run fmt:check
+
+deps:
+    bun install --frozen-lockfile

@@ -1,5 +1,5 @@
 {
-  description = "Minimal Rust development environment for the Anvil pre-1.0 rewrite";
+  description = "Bun-first development environment for the Anvil pre-1.0 rewrite";
 
   inputs = {
     sdlc.url = "github:blogle/sdlc/v2";
@@ -24,6 +24,24 @@
           craneLib = crane.mkLib pkgs;
           src = craneLib.cleanCargoSource ./.;
           cargoArtifacts = craneLib.buildDepsOnly { inherit src; };
+          typescript = pkgs.buildNpmPackage {
+            pname = "anvil-typescript-check";
+            version = "0.1.0";
+            src = ./.;
+            npmDepsHash = "sha256-zqpvZil2sFD649Wh1G6CdJTKFADSDCJ4IjnG/J9rTtk=";
+            npmDepsFetcherVersion = 2;
+            dontNpmBuild = true;
+            nativeBuildInputs = [ pkgs.bun ];
+            installPhase = ''
+              runHook preInstall
+              bun run fmt:check
+              bun run typecheck
+              bun test
+              mkdir -p $out
+              touch $out
+              runHook postInstall
+            '';
+          };
           package = craneLib.buildPackage {
             inherit src cargoArtifacts;
             doCheck = true;
@@ -31,6 +49,7 @@
         in {
           build = package;
           test = package;
+          inherit typescript;
           fmt = craneLib.cargoFmt { inherit src; };
           clippy = craneLib.cargoClippy {
             inherit src cargoArtifacts;
@@ -78,7 +97,13 @@
           craneLib = crane.mkLib pkgs;
         in {
           default = craneLib.devShell {
-            packages = [ pkgs.just pkgs.nix pkgs.rustfmt ];
+            packages = [
+              pkgs.bun
+              pkgs.just
+              pkgs.nix
+              pkgs.nodejs
+              pkgs.rustfmt
+            ];
           };
         });
     };
