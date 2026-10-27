@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anvil — Convergence and review mockups</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="masthead"><div class="shell masthead-inner"><a class="wordmark" href="index.md"><span class="mark">A</span>Anvil <span class="kicker">/ docs</span></a><nav aria-label="Documentation"><a href="index.md">Overview</a><a href="spec.md">Specification</a><a href="architecture.md">Architecture</a><a href="ui.html">UI reference</a></nav></div></header>
+<main class="main"><div class="shell">
+<section id="convergence-review-ux">
+<p><span class="status provisional">Provisional direction · #8</span> Commission reconciliation computes an evidence and review-readiness projection from authoritative specification generations, worker reports, observable Git/CI results, durable Findings, and review decisions. Review is an explicit waiting condition for a policy requiring operator authorization. Neither Lific plan completion nor model self-report establishes delivery.</p>
+<div class="acceptance-demo">
+  <figure class="acceptance-demo-flow">
+    <figcaption>Convergence flow — illustrative controller outcomes</figcaption>
+    <div class="acceptance-demo-flowsteps" aria-label="Commission convergence flow">
+      <div class="acceptance-demo-step"><strong>1. Implement</strong><span>Worker edits, runs targeted tests, pushes and submits evidence</span></div>
+      <div class="acceptance-demo-step"><strong>2. Observe and assess</strong><span>Candidate, semantic gaps, Findings, CI, budgets and PR health</span></div>
+      <div class="acceptance-demo-branches">
+        <div><b>Gaps or failures</b><span>Continue, repair, refresh context or change Attempt; re-assess</span></div>
+        <div><b>Healthy external wait</b><span>Wait for CI, dependency or reviewer; no unnecessary prompt</span></div>
+        <div><b>Budget exhausted</b><span>Hold and escalate with evidence and unresolved obligations</span></div>
+      </div>
+      <div class="acceptance-demo-step emphasis"><strong>3. Ready for review</strong><span>Present review packet in Anvil inbox; hold integration if required</span></div>
+      <div class="acceptance-demo-branches">
+        <div><b>Changes requested</b><span>Create Findings or governed amendment, then resume convergence</span></div>
+        <div><b>Approved</b><span>Authorize integration subject to repository delivery policy</span></div>
+      </div>
+      <div class="acceptance-demo-step"><strong>4. Observe delivery</strong><span>GitHub/Mergify integration evidence determines completion</span></div>
+    </div>
+  </figure>
+  <div class="acceptance-demo-grid">
+    <figure class="acceptance-demo-panel">
+      <figcaption>Commission progress card — illustrative data</figcaption>
+      <div class="acceptance-demo-kicker">COMMISSION / TRANSACTION FORM</div>
+      <div class="acceptance-demo-panelhead"><strong>Responsive transaction entry</strong><span class="acceptance-demo-tag">Implementation</span></div>
+      <div class="acceptance-demo-muted">Lific execution plan · 4 of 6 steps completed (agent-reported)</div>
+      <div class="acceptance-demo-progress" aria-label="Four of six execution plan steps completed"><span style="width:66.67%"></span></div>
+      <div class="acceptance-demo-subhead">Acceptance evidence</div>
+      <div class="acceptance-demo-line"><span>✓ A1, A2, A6</span><small>Submitted and assessed</small></div>
+      <div class="acceptance-demo-line"><span>○ A3, A4, A5</span><small>Missing or insufficient</small></div>
+      <div class="acceptance-demo-subhead">External evidence</div>
+      <div class="acceptance-demo-line"><span>CI</span><small>Responsive-layout check failing</small></div>
+      <div class="acceptance-demo-line"><span>Review</span><small>Not yet requested</small></div>
+      <div class="acceptance-demo-next"><b>Next controller action</b><span>Resume implementation with all remaining gaps and CI failure context</span></div>
+    </figure>
+    <figure class="acceptance-demo-panel">
+      <figcaption>Review and intervention inbox — illustrative data</figcaption>
+      <div class="acceptance-demo-kicker">ATTENTION / COMPUTED FROM COMMISSIONS</div>
+      <div class="acceptance-demo-inboxrow">
+        <span class="acceptance-demo-mark">↗</span>
+        <div><strong>Transaction form responsiveness</strong><small>Evidence provided · CI passing · PR reviewable · preview available</small></div>
+        <span class="acceptance-demo-tag">Review</span>
+      </div>
+      <div class="acceptance-demo-inboxrow">
+        <span class="acceptance-demo-mark">!</span>
+        <div><strong>Sandbox integration failure</strong><small>Attempt budget exhausted · strategy decision required</small></div>
+        <span class="acceptance-demo-tag">Blocked</span>
+      </div>
+      <div class="acceptance-demo-inboxrow">
+        <span class="acceptance-demo-mark">○</span>
+        <div><strong>Authentication refactor</strong><small>CI running · no operator action required</small></div>
+        <span class="acceptance-demo-tag">Waiting</span>
+      </div>
+      <div class="acceptance-demo-next"><b>Review package</b><span>Approved criteria, Candidate SHA, diff, evidence, Findings, CI and mergeability, PR and preview links, outstanding actions</span></div>
+    </figure>
+  </div>
+</div>
+<p>The UI SHALL distinguish observed facts, worker-reported progress, controller assessments, stale information, and authorized interventions. Inbox rows are derived from Commission state; they are not separate persisted lifecycle aggregates. Completion requires authoritative integration outcome, not mere approval, CI success, or PR creation.</p>
+<p>See <a href="spec.md#acceptance-obligations-evidence-and-review">Acceptance obligations and review contract</a> for the normative boundaries.</p>
+</section>
+</div></main>
+<footer class="footer"><div class="shell">Anvil · Technical design · Illustrative mockup</div></footer>
+</body></html>
