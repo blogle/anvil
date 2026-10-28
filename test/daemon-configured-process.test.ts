@@ -71,10 +71,13 @@ async function waitUntilReady(baseUrl: string): Promise<void> {
   throw new Error("Configured daemon did not become ready within four seconds");
 }
 
-async function waitForBootstrapOperations(baseUrl: string): Promise<void> {
+async function waitForBootstrapOperations(
+  baseUrl: string,
+  commissionId: string,
+): Promise<void> {
   for (let attempt = 0; attempt < 200; attempt += 1) {
     const response = await fetch(
-      `${baseUrl}/api/commissions/configured-commission/operations`,
+      `${baseUrl}/api/commissions/${commissionId}/operations`,
       { headers: { authorization: `Bearer ${apiToken}` } },
     );
     if (response.ok) {
@@ -100,6 +103,35 @@ async function waitForBootstrapOperations(baseUrl: string): Promise<void> {
   throw new Error("Configured provider bootstrap Operations did not finish");
 }
 
+async function waitForAmbiguousSessionCreate(
+  baseUrl: string,
+  commissionId: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 160; attempt += 1) {
+    const response = await fetch(
+      `${baseUrl}/api/commissions/${commissionId}/operations`,
+      { headers: { authorization: `Bearer ${apiToken}` } },
+    );
+    if (response.ok) {
+      const body = (await response.json()) as {
+        operations: readonly { kind: string; outcome: { kind: string } }[];
+      };
+      if (
+        body.operations.some(
+          (operation) =>
+            operation.kind === "create_session" &&
+            operation.outcome.kind === "ambiguous",
+        )
+      )
+        return;
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error(
+    "Session-create lost acknowledgement was not durably recorded",
+  );
+}
+
 test("configured Bun daemon composes local HTTP providers and recovers bindings without replay", async () => {
   directory = mkdtempSync(join(tmpdir(), "anvil-configured-daemon-"));
   const serverPort = allocatePort();
@@ -107,9 +139,10 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   const openCodePort = allocatePort();
   const githubPort = allocatePort();
   const mergifyPort = allocatePort();
-  let sandboxResource: Record<string, unknown> | null = null;
-  let sessionId: string | null = null;
-  let userMessageId: string | null = null;
+  const sandboxResources = new Map<string, Record<string, unknown>>();
+  const sessions = new Map<string, string>();
+  const userMessageIds = new Map<string, string>();
+  let loseNextSessionCreateAck = false;
   provisionCount = 0;
   sessionCreateCount = 0;
   promptCount = 0;
@@ -122,14 +155,12 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
       );
       const url = new URL(request.url);
       if (url.pathname.endsWith("/sandboxes") && request.method === "GET")
-        return Response.json({
-          items: sandboxResource === null ? [] : [sandboxResource],
-        });
+        return Response.json({ items: [...sandboxResources.values()] });
       if (url.pathname.endsWith("/sandboxes") && request.method === "POST") {
         provisionCount += 1;
         const desired = (await request.json()) as Record<string, unknown>;
         const metadata = desired["metadata"] as Record<string, unknown>;
-        sandboxResource = {
+        const resource = {
           ...desired,
           metadata: {
             ...metadata,
@@ -138,14 +169,18 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
           },
           status: { conditions: [{ type: "Ready", status: "True" }] },
         };
-        return Response.json(sandboxResource, { status: 201 });
+        sandboxResources.set(metadata["name"] as string, resource);
+        return Response.json(resource, { status: 201 });
       }
       const prefix =
         "/apis/agents.x-k8s.io/v1beta1/namespaces/configured-test/sandboxes/";
-      if (url.pathname.startsWith(prefix))
-        return sandboxResource === null
+      if (url.pathname.startsWith(prefix)) {
+        const name = decodeURIComponent(url.pathname.slice(prefix.length));
+        const resource = sandboxResources.get(name);
+        return resource === undefined
           ? Response.json({ message: "not found" }, { status: 404 })
-          : Response.json(sandboxResource);
+          : Response.json(resource);
+      }
       return Response.json({ message: "not found" }, { status: 404 });
     },
   });
@@ -160,7 +195,16 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
         return Response.json({ data: [] });
       if (url.pathname.endsWith("/api/session") && request.method === "POST") {
         sessionCreateCount += 1;
-        sessionId = "configured-session-1";
+        const sandboxName = url.pathname.split("/")[1]!;
+        const sessionId = `session-${sandboxName}`;
+        sessions.set(sandboxName, sessionId);
+        if (loseNextSessionCreateAck) {
+          loseNextSessionCreateAck = false;
+          return Response.json(
+            { message: "accepted but acknowledgement lost" },
+            { status: 504 },
+          );
+        }
         return Response.json({ data: { id: sessionId } });
       }
       if (url.pathname.endsWith("/model"))
@@ -168,14 +212,18 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
       if (url.pathname.endsWith("/prompt")) {
         promptCount += 1;
         const prompt = (await request.json()) as { id: string; text: string };
-        userMessageId = prompt.id;
+        userMessageIds.set(url.pathname.split("/")[1]!, prompt.id);
         return Response.json({ data: { id: prompt.id } });
       }
-      if (url.pathname.endsWith("/message"))
+      if (url.pathname.endsWith("/message")) {
+        const userMessageId = userMessageIds.get(url.pathname.split("/")[1]!);
         return Response.json({
           data:
-            userMessageId === null ? [] : [{ id: userMessageId, type: "user" }],
+            userMessageId === undefined
+              ? []
+              : [{ id: userMessageId, type: "user" }],
         });
+      }
       return Response.json({ message: "not found" }, { status: 404 });
     },
   });
@@ -269,11 +317,11 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
     { method: "POST", headers, body: "{}" },
   );
   expect(admitted.status).toBe(200);
-  await waitForBootstrapOperations(baseUrl);
+  await waitForBootstrapOperations(baseUrl, "configured-commission");
   expect(provisionCount).toBe(1);
   expect(sessionCreateCount).toBe(1);
   expect(promptCount).toBe(1);
-  expect(String(sessionId)).toBe("configured-session-1");
+  expect(sessions.size).toBe(1);
 
   daemonProcess.kill("SIGTERM");
   await daemonProcess.exited;
@@ -293,6 +341,48 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
       { kind: "provision_sandbox", outcome: { kind: "observed" } },
       { kind: "create_session", outcome: { kind: "observed" } },
       { kind: "continue", outcome: { kind: "observed" } },
+    ],
+  });
+  const ambiguousId = "configured-ambiguous-session";
+  loseNextSessionCreateAck = true;
+  const ambiguousCreated = await fetch(`${baseUrl}/api/commissions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(
+      proposalInput({
+        id: ambiguousId,
+        repository: "https://github.com/acme/demo",
+      }),
+    ),
+  });
+  expect(ambiguousCreated.status).toBe(201);
+  const ambiguousAdmitted = await fetch(
+    `${baseUrl}/api/commissions/${ambiguousId}/admit`,
+    { method: "POST", headers, body: "{}" },
+  );
+  expect(ambiguousAdmitted.status).toBe(200);
+  await waitForAmbiguousSessionCreate(baseUrl, ambiguousId);
+  expect(provisionCount).toBe(2);
+  expect(sessionCreateCount).toBe(2);
+  expect(promptCount).toBe(1);
+
+  daemonProcess.kill("SIGTERM");
+  await daemonProcess.exited;
+  daemonProcess = undefined;
+  daemonProcess = startDaemon(runtimeEnvironment);
+  await waitUntilReady(baseUrl);
+  await Bun.sleep(100);
+  expect(provisionCount).toBe(2);
+  expect(sessionCreateCount).toBe(2);
+  expect(promptCount).toBe(1);
+  const unresolved = await fetch(
+    `${baseUrl}/api/commissions/${ambiguousId}/operations`,
+    { headers },
+  ).then((response) => response.json());
+  expect(unresolved).toMatchObject({
+    operations: [
+      { kind: "provision_sandbox", outcome: { kind: "observed" } },
+      { kind: "create_session", outcome: { kind: "ambiguous" } },
     ],
   });
 }, 15_000);
