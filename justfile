@@ -3,38 +3,28 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 default:
     just --list
 
+deps:
+    bun install --frozen-lockfile
+
 fmt:
-    cargo fmt --all
     bun run fmt
 
-build:
-    cargo build
+fmt-check:
+    bun run fmt:check
+
+typecheck:
     bun run typecheck
 
 test:
-    cargo test
-    bun run test
+    bun test
 
-lint:
-    cargo clippy --all-targets -- -D warnings
+check: deps fmt-check typecheck test
 
-nix-check:
+ci-check:
     nix flake check
+
+ci-verify:
+    nix build .#ci.x86_64-linux.verify.typescript --no-link
 
 docs port="8765" host="127.0.0.1":
     nix run .#docs -- --root docs --project . --port "{{port}}" --host "{{host}}"
-
-check:
-    just deps
-    just fmt-check
-    just build
-    just lint
-    just test
-    just nix-check
-
-fmt-check:
-    cargo fmt --all -- --check
-    bun run fmt:check
-
-deps:
-    bun install --frozen-lockfile

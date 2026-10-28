@@ -3,18 +3,183 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import {
-  commissionSchema,
-  decideCommission,
-  operationMatchesDecision,
-  operationSchema,
+  isCommissionProposal,
+  isDomainTransition,
+  type Attempt,
   type Commission,
+  type DeliveryEvidence,
+  type Evidence,
+  type Obligation,
   type Operation,
+  type OperationOutcome,
+  type Proposal,
+  type Transition,
 } from "../domain";
 
-const migration = readFileSync(
-  fileURLToPath(new URL("./migrations/0001_initial.sql", import.meta.url)),
-  "utf8",
-);
+const migrationList = [
+  {
+    version: 1,
+    sql: readFileSync(
+      fileURLToPath(new URL("./migrations/0001_core.sql", import.meta.url)),
+      "utf8",
+    ),
+  },
+] as const;
+const latestSchemaVersion = 1;
+const commissionColumns = [
+  "id",
+  "campaign_id",
+  "objective",
+  "repository",
+  "integration_target",
+  "specification_generation",
+  "independent_review_required",
+  "lifecycle",
+  "hold_reason",
+  "owner_controller_id",
+  "owner_epoch",
+  "version",
+  "active_attempt_id",
+  "max_attempts",
+  "max_instructions",
+  "max_repairs",
+  "max_cost_micros",
+  "deadline_at",
+  "attempts_used",
+  "instructions_used",
+  "repairs_used",
+  "cost_used_micros",
+  "candidate_revision",
+  "candidate_observed_at",
+  "candidate_expires_at",
+  "candidate_source",
+  "delivered_revision",
+  "delivered_provider_identity",
+  "delivered_source",
+  "delivered_observed_at",
+  "delivered_expires_at",
+  "delivered_check_run_id",
+  "delivered_specification_generation",
+] as const;
+
+const commissionRow = z.object({
+  id: z.string(),
+  campaign_id: z.string(),
+  objective: z.string(),
+  repository: z.string(),
+  integration_target: z.string(),
+  specification_generation: z.number(),
+  independent_review_required: z.number(),
+  lifecycle: z.enum(["proposed", "admitted", "active", "held", "concluded"]),
+  hold_reason: z.string().nullable(),
+  owner_controller_id: z.string().nullable(),
+  owner_epoch: z.number().nullable(),
+  version: z.number(),
+  active_attempt_id: z.string().nullable(),
+  max_attempts: z.number(),
+  max_instructions: z.number(),
+  max_repairs: z.number(),
+  max_cost_micros: z.number(),
+  deadline_at: z.number(),
+  attempts_used: z.number(),
+  instructions_used: z.number(),
+  repairs_used: z.number(),
+  cost_used_micros: z.number(),
+  candidate_revision: z.string().nullable(),
+  candidate_observed_at: z.number().nullable(),
+  candidate_expires_at: z.number().nullable(),
+  candidate_source: z.string().nullable(),
+  delivered_revision: z.string().nullable(),
+  delivered_provider_identity: z.string().nullable(),
+  delivered_source: z.string().nullable(),
+  delivered_observed_at: z.number().nullable(),
+  delivered_expires_at: z.number().nullable(),
+  delivered_check_run_id: z.string().nullable(),
+  delivered_specification_generation: z.number().nullable(),
+});
+const obligationRow = z.object({
+  id: z.string(),
+  description: z.string(),
+  independent_review_required: z.number(),
+});
+const attemptRow = z.object({
+  id: z.string(),
+  assignment_id: z.string(),
+  ordinal: z.number(),
+  strategy: z.string(),
+  lifecycle: z.enum(["active", "superseded", "completed"]),
+  next_instruction_sequence: z.number(),
+});
+const evidenceRow = z.object({
+  id: z.string(),
+  obligation_id: z.string(),
+  specification_generation: z.number(),
+  candidate_revision: z.string(),
+  source_kind: z.enum(["worker", "independent"]),
+  source_identity: z.string(),
+  disposition: z.enum(["submitted", "accepted", "challenged"]),
+  observed_at: z.number(),
+  expires_at: z.number(),
+  claim: z.string(),
+  check_run_id: z.string().nullable(),
+});
+const operationRow = z.object({
+  id: z.string(),
+  logical_key: z.string(),
+  commission_id: z.string(),
+  kind: z.enum([
+    "continue",
+    "repair",
+    "refresh_context",
+    "change_strategy",
+    "verify",
+    "integrate",
+  ]),
+  target: z.string(),
+  controller_id: z.string(),
+  owner_epoch: z.number(),
+  specification_generation: z.number(),
+  assignment_id: z.string(),
+  attempt_id: z.string(),
+  instruction_sequence: z.number(),
+  candidate_revision: z.string().nullable(),
+  directive: z.string(),
+  created_at: z.number(),
+  retry_count: z.number(),
+  outcome_kind: z.enum([
+    "prepared",
+    "submitted",
+    "ambiguous",
+    "observed",
+    "retry_authorized",
+    "rejected",
+  ]),
+  outcome_at: z.number().nullable(),
+  retry_authorized_at: z.number().nullable(),
+  outcome_source: z.string().nullable(),
+  outcome_result: z
+    .enum(["accepted", "rejected", "applied", "not_applied"])
+    .nullable(),
+  outcome_reason: z.string().nullable(),
+  retry_safe: z.number(),
+});
+const operationFindingRow = z.object({ finding_id: z.string() });
+
+export type StoreError =
+  | "untrusted_transition"
+  | "untrusted_proposal"
+  | "not_found"
+  | "conflict"
+  | "logical_operation_conflict";
+export type StoreResult<T> =
+  | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly error: StoreError };
+
+class AbortTransaction extends Error {
+  constructor(readonly storeError: StoreError) {
+    super(storeError);
+  }
+}
 
 export class CommissionStore {
   readonly #database: Database;
@@ -22,278 +187,531 @@ export class CommissionStore {
   constructor(path: string) {
     this.#database = new Database(path, { create: true, strict: true });
     this.#database.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
-    this.#database.exec(migration);
-    this.#database
-      .query(
-        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'))",
-      )
-      .run();
+    this.#migrate();
   }
 
   close(): void {
     this.#database.close();
   }
 
-  create(commission: Commission): boolean {
-    const parsed = commissionSchema.parse(commission);
-    if (parsed.lifecycle === "concluded") {
-      throw new Error(
-        "A Commission must be admitted and reconciled before conclusion",
-      );
-    }
-    if (parsed.operations.length > 0) {
-      throw new Error(
-        "Create the Commission before authorizing external Operations",
-      );
-    }
-    const transaction = this.#database.transaction(() => {
-      const result = this.#database
-        .query(
-          "INSERT OR IGNORE INTO commissions(id, generation, document, updated_at) VALUES (?, ?, ?, datetime('now'))",
-        )
-        .run(parsed.id, parsed.generation, JSON.stringify(parsed));
-      if (result.changes !== 1) return false;
-      this.#writeOperations(parsed.id, parsed.operations);
-      return true;
-    });
-    return transaction();
-  }
-
   get(commissionId: string): Commission | null {
-    const row = this.#database
-      .query("SELECT document FROM commissions WHERE id = ?")
+    const raw = this.#database
+      .query("SELECT * FROM commissions WHERE id = ?")
       .get(commissionId);
-    if (row === null) return null;
-    const document = rowDocumentSchema.parse(row).document;
-    return commissionSchema.parse(JSON.parse(document));
-  }
-
-  save(commission: Commission, expectedGeneration: number): boolean {
-    return this.#saveCommission(commission, expectedGeneration);
-  }
-
-  conclude(
-    commissionId: string,
-    expectedGeneration: number,
-    now: number,
-  ): Commission | null {
-    const current = this.get(commissionId);
-    if (current === null || current.generation !== expectedGeneration)
-      return null;
-    const decision = decideCommission(current, now);
-    if (decision.kind !== "conclude") return null;
-    const concluded: Commission = {
-      ...current,
-      generation: current.generation + 1,
-      lifecycle: "concluded",
+    if (raw === null || raw === undefined) return null;
+    const row = commissionRow.parse(raw);
+    const obligations = this.#database
+      .query(
+        "SELECT id, description, independent_review_required FROM obligations WHERE commission_id = ? AND specification_generation = ? ORDER BY id",
+      )
+      .all(commissionId, row.specification_generation)
+      .map((item) => {
+        const value = obligationRow.parse(item);
+        return {
+          id: value.id,
+          description: value.description,
+          independentReviewRequired: value.independent_review_required === 1,
+        } satisfies Obligation;
+      });
+    const attempts = this.#database
+      .query(
+        "SELECT id, assignment_id, ordinal, strategy, lifecycle, next_instruction_sequence FROM attempts WHERE commission_id = ? ORDER BY ordinal",
+      )
+      .all(commissionId)
+      .map((item) => {
+        const value = attemptRow.parse(item);
+        return {
+          id: value.id,
+          assignmentId: value.assignment_id,
+          ordinal: value.ordinal,
+          strategy: value.strategy,
+          lifecycle: value.lifecycle,
+          nextInstructionSequence: value.next_instruction_sequence,
+        } satisfies Attempt;
+      });
+    const evidence = this.#database
+      .query(
+        "SELECT id, obligation_id, specification_generation, candidate_revision, source_kind, source_identity, disposition, observed_at, expires_at, claim, check_run_id FROM evidence WHERE commission_id = ? ORDER BY id",
+      )
+      .all(commissionId)
+      .map((item) => {
+        const value = evidenceRow.parse(item);
+        return {
+          id: value.id,
+          obligationId: value.obligation_id,
+          specificationGeneration: value.specification_generation,
+          candidateRevision: value.candidate_revision,
+          source: { kind: value.source_kind, identity: value.source_identity },
+          disposition: value.disposition,
+          observedAt: value.observed_at,
+          expiresAt: value.expires_at,
+          claim: value.claim,
+          checkRunId: value.check_run_id,
+        } satisfies Evidence;
+      });
+    const owner =
+      row.owner_controller_id === null || row.owner_epoch === null
+        ? null
+        : { controllerId: row.owner_controller_id, epoch: row.owner_epoch };
+    return {
+      id: row.id,
+      campaignId: row.campaign_id,
+      objective: row.objective,
+      repository: row.repository,
+      integrationTarget: row.integration_target,
+      specificationGeneration: row.specification_generation,
+      obligations,
+      independentReviewRequired: row.independent_review_required === 1,
+      lifecycle: row.lifecycle,
+      holdReason: row.hold_reason,
+      owner,
+      version: row.version,
+      attempts,
+      activeAttemptId: row.active_attempt_id,
+      budget: {
+        limits: {
+          maxAttempts: row.max_attempts,
+          maxInstructions: row.max_instructions,
+          maxRepairs: row.max_repairs,
+          maxCostMicros: row.max_cost_micros,
+          deadlineAt: row.deadline_at,
+        },
+        used: {
+          attempts: row.attempts_used,
+          instructions: row.instructions_used,
+          repairs: row.repairs_used,
+          costMicros: row.cost_used_micros,
+        },
+      },
+      candidateRevision: row.candidate_revision,
+      candidateObservedAt: row.candidate_observed_at,
+      candidateExpiresAt: row.candidate_expires_at,
+      candidateSource: row.candidate_source,
+      deliveryEvidence:
+        row.delivered_revision === null
+          ? null
+          : ({
+              revision: row.delivered_revision,
+              providerIdentity: required(row.delivered_provider_identity),
+              source: required(row.delivered_source),
+              observedAt: required(row.delivered_observed_at),
+              expiresAt: required(row.delivered_expires_at),
+              checkRunId: required(row.delivered_check_run_id),
+              specificationGeneration: required(
+                row.delivered_specification_generation,
+              ),
+            } satisfies DeliveryEvidence),
+      evidence,
     };
-    return this.#saveCommission(concluded, expectedGeneration, undefined, true)
-      ? concluded
-      : null;
   }
 
-  #saveCommission(
-    commission: Commission,
-    expectedGeneration: number,
-    authorizedNewOperationId?: string,
-    authorizedConclusion = false,
-  ): boolean {
-    const parsed = commissionSchema.parse(commission);
-    if (parsed.generation !== expectedGeneration + 1) {
-      throw new Error("A Commission save must advance exactly one generation");
-    }
-    const transaction = this.#database.transaction(() => {
-      const current = this.get(parsed.id);
-      if (current === null || current.generation !== expectedGeneration)
-        return false;
-      assertMonotonicUpdate(
-        current,
-        parsed,
-        authorizedNewOperationId,
-        authorizedConclusion,
-      );
-      const result = this.#database
+  operations(commissionId: string): readonly Operation[] {
+    const rows = this.#database
+      .query(
+        "SELECT * FROM operations WHERE commission_id = ? ORDER BY created_at, id",
+      )
+      .all(commissionId);
+    return rows.map((raw) => {
+      const row = operationRow.parse(raw);
+      const findingIds = this.#database
         .query(
-          "UPDATE commissions SET generation = ?, document = ?, updated_at = datetime('now') WHERE id = ? AND generation = ?",
+          "SELECT finding_id FROM operation_findings WHERE operation_id = ? ORDER BY finding_id",
         )
-        .run(
-          parsed.generation,
-          JSON.stringify(parsed),
-          parsed.id,
-          expectedGeneration,
-        );
-      if (result.changes !== 1) return false;
-      this.#database
-        .query("DELETE FROM operations WHERE commission_id = ?")
-        .run(parsed.id);
-      this.#writeOperations(parsed.id, parsed.operations);
-      return true;
+        .all(row.id)
+        .map((item) => operationFindingRow.parse(item).finding_id);
+      return {
+        id: row.id,
+        logicalKey: row.logical_key,
+        commissionId: row.commission_id,
+        kind: row.kind,
+        target: row.target,
+        controllerId: row.controller_id,
+        ownerEpoch: row.owner_epoch,
+        specificationGeneration: row.specification_generation,
+        assignmentId: row.assignment_id,
+        attemptId: row.attempt_id,
+        instructionSequence: row.instruction_sequence,
+        retryCount: row.retry_count,
+        candidateRevision: row.candidate_revision,
+        findingIds,
+        directive: row.directive,
+        createdAt: row.created_at,
+        outcome: operationOutcome(row),
+      } satisfies Operation;
     });
-    return transaction();
   }
 
-  prepareOperation(
-    commissionId: string,
-    expectedGeneration: number,
-    operation: Operation,
-    authorizedAt: number,
-  ): Commission | null {
-    const parsedOperation = operationSchema.parse(operation);
-    if (parsedOperation.state.kind !== "prepared") {
-      throw new Error(
-        "An external Operation must be persisted as prepared before submission",
-      );
+  propose(proposal: Proposal): StoreResult<void> {
+    if (!isCommissionProposal(proposal))
+      return { ok: false, error: "untrusted_proposal" };
+    const commission = proposal.commission;
+    try {
+      const insert = this.#database.transaction(() => {
+        const exists = this.#database
+          .query("SELECT 1 FROM commissions WHERE id = ?")
+          .get(commission.id);
+        if (exists !== null && exists !== undefined)
+          throw new AbortTransaction("conflict");
+        this.#insertCommission(commission);
+        this.#insertObligations(commission);
+      });
+      insert.immediate();
+      return { ok: true, value: undefined };
+    } catch (cause) {
+      if (cause instanceof AbortTransaction)
+        return { ok: false, error: cause.storeError };
+      throw cause;
     }
-    const current = this.get(commissionId);
-    if (current === null) return null;
-    const previous = current.operations.find(
-      ({ id }) => id === parsedOperation.id,
+  }
+
+  commitTransition(authorized: Transition): StoreResult<number> {
+    if (!isDomainTransition(authorized))
+      return { ok: false, error: "untrusted_transition" };
+    try {
+      let committedVersion: number | undefined;
+      const commit = this.#database.transaction(() => {
+        const current = this.get(authorized.commission.id);
+        if (current === null) throw new AbortTransaction("not_found");
+        if (
+          current.version !== authorized.beforeVersion ||
+          authorized.commission.version !== current.version + 1
+        ) {
+          throw new AbortTransaction("conflict");
+        }
+        for (const operation of authorized.newOperations) {
+          const existing = this.#database
+            .query("SELECT id FROM operations WHERE logical_key = ?")
+            .get(operation.logicalKey);
+          if (existing !== null && existing !== undefined)
+            throw new AbortTransaction("logical_operation_conflict");
+        }
+        this.#writeCommission(authorized.commission, current.version);
+        if (
+          authorized.commission.specificationGeneration !==
+          current.specificationGeneration
+        ) {
+          this.#insertObligations(authorized.commission);
+        }
+        this.#writeAttempts(authorized.commission);
+        this.#insertEvidence(authorized.commission, current.evidence);
+        this.#insertOperations(authorized.newOperations);
+        this.#updateOperations(authorized.updatedOperations);
+        committedVersion = authorized.commission.version;
+      });
+      commit.immediate();
+      if (committedVersion === undefined)
+        throw new Error("Transaction did not commit a Commission version");
+      return { ok: true, value: committedVersion };
+    } catch (cause) {
+      if (cause instanceof AbortTransaction)
+        return { ok: false, error: cause.storeError };
+      throw cause;
+    }
+  }
+
+  migrationVersion(): number {
+    const row = this.#database
+      .query("SELECT MAX(version) AS version FROM schema_migrations")
+      .get();
+    const parsed = z.object({ version: z.number().nullable() }).parse(row);
+    return parsed.version ?? 0;
+  }
+
+  #migrate(): void {
+    this.#database.exec(
+      "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
     );
-    if (previous !== undefined) {
-      return previous.state.kind === "prepared" &&
-        JSON.stringify(previous) === JSON.stringify(parsedOperation)
-        ? current
-        : null;
-    }
-    if (current.generation !== expectedGeneration) return null;
-    if (parsedOperation.authorizedGeneration !== expectedGeneration) {
-      throw new Error(
-        "Operation precondition does not match the current Commission generation",
-      );
-    }
-    if (
-      parsedOperation.assignmentId !== current.assignmentId ||
-      parsedOperation.attemptId !== current.attempt.id
-    ) {
-      throw new Error(
-        "Operation is outside the current Assignment and Attempt",
-      );
-    }
-    if (
-      current.owner === null ||
-      current.owner.leaseExpiresAt <= authorizedAt
-    ) {
-      throw new Error(
-        "Cannot authorize an Operation without current Commission ownership",
-      );
-    }
-    const decision = decideCommission(current, authorizedAt);
-    if (!operationMatchesDecision(decision, parsedOperation)) {
-      throw new Error(
-        `Operation ${parsedOperation.kind} is not authorized by the current ${decision.kind} decision`,
-      );
-    }
-    const next: Commission = {
-      ...current,
-      generation: current.generation + 1,
-      operations: [...current.operations, parsedOperation],
-    };
-    return this.#saveCommission(next, expectedGeneration, parsedOperation.id)
-      ? next
-      : null;
+    const migrate = this.#database.transaction(() => {
+      let applied = this.migrationVersion();
+      if (applied > latestSchemaVersion) {
+        throw new Error(
+          `Database schema version ${applied} is newer than this runtime`,
+        );
+      }
+      for (const migration of migrationList) {
+        if (migration.version <= applied) continue;
+        if (migration.version !== applied + 1)
+          throw new Error(`Missing SQLite migration ${applied + 1}`);
+        this.#database.exec(migration.sql);
+        this.#database
+          .query(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+          )
+          .run(migration.version, Date.now());
+        applied = migration.version;
+      }
+    });
+    migrate.immediate();
   }
 
-  #writeOperations(commissionId: string, operations: Operation[]): void {
+  #insertCommission(commission: Commission): void {
+    this.#database
+      .query(
+        `INSERT INTO commissions (${commissionColumns.join(",")}) VALUES (${new Array(commissionColumns.length).fill("?").join(",")})`,
+      )
+      .run(...commissionValues(commission));
+  }
+
+  #writeCommission(commission: Commission, expectedVersion: number): void {
+    const values = commissionValues(commission);
+    const assignments = commissionColumns
+      .slice(1)
+      .map((column) => `${column} = ?`)
+      .join(",");
+    const result = this.#database
+      .query(
+        `UPDATE commissions SET ${assignments} WHERE id = ? AND version = ?`,
+      )
+      .run(...values.slice(1), commission.id, expectedVersion);
+    if (result.changes !== 1) throw new AbortTransaction("conflict");
+  }
+
+  #insertObligations(commission: Commission): void {
     const insert = this.#database.query(
-      "INSERT INTO operations(id, commission_id, kind, target, state, document, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO obligations(commission_id, specification_generation, id, description, independent_review_required) VALUES (?, ?, ?, ?, ?)",
+    );
+    for (const item of commission.obligations)
+      insert.run(
+        commission.id,
+        commission.specificationGeneration,
+        item.id,
+        item.description,
+        Number(item.independentReviewRequired),
+      );
+  }
+
+  #writeAttempts(commission: Commission): void {
+    const insert = this.#database
+      .query(`INSERT INTO attempts(commission_id, id, assignment_id, ordinal, strategy, lifecycle, next_instruction_sequence)
+      VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(commission_id, id) DO UPDATE SET
+      strategy = excluded.strategy, lifecycle = excluded.lifecycle, next_instruction_sequence = excluded.next_instruction_sequence`);
+    for (const attempt of commission.attempts)
+      insert.run(
+        commission.id,
+        attempt.id,
+        attempt.assignmentId,
+        attempt.ordinal,
+        attempt.strategy,
+        attempt.lifecycle,
+        attempt.nextInstructionSequence,
+      );
+  }
+
+  #insertEvidence(commission: Commission, previous: readonly Evidence[]): void {
+    const known = new Set(previous.map(({ id }) => id));
+    const insert = this.#database.query(`INSERT INTO evidence(
+      commission_id, id, obligation_id, specification_generation, candidate_revision, source_kind,
+      source_identity, disposition, observed_at, expires_at, claim, check_run_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    for (const evidence of commission.evidence) {
+      if (known.has(evidence.id)) continue;
+      insert.run(
+        commission.id,
+        evidence.id,
+        evidence.obligationId,
+        evidence.specificationGeneration,
+        evidence.candidateRevision,
+        evidence.source.kind,
+        evidence.source.identity,
+        evidence.disposition,
+        evidence.observedAt,
+        evidence.expiresAt,
+        evidence.claim,
+        evidence.checkRunId,
+      );
+    }
+  }
+
+  #insertOperations(operations: readonly Operation[]): void {
+    const insert = this.#database.query(`INSERT INTO operations(
+      id, logical_key, commission_id, kind, target, controller_id, owner_epoch,
+      specification_generation, assignment_id, attempt_id, instruction_sequence,
+      candidate_revision, directive, created_at, retry_count, outcome_kind, outcome_at,
+      retry_authorized_at, outcome_source, outcome_result, outcome_reason, retry_safe
+    ) VALUES (${new Array(22).fill("?").join(",")})`);
+    const insertFinding = this.#database.query(
+      "INSERT INTO operation_findings(operation_id, finding_id) VALUES (?, ?)",
     );
     for (const operation of operations) {
+      const row = outcomeValues(operation.outcome);
       insert.run(
         operation.id,
-        commissionId,
+        operation.logicalKey,
+        operation.commissionId,
         operation.kind,
         operation.target,
-        operation.state.kind,
-        JSON.stringify(operation),
+        operation.controllerId,
+        operation.ownerEpoch,
+        operation.specificationGeneration,
+        operation.assignmentId,
+        operation.attemptId,
+        operation.instructionSequence,
+        operation.candidateRevision,
+        operation.directive,
         operation.createdAt,
+        operation.retryCount,
+        ...row,
       );
+      for (const findingId of operation.findingIds)
+        insertFinding.run(operation.id, findingId);
+    }
+  }
+
+  #updateOperations(operations: readonly Operation[]): void {
+    const update = this.#database.query(
+      `UPDATE operations SET retry_count = ?, outcome_kind = ?, outcome_at = ?, retry_authorized_at = ?, outcome_source = ?, outcome_result = ?, outcome_reason = ?, retry_safe = ? WHERE id = ? AND commission_id = ?`,
+    );
+    for (const operation of operations) {
+      const result = update.run(
+        operation.retryCount,
+        ...outcomeValues(operation.outcome),
+        operation.id,
+        operation.commissionId,
+      );
+      if (result.changes !== 1) throw new AbortTransaction("not_found");
     }
   }
 }
 
-const rowDocumentSchema = z.object({ document: z.string() });
+function commissionValues(commission: Commission): (string | number | null)[] {
+  const delivery = commission.deliveryEvidence;
+  return [
+    commission.id,
+    commission.campaignId,
+    commission.objective,
+    commission.repository,
+    commission.integrationTarget,
+    commission.specificationGeneration,
+    Number(commission.independentReviewRequired),
+    commission.lifecycle,
+    commission.holdReason,
+    commission.owner?.controllerId ?? null,
+    commission.owner?.epoch ?? null,
+    commission.version,
+    commission.activeAttemptId,
+    commission.budget.limits.maxAttempts,
+    commission.budget.limits.maxInstructions,
+    commission.budget.limits.maxRepairs,
+    commission.budget.limits.maxCostMicros,
+    commission.budget.limits.deadlineAt,
+    commission.budget.used.attempts,
+    commission.budget.used.instructions,
+    commission.budget.used.repairs,
+    commission.budget.used.costMicros,
+    commission.candidateRevision,
+    commission.candidateObservedAt,
+    commission.candidateExpiresAt,
+    commission.candidateSource,
+    delivery?.revision ?? null,
+    delivery?.providerIdentity ?? null,
+    delivery?.source ?? null,
+    delivery?.observedAt ?? null,
+    delivery?.expiresAt ?? null,
+    delivery?.checkRunId ?? null,
+    delivery?.specificationGeneration ?? null,
+  ];
+}
 
-function assertMonotonicUpdate(
-  previous: Commission,
-  next: Commission,
-  authorizedNewOperationId?: string,
-  authorizedConclusion = false,
-): void {
-  if (
-    previous.lifecycle !== next.lifecycle &&
-    (!authorizedConclusion || next.lifecycle !== "concluded")
-  ) {
-    throw new Error(
-      "Commission lifecycle changes require their authorized application operation",
-    );
+function outcomeValues(outcome: OperationOutcome): (string | number | null)[] {
+  switch (outcome.kind) {
+    case "prepared":
+      return ["prepared", null, null, null, null, null, 0];
+    case "submitted":
+      return ["submitted", outcome.submittedAt, null, null, null, null, 0];
+    case "ambiguous":
+      return [
+        "ambiguous",
+        outcome.observedAt,
+        null,
+        null,
+        null,
+        outcome.reason,
+        0,
+      ];
+    case "observed":
+      return [
+        "observed",
+        outcome.observedAt,
+        null,
+        outcome.source,
+        outcome.result,
+        null,
+        Number(outcome.retrySafe),
+      ];
+    case "retry_authorized":
+      return [
+        "retry_authorized",
+        outcome.observation.observedAt,
+        outcome.authorizedAt,
+        outcome.observation.source,
+        outcome.observation.result,
+        null,
+        Number(outcome.observation.retrySafe),
+      ];
+    case "rejected":
+      return [
+        "rejected",
+        outcome.observedAt,
+        null,
+        null,
+        "rejected",
+        outcome.reason,
+        0,
+      ];
+    default:
+      return exhaustive(outcome);
   }
-  const oldBudget = previous.budget;
-  const newBudget = next.budget;
-  if (
-    oldBudget.maxAttempts !== newBudget.maxAttempts ||
-    oldBudget.maxRepairs !== newBudget.maxRepairs ||
-    oldBudget.costLimitMicros !== newBudget.costLimitMicros ||
-    oldBudget.deadlineAt !== newBudget.deadlineAt ||
-    newBudget.attemptsUsed < oldBudget.attemptsUsed ||
-    newBudget.repairsUsed < oldBudget.repairsUsed ||
-    newBudget.costUsedMicros < oldBudget.costUsedMicros
-  ) {
-    throw new Error(
-      "Commission budget limits are immutable and usage cannot decrease",
-    );
-  }
+}
 
-  for (const oldOperation of previous.operations) {
-    const newOperation = next.operations.find(
-      ({ id }) => id === oldOperation.id,
-    );
-    if (newOperation === undefined) {
-      throw new Error(
-        "A durable Operation cannot be removed from Commission history",
-      );
-    }
-    const oldIntent = { ...oldOperation, state: null };
-    const newIntent = { ...newOperation, state: null };
-    if (JSON.stringify(oldIntent) !== JSON.stringify(newIntent)) {
-      throw new Error(
-        "A durable Operation identity, target, or precondition cannot change",
-      );
-    }
-    if (
-      oldOperation.state.kind === newOperation.state.kind &&
-      JSON.stringify(oldOperation.state) !== JSON.stringify(newOperation.state)
-    ) {
-      throw new Error("An Operation state observation cannot be rewritten");
-    }
-    const previousState = oldOperation.state.kind;
-    const nextState = newOperation.state.kind;
-    const allowed =
-      previousState === nextState ||
-      (previousState === "prepared" && nextState !== "prepared") ||
-      (previousState === "submitted" &&
-        ["ambiguous", "observed", "rejected"].includes(nextState)) ||
-      (previousState === "ambiguous" &&
-        ["observed", "rejected"].includes(nextState));
-    if (!allowed)
-      throw new Error(
-        `Invalid Operation state transition: ${previousState} -> ${nextState}`,
-      );
+function operationOutcome(row: z.infer<typeof operationRow>): OperationOutcome {
+  switch (row.outcome_kind) {
+    case "prepared":
+      return { kind: "prepared" };
+    case "submitted":
+      return { kind: "submitted", submittedAt: required(row.outcome_at) };
+    case "ambiguous":
+      return {
+        kind: "ambiguous",
+        observedAt: required(row.outcome_at),
+        reason: required(row.outcome_reason),
+      };
+    case "observed":
+      return {
+        kind: "observed",
+        observedAt: required(row.outcome_at),
+        source: required(row.outcome_source),
+        result: required(row.outcome_result),
+        retrySafe: row.retry_safe === 1,
+      };
+    case "retry_authorized":
+      if (row.retry_safe !== 1)
+        throw new Error("Corrupt retry authorization without safe observation");
+      return {
+        kind: "retry_authorized",
+        authorizedAt: required(row.retry_authorized_at),
+        observation: {
+          observedAt: required(row.outcome_at),
+          source: required(row.outcome_source),
+          result: "not_applied",
+          retrySafe: true,
+        },
+      };
+    case "rejected":
+      return {
+        kind: "rejected",
+        observedAt: required(row.outcome_at),
+        reason: required(row.outcome_reason),
+      };
+    default:
+      return exhaustive(row.outcome_kind);
   }
-  const addedOperations = next.operations.filter(
-    ({ id }) =>
-      !previous.operations.some((oldOperation) => oldOperation.id === id),
-  );
-  if (
-    addedOperations.length !==
-      (authorizedNewOperationId === undefined ? 0 : 1) ||
-    addedOperations.some(
-      (operation) =>
-        operation.id !== authorizedNewOperationId ||
-        operation.state.kind !== "prepared",
-    )
-  ) {
-    throw new Error(
-      "New external Operations must pass through authorization and preparation",
-    );
-  }
+}
+
+function required<T>(value: T | null): T {
+  if (value === null) throw new Error("Corrupt Operation outcome row");
+  return value;
+}
+
+function exhaustive(value: never): never {
+  throw new Error(`Unhandled persisted variant: ${JSON.stringify(value)}`);
 }

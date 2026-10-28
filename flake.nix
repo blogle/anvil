@@ -1,16 +1,19 @@
 {
-  description = "Bun-first development environment for the Anvil pre-1.0 rewrite";
+  description = "Bun-first local development for the Anvil pre-1.0 rewrite";
 
   inputs = {
     sdlc.url = "github:blogle/sdlc/v2";
-    crane.url = "github:ipetkov/crane";
+    bun2nix = {
+      url = "github:nix-community/bun2nix";
+      inputs.nixpkgs.follows = "sdlc/nixpkgs-latest";
+    };
     fieldnotes = {
       url = "github:blogle/fieldnotes";
       inputs.sdlc.follows = "sdlc";
     };
   };
 
-  outputs = { self, sdlc, crane, fieldnotes }:
+  outputs = { self, sdlc, bun2nix, fieldnotes }:
     let
       systems = [ "x86_64-linux" ];
       forAllSystems = f: builtins.listToAttrs (map (system: {
@@ -21,49 +24,45 @@
       checks = forAllSystems (system:
         let
           pkgs = (sdlc.lib.importPackages { inherit system; }).latest;
-          craneLib = crane.mkLib pkgs;
-          src = craneLib.cleanCargoSource ./.;
-          cargoArtifacts = craneLib.buildDepsOnly { inherit src; };
-          typescript = pkgs.buildNpmPackage {
+          bun = import ./nix/bun.nix { inherit pkgs; };
+          bun2nixPackage = bun2nix.packages.${system}.default;
+          typescript = pkgs.stdenvNoCC.mkDerivation {
             pname = "anvil-typescript-check";
             version = "0.1.0";
             src = ./.;
-            npmDepsHash = "sha256-zqpvZil2sFD649Wh1G6CdJTKFADSDCJ4IjnG/J9rTtk=";
-            npmDepsFetcherVersion = 2;
-            dontNpmBuild = true;
-            nativeBuildInputs = [ pkgs.bun ];
+            nativeBuildInputs = [
+              bun
+              bun2nixPackage
+              bun2nixPackage.hook
+            ];
+            bunDeps = bun2nixPackage.fetchBunDeps { bunNix = ./bun.nix; };
+            bunInstallFlags = [ "--linker=hoisted" "--backend=copyfile" ];
+            dontUseBunBuild = true;
+            dontUseBunCheck = true;
+            dontUseBunInstall = true;
+            buildPhase = ''
+              runHook preBuild
+              bun2nix -o "$TMPDIR/bun.nix"
+              cmp "$TMPDIR/bun.nix" ${./bun.nix}
+              bun run check
+              runHook postBuild
+            '';
             installPhase = ''
-              runHook preInstall
-              bun run fmt:check
-              bun run typecheck
-              bun test
-              mkdir -p $out
-              touch $out
-              runHook postInstall
+              mkdir -p "$out"
+              touch "$out/check-passed"
             '';
           };
-          package = craneLib.buildPackage {
-            inherit src cargoArtifacts;
-            doCheck = true;
-          };
         in {
-          build = package;
-          test = package;
           inherit typescript;
-          fmt = craneLib.cargoFmt { inherit src; };
-          clippy = craneLib.cargoClippy {
-            inherit src cargoArtifacts;
-            cargoClippyExtraArgs = "--all-targets -- -D warnings";
-          };
-          flake = pkgs.runCommand "anvil-v2-flake-check" { } ''
+          flake = pkgs.runCommand "anvil-flake-check" { } ''
             test -f ${./flake.nix}
             test -f ${./flake.lock}
+            test -f ${./bun.lock}
             touch $out
           '';
         });
 
       packages = forAllSystems (system: {
-        default = self.checks.${system}.build;
         sdlc = sdlc.packages.${system}.sdlc;
         nix-eval-jobs = sdlc.packages.${system}.nix-eval-jobs;
       });
@@ -80,7 +79,7 @@
         in {
           type = "app";
           program = "${pkgs.writeShellScript "anvil-sdlc-publish" ''
-            echo "Anvil's pre-1.0 rewrite scaffold has no deployment artifacts."
+            echo "Anvil has no application package or deployment artifact in this checkpoint."
             exit 1
           ''}";
         });
@@ -94,15 +93,14 @@
       devShells = forAllSystems (system:
         let
           pkgs = (sdlc.lib.importPackages { inherit system; }).latest;
-          craneLib = crane.mkLib pkgs;
+          bun = import ./nix/bun.nix { inherit pkgs; };
         in {
-          default = craneLib.devShell {
+          default = pkgs.mkShell {
             packages = [
-              pkgs.bun
+              bun
+              bun2nix.packages.${system}.default
               pkgs.just
               pkgs.nix
-              pkgs.nodejs
-              pkgs.rustfmt
             ];
           };
         });
