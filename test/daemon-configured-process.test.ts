@@ -480,10 +480,16 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   const watchdogSessionId = sessions.get(configuredSandbox);
   if (watchdogSessionId === undefined)
     throw new Error("Configured watchdog Session identity missing");
+  const watchdogEvents = [
+    { type: "session.tool.failed", sessionID: "foreign-session" },
+    { type: "session.execution.started", sessionID: watchdogSessionId },
+    { type: "session.tool.failed", sessionID: watchdogSessionId },
+    { type: "session.tool.failed", sessionID: watchdogSessionId },
+  ];
   for (const subscriber of openCodeEventSubscribers)
     subscriber.enqueue(
       new TextEncoder().encode(
-        `data: ${JSON.stringify({ type: "session.tool.failed", sessionID: watchdogSessionId })}\n\n`,
+        `${watchdogEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}`,
       ),
     );
   const watchdogOperations = await waitForOperationKind(
