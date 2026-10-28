@@ -1,0 +1,5 @@
+{
+  "type": "feat",
+  "semver": "minor",
+  "summary": "Add repository-scoped GitHub credentials and read-only delivery observations"
+}
