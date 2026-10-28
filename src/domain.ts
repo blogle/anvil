@@ -20,6 +20,7 @@ export type Evidence = Readonly<{
   id: string;
   obligationId: string;
   specificationGeneration: number;
+  criterionVersion: string;
   candidateRevision: string;
   source: Readonly<{ kind: "worker" | "independent"; identity: string }>;
   disposition: "submitted" | "accepted" | "challenged";
@@ -517,7 +518,7 @@ export function decide(
       now,
     ) &&
     isCurrent(integration.observedAt, integration.expiresAt, policy, now) &&
-    obligationsSatisfied(commission, candidate, now) &&
+    obligationsSatisfied(commission, candidate, now, observation.checks) &&
     currentChecks(observation.checks, candidate, policy, now)?.state ===
       "passing"
   ) {
@@ -771,7 +772,12 @@ export function decide(
       directive: contextPacket(commission, null),
     };
   }
-  const accepted = obligationsSatisfied(commission, candidate, now);
+  const accepted = obligationsSatisfied(
+    commission,
+    candidate,
+    now,
+    observation.checks,
+  );
   if (!accepted) {
     if (hasCurrentWorkerEvidence(commission, candidate, now)) {
       const priorVerify = operations.find(
@@ -1081,6 +1087,12 @@ export function evolve(
           input.obligations.length
       )
         return err("invalid_amendment");
+      const unchanged =
+        input.objective === current.objective &&
+        input.integrationTarget === current.integrationTarget &&
+        input.independentReviewRequired === current.independentReviewRequired &&
+        sameObligations(input.obligations, current.obligations);
+      if (unchanged) return ok(transition(current.version, current));
       return ok(
         transition(current.version, {
           ...current,
@@ -1603,6 +1615,7 @@ function recordObservation(
         id: claim.id,
         obligationId: claim.obligationId,
         specificationGeneration: current.specificationGeneration,
+        criterionVersion: criterionVersion(current, claim.obligationId),
         candidateRevision,
         source: { kind: "worker", identity: claim.sourceIdentity },
         observedAt: claim.observedAt,
@@ -1626,6 +1639,7 @@ function recordObservation(
           id: review.id,
           obligationId: review.obligationId,
           specificationGeneration: review.specificationGeneration,
+          criterionVersion: criterionVersion(current, review.obligationId),
           candidateRevision: review.candidateRevision,
           source: { kind: "independent", identity: review.sourceIdentity },
           observedAt: review.observedAt,
@@ -1749,13 +1763,18 @@ function obligationsSatisfied(
   commission: Commission,
   revision: string,
   now: number,
+  checks: CheckObservation | null,
 ): boolean {
   return commission.obligations.every((obligation) => {
     const evidence = commission.evidence.filter(
       (item) =>
         item.obligationId === obligation.id &&
-        item.specificationGeneration === commission.specificationGeneration &&
+        item.criterionVersion === criterionVersion(commission, obligation.id) &&
         item.candidateRevision === revision &&
+        (item.checkRunId === null ||
+          (checks?.runId === item.checkRunId &&
+            checks.revision === revision &&
+            checks.state === "passing")) &&
         item.observedAt <= now &&
         item.expiresAt > now,
     );
@@ -1784,10 +1803,49 @@ function hasCurrentWorkerEvidence(
     (evidence) =>
       evidence.source.kind === "worker" &&
       evidence.candidateRevision === revision &&
-      evidence.specificationGeneration === commission.specificationGeneration &&
+      commission.obligations.some(
+        ({ id }) =>
+          id === evidence.obligationId &&
+          evidence.criterionVersion === criterionVersion(commission, id),
+      ) &&
       evidence.observedAt <= now &&
       evidence.expiresAt > now,
   );
+}
+
+function criterionVersion(
+  commission: Commission,
+  obligationId: string,
+): string {
+  const obligation = commission.obligations.find(
+    ({ id }) => id === obligationId,
+  );
+  if (obligation === undefined) return "";
+  return JSON.stringify([
+    commission.objective,
+    commission.repository,
+    commission.integrationTarget,
+    commission.independentReviewRequired,
+    obligation.id,
+    obligation.description,
+    obligation.independentReviewRequired,
+  ]);
+}
+
+function sameObligations(
+  left: readonly Obligation[],
+  right: readonly Obligation[],
+): boolean {
+  if (left.length !== right.length) return false;
+  const byId = new Map(right.map((obligation) => [obligation.id, obligation]));
+  return left.every((obligation) => {
+    const other = byId.get(obligation.id);
+    return (
+      other !== undefined &&
+      obligation.description === other.description &&
+      obligation.independentReviewRequired === other.independentReviewRequired
+    );
+  });
 }
 
 function currentChecks(

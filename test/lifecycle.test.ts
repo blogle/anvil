@@ -4,14 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { ApplicationService, type ProviderPort } from "../src/application";
-import { evolveOperation, type Observation } from "../src/domain";
+import { evolve, evolveOperation, type Observation } from "../src/domain";
 import { CommissionStore } from "../src/persistence/sqlite";
 import {
   admittedCommission,
   epoch,
+  lease,
   observation,
   policy,
   proposalInput,
+  value,
 } from "./support/fixtures";
 import { FakeWorld } from "./support/fake-world";
 
@@ -205,6 +207,124 @@ test("ambiguous outcome with no authoritative result waits and never reissues a 
   expect([...world.dispatchCount.values()].every((count) => count === 1)).toBe(
     true,
   );
+  const unresolved = repository
+    .operations("commission-unknown")
+    .find(({ outcome }) => outcome.kind === "ambiguous");
+  expect(unresolved).toMatchObject({
+    outcome: { kind: "ambiguous" },
+  });
+});
+
+test("a prepared Operation is dispatched once after restart and observed outcomes are not replayed", async () => {
+  let repository = openStore();
+  const world = new FakeWorld();
+  let app = service(repository, world);
+  expect(
+    app.propose(proposalInput({ id: "commission-prepared-crash" })).ok,
+  ).toBe(true);
+  expect(
+    (await app.admit("commission-prepared-crash", "operator-1", epoch)).ok,
+  ).toBe(true);
+  const current = repository.get("commission-prepared-crash");
+  if (current === null) throw new Error("Admitted Commission missing");
+  const beforeDispatch = value(
+    evolve(current, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: observation(),
+      operations: [],
+      policy,
+      now: epoch + 1,
+    }),
+  );
+  const original = beforeDispatch.newOperations[0];
+  if (original === undefined) throw new Error("Expected prepared Operation");
+  expect(repository.commitTransition(beforeDispatch).ok).toBe(true);
+  expect(world.dispatchCount.size).toBe(0);
+
+  repository.close();
+  store = undefined;
+  repository = openStore();
+  app = service(repository, world);
+  const resumed = await app.reconcile("commission-prepared-crash", epoch + 2);
+  expect(resumed.ok).toBe(true);
+  expect(world.dispatchCount.get(original.id)).toBe(1);
+  expect(repository.operations("commission-prepared-crash")).toMatchObject([
+    {
+      id: original.id,
+      logicalKey: original.logicalKey,
+      outcome: { kind: "observed", result: "applied" },
+    },
+  ]);
+
+  repository.close();
+  store = undefined;
+  repository = openStore();
+  app = service(repository, world);
+  await app.reconcile("commission-prepared-crash", epoch + 3);
+  expect(world.dispatchCount.get(original.id)).toBe(1);
+  expect(
+    repository
+      .operations("commission-prepared-crash")
+      .filter(({ logicalKey }) => logicalKey === original.logicalKey),
+  ).toHaveLength(1);
+});
+
+test("submitted Operation survives a provider effect followed by lost controller acknowledgement", async () => {
+  let repository = openStore();
+  const world = new FakeWorld();
+  const crashingProvider: ProviderPort = {
+    observe: (commission, now, operations) =>
+      world.observe(commission, now, operations),
+    dispatch: async (commission, operation) => {
+      await world.dispatch(commission, operation);
+      throw new Error("simulated controller crash after remote effect");
+    },
+    inspectOperation: (commission, operation) =>
+      world.inspectOperation(commission, operation),
+  };
+  const app = new ApplicationService(
+    repository,
+    world,
+    crashingProvider,
+    world,
+    "controller-1",
+    policy,
+  );
+  expect(app.propose(proposalInput({ id: "commission-after-effect" })).ok).toBe(
+    true,
+  );
+  expect(
+    (await app.admit("commission-after-effect", "operator-1", epoch)).ok,
+  ).toBe(true);
+  await expect(
+    app.reconcile("commission-after-effect", epoch + 1),
+  ).rejects.toThrow("simulated controller crash after remote effect");
+  const submitted = repository.operations("commission-after-effect")[0];
+  if (submitted === undefined) throw new Error("Submitted Operation missing");
+  expect(submitted.outcome).toEqual({
+    kind: "submitted",
+    submittedAt: epoch + 1,
+  });
+  expect(world.dispatchCount.get(submitted.id)).toBe(1);
+
+  repository.close();
+  store = undefined;
+  repository = openStore();
+  const recovered = service(repository, world);
+  const inspected = await recovered.reconcile(
+    "commission-after-effect",
+    epoch + 2,
+  );
+  expect(inspected.ok).toBe(true);
+  expect(world.dispatchCount.get(submitted.id)).toBe(1);
+  expect(repository.operations("commission-after-effect")).toMatchObject([
+    {
+      id: submitted.id,
+      logicalKey: submitted.logicalKey,
+      outcome: { kind: "observed", result: "applied" },
+    },
+  ]);
 });
 
 test("a retry follows provider proof, reuses the same Operation identity, and is bounded", async () => {
@@ -328,7 +448,7 @@ test("a stale owner cannot resolve another controller epoch Operation", () => {
 });
 
 test("a successor ApplicationService observes a predecessor's accepted turn after lost acknowledgement", async () => {
-  const repository = openStore();
+  let repository = openStore();
   const world = new FakeWorld();
   world.loseFirstInstructionAcknowledgement = true;
   const predecessor = service(repository, world);
@@ -354,6 +474,17 @@ test("a successor ApplicationService observes a predecessor's accepted turn afte
   if (prior === undefined) throw new Error("Predecessor Operation missing");
   expect(prior.outcome.kind).toBe("ambiguous");
   expect(world.dispatchCount.get(prior.id)).toBe(1);
+
+  repository.close();
+  store = undefined;
+  repository = openStore();
+  expect(repository.operations("commission-successor-recovery")).toMatchObject([
+    {
+      id: prior.id,
+      logicalKey: prior.logicalKey,
+      outcome: { kind: "ambiguous" },
+    },
+  ]);
 
   world.grant = {
     owner: { controllerId: "controller-2", epoch: 2 },
@@ -388,7 +519,8 @@ test("a successor ApplicationService observes a predecessor's accepted turn afte
   });
   expect(world.dispatchCount.get(prior.id)).toBe(1);
 
-  const stale = await predecessor.reconcile(
+  const stalePredecessor = service(repository, world);
+  const stale = await stalePredecessor.reconcile(
     "commission-successor-recovery",
     epoch + 3,
   );

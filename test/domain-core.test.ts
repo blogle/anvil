@@ -754,6 +754,186 @@ test("instruction, repair, cost, and deadline budgets stop only the constrained 
   ).toBe("change_strategy");
 });
 
+test("over-limit instructions, cost, and deadline hold without preparing effects", () => {
+  const base = admittedCommission();
+  const cases: { name: string; commission: Commission; now?: number }[] = [
+    {
+      name: "instructions",
+      commission: {
+        ...base,
+        budget: {
+          ...base.budget,
+          used: {
+            ...base.budget.used,
+            instructions: base.budget.limits.maxInstructions + 1,
+          },
+        },
+      },
+    },
+    {
+      name: "cost",
+      commission: {
+        ...base,
+        budget: {
+          ...base.budget,
+          used: {
+            ...base.budget.used,
+            costMicros: base.budget.limits.maxCostMicros + 1,
+          },
+        },
+      },
+    },
+    {
+      name: "deadline",
+      commission: {
+        ...base,
+        budget: {
+          ...base.budget,
+          limits: { ...base.budget.limits, deadlineAt: epoch + 1 },
+        },
+      },
+      now: epoch + 2,
+    },
+  ];
+  for (const testCase of cases) {
+    const now = testCase.now ?? epoch;
+    const beforeVersion = testCase.commission.version;
+    const result = value(
+      evolve(testCase.commission, {
+        kind: "reconcile",
+        lease: lease(),
+        observation: observation(),
+        operations: [],
+        policy,
+        now,
+      }),
+    );
+    expect(result.decision, testCase.name).toMatchObject({
+      kind: "hold",
+      reason: "budget_exhausted",
+    });
+    expect(result.newOperations, testCase.name).toHaveLength(0);
+    expect(result.commission.version, testCase.name).toBe(beforeVersion);
+  }
+});
+
+test("attempt and repair overlimits block only another strategy or repair", () => {
+  const base = admittedCommission({
+    budget: {
+      maxAttempts: 3,
+      maxInstructions: 12,
+      maxRepairs: 3,
+      maxCostMicros: 1_000,
+      deadlineAt: epoch + 10_000,
+    },
+  });
+  const failedCandidate = observation({
+    candidateRevision: "revision-1",
+    workerClaims: [
+      {
+        id: "attempt-repair-claim",
+        obligationId: "acceptance-1",
+        claim: "Candidate implemented",
+        observedAt: epoch,
+        expiresAt: epoch + 10_000,
+        sourceIdentity: "worker",
+      },
+    ],
+    checks: {
+      runId: "failing-check",
+      revision: "revision-1",
+      state: "failing",
+      failureIds: ["lint:E1"],
+      observedAt: epoch,
+      expiresAt: epoch + 10_000,
+      source: "ci",
+    },
+  });
+  const evidenced = value(
+    evolve(base, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: failedCandidate,
+      operations: [],
+      policy,
+      now: epoch,
+    }),
+  ).commission;
+  const noRepairs = {
+    ...evidenced,
+    budget: {
+      ...evidenced.budget,
+      limits: { ...evidenced.budget.limits, maxRepairs: 0 },
+      used: { ...evidenced.budget.used, repairs: 1 },
+    },
+  };
+  expect(decide(noRepairs, failedCandidate, [], policy, epoch)).toMatchObject({
+    kind: "change_strategy",
+  });
+  expect(
+    decide(noRepairs, failedCandidate, [], policy, epoch),
+  ).not.toMatchObject({
+    kind: "repair",
+  });
+
+  const attemptsExhausted = {
+    ...noRepairs,
+    budget: {
+      ...noRepairs.budget,
+      used: {
+        ...noRepairs.budget.used,
+        attempts: noRepairs.budget.limits.maxAttempts + 1,
+      },
+    },
+  };
+  expect(
+    decide(attemptsExhausted, failedCandidate, [], policy, epoch),
+  ).toMatchObject({ kind: "hold", reason: "budget_exhausted" });
+});
+
+test("recording measured usage may cross the cost limit but blocks the next instruction", () => {
+  const base = admittedCommission({
+    budget: {
+      maxAttempts: 3,
+      maxInstructions: 12,
+      maxRepairs: 3,
+      maxCostMicros: 10,
+      deadlineAt: epoch + 10_000,
+    },
+  });
+  const nearLimit = {
+    ...base,
+    budget: {
+      ...base.budget,
+      used: { ...base.budget.used, costMicros: 9 },
+    },
+  };
+  const charged = value(
+    evolve(nearLimit, {
+      kind: "record_usage",
+      lease: lease(),
+      costMicros: 2,
+      now: epoch,
+    }),
+  );
+  expect(charged.commission.budget.used.costMicros).toBe(11);
+  const stopped = value(
+    evolve(charged.commission, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: observation(),
+      operations: [],
+      policy,
+      now: epoch + 1,
+    }),
+  );
+  expect(stopped.decision).toMatchObject({
+    kind: "hold",
+    reason: "budget_exhausted",
+  });
+  expect(stopped.newOperations).toHaveLength(0);
+});
+
 test("seeded fast-check state-machine commands preserve owner, budget, revision evidence, and completion invariants", () => {
   const actions: fc.Arbitrary<Action> = fc.oneof(
     fc
@@ -793,6 +973,263 @@ test("seeded fast-check state-machine commands preserve owner, budget, revision 
     fc.property(commands, (sequence) => fc.modelRun(started, sequence)),
     { seed: 0x51a7e, numRuns: 100 },
   );
+});
+
+test("amendments invalidate changed criteria and retain only version-matched evidence", () => {
+  const base = admittedCommission({
+    obligations: [
+      {
+        id: "criterion-a",
+        description: "Preserve the approved API behavior",
+        independentReviewRequired: false,
+      },
+      {
+        id: "criterion-b",
+        description: "Keep the existing contract stable",
+        independentReviewRequired: false,
+      },
+    ],
+  });
+  const originalEvidence = value(
+    evolve(base, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: observation({
+        candidateRevision: "revision-1",
+        workerClaims: [
+          {
+            id: "worker-a-v1",
+            obligationId: "criterion-a",
+            claim: "criterion A done",
+            observedAt: epoch,
+            expiresAt: epoch + 30_000,
+            sourceIdentity: "worker-session",
+          },
+          {
+            id: "worker-b-v1",
+            obligationId: "criterion-b",
+            claim: "criterion B done",
+            observedAt: epoch,
+            expiresAt: epoch + 30_000,
+            sourceIdentity: "worker-session",
+          },
+        ],
+      }),
+      operations: [],
+      policy,
+      now: epoch,
+    }),
+  ).commission;
+  const amended = value(
+    evolve(originalEvidence, {
+      kind: "amend_specification",
+      actor: { kind: "approver", identity: "operator-1" },
+      expectedGeneration: 1,
+      objective: base.objective,
+      integrationTarget: base.integrationTarget,
+      independentReviewRequired: false,
+      obligations: [
+        {
+          id: "criterion-a",
+          description: "Preserve the API behavior and backward compatibility",
+          independentReviewRequired: true,
+        },
+        base.obligations[1]!,
+      ],
+      now: epoch + 1,
+    }),
+  ).commission;
+  expect(amended.specificationGeneration).toBe(2);
+  expect(
+    amended.evidence.map(({ criterionVersion }) => criterionVersion),
+  ).toEqual(
+    originalEvidence.evidence.map(({ criterionVersion }) => criterionVersion),
+  );
+
+  const merged = observation({
+    candidateRevision: "revision-1",
+    candidateObservedAt: epoch,
+    candidateExpiresAt: epoch + 30_000,
+    candidateSource: "git",
+    checks: {
+      runId: "check-green",
+      revision: "revision-1",
+      state: "passing",
+      failureIds: [],
+      observedAt: epoch,
+      expiresAt: epoch + 30_000,
+      source: "ci",
+    },
+    integration: {
+      kind: "merged",
+      revision: "revision-1",
+      providerIdentity: "github:repo/pull/1",
+      repository: base.repository,
+      target: base.integrationTarget,
+      observedAt: epoch,
+      expiresAt: epoch + 30_000,
+      source: "github",
+    },
+  });
+  const registered = {
+    ...amended,
+    registeredPullRequestId: "github:repo/pull/1",
+  };
+  expect(decide(registered, merged, [], policy, epoch).kind).not.toBe(
+    "conclude",
+  );
+
+  const workerOnly = value(
+    evolve(registered, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: {
+        ...merged,
+        workerClaims: [
+          {
+            id: "worker-a-v2",
+            obligationId: "criterion-a",
+            claim: "updated criterion A done",
+            observedAt: epoch + 2,
+            expiresAt: epoch + 30_000,
+            sourceIdentity: "worker-session",
+          },
+        ],
+      },
+      operations: [],
+      policy,
+      now: epoch + 2,
+    }),
+  ).commission;
+  expect(workerOnly.evidence).toContainEqual(
+    expect.objectContaining({
+      id: "worker-a-v2",
+      source: { kind: "worker", identity: "worker-session" },
+      disposition: "submitted",
+    }),
+  );
+  expect(decide(workerOnly, merged, [], policy, epoch + 2).kind).not.toBe(
+    "conclude",
+  );
+
+  const independentlyReviewed = value(
+    evolve(workerOnly, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: {
+        ...merged,
+        integration: { kind: "none" },
+        workerClaims: [],
+        independentReviews: [
+          {
+            id: "review-a-v2",
+            obligationId: "criterion-a",
+            candidateRevision: "revision-1",
+            specificationGeneration: 2,
+            result: "accepted",
+            checkRunId: "check-green",
+            claim: "Updated API behavior verified",
+            observedAt: epoch + 3,
+            expiresAt: epoch + 30_000,
+            sourceIdentity: "reviewer-1",
+          },
+        ],
+      },
+      operations: [],
+      policy,
+      now: epoch + 3,
+    }),
+  ).commission;
+  expect(
+    independentlyReviewed.evidence.find(({ id }) => id === "review-a-v2"),
+  ).toMatchObject({
+    source: { kind: "independent", identity: "reviewer-1" },
+    disposition: "accepted",
+    checkRunId: "check-green",
+  });
+  expect(
+    decide(independentlyReviewed, merged, [], policy, epoch + 3).kind,
+  ).toBe("conclude");
+  expect(
+    decide(
+      independentlyReviewed,
+      {
+        ...merged,
+        checks: { ...merged.checks!, runId: "different-check-run" },
+      },
+      [],
+      policy,
+      epoch + 3,
+    ).kind,
+  ).not.toBe("conclude");
+
+  const changedSharedDependency = value(
+    evolve(workerOnly, {
+      kind: "amend_specification",
+      actor: { kind: "approver", identity: "operator-1" },
+      expectedGeneration: 2,
+      objective: "Change the objective that scopes all criteria",
+      integrationTarget: base.integrationTarget,
+      independentReviewRequired: false,
+      obligations: workerOnly.obligations,
+      now: epoch + 4,
+    }),
+  ).commission;
+  expect(
+    decide(
+      {
+        ...changedSharedDependency,
+        registeredPullRequestId: "github:repo/pull/1",
+      },
+      merged,
+      [],
+      policy,
+      epoch + 4,
+    ).kind,
+  ).not.toBe("conclude");
+});
+
+test("an identical amendment is a no-op and a stale generation is rejected", () => {
+  const base = admittedCommission({
+    obligations: [
+      {
+        id: "first",
+        description: "First criterion",
+        independentReviewRequired: false,
+      },
+      {
+        id: "second",
+        description: "Second criterion",
+        independentReviewRequired: true,
+      },
+    ],
+  });
+  const unchanged = value(
+    evolve(base, {
+      kind: "amend_specification",
+      actor: { kind: "approver", identity: "operator-1" },
+      expectedGeneration: 1,
+      objective: base.objective,
+      integrationTarget: base.integrationTarget,
+      obligations: [...base.obligations].reverse(),
+      independentReviewRequired: base.independentReviewRequired,
+      now: epoch + 1,
+    }),
+  );
+  expect(unchanged.commission).toBe(base);
+  expect(unchanged.commission.version).toBe(base.version);
+  expect(
+    evolve(unchanged.commission, {
+      kind: "amend_specification",
+      actor: { kind: "approver", identity: "operator-1" },
+      expectedGeneration: 0,
+      objective: "Stale objective",
+      integrationTarget: base.integrationTarget,
+      obligations: base.obligations,
+      independentReviewRequired: base.independentReviewRequired,
+      now: epoch + 2,
+    }),
+  ).toEqual({ ok: false, error: "stale_generation" });
 });
 
 test("a fresh authoritative merge resolves its matching unresolved integration Operation", () => {

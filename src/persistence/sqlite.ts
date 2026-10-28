@@ -33,8 +33,17 @@ const migrationList = [
       "utf8",
     ),
   },
+  {
+    version: 3,
+    sql: readFileSync(
+      fileURLToPath(
+        new URL("./migrations/0003_criterion_versions.sql", import.meta.url),
+      ),
+      "utf8",
+    ),
+  },
 ] as const;
-const latestSchemaVersion = 2;
+const latestSchemaVersion = 3;
 const commissionColumns = [
   "id",
   "campaign_id",
@@ -125,6 +134,7 @@ const evidenceRow = z.object({
   id: z.string(),
   obligation_id: z.string(),
   specification_generation: z.number(),
+  criterion_version: z.string(),
   candidate_revision: z.string(),
   source_kind: z.enum(["worker", "independent"]),
   source_identity: z.string(),
@@ -245,7 +255,7 @@ export class CommissionStore {
       });
     const evidence = this.#database
       .query(
-        "SELECT id, obligation_id, specification_generation, candidate_revision, source_kind, source_identity, disposition, observed_at, expires_at, claim, check_run_id FROM evidence WHERE commission_id = ? ORDER BY id",
+        "SELECT id, obligation_id, specification_generation, criterion_version, candidate_revision, source_kind, source_identity, disposition, observed_at, expires_at, claim, check_run_id FROM evidence WHERE commission_id = ? ORDER BY id",
       )
       .all(commissionId)
       .map((item) => {
@@ -254,6 +264,7 @@ export class CommissionStore {
           id: value.id,
           obligationId: value.obligation_id,
           specificationGeneration: value.specification_generation,
+          criterionVersion: value.criterion_version,
           candidateRevision: value.candidate_revision,
           source: { kind: value.source_kind, identity: value.source_identity },
           disposition: value.disposition,
@@ -530,9 +541,9 @@ export class CommissionStore {
   #insertEvidence(commission: Commission, previous: readonly Evidence[]): void {
     const known = new Set(previous.map(({ id }) => id));
     const insert = this.#database.query(`INSERT INTO evidence(
-      commission_id, id, obligation_id, specification_generation, candidate_revision, source_kind,
+      commission_id, id, obligation_id, specification_generation, criterion_version, candidate_revision, source_kind,
       source_identity, disposition, observed_at, expires_at, claim, check_run_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     for (const evidence of commission.evidence) {
       if (known.has(evidence.id)) continue;
       insert.run(
@@ -540,6 +551,7 @@ export class CommissionStore {
         evidence.id,
         evidence.obligationId,
         evidence.specificationGeneration,
+        evidence.criterionVersion,
         evidence.candidateRevision,
         evidence.source.kind,
         evidence.source.identity,

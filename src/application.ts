@@ -380,6 +380,26 @@ export class ApplicationService {
       }
       const pending = operations.find(isPending);
       if (pending !== undefined) {
+        if (pending.outcome.kind === "prepared") {
+          const dispatched = await this.#dispatchAndRecord(
+            current,
+            pending,
+            lease.value,
+            now,
+          );
+          if (!dispatched.ok) return dispatched;
+          return {
+            ok: true,
+            value: {
+              commission: dispatched.value,
+              decision: {
+                kind: "wait",
+                reason: "prepared Operation was submitted after restart",
+                wake: { kind: "operation", operationId: pending.id },
+              },
+            },
+          };
+        }
         if (pending.outcome.kind === "retry_authorized") {
           const retried = await this.#dispatchAndRecord(
             current,
@@ -572,9 +592,28 @@ export class ApplicationService {
     lease: LeaseGrant,
     now: number,
   ): Promise<Result<Commission, ApplicationError>> {
-    const dispatched = await this.#provider.dispatch(
+    const submitted = evolveOperation(
       commission,
       operation,
+      lease,
+      { kind: "submitted", submittedAt: now },
+      now,
+    );
+    if (!submitted.ok)
+      return { ok: false, error: { kind: "domain", error: submitted.error } };
+    const savedSubmission = this.#store.commitTransition(submitted.value);
+    if (!savedSubmission.ok)
+      return {
+        ok: false,
+        error: { kind: "store", error: savedSubmission.error },
+      };
+    const submittedCommission = submitted.value.commission;
+    const submittedOperation = submitted.value.updatedOperations[0];
+    if (submittedOperation === undefined)
+      throw new Error("Submitting an Operation did not update its journal row");
+    const dispatched = await this.#provider.dispatch(
+      submittedCommission,
+      submittedOperation,
       now,
     );
     let outcome: OperationOutcome;
@@ -597,8 +636,8 @@ export class ApplicationService {
       };
     }
     const transition = evolveOperation(
-      commission,
-      operation,
+      submittedCommission,
+      submittedOperation,
       lease,
       outcome,
       now,

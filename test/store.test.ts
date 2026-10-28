@@ -35,7 +35,7 @@ function openStore(): CommissionStore {
 
 test("runs versioned schema migrations once and reopens the normalized Commission projection", () => {
   const repository = openStore();
-  expect(repository.migrationVersion()).toBe(2);
+  expect(repository.migrationVersion()).toBe(3);
   expect(repository.propose(proposal())).toEqual({
     ok: true,
     value: undefined,
@@ -44,12 +44,12 @@ test("runs versioned schema migrations once and reopens the normalized Commissio
   store = undefined;
 
   const reopened = openStore();
-  expect(reopened.migrationVersion()).toBe(2);
+  expect(reopened.migrationVersion()).toBe(3);
   expect(reopened.get("commission-1")).toEqual(proposal().commission);
   expect(reopened.operations("commission-1")).toEqual([]);
 });
 
-test("version two migration preserves an existing version one Operation journal", () => {
+test("versioned migrations preserve an existing version one Operation journal", () => {
   directory = mkdtempSync(join(tmpdir(), "anvil-migration-upgrade-"));
   const path = join(directory, "state.sqlite");
   const legacy = new Database(path);
@@ -118,6 +118,34 @@ test("version two migration preserves an existing version one Operation journal"
       epoch,
       "prepared",
     );
+  legacy
+    .query(
+      `INSERT INTO obligations(
+         commission_id, specification_generation, id, description, independent_review_required
+       ) VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run("commission-legacy", 1, "legacy-obligation", "legacy criterion", 0);
+  legacy
+    .query(
+      `INSERT INTO evidence(
+         commission_id, id, obligation_id, specification_generation, candidate_revision,
+         source_kind, source_identity, disposition, observed_at, expires_at, claim, check_run_id
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      "commission-legacy",
+      "legacy-evidence",
+      "legacy-obligation",
+      1,
+      "legacy-revision",
+      "worker",
+      "legacy-session",
+      "submitted",
+      epoch,
+      epoch + 10_000,
+      "old claim",
+      null,
+    );
   expect(
     legacy.query("SELECT id, commission_id FROM operations").all(),
   ).toEqual([
@@ -129,7 +157,7 @@ test("version two migration preserves an existing version one Operation journal"
   legacy.close();
 
   const upgraded = openStore();
-  expect(upgraded.migrationVersion()).toBe(2);
+  expect(upgraded.migrationVersion()).toBe(3);
   const probe = new Database(path);
   const migratedRows = probe
     .query("SELECT id, commission_id FROM operations")
@@ -149,6 +177,102 @@ test("version two migration preserves an existing version one Operation journal"
       outcome: { kind: "prepared" },
     },
   ]);
+  expect(upgraded.get("commission-legacy")?.evidence).toMatchObject([
+    { id: "legacy-evidence", criterionVersion: "" },
+  ]);
+});
+
+test("SQLite reopen preserves criterion provenance across specification amendments", () => {
+  const repository = openStore();
+  const initial = proposal({
+    obligations: [
+      {
+        id: "criterion-a",
+        description: "old A",
+        independentReviewRequired: false,
+      },
+      {
+        id: "criterion-b",
+        description: "stable B",
+        independentReviewRequired: false,
+      },
+    ],
+  });
+  expect(repository.propose(initial)).toEqual({ ok: true, value: undefined });
+  const admitted = value(
+    evolve(initial.commission, {
+      kind: "admit",
+      actor: { kind: "approver", identity: "operator-1" },
+      lease: lease(),
+      attemptId: "attempt-1",
+      assignmentId: "assignment-1",
+      now: epoch,
+    }),
+  );
+  expect(repository.commitTransition(admitted).ok).toBe(true);
+  const evidenced = value(
+    evolve(admitted.commission, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: observation({
+        candidateRevision: "revision-1",
+        workerClaims: [
+          {
+            id: "evidence-a",
+            obligationId: "criterion-a",
+            claim: "A complete",
+            observedAt: epoch,
+            expiresAt: epoch + 30_000,
+            sourceIdentity: "worker",
+          },
+          {
+            id: "evidence-b",
+            obligationId: "criterion-b",
+            claim: "B complete",
+            observedAt: epoch,
+            expiresAt: epoch + 30_000,
+            sourceIdentity: "worker",
+          },
+        ],
+      }),
+      operations: [],
+      policy,
+      now: epoch,
+    }),
+  );
+  expect(repository.commitTransition(evidenced).ok).toBe(true);
+  const oldEvidence = repository.get(initial.commission.id)!.evidence;
+
+  const amended = value(
+    evolve(evidenced.commission, {
+      kind: "amend_specification",
+      actor: { kind: "approver", identity: "operator-1" },
+      expectedGeneration: 1,
+      objective: evidenced.commission.objective,
+      integrationTarget: evidenced.commission.integrationTarget,
+      independentReviewRequired: false,
+      obligations: [
+        {
+          id: "criterion-a",
+          description: "new A",
+          independentReviewRequired: true,
+        },
+        evidenced.commission.obligations[1]!,
+      ],
+      now: epoch + 1,
+    }),
+  );
+  expect(repository.commitTransition(amended).ok).toBe(true);
+  repository.close();
+  store = undefined;
+
+  const reopened = openStore();
+  const restored = reopened.get(initial.commission.id)!;
+  expect(restored.specificationGeneration).toBe(2);
+  expect(restored.evidence).toEqual(oldEvidence);
+  expect(
+    restored.evidence.map(({ criterionVersion }) => criterionVersion),
+  ).toEqual(oldEvidence.map(({ criterionVersion }) => criterionVersion));
 });
 
 test("budget usage remains monotonic across SQLite reopen", () => {
@@ -225,6 +349,7 @@ test("only branded domain proposals and transitions can mutate durable state", (
             id: "forged-evidence",
             obligationId: "acceptance-1",
             specificationGeneration: 1,
+            criterionVersion: "forged",
             candidateRevision: "invented-merge",
             source: { kind: "worker", identity: "untrusted-json" },
             disposition: "accepted",
@@ -758,4 +883,51 @@ test("the application authorization port rejects objective/criterion replacement
     "Implement bounded delivery",
   );
   expect(repository.get("commission-1")?.integrationTarget).toBe("main");
+});
+
+test("the application rejects a stale approved amendment after a newer generation commits", async () => {
+  const repository = openStore();
+  repository.propose(proposal());
+  const world = new FakeWorld();
+  const app = new ApplicationService(
+    repository,
+    world,
+    world,
+    world,
+    "controller-1",
+    policy,
+  );
+  const current = await app.amendSpecification(
+    "commission-1",
+    "operator-1",
+    1,
+    {
+      objective: "Approved objective revision two",
+      integrationTarget: "main",
+      obligations: proposal().commission.obligations,
+      independentReviewRequired: false,
+    },
+    epoch,
+  );
+  expect(current.ok).toBe(true);
+  const stale = await app.amendSpecification(
+    "commission-1",
+    "operator-1",
+    1,
+    {
+      objective: "Stale objective overwrite",
+      integrationTarget: "main",
+      obligations: proposal().commission.obligations,
+      independentReviewRequired: false,
+    },
+    epoch + 1,
+  );
+  expect(stale).toEqual({
+    ok: false,
+    error: { kind: "domain", error: "stale_generation" },
+  });
+  expect(repository.get("commission-1")?.objective).toBe(
+    "Approved objective revision two",
+  );
+  expect(repository.get("commission-1")?.specificationGeneration).toBe(2);
 });
