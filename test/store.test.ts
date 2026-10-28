@@ -48,6 +48,50 @@ test("runs versioned schema migrations once and reopens the normalized Commissio
   expect(reopened.operations("commission-1")).toEqual([]);
 });
 
+test("budget usage remains monotonic across SQLite reopen", () => {
+  let repository = openStore();
+  repository.propose(proposal());
+  const proposed = repository.get("commission-1");
+  if (proposed === null) throw new Error("Proposal missing");
+  const admitted = value(
+    evolve(proposed, {
+      kind: "admit",
+      actor: { kind: "approver", identity: "operator" },
+      lease: lease(),
+      attemptId: "attempt-1",
+      assignmentId: "assignment-1",
+      now: epoch,
+    }),
+  );
+  expect(repository.commitTransition(admitted).ok).toBe(true);
+  const charged = value(
+    evolve(admitted.commission, {
+      kind: "record_usage",
+      lease: lease(),
+      costMicros: 17,
+      now: epoch + 1,
+    }),
+  );
+  expect(repository.commitTransition(charged).ok).toBe(true);
+  repository.close();
+  store = undefined;
+
+  repository = openStore();
+  expect(repository.get("commission-1")?.budget.used.costMicros).toBe(17);
+  const current = repository.get("commission-1");
+  if (current === null) throw new Error("Reopened Commission missing");
+  const chargedAgain = value(
+    evolve(current, {
+      kind: "record_usage",
+      lease: lease(),
+      costMicros: 3,
+      now: epoch + 2,
+    }),
+  );
+  expect(repository.commitTransition(chargedAgain).ok).toBe(true);
+  expect(repository.get("commission-1")?.budget.used.costMicros).toBe(20);
+});
+
 test("only branded domain proposals and transitions can mutate durable state", () => {
   const repository = openStore();
   const initial = proposal();

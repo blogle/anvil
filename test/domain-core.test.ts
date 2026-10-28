@@ -4,6 +4,7 @@ import {
   decide,
   evolve,
   evolveOperation,
+  proposeCommission,
   type Commission,
   type LeaseGrant,
   type Observation,
@@ -16,6 +17,7 @@ import {
   observation,
   policy,
   proposal,
+  proposalInput,
   value,
 } from "./support/fixtures";
 
@@ -580,6 +582,22 @@ test("maxAttempts one admits its first Attempt but blocks a second strategy Atte
   });
 });
 
+test("proposal rejects zero Attempt and instruction limits", () => {
+  const input = proposalInput();
+  expect(
+    proposeCommission({
+      ...input,
+      budget: { ...input.budget, maxAttempts: 0 },
+    }),
+  ).toEqual({ ok: false, error: "invalid_proposal" });
+  expect(
+    proposeCommission({
+      ...input,
+      budget: { ...input.budget, maxInstructions: 0 },
+    }),
+  ).toEqual({ ok: false, error: "invalid_proposal" });
+});
+
 test("budget exhaustion blocks new work but not recording authoritative delivery", () => {
   const state = admittedCommission();
   const exhausted: Commission = {
@@ -598,6 +616,108 @@ test("budget exhaustion blocks new work but not recording authoritative delivery
     kind: "hold",
     reason: "budget_exhausted",
   });
+});
+
+test("instruction, repair, cost, and deadline budgets stop only the constrained work", () => {
+  const oneInstruction = admittedCommission({
+    budget: {
+      maxAttempts: 3,
+      maxInstructions: 1,
+      maxRepairs: 3,
+      maxCostMicros: 100,
+      deadlineAt: epoch + 10_000,
+    },
+  });
+  const firstTurn = value(
+    evolve(oneInstruction, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: observation(),
+      operations: [],
+      policy,
+      now: epoch,
+    }),
+  );
+  expect(firstTurn.decision?.kind).toBe("continue");
+  expect(firstTurn.commission.budget.used.instructions).toBe(1);
+  expect(
+    decide(firstTurn.commission, observation(), [], policy, epoch).kind,
+  ).toBe("hold");
+
+  const noCost = admittedCommission({
+    budget: {
+      maxAttempts: 3,
+      maxInstructions: 12,
+      maxRepairs: 3,
+      maxCostMicros: 0,
+      deadlineAt: epoch + 10_000,
+    },
+  });
+  expect(decide(noCost, observation(), [], policy, epoch)).toMatchObject({
+    kind: "hold",
+    reason: "budget_exhausted",
+  });
+
+  const deadline = admittedCommission({
+    budget: {
+      maxAttempts: 3,
+      maxInstructions: 12,
+      maxRepairs: 3,
+      maxCostMicros: 100,
+      deadlineAt: epoch + 10,
+    },
+  });
+  expect(decide(deadline, observation(), [], policy, epoch + 10)).toMatchObject(
+    {
+      kind: "hold",
+      reason: "budget_exhausted",
+    },
+  );
+
+  const noRepairs = admittedCommission({
+    budget: {
+      maxAttempts: 3,
+      maxInstructions: 12,
+      maxRepairs: 0,
+      maxCostMicros: 100,
+      deadlineAt: epoch + 10_000,
+    },
+  });
+  const failureObservation = observation({
+    candidateRevision: "candidate-1",
+    workerClaims: [
+      {
+        id: "worker-1",
+        obligationId: "acceptance-1",
+        claim: "implemented",
+        observedAt: epoch,
+        expiresAt: epoch + 10_000,
+        sourceIdentity: "session-1",
+      },
+    ],
+    checks: {
+      runId: "failed-check",
+      revision: "candidate-1",
+      state: "failing",
+      failureIds: ["lint:1"],
+      observedAt: epoch,
+      expiresAt: epoch + 10_000,
+      source: "ci",
+    },
+  });
+  const withWorkerEvidence = value(
+    evolve(noRepairs, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: failureObservation,
+      operations: [],
+      policy,
+      now: epoch,
+    }),
+  ).commission;
+  expect(
+    decide(withWorkerEvidence, failureObservation, [], policy, epoch).kind,
+  ).toBe("change_strategy");
 });
 
 test("seeded fast-check state-machine commands preserve owner, budget, revision evidence, and completion invariants", () => {
