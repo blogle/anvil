@@ -7,3 +7,5 @@ The TypeScript slice includes a functional Commission reconciliation core, SQLit
 Run `nix develop -c just check` for the pinned Bun-only fast path. `bun.lock` is the sole JavaScript lock authority; `bun.nix` is generated from it and checked by the Nix dependency derivation. `just ci-check` and `just ci-verify` run the higher-fidelity Nix/SDLC checks. Project intent and unresolved decisions live in [`docs/index.md`](docs/index.md). Fieldnotes documentation is available through `just docs`.
 
 See [`docs/local-daemon.md`](docs/local-daemon.md) for local HTTP/MCP startup and contract details.
+
+The separately authorized live-acceptance preparation (not execution approval) is documented in [`docs/first-slice-live-acceptance-runbook.md`](docs/first-slice-live-acceptance-runbook.md).

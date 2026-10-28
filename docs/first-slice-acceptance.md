@@ -20,7 +20,7 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 | FS-12 | NOT_STARTED | `docs/review-mockups.html` is static only; no React/Vite/TanStack/Tailwind operational UI, authenticated API integration, component/browser tests, or screenshots against daemon. |
 | FS-13 | NOT_STARTED | No daemon/UI Nix package or nix2container image, image-content/startup/migration/probe/config validation, sandbox image convergence, or narrow deployment interface contract. No deployment/dotfiles work allowed. |
 | FS-14 | IMPLEMENTED_UNVERIFIED | Read-only incumbent source inventory at `origin/main` SHA above. `docs/parity-matrix.md` records feature-by-feature source references, local rewrite state/gaps, and explicit cutover prohibition. Remaining runnable comparative scenarios and independent review; no evidence supports cutover. |
-| FS-15 | BLOCKED_EXTERNAL | Required separate authorized dotfiles deployment and isolated live namespace execution cannot be performed by this worker. No cluster/dotfiles actions taken. A local acceptance runbook remains to be prepared; only independent authorized execution/review can move this status. |
+| FS-15 | BLOCKED_EXTERNAL | Required separate authorized dotfiles deployment and isolated live namespace execution cannot be performed by this worker. No cluster/dotfiles actions taken. Preparatory runbook is at `docs/first-slice-live-acceptance-runbook.md`; it is not approval or acceptance evidence. Only independently authorized execution/review can move this status. |
 
 ## G01–G06 adversarial findings
 
@@ -44,4 +44,4 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 
 ## Next checkpoint
 
-Compose the locally tested provider clients behind a single ApplicationService ProviderPort and begin a provider-backed local lifecycle harness; continue the missing GitHub write/Mergify and OpenCode watchdog contracts. Then close FS-01–FS-07 adversarial matrices, daemon scope, local multi-process recovery, UI and declarative packaging in reviewable checkpoints. FS-15 remains external and does not block local work. Do not claim `LOCAL_SLICE_READY` until FS-01–FS-14 each satisfy the complete contract with reproducible evidence and independent review.
+Compose the locally tested provider clients behind durable external references and a single ApplicationService ProviderPort, then exercise a full lifecycle over local HTTP fixtures. Continue the missing GitHub write/Mergify and OpenCode watchdog contracts, FS-01–FS-07 adversarial matrices, daemon scope, local multi-process recovery, UI and declarative packaging. The FS-15 runbook is preparatory only; that external gate remains blocked and does not block local work. Do not claim `LOCAL_SLICE_READY` until FS-01–FS-14 each satisfy the complete contract with reproducible evidence and independent review.
