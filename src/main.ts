@@ -10,9 +10,20 @@ const databasePath = process.env["ANVIL_DATABASE"] ?? "./anvil.sqlite";
 const controllerId =
   process.env["ANVIL_CONTROLLER_ID"] ?? "anvil-local-controller";
 const operatorId = process.env["ANVIL_OPERATOR_ID"] ?? "local-operator";
+const reconciliationIntervalMs = Number(
+  process.env["ANVIL_RECONCILE_INTERVAL_MS"] ?? "5000",
+);
 if (bearerToken === undefined || bearerToken.length < 32) {
   throw new Error("ANVIL_API_TOKEN must contain at least 32 characters");
 }
+if (
+  !Number.isSafeInteger(reconciliationIntervalMs) ||
+  reconciliationIntervalMs < 250 ||
+  reconciliationIntervalMs > 60_000
+)
+  throw new Error(
+    "ANVIL_RECONCILE_INTERVAL_MS must be 250..60000 milliseconds",
+  );
 
 const policy: Policy = {
   maxObservationAgeMs: 60_000,
@@ -59,7 +70,7 @@ const app = createDaemonApp({
 const port = Number(process.env["PORT"] ?? "8080");
 const server = Bun.serve({ port, fetch: app.fetch });
 const reconciler = startReconciliationLoop(application, store, {
-  intervalMs: Number(process.env["ANVIL_RECONCILE_INTERVAL_MS"] ?? "1000"),
+  intervalMs: reconciliationIntervalMs,
   onResult: (commissionId, error) => {
     const detail =
       error instanceof Error

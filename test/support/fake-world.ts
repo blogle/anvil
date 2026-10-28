@@ -27,6 +27,7 @@ export class FakeWorld implements LeasePort, ProviderPort, AuthorizationPort {
   integration: Observation["integration"] = { kind: "none" };
   verificationCount = 0;
   observationCount = 0;
+  readonly observedCommissionIds: string[] = [];
   loseRepairAcknowledgement = true;
   loseFirstInstructionAcknowledgement = false;
   loseRetryAcknowledgement = false;
@@ -35,6 +36,18 @@ export class FakeWorld implements LeasePort, ProviderPort, AuthorizationPort {
   readonly dispatchCount = new Map<string, number>();
   readonly dispatchKinds: string[] = [];
   readonly sideEffects = new Map<string, OperationOutcome>();
+  readonly #executionListeners = new Set<(commissionId: string) => void>();
+
+  subscribeExecutionEvents(
+    onCommission: (commissionId: string) => void,
+  ): () => void {
+    this.#executionListeners.add(onCommission);
+    return () => this.#executionListeners.delete(onCommission);
+  }
+
+  notifyExecutionEvent(commissionId: string): void {
+    for (const listener of this.#executionListeners) listener(commissionId);
+  }
 
   async approve(request: Readonly<{ principalId: string }>): Promise<boolean> {
     return request.principalId === "operator-1";
@@ -63,6 +76,7 @@ export class FakeWorld implements LeasePort, ProviderPort, AuthorizationPort {
     _operations: readonly Operation[],
   ): Promise<ProviderResult<Observation>> {
     this.observationCount += 1;
+    this.observedCommissionIds.push(commission.id);
     return {
       ok: true,
       value: {

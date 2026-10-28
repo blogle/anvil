@@ -198,3 +198,59 @@ test("daemon reconciliation loop performs an initial durable-state scan and stop
   await loop.stop();
   expect(world.observationCount).toBeGreaterThan(0);
 });
+
+test("an OpenCode execution event wakes only its Commission before the periodic scan", async () => {
+  const app = setup();
+  const created = await app.request(
+    "/api/commissions",
+    authorized(proposalInput({ id: "event-woken-commission" })),
+  );
+  expect(created.status).toBe(201);
+  const admitted = await app.request(
+    "/api/commissions/event-woken-commission/admit",
+    authorized({}),
+  );
+  expect(admitted.status).toBe(200);
+  const otherCreated = await app.request(
+    "/api/commissions",
+    authorized(proposalInput({ id: "not-woken-commission" })),
+  );
+  expect(otherCreated.status).toBe(201);
+  const otherAdmitted = await app.request(
+    "/api/commissions/not-woken-commission/admit",
+    authorized({}),
+  );
+  expect(otherAdmitted.status).toBe(200);
+
+  const world = new FakeWorld();
+  world.executionKind = "running";
+  const application = new ApplicationService(
+    store!,
+    world,
+    world,
+    world,
+    "controller-1",
+    policy,
+  );
+  const loop = startReconciliationLoop(application, store!, {
+    intervalMs: 60_000,
+    now: () => epoch + 10,
+  });
+  for (
+    let attempt = 0;
+    attempt < 100 && world.observationCount < 2;
+    attempt += 1
+  )
+    await Bun.sleep(5);
+  expect(world.observationCount).toBe(2);
+  world.notifyExecutionEvent("event-woken-commission");
+  for (
+    let attempt = 0;
+    attempt < 100 && world.observationCount === 2;
+    attempt += 1
+  )
+    await Bun.sleep(5);
+  expect(world.observationCount).toBe(3);
+  expect(world.observedCommissionIds.at(-1)).toBe("event-woken-commission");
+  await loop.stop();
+});

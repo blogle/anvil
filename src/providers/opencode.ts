@@ -3,7 +3,22 @@ import type { ProviderResult } from "../application";
 import type { ExecutionObservation, Operation } from "../domain";
 
 const maxResponseBytes = 2 * 1024 * 1024;
+const maxEventFrameBytes = 2 * 1024 * 1024;
 const watchdogPollIntervalMs = 5_000;
+const watchdogEventTypes = [
+  "session.execution.started",
+  "session.execution.succeeded",
+  "session.execution.failed",
+  "session.execution.interrupted",
+  "session.step.failed",
+  "session.step.ended",
+  "session.tool.failed",
+  "session.tool.success",
+  "session.tool.progress",
+  "session.retry.scheduled",
+  "session.compaction.ended",
+  "session.compaction.failed",
+] as const;
 
 export type OpenCodeInfo = Readonly<{ version: string }>;
 export type OpenCodeSession = Readonly<{ id: string }>;
@@ -375,6 +390,76 @@ export class OpenCodeAdapter {
         };
   }
 
+  async watchActivity(
+    onActivity: () => void,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const url = new URL("api/event", this.#base);
+    for (const type of watchdogEventTypes)
+      url.searchParams.append("types", type);
+    const headers = new Headers({ accept: "text/event-stream" });
+    if (this.#password !== undefined) {
+      const credentials = Buffer.from(`opencode:${this.#password}`).toString(
+        "base64",
+      );
+      headers.set("authorization", `Basic ${credentials}`);
+    }
+    let retryDelayMs = 250;
+    while (!signal.aborted) {
+      let response: Response;
+      try {
+        response = await fetch(url, { headers, signal });
+      } catch {
+        if (signal.aborted) return;
+        retryDelayMs = await reconnectDelay(retryDelayMs, signal);
+        continue;
+      }
+      if (response.status === 404) return;
+      if (!response.ok || response.body === null) {
+        await response.body?.cancel();
+        retryDelayMs = await reconnectDelay(retryDelayMs, signal);
+        continue;
+      }
+      onActivity();
+      retryDelayMs = 250;
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      try {
+        while (!signal.aborted) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer = (buffer + decoder.decode(value, { stream: true })).replace(
+            /\r\n/g,
+            "\n",
+          );
+          if (buffer.length > maxEventFrameBytes) {
+            await reader.cancel();
+            break;
+          }
+          let boundary = buffer.indexOf("\n\n");
+          while (boundary >= 0) {
+            const frame = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            if (frame.split("\n").some((line) => line.startsWith("data:"))) {
+              this.#executionSnapshots.clear();
+              onActivity();
+            }
+            boundary = buffer.indexOf("\n\n");
+          }
+        }
+      } catch {
+        if (signal.aborted) return;
+      } finally {
+        reader.releaseLock();
+      }
+      if (signal.aborted) return;
+      this.#executionSnapshots.clear();
+      onActivity();
+      retryDelayMs = await reconnectDelay(retryDelayMs, signal);
+    }
+  }
+
   async dispatchInstruction(
     sessionId: string,
     operation: Operation,
@@ -598,6 +683,25 @@ function optionalCount(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value
     : null;
+}
+
+async function reconnectDelay(
+  delayMs: number,
+  signal: AbortSignal,
+): Promise<number> {
+  if (signal.aborted) return delayMs;
+  await new Promise<void>((resolve) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    timer = setTimeout(finish, delayMs);
+    signal.addEventListener("abort", finish, { once: true });
+    if (signal.aborted) finish();
+  });
+  return Math.min(delayMs * 2, 10_000);
 }
 
 async function readBounded(

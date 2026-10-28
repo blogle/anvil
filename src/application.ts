@@ -43,6 +43,9 @@ export interface AuthorizationPort {
 }
 
 export interface ProviderPort {
+  subscribeExecutionEvents?(
+    onCommission: (commissionId: string) => void,
+  ): () => void;
   observe(
     commission: Commission,
     now: number,
@@ -261,6 +264,14 @@ export class ApplicationService {
     this.#authorization = authorization;
     this.#controllerId = controllerId;
     this.#policy = policy;
+  }
+
+  subscribeExecutionEvents(
+    onCommission: (commissionId: string) => void,
+  ): () => void {
+    return (
+      this.#provider.subscribeExecutionEvents?.(onCommission) ?? (() => {})
+    );
   }
 
   propose(input: CommissionProposalInput): Result<void, ApplicationError> {

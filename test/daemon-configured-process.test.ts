@@ -190,6 +190,9 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   let interruptCount = 0;
   let loseNextInterruptAck = false;
   let interruptInspectionBusy = false;
+  const openCodeEventSubscribers = new Set<
+    ReadableStreamDefaultController<Uint8Array>
+  >();
   const watchdogProgressAt = Date.now() - 30_000;
   provisionCount = 0;
   sessionCreateCount = 0;
@@ -237,6 +240,22 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
     port: openCodePort,
     async fetch(request) {
       const url = new URL(request.url);
+      if (url.pathname.endsWith("/api/event")) {
+        let subscriber: ReadableStreamDefaultController<Uint8Array> | undefined;
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            subscriber = controller;
+            openCodeEventSubscribers.add(controller);
+          },
+          cancel() {
+            if (subscriber !== undefined)
+              openCodeEventSubscribers.delete(subscriber);
+          },
+        });
+        return new Response(body, {
+          headers: { "content-type": "text/event-stream" },
+        });
+      }
       if (url.pathname.endsWith("/api/info"))
         return Response.json({ version: "2.0.26+fixture" });
       if (url.pathname.endsWith("/api/session/active"))
@@ -379,7 +398,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
     ANVIL_API_TOKEN: apiToken,
     ANVIL_DATABASE: join(directory, "configured.sqlite"),
     ANVIL_PROVIDER_MODE: "configured",
-    ANVIL_RECONCILE_INTERVAL_MS: "25",
+    ANVIL_RECONCILE_INTERVAL_MS: "250",
     ANVIL_SANDBOX_NAMESPACE: "configured-test",
     ANVIL_SANDBOX_IMAGE_DIGEST: `ghcr.io/example/sandbox@sha256:${"b".repeat(64)}`,
     ANVIL_WORKSPACE_SIZE: "10Gi",
@@ -451,6 +470,19 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
     safeBoundary: true,
     contextLimitTokens: 10_000,
   });
+  for (
+    let attempt = 0;
+    attempt < 100 && openCodeEventSubscribers.size === 0;
+    attempt += 1
+  )
+    await Bun.sleep(10);
+  expect(openCodeEventSubscribers.size).toBeGreaterThan(0);
+  for (const subscriber of openCodeEventSubscribers)
+    subscriber.enqueue(
+      new TextEncoder().encode(
+        'event: message\ndata: {"type":"session.tool.failed"}\n\n',
+      ),
+    );
   const watchdogOperations = await waitForOperationKind(
     baseUrl,
     "configured-commission",

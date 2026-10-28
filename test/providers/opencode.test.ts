@@ -339,6 +339,126 @@ test("OpenCode refuses to interrupt when a tool is still running at dispatch tim
   expect(interruptHits).toBe(0);
 });
 
+test("OpenCode event activity invalidates cached watchdog state and triggers a refresh", async () => {
+  const now = 1_800_000_000_000;
+  let tokenInput = 1_000;
+  let activeReads = 0;
+  let eventTypes: string[] = [];
+  const baseUrl = startFixture((request) => {
+    const url = new URL(request.url);
+    if (url.pathname === "/api/session/active") {
+      activeReads += 1;
+      return Response.json({ data: { "session-events": { type: "busy" } } });
+    }
+    if (url.pathname === "/api/session/session-events/message")
+      return Response.json({
+        data: [
+          {
+            id: "assistant-event-state",
+            type: "assistant",
+            time: { created: now - 1_000, completed: now - 100 },
+            tokens: {
+              input: tokenInput,
+              output: 10,
+              reasoning: 0,
+              cache: { read: 0, write: 0 },
+            },
+            content: [],
+          },
+        ],
+        cursor: { previous: null, next: null },
+      });
+    if (url.pathname === "/api/model")
+      return Response.json({
+        data: [
+          {
+            providerID: "provider",
+            modelID: "model",
+            limit: { context: 10_000 },
+          },
+        ],
+      });
+    if (url.pathname === "/api/event") {
+      eventTypes = url.searchParams.getAll("types");
+      tokenInput = 9_000;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              'event: message\ndata: {"type":"session.tool.failed"}\n\n',
+            ),
+          );
+          controller.close();
+        },
+      });
+      return new Response(body, {
+        headers: { "content-type": "text/event-stream" },
+      });
+    }
+    return Response.json({ message: "not found" }, { status: 404 });
+  });
+  const adapter = new OpenCodeAdapter({ baseUrl });
+  const model = { providerId: "provider", modelId: "model" };
+  expect(
+    (await adapter.observeExecution("session-events", now, model)).kind,
+  ).toBe("running");
+  const controller = new AbortController();
+  let wakes = 0;
+  await adapter.watchActivity(() => {
+    wakes += 1;
+    if (wakes === 2) controller.abort();
+  }, controller.signal);
+  expect(wakes).toBe(2);
+  expect(eventTypes).toContain("session.tool.failed");
+  const refreshed = await adapter.observeExecution(
+    "session-events",
+    now,
+    model,
+  );
+  expect(refreshed.kind).toBe("running");
+  if (refreshed.kind !== "running")
+    throw new Error("Expected refreshed active-session observation");
+  expect(refreshed.contextPressure).toBe(true);
+  expect(activeReads).toBe(2);
+});
+
+test("OpenCode event disconnects reconnect with backoff and force a fresh observation", async () => {
+  let connections = 0;
+  let subscribedTypes: string[] = [];
+  const baseUrl = startFixture((request) => {
+    const url = new URL(request.url);
+    if (url.pathname !== "/api/event")
+      return Response.json({ message: "not found" }, { status: 404 });
+    connections += 1;
+    subscribedTypes = url.searchParams.getAll("types");
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        if (connections === 1) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              'event: message\ndata: {"type":"session.tool.failed"}\n\n',
+            ),
+          );
+        }
+        controller.close();
+      },
+    });
+    return new Response(body, {
+      headers: { "content-type": "text/event-stream" },
+    });
+  });
+  const adapter = new OpenCodeAdapter({ baseUrl });
+  const controller = new AbortController();
+  let wakes = 0;
+  await adapter.watchActivity(() => {
+    wakes += 1;
+    if (wakes === 4) controller.abort();
+  }, controller.signal);
+  expect(connections).toBe(2);
+  expect(wakes).toBe(4);
+  expect(subscribedTypes).toContain("session.tool.failed");
+});
+
 test("an acknowledged-lost prompt is reconciled by message identity and never automatically replayed", async () => {
   let promptHits = 0;
   let userMessageId: string | null = null;

@@ -19,6 +19,7 @@ to a live OpenCode instance. Supported requests in `src/providers/opencode.ts`:
 | Read recent messages | `GET /api/session/{id}/message?limit=50&order=desc` | `{ "data": [...] }` with message times, assistant token usage, and tool states |
 | Read model context limits | `GET /api/model` | `{ "data": [{ "providerID", "modelID", "limit": { "context" } }] }` |
 | Interrupt safe active execution | `POST /api/session/{id}/interrupt?resume=false` | `{ "data": { "interrupted": true } }` |
+| Subscribe to execution wakeups | `GET /api/event?types=session.tool.failed&types=...` | `text/event-stream` frames; payload wakes reconciliation, which then re-reads authoritative state |
 | Select model | `POST /api/session/{id}/model` with providerID/modelID | Empty successful response |
 | Submit instruction | `POST /api/session/{id}/prompt` with deterministic `{id,text}` | `{ "data": { "id": "..." } }` |
 
@@ -45,11 +46,16 @@ interrupted or already-idle Session is observed, the controller selects a bounde
 repair, strategy change, or context refresh. The hierarchical context packet is
 reconstructed from durable Campaign/Commission, Assignment/Attempt, budget,
 evidence, and repair Operation records; it does not include a transcript.
+The filtered SSE subscription is volatile by provider contract: event activity
+wakes the owning Commission, disconnects use bounded exponential backoff, and
+each reconnect forces a fresh provider observation. The daemon's bounded periodic
+reconciliation remains the fallback when `/api/event` is unavailable or events
+are lost.
 
-The adapter is exercised through both local HTTP fixtures and the configured
-daemon process test. The fixtures pin the response shapes used by this slice but
-do not prove compatibility with the deployed OpenCode build at the incumbent's
-pinned source revision. There is no live provider acceptance. SSE event-stream
-reconnection, event-driven waking, tool output/error classification beyond the
-structured latest-message tool state, and production credential management
-remain unverified.
+The adapter is exercised through local HTTP fixtures, SSE disconnect/reconnect,
+and the configured daemon process test. The fixtures pin the response shapes
+used by this slice but do not prove compatibility with the deployed OpenCode
+build at the incumbent's pinned source revision. There is no live provider
+acceptance. Randomized event ordering/loss, tool output/error classification
+beyond the structured latest-message tool state, and production credential
+management remain unverified.

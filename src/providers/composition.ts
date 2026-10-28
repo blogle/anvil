@@ -39,9 +39,36 @@ export class ProviderComposition implements ProviderPort {
   readonly #config: ProviderCompositionConfig;
   readonly #bindings = new Map<string, RuntimeBinding>();
   readonly #openCodeAdapters = new Map<string, OpenCodeAdapter>();
+  readonly #executionListeners = new Set<(commissionId: string) => void>();
+  readonly #executionWatchers = new Map<
+    string,
+    Readonly<{ sessionId: string; controller: AbortController }>
+  >();
 
   constructor(config: ProviderCompositionConfig) {
     this.#config = config;
+  }
+
+  subscribeExecutionEvents(
+    onCommission: (commissionId: string) => void,
+  ): () => void {
+    this.#executionListeners.add(onCommission);
+    for (const [commissionId, binding] of this.#bindings) {
+      if (binding.openCodeSessionId !== null)
+        this.#ensureExecutionWatcher(
+          commissionId,
+          binding.sandboxResourceName,
+          binding.openCodeSessionId,
+        );
+    }
+    return () => {
+      this.#executionListeners.delete(onCommission);
+      if (this.#executionListeners.size === 0) {
+        for (const watcher of this.#executionWatchers.values())
+          watcher.controller.abort();
+        this.#executionWatchers.clear();
+      }
+    };
   }
 
   async observe(
@@ -144,6 +171,7 @@ export class ProviderComposition implements ProviderPort {
       };
     }
     if (openCodeSessionId === null) {
+      this.#stopExecutionWatcher(commission.id);
       return {
         ok: true,
         value: {
@@ -158,6 +186,11 @@ export class ProviderComposition implements ProviderPort {
         },
       };
     }
+    this.#ensureExecutionWatcher(
+      commission.id,
+      sandboxResourceName,
+      openCodeSessionId,
+    );
     const execution = await this.#openCode(
       sandboxResourceName,
     ).observeExecution(openCodeSessionId, now, this.#config.model);
@@ -414,6 +447,33 @@ export class ProviderComposition implements ProviderPort {
     const adapter = this.#config.openCodeForSandbox(sandboxResourceName);
     this.#openCodeAdapters.set(sandboxResourceName, adapter);
     return adapter;
+  }
+
+  #ensureExecutionWatcher(
+    commissionId: string,
+    sandboxResourceName: string,
+    sessionId: string,
+  ): void {
+    if (this.#executionListeners.size === 0) return;
+    const existing = this.#executionWatchers.get(commissionId);
+    if (existing?.sessionId === sessionId) return;
+    existing?.controller.abort();
+    const controller = new AbortController();
+    this.#executionWatchers.set(commissionId, { sessionId, controller });
+    void this.#openCode(sandboxResourceName)
+      .watchActivity(() => {
+        if (
+          this.#executionWatchers.get(commissionId)?.controller !== controller
+        )
+          return;
+        for (const listener of this.#executionListeners) listener(commissionId);
+      }, controller.signal)
+      .catch(() => {});
+  }
+
+  #stopExecutionWatcher(commissionId: string): void {
+    this.#executionWatchers.get(commissionId)?.controller.abort();
+    this.#executionWatchers.delete(commissionId);
   }
 }
 

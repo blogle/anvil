@@ -363,37 +363,85 @@ export function startReconciliationLoop(
     onResult?: (commissionId: string, error: unknown) => void;
   }>,
 ): ReconciliationLoop {
+  if (
+    !Number.isSafeInteger(options.intervalMs) ||
+    options.intervalMs < 1 ||
+    options.intervalMs > 60_000
+  )
+    throw new Error(
+      "Reconciliation interval must be an integer from 1 to 60000ms",
+    );
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let inFlight: Promise<void> = Promise.resolve();
-  let launch: () => void;
-  const schedule = () => {
-    if (stopped) return;
-    timer = setTimeout(launch, options.intervalMs);
-  };
-  const run = async (): Promise<void> => {
-    const currentTime = (options.now ?? Date.now)();
-    for (const commission of store.list()) {
-      if (stopped) break;
-      if (commission.lifecycle !== "active" && commission.lifecycle !== "held")
-        continue;
-      try {
-        const result = await application.reconcile(commission.id, currentTime);
-        if (!result.ok) options.onResult?.(commission.id, result.error);
-      } catch (error) {
-        options.onResult?.(commission.id, error);
-      }
-    }
-    schedule();
-  };
-  launch = () => {
+  let running = false;
+  const pendingEvents = new Set<string>();
+  const launchFull = () => {
+    timer = undefined;
     inFlight = run();
   };
-  launch();
+  const launchEvents = () => {
+    timer = undefined;
+    const commissionIds = [...pendingEvents];
+    pendingEvents.clear();
+    inFlight = run(commissionIds);
+  };
+  const schedule = (delayMs: number, callback: () => void) => {
+    if (stopped) return;
+    if (timer !== undefined) clearTimeout(timer);
+    timer = setTimeout(callback, delayMs);
+  };
+  const run = async (commissionIds?: readonly string[]): Promise<void> => {
+    if (running) {
+      for (const commissionId of commissionIds ?? [])
+        pendingEvents.add(commissionId);
+      return;
+    }
+    running = true;
+    const currentTime = (options.now ?? Date.now)();
+    try {
+      const commissions =
+        commissionIds === undefined
+          ? store.list()
+          : commissionIds.flatMap((commissionId) => {
+              const commission = store.get(commissionId);
+              return commission === null ? [] : [commission];
+            });
+      for (const commission of commissions) {
+        if (stopped) break;
+        if (
+          commission.lifecycle !== "active" &&
+          commission.lifecycle !== "held"
+        )
+          continue;
+        try {
+          const result = await application.reconcile(
+            commission.id,
+            currentTime,
+          );
+          if (!result.ok) options.onResult?.(commission.id, result.error);
+        } catch (error) {
+          options.onResult?.(commission.id, error);
+        }
+      }
+    } finally {
+      running = false;
+      if (stopped) return;
+      if (pendingEvents.size > 0) schedule(100, launchEvents);
+      else schedule(options.intervalMs, launchFull);
+    }
+  };
+  const unsubscribe = application.subscribeExecutionEvents((commissionId) => {
+    if (stopped) return;
+    pendingEvents.add(commissionId);
+    if (!running) schedule(100, launchEvents);
+  });
+  inFlight = run();
   return {
     stop: async () => {
       stopped = true;
       if (timer !== undefined) clearTimeout(timer);
+      unsubscribe();
       await inFlight;
     },
   };
