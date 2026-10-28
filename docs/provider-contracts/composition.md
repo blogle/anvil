@@ -19,8 +19,10 @@ inspection, never assuming that a repeated message ID is exactly-once.
 `test/providers/composition.test.ts` runs this composition through the real
 `ApplicationService` and SQLite store, with local HTTP fixtures for both
 providers and application/store reconstruction between provisioning stages. It
-proves only the local protocol path. The composition is not wired into
-`src/main.ts`: an authoritative repository/CI/Mergify observation/write
-composition, safe Session-create recovery, Git credential handoff, and runtime
-configuration are still missing. No live API or Kubernetes calls are part of
-these tests.
+proves only the local protocol path. `src/providers/runtime.ts` composes the
+provider clients and `src/main.ts` exposes them behind explicit
+`ANVIL_PROVIDER_MODE=configured`; the default remains unavailable. Configured
+daemon mode itself has not been run. Git branch publication, verification
+initiation, worker credential handoff, safe Session-create recovery and
+multi-controller Lease integration remain outstanding. No live API or
+Kubernetes calls are part of these tests.

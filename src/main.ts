@@ -1,8 +1,9 @@
 import { ApplicationService } from "./application";
 import { createDaemonApp, startReconciliationLoop } from "./daemon";
-import type { LeasePort, ProviderPort, ProviderResult } from "./application";
-import type { Operation, OperationOutcome, Policy } from "./domain";
+import type { LeasePort } from "./application";
+import type { Policy } from "./domain";
 import { CommissionStore } from "./persistence/sqlite";
+import { createProviderPort } from "./providers/runtime";
 
 const bearerToken = process.env["ANVIL_API_TOKEN"];
 const databasePath = process.env["ANVIL_DATABASE"] ?? "./anvil.sqlite";
@@ -38,29 +39,7 @@ const lease: LeasePort = {
   },
 };
 
-const provider: ProviderPort = {
-  async observe(): Promise<ProviderResult<never>> {
-    return {
-      ok: false,
-      error: {
-        kind: "unavailable",
-        message: "No external provider adapter is configured",
-      },
-    };
-  },
-  async dispatch(
-    _commission: import("./domain").Commission,
-    _operation: Operation,
-  ): Promise<ProviderResult<Exclude<OperationOutcome, { kind: "prepared" }>>> {
-    return {
-      ok: false,
-      error: { kind: "unavailable", message: "No provider adapter configured" },
-    };
-  },
-  async inspectOperation(): Promise<ProviderResult<OperationOutcome | null>> {
-    return { ok: true, value: null };
-  },
-};
+const provider = createProviderPort(process.env);
 const store = new CommissionStore(databasePath);
 const application = new ApplicationService(
   store,
@@ -80,10 +59,19 @@ const port = Number(process.env["PORT"] ?? "8080");
 const server = Bun.serve({ port, fetch: app.fetch });
 const reconciler = startReconciliationLoop(application, store, {
   intervalMs: Number(process.env["ANVIL_RECONCILE_INTERVAL_MS"] ?? "1000"),
-  onResult: (commissionId, error) =>
+  onResult: (commissionId, error) => {
+    const detail =
+      error instanceof Error
+        ? { name: error.name, message: error.message }
+        : error;
     console.error(
-      JSON.stringify({ event: "reconcile_unavailable", commissionId, error }),
-    ),
+      JSON.stringify({
+        event: "reconcile_unavailable",
+        commissionId,
+        error: detail,
+      }),
+    );
+  },
 });
 
 console.log(JSON.stringify({ event: "daemon_started", port, databasePath }));

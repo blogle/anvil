@@ -2,11 +2,12 @@
 
 The Bun daemon runs SQLite migrations, serves the authenticated HTTP/MCP
 application surface, and scans durable active Commissions on a bounded interval.
-Its current executable wiring deliberately reports provider observation as
-unavailable; no fake provider is presented as a live integration. An isolated
-OpenCode V2 HTTP client is under protocol-compatible tests, but is not yet
-composed into the daemon provider port. Injected provider ports are used by
-local HTTP/MCP and scheduler tests.
+It defaults to the explicit unavailable provider. An opt-in configured mode
+composes Agent Sandbox, OpenCode V2, GitHub App/REST, and Mergify clients; exact
+settings and provider limits are documented in
+[`provider-contracts/runtime-configuration.md`](provider-contracts/runtime-configuration.md).
+The configured mode is fixture-tested but has not been deployed, validated for
+multi-controller operation, or accepted as a live provider integration.
 
 ## Run
 

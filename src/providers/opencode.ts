@@ -38,13 +38,10 @@ export class OpenCodeAdapter {
         "OpenCode base URL must not include credentials, query, or fragment",
       );
     if (
-      options.password !== undefined &&
       base.protocol !== "https:" &&
       !["localhost", "127.0.0.1", "::1"].includes(base.hostname)
     ) {
-      throw new Error(
-        "OpenCode Basic credentials require HTTPS outside loopback",
-      );
+      throw new Error("OpenCode HTTP is permitted only for loopback fixtures");
     }
     base.pathname = base.pathname.endsWith("/")
       ? base.pathname
@@ -226,6 +223,7 @@ export class OpenCodeAdapter {
   async inspectInstruction(
     sessionId: string,
     operation: Operation,
+    observedAt = Date.now(),
   ): Promise<ProviderResult<Operation["outcome"] | null>> {
     if (
       operation.kind !== "continue" &&
@@ -262,7 +260,7 @@ export class OpenCodeAdapter {
       ok: true,
       value: {
         kind: "observed",
-        observedAt: Date.now(),
+        observedAt,
         source: "OpenCode V2 message inspection",
         result: "applied",
         retrySafe: false,

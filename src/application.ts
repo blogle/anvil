@@ -51,10 +51,12 @@ export interface ProviderPort {
   dispatch(
     commission: Commission,
     operation: Operation,
+    now: number,
   ): Promise<ProviderResult<Exclude<OperationOutcome, { kind: "prepared" }>>>;
   inspectOperation(
     commission: Commission,
     operation: Operation,
+    now: number,
   ): Promise<ProviderResult<OperationOutcome | null>>;
 }
 
@@ -402,6 +404,7 @@ export class ApplicationService {
         const inspected = await this.#provider.inspectOperation(
           current,
           pending,
+          now,
         );
         if (!inspected.ok)
           return {
@@ -569,7 +572,11 @@ export class ApplicationService {
     lease: LeaseGrant,
     now: number,
   ): Promise<Result<Commission, ApplicationError>> {
-    const dispatched = await this.#provider.dispatch(commission, operation);
+    const dispatched = await this.#provider.dispatch(
+      commission,
+      operation,
+      now,
+    );
     let outcome: OperationOutcome;
     if (dispatched.ok) {
       const parsed = operationOutcomeSchema.safeParse(dispatched.value);

@@ -189,6 +189,7 @@ export class ProviderComposition implements ProviderPort {
   async dispatch(
     commission: Commission,
     operation: Operation,
+    now: number,
   ): Promise<ProviderResult<Exclude<OperationOutcome, { kind: "prepared" }>>> {
     if (operation.kind === "provision_sandbox") {
       const result = await this.#config.sandbox.create(
@@ -199,7 +200,7 @@ export class ProviderComposition implements ProviderPort {
         ok: true,
         value: {
           kind: "observed",
-          observedAt: Date.now(),
+          observedAt: now,
           source: "agent-sandbox-v1beta1",
           result: "applied",
           retrySafe: false,
@@ -223,7 +224,7 @@ export class ProviderComposition implements ProviderPort {
         ok: true,
         value: {
           kind: "observed",
-          observedAt: Date.now(),
+          observedAt: now,
           source: "opencode-v2",
           result: "applied",
           retrySafe: false,
@@ -255,7 +256,7 @@ export class ProviderComposition implements ProviderPort {
                 ok: true,
                 value: {
                   kind: "observed",
-                  observedAt: Date.now(),
+                  observedAt: now,
                   source: "opencode-v2",
                   result: "applied",
                   retrySafe: false,
@@ -284,7 +285,7 @@ export class ProviderComposition implements ProviderPort {
         ok: true,
         value: {
           kind: "observed",
-          observedAt: Date.now(),
+          observedAt: now,
           source: "github-pull-request-rest",
           result: "accepted",
           retrySafe: false,
@@ -300,6 +301,7 @@ export class ProviderComposition implements ProviderPort {
   async inspectOperation(
     commission: Commission,
     operation: Operation,
+    now: number,
   ): Promise<ProviderResult<OperationOutcome | null>> {
     if (operation.kind === "provision_sandbox") {
       const result = await this.#config.sandbox.inspectIntent(
@@ -310,7 +312,7 @@ export class ProviderComposition implements ProviderPort {
           ok: true,
           value: {
             kind: "observed",
-            observedAt: Date.now(),
+            observedAt: now,
             source: "agent-sandbox-v1beta1-inspection",
             result: "applied",
             retrySafe: false,
@@ -336,7 +338,7 @@ export class ProviderComposition implements ProviderPort {
         return { ok: true, value: null };
       return this.#config
         .openCodeForSandbox(binding.sandboxResourceName)
-        .inspectInstruction(binding.openCodeSessionId, operation);
+        .inspectInstruction(binding.openCodeSessionId, operation, now);
     }
     if (
       operation.kind === "integrate" &&
@@ -360,7 +362,7 @@ export class ProviderComposition implements ProviderPort {
         ok: true,
         value: {
           kind: "observed",
-          observedAt: Date.now(),
+          observedAt: now,
           source: "github-pull-request-inspection",
           result: "accepted",
           retrySafe: false,

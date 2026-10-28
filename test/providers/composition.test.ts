@@ -339,7 +339,11 @@ test("ProviderComposition creates and reobserves a GitHub PR without duplicate c
     createdAt: epoch,
     outcome: { kind: "prepared" },
   };
-  const dispatched = await composition.dispatch(commission, operation);
+  const dispatched = await composition.dispatch(
+    commission,
+    operation,
+    epoch + 1,
+  );
   expect(dispatched).toMatchObject({
     ok: true,
     value: {
@@ -348,7 +352,11 @@ test("ProviderComposition creates and reobserves a GitHub PR without duplicate c
       externalIdentity: "https://github.com/acme/demo/pull/31",
     },
   });
-  const inspected = await composition.inspectOperation(commission, operation);
+  const inspected = await composition.inspectOperation(
+    commission,
+    operation,
+    epoch + 2,
+  );
   expect(inspected).toMatchObject({
     ok: true,
     value: {

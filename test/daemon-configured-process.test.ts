@@ -1,0 +1,298 @@
+import { afterEach, expect, test } from "bun:test";
+import { generateKeyPairSync } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { proposalInput } from "./support/fixtures";
+
+type Child = Readonly<{
+  kill: (signal?: number | NodeJS.Signals) => void;
+  exited: Promise<number>;
+}>;
+
+const apiToken = "local-configured-provider-daemon-token-45chars";
+let directory: string | undefined;
+let daemonProcess: Child | undefined;
+let sandboxServer: ReturnType<typeof Bun.serve> | undefined;
+let openCodeServer: ReturnType<typeof Bun.serve> | undefined;
+let githubServer: ReturnType<typeof Bun.serve> | undefined;
+let mergifyServer: ReturnType<typeof Bun.serve> | undefined;
+let provisionCount = 0;
+let sessionCreateCount = 0;
+let promptCount = 0;
+
+afterEach(async () => {
+  if (daemonProcess !== undefined) {
+    daemonProcess.kill("SIGTERM");
+    await daemonProcess.exited;
+    daemonProcess = undefined;
+  }
+  for (const server of [
+    sandboxServer,
+    openCodeServer,
+    githubServer,
+    mergifyServer,
+  ])
+    server?.stop(true);
+  sandboxServer = undefined;
+  openCodeServer = undefined;
+  githubServer = undefined;
+  mergifyServer = undefined;
+  if (directory !== undefined)
+    rmSync(directory, { recursive: true, force: true });
+  directory = undefined;
+});
+
+function allocatePort(): number {
+  const listener = Bun.serve({ port: 0, fetch: () => new Response() });
+  const port = listener.port;
+  listener.stop(true);
+  return port;
+}
+
+function startDaemon(environment: Record<string, string>): Child {
+  return Bun.spawn(["bun", "run", "src/main.ts"], {
+    cwd: process.cwd(),
+    env: { ...(process.env as Record<string, string>), ...environment },
+    stdout: "ignore",
+    stderr: "inherit",
+  });
+}
+
+async function waitUntilReady(baseUrl: string): Promise<void> {
+  for (let attempt = 0; attempt < 160; attempt += 1) {
+    try {
+      if ((await fetch(`${baseUrl}/readyz`)).ok) return;
+    } catch {
+      // The configured Bun child may still be starting.
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error("Configured daemon did not become ready within four seconds");
+}
+
+async function waitForBootstrapOperations(baseUrl: string): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const response = await fetch(
+      `${baseUrl}/api/commissions/configured-commission/operations`,
+      { headers: { authorization: `Bearer ${apiToken}` } },
+    );
+    if (response.ok) {
+      const body = (await response.json()) as {
+        operations: readonly {
+          kind: string;
+          outcome: { kind: string };
+        }[];
+      };
+      const expected = ["provision_sandbox", "create_session", "continue"];
+      if (
+        expected.every((kind) =>
+          body.operations.some(
+            (operation) =>
+              operation.kind === kind && operation.outcome.kind === "observed",
+          ),
+        )
+      )
+        return;
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error("Configured provider bootstrap Operations did not finish");
+}
+
+test("configured Bun daemon composes local HTTP providers and recovers bindings without replay", async () => {
+  directory = mkdtempSync(join(tmpdir(), "anvil-configured-daemon-"));
+  const serverPort = allocatePort();
+  const sandboxPort = allocatePort();
+  const openCodePort = allocatePort();
+  const githubPort = allocatePort();
+  const mergifyPort = allocatePort();
+  let sandboxResource: Record<string, unknown> | null = null;
+  let sessionId: string | null = null;
+  let userMessageId: string | null = null;
+  provisionCount = 0;
+  sessionCreateCount = 0;
+  promptCount = 0;
+
+  sandboxServer = Bun.serve({
+    port: sandboxPort,
+    async fetch(request) {
+      expect(request.headers.get("authorization")).toBe(
+        "Bearer local-kubernetes-token",
+      );
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/sandboxes") && request.method === "GET")
+        return Response.json({
+          items: sandboxResource === null ? [] : [sandboxResource],
+        });
+      if (url.pathname.endsWith("/sandboxes") && request.method === "POST") {
+        provisionCount += 1;
+        const desired = (await request.json()) as Record<string, unknown>;
+        const metadata = desired["metadata"] as Record<string, unknown>;
+        sandboxResource = {
+          ...desired,
+          metadata: {
+            ...metadata,
+            resourceVersion: "1",
+            uid: "configured-uid",
+          },
+          status: { conditions: [{ type: "Ready", status: "True" }] },
+        };
+        return Response.json(sandboxResource, { status: 201 });
+      }
+      const prefix =
+        "/apis/agents.x-k8s.io/v1beta1/namespaces/configured-test/sandboxes/";
+      if (url.pathname.startsWith(prefix))
+        return sandboxResource === null
+          ? Response.json({ message: "not found" }, { status: 404 })
+          : Response.json(sandboxResource);
+      return Response.json({ message: "not found" }, { status: 404 });
+    },
+  });
+
+  openCodeServer = Bun.serve({
+    port: openCodePort,
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/api/info"))
+        return Response.json({ version: "2.0.26+fixture" });
+      if (url.pathname.endsWith("/api/session/active"))
+        return Response.json({ data: [] });
+      if (url.pathname.endsWith("/api/session") && request.method === "POST") {
+        sessionCreateCount += 1;
+        sessionId = "configured-session-1";
+        return Response.json({ data: { id: sessionId } });
+      }
+      if (url.pathname.endsWith("/model"))
+        return new Response(null, { status: 204 });
+      if (url.pathname.endsWith("/prompt")) {
+        promptCount += 1;
+        const prompt = (await request.json()) as { id: string; text: string };
+        userMessageId = prompt.id;
+        return Response.json({ data: { id: prompt.id } });
+      }
+      if (url.pathname.endsWith("/message"))
+        return Response.json({
+          data:
+            userMessageId === null ? [] : [{ id: userMessageId, type: "user" }],
+        });
+      return Response.json({ message: "not found" }, { status: 404 });
+    },
+  });
+
+  githubServer = Bun.serve({
+    port: githubPort,
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/app/installations/42/access_tokens")) {
+        const body = (await request.json()) as {
+          permissions: Record<string, string>;
+        };
+        return Response.json(
+          {
+            token: `ghs_${body.permissions["pull_requests"]}`,
+            expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+            permissions: body.permissions,
+          },
+          { status: 201 },
+        );
+      }
+      if (url.pathname.endsWith("/branches/anvil%2Fconfigured-commission"))
+        return Response.json({ message: "branch not found" }, { status: 404 });
+      if (url.pathname.endsWith("/pulls")) return Response.json([]);
+      return Response.json({ message: "not found" }, { status: 404 });
+    },
+  });
+  mergifyServer = Bun.serve({
+    port: mergifyPort,
+    fetch: () =>
+      Response.json(
+        { error_code: "PULL_REQUEST_NOT_QUEUED", detail: "not queued" },
+        { status: 404 },
+      ),
+  });
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const privateKeyPath = join(directory, "github-app.pem");
+  const mergifyTokenPath = join(directory, "mergify-token");
+  const kubernetesTokenPath = join(directory, "kubernetes-token");
+  writeFileSync(
+    privateKeyPath,
+    privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+  );
+  writeFileSync(mergifyTokenPath, "local-mergify-token");
+  writeFileSync(kubernetesTokenPath, "local-kubernetes-token");
+  const runtimeEnvironment = {
+    ANVIL_API_TOKEN: apiToken,
+    ANVIL_DATABASE: join(directory, "configured.sqlite"),
+    ANVIL_PROVIDER_MODE: "configured",
+    ANVIL_RECONCILE_INTERVAL_MS: "25",
+    ANVIL_SANDBOX_NAMESPACE: "configured-test",
+    ANVIL_SANDBOX_IMAGE_DIGEST: `ghcr.io/example/sandbox@sha256:${"b".repeat(64)}`,
+    ANVIL_WORKSPACE_SIZE: "10Gi",
+    ANVIL_PROFILE_PVC: "profile-pvc",
+    ANVIL_NIX_PVC: "nix-pvc",
+    ANVIL_KUBERNETES_API_URL: `http://127.0.0.1:${sandboxPort}/`,
+    ANVIL_KUBERNETES_TOKEN_FILE: kubernetesTokenPath,
+    ANVIL_OPENCODE_URL_TEMPLATE: `http://127.0.0.1:${openCodePort}/{sandbox}/{namespace}/`,
+    ANVIL_OPENCODE_MODEL_PROVIDER: "fixture-provider",
+    ANVIL_OPENCODE_MODEL_ID: "fixture-model",
+    ANVIL_GITHUB_APP_ID: "fixture-app",
+    ANVIL_GITHUB_INSTALLATION_ID: "42",
+    ANVIL_GITHUB_PRIVATE_KEY_FILE: privateKeyPath,
+    ANVIL_GITHUB_API_URL: `http://127.0.0.1:${githubPort}/api/`,
+    ANVIL_MERGIFY_TOKEN_FILE: mergifyTokenPath,
+    ANVIL_MERGIFY_API_URL: `http://127.0.0.1:${mergifyPort}/v1/`,
+    PORT: String(serverPort),
+  };
+
+  // Server startup happens after all local fixture services and secret files exist.
+  daemonProcess = startDaemon(runtimeEnvironment);
+  const baseUrl = `http://127.0.0.1:${serverPort}`;
+  await waitUntilReady(baseUrl);
+  const headers = {
+    authorization: `Bearer ${apiToken}`,
+    "content-type": "application/json",
+  };
+  const created = await fetch(`${baseUrl}/api/commissions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(
+      proposalInput({
+        id: "configured-commission",
+        repository: "https://github.com/acme/demo",
+      }),
+    ),
+  });
+  expect(created.status).toBe(201);
+  const admitted = await fetch(
+    `${baseUrl}/api/commissions/configured-commission/admit`,
+    { method: "POST", headers, body: "{}" },
+  );
+  expect(admitted.status).toBe(200);
+  await waitForBootstrapOperations(baseUrl);
+  expect(provisionCount).toBe(1);
+  expect(sessionCreateCount).toBe(1);
+  expect(promptCount).toBe(1);
+  expect(String(sessionId)).toBe("configured-session-1");
+
+  daemonProcess.kill("SIGTERM");
+  await daemonProcess.exited;
+  daemonProcess = undefined;
+  daemonProcess = startDaemon(runtimeEnvironment);
+  await waitUntilReady(baseUrl);
+  await Bun.sleep(100);
+  expect(provisionCount).toBe(1);
+  expect(sessionCreateCount).toBe(1);
+  expect(promptCount).toBe(1);
+  const operations = await fetch(
+    `${baseUrl}/api/commissions/configured-commission/operations`,
+    { headers },
+  ).then((response) => response.json());
+  expect(operations).toMatchObject({
+    operations: [
+      { kind: "provision_sandbox", outcome: { kind: "observed" } },
+      { kind: "create_session", outcome: { kind: "observed" } },
+      { kind: "continue", outcome: { kind: "observed" } },
+    ],
+  });
+}, 15_000);

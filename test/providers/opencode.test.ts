@@ -197,7 +197,7 @@ test("message absence remains unknown, not safe-to-retry, and invalid credential
         baseUrl: "http://opencode.example.invalid/",
         password: "must-not-travel-over-http",
       }),
-  ).toThrow("require HTTPS");
+  ).toThrow("loopback fixtures");
 });
 
 test("duplicate parent messages are not promoted to a successful Operation outcome", async () => {
