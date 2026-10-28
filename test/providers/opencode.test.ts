@@ -473,6 +473,25 @@ test("OpenCode event disconnects reconnect with backoff and force a fresh observ
   expect(eventRequestPath).toBe("/api/event");
 });
 
+test("an unsupported OpenCode event route leaves bounded reconciliation as the fallback", async () => {
+  let requests = 0;
+  const baseUrl = startFixture(() => {
+    requests += 1;
+    return Response.json({ message: "not found" }, { status: 404 });
+  });
+  const adapter = new OpenCodeAdapter({ baseUrl });
+  let wakes = 0;
+  await adapter.watchActivity(
+    "session-fixture",
+    () => {
+      wakes += 1;
+    },
+    new AbortController().signal,
+  );
+  expect(requests).toBe(1);
+  expect(wakes).toBe(0);
+});
+
 test("an acknowledged-lost prompt is reconciled by message identity and never automatically replayed", async () => {
   let promptHits = 0;
   let userMessageId: string | null = null;
