@@ -244,6 +244,8 @@ test("an OpenCode execution event wakes only its Commission before the periodic 
     await Bun.sleep(5);
   expect(world.observationCount).toBe(2);
   world.notifyExecutionEvent("event-woken-commission");
+  world.notifyExecutionEvent("event-woken-commission");
+  world.notifyExecutionEvent("event-woken-commission");
   for (
     let attempt = 0;
     attempt < 100 && world.observationCount === 2;
@@ -252,5 +254,7 @@ test("an OpenCode execution event wakes only its Commission before the periodic 
     await Bun.sleep(5);
   expect(world.observationCount).toBe(3);
   expect(world.observedCommissionIds.at(-1)).toBe("event-woken-commission");
+  await Bun.sleep(125);
+  expect(world.observationCount).toBe(3);
   await loop.stop();
 });
