@@ -2,11 +2,11 @@
 
 This ledger follows immutable requirements in [the acceptance contract](first-slice-contract.md), together with [domain semantics](spec.md) and [architecture](architecture.md). A local check proves only the behavior it measures. Permitted statuses are `NOT_STARTED`, `IN_PROGRESS`, `IMPLEMENTED_UNVERIFIED`, `VERIFIED`, `BLOCKED_EXTERNAL`, and `FAILED`. A status of `VERIFIED` requires the complete obligation's evidence, not merely implementation or a green broad test suite.
 
-Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7f4076`; latest pushed checkpoint is `e5ca69f` (local provider-composed Commission delivery lifecycle). The configured-provider daemon process test is in the current working tree. Incumbent source baseline inspected read-only at `origin/main` SHA `b55f9b0ecbf89309832c6dcdc9a615cbc4e15f8b`.
+Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7f4076`; latest pushed checkpoint is `63b1e90` (opt-in configured provider runtime). Incumbent source baseline inspected read-only at `origin/main` SHA `b55f9b0ecbf89309832c6dcdc9a615cbc4e15f8b`.
 
 | ID | Status | Evidence, executed tests, and remaining gap |
 |---|---|---|
-| FS-01 | IMPLEMENTED_UNVERIFIED | Bun/Nix/SDLC config in `flake.nix`, `nix/bun.nix`, `bun.lock`, generated `bun.nix`, `package.json`, `justfile`; bun.lock sole JS lock; no tracked Cargo/Rust/npm lock/image files. `scripts/check-bun-lock-drift.sh` runs in `just check`/`bun run check`; generated lock match and deliberate drift detection passed. Clean clone at `e5ca69f`: `nix develop -c just check` passed (60 tests / 723 assertions). `just ci-check`, `just ci-verify`, and SDLC adapter check passed on that source; the current runtime changes rerun these locally. Five feature fragments are committed; external release-policy review remains. |
+| FS-01 | IMPLEMENTED_UNVERIFIED | Bun/Nix/SDLC config in `flake.nix`, `nix/bun.nix`, `bun.lock`, generated `bun.nix`, `package.json`, `justfile`; bun.lock sole JS lock; no tracked Cargo/Rust/npm lock/image files. `scripts/check-bun-lock-drift.sh` runs in `just check`/`bun run check`; generated lock match and deliberate drift detection passed. Clean clone at `63b1e90`: `nix develop -c just check` passed (63 tests / 743 assertions). `just ci-check`, `just ci-verify`, and SDLC adapter check passed on the same source; GitHub evaluate/policy passed, check/gate/pr-fast pending, verify skipped. Five feature fragments are committed; external release-policy review remains. |
 | FS-02 | IMPLEMENTED_UNVERIFIED | Pure domain in `src/domain.ts`; frozen-input test and no-op decisions in `test/domain-core.test.ts`; SQL trigger test `test/lifecycle.test.ts` proves identical Wait, Hold, and Escalate polling execute zero Commission UPDATEs; forged transition denied in `test/store.test.ts`; roots `src/` and `test/`. Current suite: 63 tests / 743 assertions. Remaining: exhaustive decision coverage and independent source review. |
 | FS-03 | IMPLEMENTED_UNVERIFIED | Typed commands/authorization in `src/application.ts`, `src/domain.ts`; tests in `test/store.test.ts` “only branded…”, “generation CAS…”, “application authorization…”; terminal amendment rejection in `test/lifecycle.test.ts`; attempted worker criterion waiver rejected by strict observation schema in test “a worker observation cannot waive…”. Remaining: changed-vs-unchanged criteria evidence retention/invalidation and authority/decision freshness beyond current test cases. |
 | FS-04 | IMPLEMENTED_UNVERIFIED | Normalized SQL Operation journal/migrations `0001_core.sql` + `0002_runtime_operations.sql`; `test/store.test.ts` verifies v1→v2 journal preservation, prepared/submitted reopen without replay, retry authorization, and lost acknowledgement during retry followed by a second reopen/inspection. `test/lifecycle.test.ts` covers remote repair effect/lost ack. Remaining full failpoint matrix and duplicate counterexamples per phase, especially before-submit and after outcome-record restart counts. |
@@ -33,14 +33,14 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 | G05 / FS-03 concluded specification immutability | `test/lifecycle.test.ts` terminal amendment rejection; objective retained. | Passed. |
 | G06 / FS-02 stable no-op | `test/domain-core.test.ts`, `test/lifecycle.test.ts` repeated Wait/Hold/Escalate and SQL UPDATE trigger. | Passed locally. |
 
-## Latest executed verification (working tree after `e5ca69f`)
+## Latest executed verification (commit `63b1e90`)
 
 - `nix develop -c just check` — passed: generated lock matched, deliberate drift detected, format and strict TypeScript passed, 63 Bun tests / 743 assertions.
 - `nix develop -c just ci-check` — passed on the same source, including runtime-factory configuration tests.
 - `nix develop -c just ci-verify` — passed on the same source.
 - `nix run .#sdlc -- install --check` — passed on the same source.
-- Clean clone at committed `e5ca69f`: `nix develop -c just check` passed, 60 tests / 723 assertions; configured-provider process test and runtime factory are newer.
-- GitHub checks for `e5ca69f` were pending at last query; remote verify skipped. No merge queue action requested.
+- Clean clone at committed `63b1e90`: `nix develop -c just check` passed, 63 tests / 743 assertions.
+- GitHub checks for `63b1e90` were pending at last query; remote verify skipped. No merge queue action requested.
 
 ## Next checkpoint
 
