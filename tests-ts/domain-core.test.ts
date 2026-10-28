@@ -42,6 +42,9 @@ type Action =
   | { kind: "candidate"; revision: number }
   | { kind: "report" }
   | { kind: "check"; passing: boolean }
+  | { kind: "execution"; state: "running" | "idle" | "active_tool_failure" }
+  | { kind: "queue" }
+  | { kind: "continue" }
   | { kind: "merge"; matching: boolean }
   | { kind: "ack_lost" | "ack_seen" | "duplicate" }
   | { kind: "expire" }
@@ -189,6 +192,49 @@ class ActionCommand implements Command<Reference, System> {
           this.#reconcile(model, system, now);
         }
         break;
+      case "execution":
+        system.world = {
+          ...system.world,
+          execution:
+            this.action.state === "idle"
+              ? {
+                  kind: "idle",
+                  sessionId: "session-1",
+                  observedAt: now,
+                  expiresAt: now + 60_000,
+                  source: "opencode",
+                }
+              : {
+                  kind: "running",
+                  sessionId: "session-1",
+                  contextPressure: false,
+                  repeatedToolFailures:
+                    this.action.state === "active_tool_failure"
+                      ? ["tool-1", "tool-2", "tool-3"]
+                      : [],
+                  observedAt: now,
+                  expiresAt: now + 60_000,
+                  source: "opencode",
+                },
+        };
+        this.#reconcile(model, system, now);
+        break;
+      case "queue":
+        if (model.candidate !== null) {
+          system.world = {
+            ...system.world,
+            integration: {
+              kind: "queued",
+              revision: model.candidate,
+              providerIdentity: "model-pr/1",
+              observedAt: now,
+              expiresAt: now + 60_000,
+              source: "mergify",
+            },
+          };
+          this.#reconcile(model, system, now);
+        }
+        break;
       case "merge":
         if (model.candidate !== null) {
           model.mergedRevision = this.action.matching
@@ -318,6 +364,9 @@ class ActionCommand implements Command<Reference, System> {
       case "reconcile":
         this.#reconcile(model, system, now);
         break;
+      case "continue":
+        this.#reconcile(model, system, now);
+        break;
     }
     expect(system.commission.budget.used.costMicros).toBe(model.costUsed);
     expect(system.commission.owner?.epoch ?? null).toBe(model.ownerEpoch);
@@ -392,7 +441,7 @@ class ActionCommand implements Command<Reference, System> {
 test("seeded fast-check state-machine commands preserve owner, budget, revision evidence, and completion invariants", () => {
   const actions: fc.Arbitrary<Action> = fc.oneof(
     fc
-      .integer({ min: 0, max: 100 })
+      .integer({ min: 0, max: 1_000_000 })
       .map((amount): Action => ({ kind: "spend", amount })),
     fc
       .integer({ min: 1, max: 20 })
@@ -402,6 +451,13 @@ test("seeded fast-check state-machine commands preserve owner, budget, revision 
       { kind: "check", passing: true },
       { kind: "check", passing: false },
     ),
+    fc.constantFrom<Action>(
+      { kind: "execution", state: "running" },
+      { kind: "execution", state: "idle" },
+      { kind: "execution", state: "active_tool_failure" },
+    ),
+    fc.constant<Action>({ kind: "queue" }),
+    fc.constant<Action>({ kind: "continue" }),
     fc.constantFrom<Action>(
       { kind: "merge", matching: true },
       { kind: "merge", matching: false },
