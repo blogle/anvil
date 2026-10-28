@@ -618,6 +618,40 @@ test("budget exhaustion blocks new work but not recording authoritative delivery
   });
 });
 
+test("runtime provisioning must persist an external identity before the next effect", () => {
+  const current = admittedCommission();
+  const prepared = value(
+    evolve(current, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: observation(),
+      operations: [],
+      policy: { ...policy, runtimeProvisioning: true },
+      now: epoch,
+    }),
+  );
+  expect(prepared.decision?.kind).toBe("provision_sandbox");
+  const operation = prepared.newOperations[0];
+  if (operation === undefined)
+    throw new Error("Sandbox intent was not journaled");
+  expect(
+    evolveOperation(
+      prepared.commission,
+      operation,
+      lease(),
+      {
+        kind: "observed",
+        observedAt: epoch + 1,
+        source: "sandbox fixture",
+        result: "applied",
+        retrySafe: false,
+        externalIdentity: null,
+      },
+      epoch + 1,
+    ),
+  ).toEqual({ ok: false, error: "invalid_observation" });
+});
+
 test("instruction, repair, cost, and deadline budgets stop only the constrained work", () => {
   const oneInstruction = admittedCommission({
     budget: {

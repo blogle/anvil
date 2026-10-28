@@ -201,6 +201,17 @@ export class AgentSandboxClient {
     return parsed;
   }
 
+  async inspectIntent(
+    intent: SandboxIntent,
+  ): Promise<SandboxAdapterResult<SandboxObservation>> {
+    const existing = await this.inspect(intent.commissionId);
+    if (!existing.ok) return existing;
+    return verifySameIntent(
+      existing.value,
+      buildSandboxResource(intent, this.#namespace),
+    );
+  }
+
   async suspend(
     commissionId: string,
   ): Promise<SandboxAdapterResult<SandboxObservation>> {

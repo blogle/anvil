@@ -23,12 +23,15 @@ separated by normalized repository and purpose and refreshed inside a bounded
 expiry margin. Errors retain safe code/status/request-ID diagnostics but do
 not return upstream body text or credential material.
 
-This checkpoint implements token issuance only. It is not yet wired into worker
-Git/`gh` processes or a provider composition. `src/providers/github-delivery.ts`
-adds read-only repository branch, pull-request, and check-run observations over
-the broker's `gh_read` token. `test/providers/github-delivery.test.ts` uses a
-local HTTP fixture to prove repository-scoped auth, identity/revision mapping,
-incomplete check pagination, and unavailable/not-found distinctions. It does
-not yet implement branch creation/push, pull-request creation, commit-status
-contexts, Mergify, or session-capability endpoints. Worker/controller
-credential handoff and live GitHub integration remain unverified.
+This checkpoint does not wire the broker into worker Git/`gh` processes. The
+`GitHubDeliveryClient` adds repository branch, PR and check-run reads with the
+`gh_read` profile, and governed PR create-or-observe with the `gh` profile.
+After a lost PR-create acknowledgement it queries by owner/branch and only
+records a discovered postcondition; absence remains ambiguous and is never
+blindly replayed. `test/providers/github-delivery.test.ts` uses local fixtures
+for repository-scoped auth, identity/revision mapping, check pagination, and
+PR postcondition recovery. It does not implement branch push or commit-status
+contexts. `GitHubWorldObserver` in `src/providers/github-world.ts` combines
+Candidate, check, registered-PR and Mergify queue observations without defining
+repository check policy. Worker/controller credential handoff and live GitHub
+integration remain unverified.

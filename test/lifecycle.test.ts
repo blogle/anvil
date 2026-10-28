@@ -399,6 +399,71 @@ test("a successor ApplicationService observes a predecessor's accepted turn afte
   expect(world.dispatchCount.get(prior.id)).toBe(1);
 });
 
+test("runtime provisioning and Session binding are journaled before the first instruction", async () => {
+  const repository = openStore();
+  const world = new FakeWorld();
+  const runtimePolicy = { ...policy, runtimeProvisioning: true };
+  const app = new ApplicationService(
+    repository,
+    world,
+    world,
+    world,
+    "controller-1",
+    runtimePolicy,
+  );
+  expect(
+    app.propose(proposalInput({ id: "commission-runtime-bootstrap" })).ok,
+  ).toBe(true);
+  expect(
+    (await app.admit("commission-runtime-bootstrap", "operator-1", epoch)).ok,
+  ).toBe(true);
+
+  const decisions: ("provision_sandbox" | "create_session" | "continue")[] = [];
+  for (let step = 1; step <= 3; step += 1) {
+    const result = await app.reconcile(
+      "commission-runtime-bootstrap",
+      epoch + step,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("Runtime bootstrap reconciliation failed");
+    expect(result.value.decision).not.toBeNull();
+    const kind = result.value.decision?.kind;
+    if (
+      kind !== "provision_sandbox" &&
+      kind !== "create_session" &&
+      kind !== "continue"
+    ) {
+      throw new Error(`Unexpected runtime bootstrap decision: ${kind}`);
+    }
+    decisions.push(kind);
+  }
+
+  const operations = repository.operations("commission-runtime-bootstrap");
+  expect(decisions).toEqual([
+    "provision_sandbox",
+    "create_session",
+    "continue",
+  ]);
+  expect(operations.map(({ kind }) => kind)).toEqual(decisions);
+  expect(operations[0]?.outcome).toMatchObject({
+    kind: "observed",
+    result: "applied",
+    externalIdentity: "fake-sandbox:commission-runtime-bootstrap",
+  });
+  expect(operations[1]).toMatchObject({
+    target: "opencode:fake-sandbox:commission-runtime-bootstrap",
+    outcome: {
+      kind: "observed",
+      result: "applied",
+      externalIdentity: "fake-session:commission-runtime-bootstrap",
+    },
+  });
+  expect(world.dispatchKinds).toEqual(decisions);
+  expect(
+    repository.get("commission-runtime-bootstrap")?.budget.used.instructions,
+  ).toBe(1);
+});
+
 test("repeated identical Wait and Hold calls leave the durable Commission version unchanged", async () => {
   const repository = openStore();
   const world = new FakeWorld();
@@ -520,8 +585,9 @@ test("a worker observation cannot waive or replace an approved obligation", asyn
   } as unknown as Observation;
   const provider: ProviderPort = {
     observe: async () => ({ ok: true, value: attemptedWaiver }),
-    dispatch: (operation) => world.dispatch(operation),
-    inspectOperation: (operation) => world.inspectOperation(operation),
+    dispatch: (commission, operation) => world.dispatch(commission, operation),
+    inspectOperation: (commission, operation) =>
+      world.inspectOperation(commission, operation),
   };
   const app = new ApplicationService(
     repository,

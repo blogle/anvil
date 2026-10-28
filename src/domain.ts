@@ -92,6 +92,8 @@ export type Commission = Readonly<{
 }>;
 
 export type OperationKind =
+  | "provision_sandbox"
+  | "create_session"
   | "continue"
   | "repair"
   | "refresh_context"
@@ -228,6 +230,7 @@ export type Observation = Readonly<{
 export type Policy = Readonly<{
   maxObservationAgeMs: number;
   repeatedToolFailureThreshold: number;
+  runtimeProvisioning: boolean;
 }>;
 
 export type WakeCondition =
@@ -238,6 +241,8 @@ export type WakeCondition =
   | Readonly<{ kind: "provider_refresh"; provider: string }>;
 
 export type Decision =
+  | Readonly<{ kind: "provision_sandbox"; attemptId: string }>
+  | Readonly<{ kind: "create_session"; attemptId: string; sandboxId: string }>
   | Readonly<{ kind: "wait"; reason: string; wake: WakeCondition }>
   | Readonly<{ kind: "continue"; attemptId: string; directive: string }>
   | Readonly<{
@@ -623,6 +628,52 @@ export function decide(
   const attempt = activeAttempt(commission);
   if (attempt === null)
     return { kind: "escalate", reason: "No active Attempt is assigned" };
+  if (policy.runtimeProvisioning) {
+    const provisionedSandbox = operations.find(
+      (operation) =>
+        operation.commissionId === commission.id &&
+        operation.kind === "provision_sandbox" &&
+        operation.specificationGeneration ===
+          commission.specificationGeneration &&
+        operation.outcome.kind === "observed" &&
+        operation.outcome.result === "applied" &&
+        operation.outcome.externalIdentity !== null,
+    );
+    if (provisionedSandbox === undefined)
+      return { kind: "provision_sandbox", attemptId: attempt.id };
+    if (
+      provisionedSandbox.outcome.kind !== "observed" ||
+      provisionedSandbox.outcome.externalIdentity === null
+    )
+      return {
+        kind: "escalate",
+        reason: "Sandbox Operation has no external identity",
+      };
+    const sandboxId = provisionedSandbox.outcome.externalIdentity;
+    const session = operations.find(
+      (operation) =>
+        operation.commissionId === commission.id &&
+        operation.kind === "create_session" &&
+        operation.specificationGeneration ===
+          commission.specificationGeneration &&
+        operation.target === `opencode:${sandboxId}` &&
+        operation.outcome.kind === "observed" &&
+        operation.outcome.result === "applied" &&
+        operation.outcome.externalIdentity !== null,
+    );
+    if (session === undefined && observation.execution.kind !== "idle")
+      return {
+        kind: "wait",
+        reason: "Sandbox is not ready for OpenCode Session creation",
+        wake: { kind: "provider_refresh", provider: "sandbox" },
+      };
+    if (session === undefined)
+      return {
+        kind: "create_session",
+        attemptId: attempt.id,
+        sandboxId,
+      };
+  }
   const refusedOperation = operations.find(
     (operation) =>
       operation.attemptId === attempt.id &&
@@ -1320,6 +1371,16 @@ export function evolveOperation(
   if (!allowedOutcome(operation.outcome, outcome))
     return err("invalid_operation_transition");
   if (
+    (operation.kind === "provision_sandbox" ||
+      operation.kind === "create_session") &&
+    outcome.kind === "observed" &&
+    outcome.result === "applied" &&
+    (outcome.externalIdentity === null ||
+      outcome.externalIdentity.trim() === "")
+  ) {
+    return err("invalid_observation");
+  }
+  if (
     operation.kind === "integrate" &&
     outcome.kind === "observed" &&
     outcome.result === "accepted"
@@ -1456,6 +1517,7 @@ function operationFor(
     candidateRevision ?? "none",
     decision.kind === "repair" ? decision.findingIds.join(",") : "",
     decision.kind === "change_strategy" ? decision.nextStrategy : "",
+    decision.kind === "create_session" ? decision.sandboxId : "",
   ].join("|");
   const logicalKey = [
     commission.id,
@@ -1466,6 +1528,12 @@ function operationFor(
   ].join(":");
   let directive: string;
   switch (decision.kind) {
+    case "provision_sandbox":
+      directive = "Provision the approved Agent Sandbox Workspace";
+      break;
+    case "create_session":
+      directive = "Create an OpenCode Session in the provisioned Sandbox";
+      break;
     case "continue":
     case "repair":
     case "refresh_context":
@@ -1479,17 +1547,29 @@ function operationFor(
     default:
       return exhaustive(decision);
   }
+  let target: string;
+  switch (decision.kind) {
+    case "provision_sandbox":
+      target = `sandbox:${commission.id}`;
+      break;
+    case "create_session":
+      target = `opencode:${decision.sandboxId}`;
+      break;
+    case "verify":
+      target = `checks:${commission.repository}:${candidateRevision}`;
+      break;
+    case "integrate":
+      target = `delivery:${commission.repository}:${commission.integrationTarget}`;
+      break;
+    default:
+      target = `assignment:${attempt.assignmentId}`;
+  }
   return {
     id: logicalKey,
     logicalKey,
     commissionId: commission.id,
     kind,
-    target:
-      kind === "verify"
-        ? `checks:${commission.repository}:${candidateRevision}`
-        : kind === "integrate"
-          ? `delivery:${commission.repository}:${commission.integrationTarget}`
-          : `assignment:${attempt.assignmentId}`,
+    target,
     controllerId: owner.controllerId,
     ownerEpoch: owner.epoch,
     specificationGeneration: commission.specificationGeneration,

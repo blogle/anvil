@@ -60,6 +60,7 @@ export class FakeWorld implements LeasePort, ProviderPort, AuthorizationPort {
   async observe(
     commission: Commission,
     now: number,
+    _operations: readonly Operation[],
   ): Promise<ProviderResult<Observation>> {
     this.observationCount += 1;
     return {
@@ -120,6 +121,7 @@ export class FakeWorld implements LeasePort, ProviderPort, AuthorizationPort {
   }
 
   async dispatch(
+    _commission: Commission,
     operation: Operation,
   ): Promise<ProviderResult<Exclude<OperationOutcome, { kind: "prepared" }>>> {
     const count = (this.dispatchCount.get(operation.id) ?? 0) + 1;
@@ -148,10 +150,19 @@ export class FakeWorld implements LeasePort, ProviderPort, AuthorizationPort {
       result: operation.kind === "integrate" ? "accepted" : "applied",
       retrySafe: false,
       externalIdentity:
-        operation.kind === "integrate" ? "github:repo/pull/1" : null,
+        operation.kind === "integrate"
+          ? "github:repo/pull/1"
+          : operation.kind === "provision_sandbox"
+            ? `fake-sandbox:${operation.commissionId}`
+            : operation.kind === "create_session"
+              ? `fake-session:${operation.commissionId}`
+              : null,
     };
 
     switch (operation.kind) {
+      case "provision_sandbox":
+      case "create_session":
+        break;
       case "continue":
         this.revision ??= "revision-1";
         this.claims.set(
@@ -248,6 +259,7 @@ export class FakeWorld implements LeasePort, ProviderPort, AuthorizationPort {
   }
 
   async inspectOperation(
+    _commission: Commission,
     operation: Operation,
   ): Promise<ProviderResult<OperationOutcome | null>> {
     if (this.unknownRecovery) return { ok: true, value: null };

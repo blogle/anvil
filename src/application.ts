@@ -46,11 +46,14 @@ export interface ProviderPort {
   observe(
     commission: Commission,
     now: number,
+    operations: readonly Operation[],
   ): Promise<ProviderResult<Observation>>;
   dispatch(
+    commission: Commission,
     operation: Operation,
   ): Promise<ProviderResult<Exclude<OperationOutcome, { kind: "prepared" }>>>;
   inspectOperation(
+    commission: Commission,
     operation: Operation,
   ): Promise<ProviderResult<OperationOutcome | null>>;
 }
@@ -324,7 +327,11 @@ export class ApplicationService {
       }
 
       let operations = this.#store.operations(commissionId);
-      const rawObservation = await this.#provider.observe(current, now);
+      const rawObservation = await this.#provider.observe(
+        current,
+        now,
+        operations,
+      );
       if (!rawObservation.ok)
         return {
           ok: false,
@@ -392,7 +399,10 @@ export class ApplicationService {
             },
           };
         }
-        const inspected = await this.#provider.inspectOperation(pending);
+        const inspected = await this.#provider.inspectOperation(
+          current,
+          pending,
+        );
         if (!inspected.ok)
           return {
             ok: false,
@@ -559,7 +569,7 @@ export class ApplicationService {
     lease: LeaseGrant,
     now: number,
   ): Promise<Result<Commission, ApplicationError>> {
-    const dispatched = await this.#provider.dispatch(operation);
+    const dispatched = await this.#provider.dispatch(commission, operation);
     let outcome: OperationOutcome;
     if (dispatched.ok) {
       const parsed = operationOutcomeSchema.safeParse(dispatched.value);

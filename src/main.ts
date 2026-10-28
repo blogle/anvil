@@ -16,6 +16,7 @@ if (bearerToken === undefined || bearerToken.length < 32) {
 const policy: Policy = {
   maxObservationAgeMs: 60_000,
   repeatedToolFailureThreshold: 3,
+  runtimeProvisioning: true,
 };
 
 const lease: LeasePort = {
@@ -48,6 +49,7 @@ const provider: ProviderPort = {
     };
   },
   async dispatch(
+    _commission: import("./domain").Commission,
     _operation: Operation,
   ): Promise<ProviderResult<Exclude<OperationOutcome, { kind: "prepared" }>>> {
     return {

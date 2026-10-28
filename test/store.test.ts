@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ApplicationService } from "../src/application";
@@ -34,7 +35,7 @@ function openStore(): CommissionStore {
 
 test("runs versioned schema migrations once and reopens the normalized Commission projection", () => {
   const repository = openStore();
-  expect(repository.migrationVersion()).toBe(1);
+  expect(repository.migrationVersion()).toBe(2);
   expect(repository.propose(proposal())).toEqual({
     ok: true,
     value: undefined,
@@ -43,9 +44,111 @@ test("runs versioned schema migrations once and reopens the normalized Commissio
   store = undefined;
 
   const reopened = openStore();
-  expect(reopened.migrationVersion()).toBe(1);
+  expect(reopened.migrationVersion()).toBe(2);
   expect(reopened.get("commission-1")).toEqual(proposal().commission);
   expect(reopened.operations("commission-1")).toEqual([]);
+});
+
+test("version two migration preserves an existing version one Operation journal", () => {
+  directory = mkdtempSync(join(tmpdir(), "anvil-migration-upgrade-"));
+  const path = join(directory, "state.sqlite");
+  const legacy = new Database(path);
+  legacy.exec(
+    "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
+  );
+  legacy.exec(
+    readFileSync(
+      new URL("../src/persistence/migrations/0001_core.sql", import.meta.url),
+      "utf8",
+    ),
+  );
+  legacy
+    .query("INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?)")
+    .run(epoch);
+  legacy
+    .query(
+      `INSERT INTO commissions(
+         id, campaign_id, objective, repository, integration_target,
+         specification_generation, independent_review_required, lifecycle, version,
+         max_attempts, max_instructions, max_repairs, max_cost_micros, deadline_at,
+         attempts_used, instructions_used, repairs_used, cost_used_micros
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      "commission-legacy",
+      "campaign-legacy",
+      "legacy migration",
+      "https://github.com/acme/repo",
+      "main",
+      1,
+      0,
+      "proposed",
+      0,
+      1,
+      1,
+      0,
+      0,
+      epoch + 60_000,
+      0,
+      0,
+      0,
+      0,
+    );
+  legacy
+    .query(
+      `INSERT INTO operations(
+         id, logical_key, commission_id, kind, target, controller_id, owner_epoch,
+         specification_generation, assignment_id, attempt_id, instruction_sequence,
+         directive, created_at, outcome_kind
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      "legacy-operation",
+      "legacy-logical-key",
+      "commission-legacy",
+      "continue",
+      "assignment:legacy",
+      "controller-1",
+      1,
+      1,
+      "assignment-1",
+      "attempt-1",
+      1,
+      "continue work",
+      epoch,
+      "prepared",
+    );
+  expect(
+    legacy.query("SELECT id, commission_id FROM operations").all(),
+  ).toEqual([
+    {
+      id: "legacy-operation",
+      commission_id: "commission-legacy",
+    },
+  ]);
+  legacy.close();
+
+  const upgraded = openStore();
+  expect(upgraded.migrationVersion()).toBe(2);
+  const probe = new Database(path);
+  const migratedRows = probe
+    .query("SELECT id, commission_id FROM operations")
+    .all();
+  probe.close();
+  expect(migratedRows).toEqual([
+    {
+      id: "legacy-operation",
+      commission_id: "commission-legacy",
+    },
+  ]);
+  expect(upgraded.operations("commission-legacy")).toMatchObject([
+    {
+      id: "legacy-operation",
+      logicalKey: "legacy-logical-key",
+      kind: "continue",
+      outcome: { kind: "prepared" },
+    },
+  ]);
 });
 
 test("budget usage remains monotonic across SQLite reopen", () => {

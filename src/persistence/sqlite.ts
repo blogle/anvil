@@ -24,8 +24,17 @@ const migrationList = [
       "utf8",
     ),
   },
+  {
+    version: 2,
+    sql: readFileSync(
+      fileURLToPath(
+        new URL("./migrations/0002_runtime_operations.sql", import.meta.url),
+      ),
+      "utf8",
+    ),
+  },
 ] as const;
-const latestSchemaVersion = 1;
+const latestSchemaVersion = 2;
 const commissionColumns = [
   "id",
   "campaign_id",
@@ -130,6 +139,8 @@ const operationRow = z.object({
   logical_key: z.string(),
   commission_id: z.string(),
   kind: z.enum([
+    "provision_sandbox",
+    "create_session",
     "continue",
     "repair",
     "refresh_context",

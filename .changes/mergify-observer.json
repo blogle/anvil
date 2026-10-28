@@ -1,0 +1,5 @@
+{
+  "type": "feat",
+  "semver": "minor",
+  "summary": "Add a locally fixture-tested Mergify merge-queue observer"
+}

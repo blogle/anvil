@@ -43,7 +43,14 @@ export type GitHubBranchFact = Readonly<{
 }>;
 
 export type GitHubDeliveryError = Readonly<{
-  kind: "credentials" | "not_found" | "unavailable" | "invalid_response";
+  kind:
+    | "credentials"
+    | "not_found"
+    | "unavailable"
+    | "invalid_response"
+    | "conflict"
+    | "ambiguous"
+    | "rejected";
   message: string;
   upstreamStatus?: number;
   requestId?: string;
@@ -57,6 +64,15 @@ export type GitHubDeliveryConfig = Readonly<{
   apiUrl?: string;
   timeoutMs?: number;
   now?: () => number;
+}>;
+
+export type GitHubPullRequestInput = Readonly<{
+  repositoryUrl: string;
+  headRef: string;
+  baseRef: string;
+  title: string;
+  body: string;
+  draft?: boolean;
 }>;
 
 const maximumBodyBytes = 2 * 1024 * 1024;
@@ -154,6 +170,199 @@ export class GitHubDeliveryClient {
         source: "github-rest",
       },
     };
+  }
+
+  async createOrFindPullRequest(
+    input: GitHubPullRequestInput,
+  ): Promise<GitHubDeliveryResult<GitHubPullRequestFact>> {
+    const repository = parseGitHubRepository(input.repositoryUrl);
+    if (!repository.ok)
+      return {
+        ok: false,
+        error: {
+          kind: "invalid_response",
+          message: repository.error.diagnostic.message,
+        },
+      };
+    if (
+      !validGitRef(input.headRef) ||
+      !validGitRef(input.baseRef) ||
+      input.title.trim().length === 0 ||
+      /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(input.body)
+    ) {
+      return {
+        ok: false,
+        error: {
+          kind: "invalid_response",
+          message: "Pull request input is invalid",
+        },
+      };
+    }
+    const [owner] = repository.value.split("/") as [string, string];
+    const head = `${owner}:${input.headRef}`;
+    const findExisting = async () => {
+      const result = await this.#request(
+        input.repositoryUrl,
+        `pulls?head=${encodeURIComponent(head)}&state=all&per_page=100`,
+        "gh_read",
+        "GET",
+      );
+      if (!result.ok) return result;
+      if (!Array.isArray(result.value))
+        return {
+          ok: false as const,
+          error: {
+            kind: "invalid_response" as const,
+            message: "GitHub pull request search response was malformed",
+          },
+        };
+      const facts: GitHubPullRequestFact[] = [];
+      for (const item of result.value) {
+        const parsed = parsePullRequestFact(
+          item,
+          repository.value,
+          this.#now(),
+        );
+        if (!parsed.ok) return parsed;
+        if (parsed.value.headRef === input.headRef) facts.push(parsed.value);
+      }
+      if (facts.length > 1)
+        return {
+          ok: false as const,
+          error: {
+            kind: "conflict" as const,
+            message: "Multiple pull requests use the registered work branch",
+          },
+        };
+      const existing = facts[0];
+      if (existing !== undefined && existing.baseRef !== input.baseRef)
+        return {
+          ok: false as const,
+          error: {
+            kind: "conflict" as const,
+            message:
+              "Existing pull request targets a different integration branch",
+          },
+        };
+      return { ok: true as const, value: existing ?? null };
+    };
+
+    const existing = await findExisting();
+    if (!existing.ok) return existing;
+    if (existing.value !== null) return { ok: true, value: existing.value };
+    const created = await this.#request(
+      input.repositoryUrl,
+      "pulls",
+      "gh",
+      "POST",
+      {
+        head,
+        base: input.baseRef,
+        title: input.title,
+        body: input.body,
+        draft: input.draft ?? false,
+      },
+    );
+    if (created.ok) {
+      const fact = parsePullRequestFact(
+        created.value,
+        repository.value,
+        this.#now(),
+      );
+      if (
+        fact.ok &&
+        fact.value.headRef === input.headRef &&
+        fact.value.baseRef === input.baseRef
+      ) {
+        return fact;
+      }
+      // A successful write with an invalid response still requires a remote
+      // postcondition read before the Operation can be considered complete.
+    } else if (
+      created.error.kind !== "ambiguous" &&
+      created.error.kind !== "conflict"
+    ) {
+      return created;
+    }
+
+    const observed = await findExisting();
+    if (!observed.ok) return observed;
+    if (observed.value !== null) return { ok: true, value: observed.value };
+    const createStatus = created.ok ? undefined : created.error.upstreamStatus;
+    return {
+      ok: false,
+      error: {
+        kind: "ambiguous",
+        message:
+          "Pull request create outcome is not observable; do not replay blindly",
+        ...(createStatus === undefined ? {} : { upstreamStatus: createStatus }),
+      },
+    };
+  }
+
+  async findPullRequestByHead(
+    repositoryUrl: string,
+    headRef: string,
+    baseRef: string,
+  ): Promise<GitHubDeliveryResult<GitHubPullRequestFact | null>> {
+    const repository = parseGitHubRepository(repositoryUrl);
+    if (!repository.ok)
+      return {
+        ok: false,
+        error: {
+          kind: "invalid_response",
+          message: repository.error.diagnostic.message,
+        },
+      };
+    if (!validGitRef(headRef) || !validGitRef(baseRef))
+      return {
+        ok: false,
+        error: {
+          kind: "invalid_response",
+          message: "Pull request branch is invalid",
+        },
+      };
+    const [owner] = repository.value.split("/") as [string, string];
+    const result = await this.#request(
+      repositoryUrl,
+      `pulls?head=${encodeURIComponent(`${owner}:${headRef}`)}&state=all&per_page=100`,
+      "gh_read",
+      "GET",
+    );
+    if (!result.ok) return result;
+    if (!Array.isArray(result.value))
+      return {
+        ok: false,
+        error: {
+          kind: "invalid_response",
+          message: "GitHub pull request search response was malformed",
+        },
+      };
+    const matches: GitHubPullRequestFact[] = [];
+    for (const value of result.value) {
+      const fact = parsePullRequestFact(value, repository.value, this.#now());
+      if (!fact.ok) return fact;
+      if (fact.value.headRef === headRef) matches.push(fact.value);
+    }
+    if (matches.length > 1)
+      return {
+        ok: false,
+        error: {
+          kind: "conflict",
+          message: "Multiple pull requests use the registered work branch",
+        },
+      };
+    const match = matches[0];
+    if (match !== undefined && match.baseRef !== baseRef)
+      return {
+        ok: false,
+        error: {
+          kind: "conflict",
+          message:
+            "Existing pull request targets a different integration branch",
+        },
+      };
+    return { ok: true, value: match ?? null };
   }
 
   async checkRuns(
@@ -303,6 +512,16 @@ export class GitHubDeliveryClient {
     path: string,
     purpose: GitHubCredentialPurpose,
   ): Promise<GitHubDeliveryResult<unknown>> {
+    return this.#request(repositoryUrl, path, purpose, "GET");
+  }
+
+  async #request(
+    repositoryUrl: string,
+    path: string,
+    purpose: GitHubCredentialPurpose,
+    method: "GET" | "POST",
+    body?: unknown,
+  ): Promise<GitHubDeliveryResult<unknown>> {
     const repo = parseGitHubRepository(repositoryUrl);
     if (!repo.ok)
       return {
@@ -325,19 +544,27 @@ export class GitHubDeliveryClient {
     let response: Response;
     try {
       response = await fetch(url, {
-        method: "GET",
+        method,
         headers: {
           accept: "application/vnd.github+json",
           "user-agent": "anvil-github-observer/0.1",
           "x-github-api-version": "2022-11-28",
           authorization: `Bearer ${credential.value.token}`,
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         signal: AbortSignal.timeout(this.#timeoutMs),
       });
     } catch {
       return {
         ok: false,
-        error: { kind: "unavailable", message: "GitHub API is unavailable" },
+        error: {
+          kind: method === "POST" ? "ambiguous" : "unavailable",
+          message:
+            method === "POST"
+              ? "GitHub write acknowledgement was lost; inspect the postcondition before retry"
+              : "GitHub API is unavailable",
+        },
       };
     }
     const requestId = cleanHeader(response.headers.get("x-github-request-id"));
@@ -376,7 +603,14 @@ export class GitHubDeliveryClient {
               ? "not_found"
               : response.status === 401 || response.status === 403
                 ? "credentials"
-                : "unavailable",
+                : method === "POST" &&
+                    (response.status === 409 ||
+                      response.status === 422 ||
+                      response.status >= 500)
+                  ? "ambiguous"
+                  : method === "POST"
+                    ? "rejected"
+                    : "unavailable",
           message: `GitHub API returned HTTP ${response.status}`,
           upstreamStatus: response.status,
           ...(requestId === undefined ? {} : { requestId }),
@@ -403,6 +637,66 @@ function credentialError(
         : { requestId: error.diagnostic.requestId }),
     },
   };
+}
+
+function parsePullRequestFact(
+  value: unknown,
+  repository: string,
+  observedAt: number,
+): GitHubDeliveryResult<GitHubPullRequestFact> {
+  const data = asRecord(value);
+  const head = asRecord(data?.["head"]);
+  const base = asRecord(data?.["base"]);
+  const state = data?.["state"];
+  const merged = data?.["merged"];
+  const number = data?.["number"];
+  const url = data?.["html_url"];
+  const headSha = head?.["sha"];
+  const headRef = head?.["ref"];
+  const baseRef = base?.["ref"];
+  if (
+    !Number.isSafeInteger(number) ||
+    typeof url !== "string" ||
+    typeof headSha !== "string" ||
+    typeof headRef !== "string" ||
+    typeof baseRef !== "string" ||
+    (state !== "open" && state !== "closed") ||
+    typeof merged !== "boolean"
+  ) {
+    return {
+      ok: false,
+      error: {
+        kind: "invalid_response",
+        message: "GitHub pull request response was malformed",
+      },
+    };
+  }
+  return {
+    ok: true,
+    value: {
+      number: number as number,
+      url,
+      repository,
+      state: merged ? "merged" : state,
+      headSha,
+      headRef,
+      baseRef,
+      observedAt,
+      source: "github-rest",
+    },
+  };
+}
+
+function validGitRef(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value.length <= 255 &&
+    !/[\u0000-\u0020\u007f~^:?*[]\\]/.test(value) &&
+    !value.includes("..") &&
+    !value.startsWith("/") &&
+    !value.endsWith("/") &&
+    !value.endsWith(".")
+  );
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

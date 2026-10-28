@@ -205,3 +205,192 @@ test("GitHub read adapter distinguishes missing PRs from authorization and provi
     error: { kind: "credentials", upstreamStatus: 403 },
   });
 });
+
+test("GitHub PR creation discovers an existing registered branch and inspects after lost acknowledgement", async () => {
+  let currentPullRequest: Record<string, unknown> | null = null;
+  let createRequests = 0;
+  let tokenRequests = 0;
+  let loseNextCreateAck = false;
+  const paths: string[] = [];
+  server = Bun.serve({
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      paths.push(`${request.method} ${url.pathname}${url.search}`);
+      if (url.pathname === "/api/app/installations/42/access_tokens") {
+        tokenRequests += 1;
+        const body = (await request.json()) as {
+          permissions: Record<string, string>;
+        };
+        expect(body.permissions["pull_requests"]).toBe(
+          tokenRequests === 1 ? "read" : "write",
+        );
+        return Response.json(
+          {
+            token: "ghs_write_fixture",
+            expires_at: new Date(epoch + 3_600_000).toISOString(),
+            permissions: body.permissions,
+          },
+          { status: 201 },
+        );
+      }
+      if (
+        url.pathname === "/api/repos/acme/demo/pulls" &&
+        request.method === "GET"
+      )
+        return Response.json(
+          currentPullRequest === null ? [] : [currentPullRequest],
+        );
+      if (
+        url.pathname === "/api/repos/acme/demo/pulls" &&
+        request.method === "POST"
+      ) {
+        createRequests += 1;
+        const body = (await request.json()) as {
+          head: string;
+          base: string;
+          title: string;
+          body: string;
+          draft: boolean;
+        };
+        expect(body).toEqual({
+          head: `acme:${body.head.slice("acme:".length)}`,
+          base: "main",
+          title: "Implement runtime support",
+          body: "Commission: runtime-1",
+          draft: false,
+        });
+        const requestedHead = body.head.split(":").slice(1).join(":");
+        currentPullRequest = {
+          number: 24,
+          html_url: "https://github.com/acme/demo/pull/24",
+          state: "open",
+          merged: false,
+          head: { sha: "candidate-1", ref: requestedHead },
+          base: { ref: "main" },
+        };
+        if (loseNextCreateAck) {
+          loseNextCreateAck = false;
+          return Response.json(
+            { message: "acknowledgement lost" },
+            { status: 504 },
+          );
+        }
+        return Response.json(currentPullRequest, { status: 201 });
+      }
+      return Response.json(
+        { message: "fixture route not found" },
+        { status: 404 },
+      );
+    },
+  });
+  const apiUrl = `http://127.0.0.1:${server.port}/api/`;
+  const broker = new GitHubAppBroker({
+    appId: "app-id",
+    installationId: 42,
+    privateKey,
+    apiUrl,
+    now: () => epoch,
+  });
+  const client = new GitHubDeliveryClient(broker, {
+    apiUrl,
+    now: () => epoch + 1,
+  });
+  const input = {
+    repositoryUrl: "https://github.com/acme/demo",
+    headRef: "feature/runtime",
+    baseRef: "main",
+    title: "Implement runtime support",
+    body: "Commission: runtime-1",
+  };
+
+  const created = await client.createOrFindPullRequest(input);
+  expect(created).toMatchObject({
+    ok: true,
+    value: {
+      number: 24,
+      repository: "acme/demo",
+      headSha: "candidate-1",
+      headRef: "feature/runtime",
+      baseRef: "main",
+    },
+  });
+  expect(createRequests).toBe(1);
+  const discovered = await client.createOrFindPullRequest(input);
+  expect(discovered).toEqual(created);
+  expect(createRequests).toBe(1);
+
+  currentPullRequest = null;
+  loseNextCreateAck = true;
+  const recovered = await client.createOrFindPullRequest({
+    ...input,
+    headRef: "feature/runtime-2",
+  });
+  expect(recovered).toMatchObject({ ok: true, value: { number: 24 } });
+  expect(createRequests).toBe(2);
+  expect(
+    paths.filter((path) => path.startsWith("POST /api/repos/acme/demo/pulls")),
+  ).toHaveLength(2);
+});
+
+test("GitHub PR create with no observable postcondition remains ambiguous and is not replayed", async () => {
+  let createRequests = 0;
+  server = Bun.serve({
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (url.pathname === "/api/app/installations/42/access_tokens") {
+        const body = (await request.json()) as {
+          permissions: Record<string, string>;
+        };
+        return Response.json(
+          {
+            token: "ghs_write_fixture",
+            expires_at: new Date(epoch + 3_600_000).toISOString(),
+            permissions: body.permissions,
+          },
+          { status: 201 },
+        );
+      }
+      if (
+        url.pathname === "/api/repos/acme/demo/pulls" &&
+        request.method === "GET"
+      )
+        return Response.json([]);
+      if (
+        url.pathname === "/api/repos/acme/demo/pulls" &&
+        request.method === "POST"
+      ) {
+        createRequests += 1;
+        return Response.json(
+          { message: "acknowledgement lost" },
+          { status: 504 },
+        );
+      }
+      return Response.json(
+        { message: "fixture route not found" },
+        { status: 404 },
+      );
+    },
+  });
+  const apiUrl = `http://127.0.0.1:${server.port}/api/`;
+  const client = new GitHubDeliveryClient(
+    new GitHubAppBroker({
+      appId: "app-id",
+      installationId: 42,
+      privateKey,
+      apiUrl,
+      now: () => epoch,
+    }),
+    { apiUrl },
+  );
+  const result = await client.createOrFindPullRequest({
+    repositoryUrl: "https://github.com/acme/demo",
+    headRef: "feature/unknown",
+    baseRef: "main",
+    title: "Unknown postcondition",
+    body: "Do not duplicate",
+  });
+  expect(result).toMatchObject({ ok: false, error: { kind: "ambiguous" } });
+  expect(createRequests).toBe(1);
+});

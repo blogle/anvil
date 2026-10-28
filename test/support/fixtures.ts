@@ -14,6 +14,7 @@ export const epoch = 1_800_000_000_000;
 export const policy: Policy = {
   maxObservationAgeMs: 60_000,
   repeatedToolFailureThreshold: 3,
+  runtimeProvisioning: false,
 };
 
 export function lease(
