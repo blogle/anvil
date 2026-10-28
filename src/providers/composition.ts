@@ -38,6 +38,7 @@ type RuntimeBinding = Readonly<{
 export class ProviderComposition implements ProviderPort {
   readonly #config: ProviderCompositionConfig;
   readonly #bindings = new Map<string, RuntimeBinding>();
+  readonly #openCodeAdapters = new Map<string, OpenCodeAdapter>();
 
   constructor(config: ProviderCompositionConfig) {
     this.#config = config;
@@ -157,31 +158,14 @@ export class ProviderComposition implements ProviderPort {
         },
       };
     }
-    const openCode = this.#config.openCodeForSandbox(sandboxResourceName);
-    const active = await openCode.activeSessions();
-    if (!active.ok) return active;
-    const isRunning = active.value.some(({ id }) => id === openCodeSessionId);
+    const execution = await this.#openCode(
+      sandboxResourceName,
+    ).observeExecution(openCodeSessionId, now, this.#config.model);
     return {
       ok: true,
       value: {
         ...world.value,
-        execution: isRunning
-          ? {
-              kind: "running",
-              sessionId: openCodeSessionId,
-              contextPressure: false,
-              repeatedToolFailures: [],
-              observedAt: now,
-              expiresAt: now + 1_000,
-              source: "opencode-v2",
-            }
-          : {
-              kind: "idle",
-              sessionId: openCodeSessionId,
-              observedAt: now,
-              expiresAt: now + 1_000,
-              source: "opencode-v2",
-            },
+        execution,
       },
     };
   }
@@ -212,9 +196,7 @@ export class ProviderComposition implements ProviderPort {
       const sandboxResourceName = operation.target.slice("opencode:".length);
       if (sandboxResourceName.length === 0)
         return rejected("OpenCode Session Operation has no Sandbox identity");
-      const result = await this.#config
-        .openCodeForSandbox(sandboxResourceName)
-        .createSession();
+      const result = await this.#openCode(sandboxResourceName).createSession();
       if (!result.ok) return result;
       this.#bindings.set(commission.id, {
         sandboxResourceName,
@@ -232,6 +214,31 @@ export class ProviderComposition implements ProviderPort {
         },
       };
     }
+    if (operation.kind === "interrupt") {
+      const binding = this.#bindings.get(commission.id);
+      const sessionId = operation.target.slice("session:".length);
+      if (
+        binding?.openCodeSessionId === null ||
+        binding === undefined ||
+        binding.openCodeSessionId !== sessionId
+      )
+        return rejected("Watchdog interrupt does not target the bound Session");
+      const interrupted = await this.#openCode(
+        binding.sandboxResourceName,
+      ).interruptSession(sessionId, this.#config.model, now);
+      if (!interrupted.ok) return interrupted;
+      return {
+        ok: true,
+        value: {
+          kind: "observed",
+          observedAt: now,
+          source: "opencode-v2-session-interrupt",
+          result: "applied",
+          retrySafe: false,
+          externalIdentity: sessionId,
+        },
+      };
+    }
     if (
       operation.kind === "continue" ||
       operation.kind === "repair" ||
@@ -243,8 +250,7 @@ export class ProviderComposition implements ProviderPort {
         return rejected(
           "No observed OpenCode Session is bound to the Commission",
         );
-      return this.#config
-        .openCodeForSandbox(binding.sandboxResourceName)
+      return this.#openCode(binding.sandboxResourceName)
         .dispatchInstruction(
           binding.openCodeSessionId,
           operation,
@@ -327,6 +333,33 @@ export class ProviderComposition implements ProviderPort {
       // acknowledgement therefore stays unknown instead of creating another.
       return { ok: true, value: null };
     }
+    if (operation.kind === "interrupt") {
+      const binding = this.#bindings.get(commission.id);
+      const sessionId = operation.target.slice("session:".length);
+      if (
+        binding?.openCodeSessionId === null ||
+        binding === undefined ||
+        binding.openCodeSessionId !== sessionId
+      )
+        return { ok: true, value: null };
+      const active = await this.#openCode(
+        binding.sandboxResourceName,
+      ).activeSessions();
+      if (!active.ok) return active;
+      if (active.value.some(({ id }) => id === sessionId))
+        return { ok: true, value: null };
+      return {
+        ok: true,
+        value: {
+          kind: "observed",
+          observedAt: now,
+          source: "opencode-v2-session-interrupt-inspection",
+          result: "applied",
+          retrySafe: false,
+          externalIdentity: sessionId,
+        },
+      };
+    }
     if (
       operation.kind === "continue" ||
       operation.kind === "repair" ||
@@ -336,9 +369,11 @@ export class ProviderComposition implements ProviderPort {
       const binding = this.#bindings.get(commission.id);
       if (binding?.openCodeSessionId === null || binding === undefined)
         return { ok: true, value: null };
-      return this.#config
-        .openCodeForSandbox(binding.sandboxResourceName)
-        .inspectInstruction(binding.openCodeSessionId, operation, now);
+      return this.#openCode(binding.sandboxResourceName).inspectInstruction(
+        binding.openCodeSessionId,
+        operation,
+        now,
+      );
     }
     if (
       operation.kind === "integrate" &&
@@ -371,6 +406,14 @@ export class ProviderComposition implements ProviderPort {
       };
     }
     return { ok: true, value: null };
+  }
+
+  #openCode(sandboxResourceName: string): OpenCodeAdapter {
+    const existing = this.#openCodeAdapters.get(sandboxResourceName);
+    if (existing !== undefined) return existing;
+    const adapter = this.#config.openCodeForSandbox(sandboxResourceName);
+    this.#openCodeAdapters.set(sandboxResourceName, adapter);
+    return adapter;
   }
 }
 

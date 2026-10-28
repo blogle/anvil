@@ -3,6 +3,7 @@ import { generateKeyPairSync } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { OpenCodeAdapter } from "../src/providers/opencode";
 import { proposalInput } from "./support/fixtures";
 
 type Child = Readonly<{
@@ -132,6 +133,48 @@ async function waitForAmbiguousSessionCreate(
   );
 }
 
+async function waitForOperationKind(
+  baseUrl: string,
+  commissionId: string,
+  kind: string,
+  outcomeKind = "observed",
+): Promise<
+  readonly { kind: string; directive: string; outcome: { kind: string } }[]
+> {
+  let lastOperations: readonly {
+    kind: string;
+    directive: string;
+    outcome: { kind: string };
+  }[] = [];
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const response = await fetch(
+      `${baseUrl}/api/commissions/${commissionId}/operations`,
+      { headers: { authorization: `Bearer ${apiToken}` } },
+    );
+    if (response.ok) {
+      const body = (await response.json()) as {
+        operations: readonly {
+          kind: string;
+          directive: string;
+          outcome: { kind: string };
+        }[];
+      };
+      lastOperations = body.operations;
+      if (
+        body.operations.some(
+          (operation) =>
+            operation.kind === kind && operation.outcome.kind === outcomeKind,
+        )
+      )
+        return body.operations;
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error(
+    `Configured daemon did not complete ${kind} watchdog work: ${JSON.stringify(lastOperations)}`,
+  );
+}
+
 test("configured Bun daemon composes local HTTP providers and recovers bindings without replay", async () => {
   directory = mkdtempSync(join(tmpdir(), "anvil-configured-daemon-"));
   const serverPort = allocatePort();
@@ -143,6 +186,11 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   const sessions = new Map<string, string>();
   const userMessageIds = new Map<string, string>();
   let loseNextSessionCreateAck = false;
+  let watchdogMode = false;
+  let interruptCount = 0;
+  let loseNextInterruptAck = false;
+  let interruptInspectionBusy = false;
+  const watchdogProgressAt = Date.now() - 30_000;
   provisionCount = 0;
   sessionCreateCount = 0;
   promptCount = 0;
@@ -192,7 +240,33 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
       if (url.pathname.endsWith("/api/info"))
         return Response.json({ version: "2.0.26+fixture" });
       if (url.pathname.endsWith("/api/session/active"))
-        return Response.json({ data: [] });
+        return Response.json({
+          data:
+            watchdogMode || interruptInspectionBusy
+              ? Object.fromEntries(
+                  [...sessions]
+                    .filter(([sandboxName]) =>
+                      sandboxName.startsWith("anvil-configured-commission-"),
+                    )
+                    .map(([, sessionId]) => [sessionId, { type: "busy" }]),
+                )
+              : {},
+        });
+      if (url.pathname.endsWith("/interrupt")) {
+        expect(request.method).toBe("POST");
+        expect(url.searchParams.get("resume")).toBe("false");
+        interruptCount += 1;
+        watchdogMode = false;
+        if (loseNextInterruptAck) {
+          loseNextInterruptAck = false;
+          interruptInspectionBusy = true;
+          return Response.json(
+            { message: "interrupt accepted but acknowledgement lost" },
+            { status: 504 },
+          );
+        }
+        return Response.json({ data: { interrupted: true } });
+      }
       if (url.pathname.endsWith("/api/session") && request.method === "POST") {
         sessionCreateCount += 1;
         const sandboxName = url.pathname.split("/")[1]!;
@@ -207,6 +281,16 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
         }
         return Response.json({ data: { id: sessionId } });
       }
+      if (url.pathname.endsWith("/api/model"))
+        return Response.json({
+          data: [
+            {
+              providerID: "fixture-provider",
+              modelID: "fixture-model",
+              limit: { context: 10_000 },
+            },
+          ],
+        });
       if (url.pathname.endsWith("/model"))
         return new Response(null, { status: 204 });
       if (url.pathname.endsWith("/prompt")) {
@@ -221,7 +305,29 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
           data:
             userMessageId === undefined
               ? []
-              : [{ id: userMessageId, type: "user" }],
+              : [
+                  { id: userMessageId, type: "user" },
+                  ...(watchdogMode
+                    ? [
+                        {
+                          id: "watchdog-assistant-message",
+                          type: "assistant",
+                          time: {
+                            created: watchdogProgressAt - 20_000,
+                            streamed: watchdogProgressAt - 10_000,
+                            completed: watchdogProgressAt,
+                          },
+                          tokens: {
+                            input: 9_000,
+                            output: 100,
+                            reasoning: 0,
+                            cache: { read: 0, write: 0 },
+                          },
+                          content: [],
+                        },
+                      ]
+                    : []),
+                ],
         });
       }
       return Response.json({ message: "not found" }, { status: 404 });
@@ -323,26 +429,86 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   expect(promptCount).toBe(1);
   expect(sessions.size).toBe(1);
 
+  watchdogMode = true;
+  loseNextInterruptAck = true;
+  const configuredSandbox = [...sessions.keys()].find((name) =>
+    name.startsWith("anvil-configured-commission-"),
+  );
+  if (configuredSandbox === undefined)
+    throw new Error("Configured Session Sandbox fixture missing");
+  const watchdogAdapter = new OpenCodeAdapter({
+    baseUrl: `http://127.0.0.1:${openCodePort}/${encodeURIComponent(configuredSandbox)}/configured-test/`,
+  });
+  expect(
+    await watchdogAdapter.observeExecution(
+      sessions.get(configuredSandbox)!,
+      Date.now(),
+      { providerId: "fixture-provider", modelId: "fixture-model" },
+    ),
+  ).toMatchObject({
+    kind: "running",
+    contextPressure: true,
+    safeBoundary: true,
+    contextLimitTokens: 10_000,
+  });
+  const watchdogOperations = await waitForOperationKind(
+    baseUrl,
+    "configured-commission",
+    "interrupt",
+    "ambiguous",
+  );
+  expect(promptCount).toBe(1);
+  expect(interruptCount).toBe(1);
+  expect(
+    watchdogOperations.find(({ kind }) => kind === "interrupt")?.outcome,
+  ).toMatchObject({ kind: "ambiguous" });
+
   daemonProcess.kill("SIGTERM");
   await daemonProcess.exited;
   daemonProcess = undefined;
+  interruptInspectionBusy = false;
   daemonProcess = startDaemon(runtimeEnvironment);
   await waitUntilReady(baseUrl);
+  const recoveredWatchdog = await waitForOperationKind(
+    baseUrl,
+    "configured-commission",
+    "refresh_context",
+  );
+  expect(promptCount).toBe(2);
+  expect(
+    recoveredWatchdog.find(({ kind }) => kind === "refresh_context")?.directive,
+  ).toContain("Assignment: configured-commission:assignment-1");
+  expect(interruptCount).toBe(1);
   await Bun.sleep(100);
   expect(provisionCount).toBe(1);
   expect(sessionCreateCount).toBe(1);
-  expect(promptCount).toBe(1);
+  expect(promptCount).toBe(2);
+  expect(interruptCount).toBe(1);
   const operations = await fetch(
     `${baseUrl}/api/commissions/configured-commission/operations`,
     { headers },
   ).then((response) => response.json());
-  expect(operations).toMatchObject({
-    operations: [
-      { kind: "provision_sandbox", outcome: { kind: "observed" } },
-      { kind: "create_session", outcome: { kind: "observed" } },
-      { kind: "continue", outcome: { kind: "observed" } },
-    ],
-  });
+  const persistedOperations = (
+    operations as {
+      operations: readonly {
+        kind: string;
+        directive: string;
+        outcome: { kind: string; result?: string };
+      }[];
+    }
+  ).operations;
+  expect(
+    persistedOperations.find(({ kind }) => kind === "interrupt")?.outcome,
+  ).toMatchObject({ kind: "observed", result: "applied" });
+  expect(
+    persistedOperations.find(({ kind }) => kind === "refresh_context")
+      ?.directive,
+  ).toContain("Campaign: campaign-1");
+  expect(
+    persistedOperations.filter(
+      ({ kind }) => kind === "interrupt" || kind === "refresh_context",
+    ),
+  ).toHaveLength(2);
   const ambiguousId = "configured-ambiguous-session";
   loseNextSessionCreateAck = true;
   const ambiguousCreated = await fetch(`${baseUrl}/api/commissions`, {
@@ -364,7 +530,8 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   await waitForAmbiguousSessionCreate(baseUrl, ambiguousId);
   expect(provisionCount).toBe(2);
   expect(sessionCreateCount).toBe(2);
-  expect(promptCount).toBe(1);
+  expect(promptCount).toBe(2);
+  expect(interruptCount).toBe(1);
 
   daemonProcess.kill("SIGTERM");
   await daemonProcess.exited;
@@ -374,7 +541,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   await Bun.sleep(100);
   expect(provisionCount).toBe(2);
   expect(sessionCreateCount).toBe(2);
-  expect(promptCount).toBe(1);
+  expect(promptCount).toBe(2);
   const unresolved = await fetch(
     `${baseUrl}/api/commissions/${ambiguousId}/operations`,
     { headers },
@@ -385,4 +552,4 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
       { kind: "create_session", outcome: { kind: "ambiguous" } },
     ],
   });
-}, 15_000);
+}, 20_000);

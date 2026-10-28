@@ -53,7 +53,7 @@ test("OpenCode V2 adapter follows the pinned session/model/prompt API with bound
     if (url.pathname === "/api/session" && request.method === "POST")
       return Response.json({ data: { id: "session-fixture" } });
     if (url.pathname === "/api/session/active")
-      return Response.json({ data: [{ id: "session-fixture" }] });
+      return Response.json({ data: { "session-fixture": { type: "busy" } } });
     if (url.pathname === "/api/session/session-fixture/model")
       return new Response(null, { status: 204 });
     if (url.pathname === "/api/session/session-fixture/prompt")
@@ -76,7 +76,7 @@ test("OpenCode V2 adapter follows the pinned session/model/prompt API with bound
   });
   expect(await adapter.activeSessions()).toEqual({
     ok: true,
-    value: [{ id: "session-fixture" }],
+    value: [{ id: "session-fixture", status: "busy" }],
   });
   const sent = await adapter.dispatchInstruction("session-fixture", operation, {
     providerId: "fixture-provider",
@@ -109,6 +109,234 @@ test("OpenCode V2 adapter follows the pinned session/model/prompt API with bound
     ok: true,
     value: null,
   });
+});
+
+test("OpenCode watchdog derives active failures, progress, boundary, and token pressure from provider state", async () => {
+  const now = 1_800_000_000_000;
+  const baseUrl = startFixture((request) => {
+    const url = new URL(request.url);
+    if (url.pathname === "/api/session/active")
+      return Response.json({
+        data: { "session-watchdog": { type: "busy" } },
+      });
+    if (url.pathname === "/api/session/session-watchdog/message")
+      return Response.json({
+        data: [
+          {
+            id: "assistant-latest",
+            type: "assistant",
+            time: {
+              created: now - 120_000,
+              streamed: now - 20_000,
+              completed: now - 5_000,
+            },
+            tokens: {
+              input: 8_600,
+              output: 300,
+              reasoning: 100,
+              cache: { read: 100, write: 0 },
+            },
+            content: [
+              {
+                type: "tool",
+                name: "test",
+                time: {
+                  created: now - 40_000,
+                  ran: now - 38_000,
+                  completed: now - 35_000,
+                },
+                state: {
+                  status: "error",
+                  input: {},
+                  error: { name: "TestFailure" },
+                },
+              },
+              {
+                type: "tool",
+                name: "lint",
+                time: {
+                  created: now - 30_000,
+                  ran: now - 28_000,
+                  completed: now - 25_000,
+                },
+                state: {
+                  status: "error",
+                  input: {},
+                  error: { name: "LintFailure" },
+                },
+              },
+              {
+                type: "tool",
+                name: "test",
+                time: {
+                  created: now - 20_000,
+                  ran: now - 18_000,
+                  completed: now - 15_000,
+                },
+                state: {
+                  status: "error",
+                  input: {},
+                  error: { name: "TestFailure" },
+                },
+              },
+            ],
+          },
+        ],
+        cursor: { previous: null, next: null },
+      });
+    if (url.pathname === "/api/model")
+      return Response.json({
+        data: [
+          {
+            providerID: "fixture-provider",
+            modelID: "fixture-model",
+            limit: { context: 10_000 },
+          },
+        ],
+      });
+    return Response.json({ message: "not found" }, { status: 404 });
+  });
+  const adapter = new OpenCodeAdapter({ baseUrl });
+  expect(
+    await adapter.observeExecution("session-watchdog", now, {
+      providerId: "fixture-provider",
+      modelId: "fixture-model",
+    }),
+  ).toEqual({
+    kind: "running",
+    sessionId: "session-watchdog",
+    contextPressure: true,
+    contextTokens: 8_600,
+    contextLimitTokens: 10_000,
+    repeatedToolFailures: [
+      "tool:test:error",
+      "tool:lint:error",
+      "tool:test:error",
+    ],
+    lastProgressAt: now - 5_000,
+    safeBoundary: true,
+    observedAt: now,
+    expiresAt: now + 5_000,
+    source: "opencode-v2",
+  });
+});
+
+test("OpenCode interrupt uses the provider endpoint and reports whether it interrupted active work", async () => {
+  const paths: string[] = [];
+  const baseUrl = startFixture((request) => {
+    const url = new URL(request.url);
+    paths.push(`${request.method} ${url.pathname}${url.search}`);
+    if (url.pathname === "/api/session/active")
+      return Response.json({ data: { "session-fixture": { type: "busy" } } });
+    if (url.pathname === "/api/session/session-fixture/message")
+      return Response.json({
+        data: [
+          {
+            id: "assistant-complete",
+            type: "assistant",
+            time: { created: 1, completed: 2 },
+            tokens: {
+              input: 100,
+              output: 20,
+              reasoning: 0,
+              cache: { read: 0, write: 0 },
+            },
+            content: [],
+          },
+        ],
+      });
+    if (url.pathname === "/api/model")
+      return Response.json({
+        data: [
+          {
+            providerID: "provider",
+            modelID: "model",
+            limit: { context: 10_000 },
+          },
+        ],
+      });
+    return Response.json({ data: { interrupted: true } });
+  });
+  const adapter = new OpenCodeAdapter({ baseUrl });
+  expect(
+    await adapter.interruptSession(
+      "session-fixture",
+      {
+        providerId: "provider",
+        modelId: "model",
+      },
+      10,
+    ),
+  ).toEqual({
+    ok: true,
+    value: true,
+  });
+  expect(paths).toEqual([
+    "GET /api/session/active",
+    "GET /api/session/session-fixture/message?limit=50&order=desc",
+    "GET /api/model",
+    "POST /api/session/session-fixture/interrupt?resume=false",
+  ]);
+});
+
+test("OpenCode refuses to interrupt when a tool is still running at dispatch time", async () => {
+  let interruptHits = 0;
+  const baseUrl = startFixture((request) => {
+    const url = new URL(request.url);
+    if (url.pathname === "/api/session/active")
+      return Response.json({ data: { "session-fixture": { type: "busy" } } });
+    if (url.pathname === "/api/session/session-fixture/message")
+      return Response.json({
+        data: [
+          {
+            id: "assistant-running-tool",
+            type: "assistant",
+            time: { created: 1 },
+            content: [
+              {
+                type: "tool",
+                name: "shell",
+                time: { created: 2, ran: 3 },
+                state: { status: "running", input: {}, metadata: {} },
+              },
+            ],
+          },
+        ],
+      });
+    if (url.pathname === "/api/model")
+      return Response.json({
+        data: [
+          {
+            providerID: "provider",
+            modelID: "model",
+            limit: { context: 10_000 },
+          },
+        ],
+      });
+    if (url.pathname.endsWith("/interrupt")) {
+      interruptHits += 1;
+      return Response.json({ data: { interrupted: true } });
+    }
+    return Response.json({ message: "not found" }, { status: 404 });
+  });
+  const adapter = new OpenCodeAdapter({ baseUrl });
+  expect(
+    await adapter.interruptSession(
+      "session-fixture",
+      {
+        providerId: "provider",
+        modelId: "model",
+      },
+      10,
+    ),
+  ).toEqual({
+    ok: false,
+    error: {
+      kind: "rejected",
+      message: "OpenCode no longer reports a safe interruption boundary",
+    },
+  });
+  expect(interruptHits).toBe(0);
 });
 
 test("an acknowledged-lost prompt is reconciled by message identity and never automatically replayed", async () => {

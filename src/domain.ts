@@ -95,6 +95,7 @@ export type Commission = Readonly<{
 export type OperationKind =
   | "provision_sandbox"
   | "create_session"
+  | "interrupt"
   | "continue"
   | "repair"
   | "refresh_context"
@@ -151,7 +152,11 @@ export type ExecutionObservation =
       kind: "running";
       sessionId: string;
       contextPressure: boolean;
+      contextTokens: number | null;
+      contextLimitTokens: number | null;
       repeatedToolFailures: readonly string[];
+      lastProgressAt: number | null;
+      safeBoundary: boolean;
       observedAt: number;
       expiresAt: number;
       source: string;
@@ -231,6 +236,7 @@ export type Observation = Readonly<{
 export type Policy = Readonly<{
   maxObservationAgeMs: number;
   repeatedToolFailureThreshold: number;
+  activeTurnStuckAfterMs: number;
   runtimeProvisioning: boolean;
 }>;
 
@@ -254,6 +260,14 @@ export type Decision =
       directive: string;
     }>
   | Readonly<{ kind: "refresh_context"; attemptId: string; directive: string }>
+  | Readonly<{
+      kind: "interrupt";
+      attemptId: string;
+      sessionId: string;
+      candidateRevision: string | null;
+      findingIds: readonly string[];
+      directive: string;
+    }>
   | Readonly<{
       kind: "change_strategy";
       attemptId: string;
@@ -675,6 +689,84 @@ export function decide(
         sandboxId,
       };
   }
+  const priorInterrupt = operations
+    .filter(
+      (operation) =>
+        operation.kind === "interrupt" &&
+        operation.attemptId === attempt.id &&
+        operation.specificationGeneration ===
+          commission.specificationGeneration &&
+        operation.candidateRevision === candidate &&
+        operation.outcome.kind === "observed" &&
+        operation.outcome.result === "applied",
+    )
+    .sort((left, right) => right.createdAt - left.createdAt)[0];
+  if (priorInterrupt !== undefined) {
+    const hasFollowup = operations.some(
+      (operation) =>
+        operation.attemptId === attempt.id &&
+        operation.instructionSequence > priorInterrupt.instructionSequence &&
+        operation.specificationGeneration ===
+          commission.specificationGeneration &&
+        operation.candidateRevision === candidate &&
+        (operation.kind === "refresh_context" ||
+          operation.kind === "repair" ||
+          operation.kind === "change_strategy"),
+    );
+    if (
+      observation.execution.kind === "unknown" ||
+      observation.execution.kind === "unavailable" ||
+      (observation.execution.kind === "running" && !hasFollowup)
+    ) {
+      return {
+        kind: "wait",
+        reason:
+          "watchdog interrupt recorded; awaiting a fresh execution boundary",
+        wake: { kind: "provider_refresh", provider: "execution" },
+      };
+    }
+    if (!hasFollowup) {
+      if (priorInterrupt.directive.includes("context-pressure"))
+        return {
+          kind: "refresh_context",
+          attemptId: attempt.id,
+          directive: contextPacket(
+            commission,
+            candidate,
+            operations,
+            now,
+            observation.checks,
+          ),
+        };
+      if (priorInterrupt.directive.includes("repeated-tool-failures")) {
+        const findingIds = priorInterrupt.findingIds;
+        const revision = candidate ?? commission.candidateRevision;
+        if (
+          revision !== null &&
+          commission.budget.used.repairs < commission.budget.limits.maxRepairs
+        )
+          return {
+            kind: "repair",
+            attemptId: attempt.id,
+            candidateRevision: revision,
+            findingIds,
+            directive: `Repair repeated OpenCode tool failures on ${revision}: ${findingIds.join("; ")}`,
+          };
+        return strategyOrHold(
+          commission,
+          attempt,
+          "recover-repeated-tool-failures",
+          `Select a bounded strategy after repeated OpenCode tool failures: ${findingIds.join("; ")}`,
+        );
+      }
+      return strategyOrHold(
+        commission,
+        attempt,
+        "recover-stuck-active-turn",
+        "Choose a bounded strategy after the watchdog interrupted an active stall",
+      );
+    }
+  }
   const refusedOperation = operations.find(
     (operation) =>
       operation.attemptId === attempt.id &&
@@ -701,36 +793,74 @@ export function decide(
     );
   }
   if (observation.execution.kind === "running") {
-    if (observation.execution.contextPressure) {
-      return {
-        kind: "refresh_context",
-        attemptId: attempt.id,
-        directive: contextPacket(commission, candidate),
-      };
-    }
-    if (
-      observation.execution.repeatedToolFailures.length >=
+    const execution = observation.execution;
+    const stuckForMs =
+      execution.lastProgressAt === null
+        ? 0
+        : Math.max(0, now - execution.lastProgressAt);
+    const repeatedToolFailures =
+      execution.repeatedToolFailures.length >=
         policy.repeatedToolFailureThreshold &&
-      observation.execution.repeatedToolFailures.length > 0
-    ) {
-      const revision = candidate ?? commission.candidateRevision;
-      if (
-        revision !== null &&
-        commission.budget.used.repairs < commission.budget.limits.maxRepairs
-      ) {
+      execution.repeatedToolFailures.length > 0;
+    const watchdogFinding =
+      execution.contextPressure ||
+      repeatedToolFailures ||
+      stuckForMs >= policy.activeTurnStuckAfterMs;
+    if (watchdogFinding) {
+      if (!execution.safeBoundary) {
         return {
-          kind: "repair",
-          attemptId: attempt.id,
-          candidateRevision: revision,
-          findingIds: observation.execution.repeatedToolFailures,
-          directive: `Repair repeated tool failures on ${revision}: ${observation.execution.repeatedToolFailures.join("; ")}`,
+          kind: "wait",
+          reason:
+            "watchdog finding observed while provider reports no safe execution boundary",
+          wake: {
+            kind: "execution",
+            sessionId: execution.sessionId,
+          },
         };
       }
+      const priorWatchdogAction = operations.find(
+        (operation) =>
+          operation.attemptId === attempt.id &&
+          operation.specificationGeneration ===
+            commission.specificationGeneration &&
+          operation.candidateRevision === candidate &&
+          (operation.kind === "refresh_context" ||
+            operation.kind === "repair") &&
+          operation.outcome.kind === "observed" &&
+          operation.outcome.result === "applied" &&
+          (execution.lastProgressAt === null ||
+            execution.lastProgressAt <= operation.outcome.observedAt) &&
+          (!repeatedToolFailures ||
+            operation.kind !== "repair" ||
+            sameStrings(operation.findingIds, execution.repeatedToolFailures)),
+      );
+      if (priorWatchdogAction !== undefined) {
+        return {
+          kind: "wait",
+          reason: "watchdog action is awaiting new OpenCode progress",
+          wake: { kind: "execution", sessionId: execution.sessionId },
+        };
+      }
+      const cause = execution.contextPressure
+        ? "context-pressure"
+        : repeatedToolFailures
+          ? "repeated-tool-failures"
+          : "stuck-active-turn";
+      return {
+        kind: "interrupt",
+        attemptId: attempt.id,
+        sessionId: execution.sessionId,
+        candidateRevision: candidate,
+        findingIds: [
+          ...(repeatedToolFailures ? [...execution.repeatedToolFailures] : []),
+        ],
+        directive: `Watchdog interrupt cause: ${cause}`,
+      };
     }
     return {
       kind: "wait",
       reason: "OpenCode execution is active",
-      wake: { kind: "execution", sessionId: observation.execution.sessionId },
+      wake: { kind: "execution", sessionId: execution.sessionId },
     };
   }
   if (
@@ -769,7 +899,13 @@ export function decide(
     return {
       kind: "continue",
       attemptId: attempt.id,
-      directive: contextPacket(commission, null),
+      directive: contextPacket(
+        commission,
+        null,
+        operations,
+        now,
+        observation.checks,
+      ),
     };
   }
   const accepted = obligationsSatisfied(
@@ -825,7 +961,13 @@ export function decide(
     return {
       kind: "continue",
       attemptId: attempt.id,
-      directive: contextPacket(commission, candidate),
+      directive: contextPacket(
+        commission,
+        candidate,
+        operations,
+        now,
+        observation.checks,
+      ),
     };
   }
 
@@ -1356,6 +1498,18 @@ function authorizeDecision(
         },
       },
     };
+  } else if (decision.kind === "interrupt") {
+    commission = {
+      ...commission,
+      attempts: current.attempts.map((item) =>
+        item.id === attempt.id
+          ? {
+              ...item,
+              nextInstructionSequence: item.nextInstructionSequence + 1,
+            }
+          : item,
+      ),
+    };
   }
   return ok(transition(beforeVersion, commission, [operation], [], decision));
 }
@@ -1384,7 +1538,8 @@ export function evolveOperation(
     return err("invalid_operation_transition");
   if (
     (operation.kind === "provision_sandbox" ||
-      operation.kind === "create_session") &&
+      operation.kind === "create_session" ||
+      operation.kind === "interrupt") &&
     outcome.kind === "observed" &&
     outcome.result === "applied" &&
     (outcome.externalIdentity === null ||
@@ -1528,6 +1683,8 @@ function operationFor(
     commission.specificationGeneration,
     candidateRevision ?? "none",
     decision.kind === "repair" ? decision.findingIds.join(",") : "",
+    decision.kind === "interrupt" ? decision.findingIds.join(",") : "",
+    decision.kind === "interrupt" ? decision.directive : "",
     decision.kind === "change_strategy" ? decision.nextStrategy : "",
     decision.kind === "create_session" ? decision.sandboxId : "",
   ].join("|");
@@ -1549,6 +1706,7 @@ function operationFor(
     case "continue":
     case "repair":
     case "refresh_context":
+    case "interrupt":
     case "change_strategy":
       directive = decision.directive;
       break;
@@ -1566,6 +1724,9 @@ function operationFor(
       break;
     case "create_session":
       target = `opencode:${decision.sandboxId}`;
+      break;
+    case "interrupt":
+      target = `session:${decision.sessionId}`;
       break;
     case "verify":
       target = `checks:${commission.repository}:${candidateRevision}`;
@@ -1590,7 +1751,10 @@ function operationFor(
     instructionSequence: sequence,
     retryCount: 0,
     candidateRevision,
-    findingIds: decision.kind === "repair" ? [...decision.findingIds] : [],
+    findingIds:
+      decision.kind === "repair" || decision.kind === "interrupt"
+        ? [...decision.findingIds]
+        : [],
     directive,
     createdAt: now,
     outcome: { kind: "prepared" },
@@ -1684,6 +1848,10 @@ function observationValid(observation: Observation): boolean {
     observation.candidateExpiresAt,
     observation.execution.observedAt,
     observation.execution.expiresAt,
+    ...(observation.execution.kind === "running" &&
+    observation.execution.lastProgressAt !== null
+      ? [observation.execution.lastProgressAt]
+      : []),
     ...(observation.checks === null
       ? []
       : [observation.checks.observedAt, observation.checks.expiresAt]),
@@ -1719,6 +1887,24 @@ function observationValidFor(
   observation: Observation,
 ): boolean {
   if (!observationValid(observation)) return false;
+  if (observation.execution.kind === "running") {
+    const execution = observation.execution;
+    if (
+      (execution.contextTokens !== null &&
+        (!Number.isSafeInteger(execution.contextTokens) ||
+          execution.contextTokens < 0)) ||
+      (execution.contextLimitTokens !== null &&
+        (!Number.isSafeInteger(execution.contextLimitTokens) ||
+          execution.contextLimitTokens < 1)) ||
+      (execution.contextPressure &&
+        (execution.contextTokens === null ||
+          execution.contextLimitTokens === null)) ||
+      (execution.lastProgressAt !== null &&
+        (execution.lastProgressAt > execution.observedAt ||
+          execution.lastProgressAt > execution.expiresAt))
+    )
+      return false;
+  }
   if (
     observation.candidateRevision === null &&
     (observation.workerClaims.length > 0 ||
@@ -1765,33 +1951,44 @@ function obligationsSatisfied(
   now: number,
   checks: CheckObservation | null,
 ): boolean {
-  return commission.obligations.every((obligation) => {
-    const evidence = commission.evidence.filter(
-      (item) =>
-        item.obligationId === obligation.id &&
-        item.criterionVersion === criterionVersion(commission, obligation.id) &&
-        item.candidateRevision === revision &&
-        (item.checkRunId === null ||
-          (checks?.runId === item.checkRunId &&
-            checks.revision === revision &&
-            checks.state === "passing")) &&
-        item.observedAt <= now &&
-        item.expiresAt > now,
-    );
-    const worker = evidence.some(({ source }) => source.kind === "worker");
-    const independent = evidence.some(
-      ({ source, disposition }) =>
-        source.kind === "independent" && disposition === "accepted",
-    );
-    return (
-      worker &&
-      (!(
-        commission.independentReviewRequired ||
-        obligation.independentReviewRequired
-      ) ||
-        independent)
-    );
-  });
+  return commission.obligations.every((obligation) =>
+    obligationSatisfied(commission, obligation, revision, now, checks),
+  );
+}
+
+function obligationSatisfied(
+  commission: Commission,
+  obligation: Obligation,
+  revision: string | null,
+  now: number,
+  checks: CheckObservation | null,
+): boolean {
+  if (revision === null) return false;
+  const applicable = commission.evidence.filter(
+    (item) =>
+      item.obligationId === obligation.id &&
+      item.criterionVersion === criterionVersion(commission, obligation.id) &&
+      item.candidateRevision === revision &&
+      (item.checkRunId === null ||
+        (checks?.runId === item.checkRunId &&
+          checks.revision === revision &&
+          checks.state === "passing")) &&
+      item.observedAt <= now &&
+      item.expiresAt > now,
+  );
+  const worker = applicable.some(({ source }) => source.kind === "worker");
+  const independent = applicable.some(
+    ({ source, disposition }) =>
+      source.kind === "independent" && disposition === "accepted",
+  );
+  return (
+    worker &&
+    (!(
+      commission.independentReviewRequired ||
+      obligation.independentReviewRequired
+    ) ||
+      independent)
+  );
 }
 
 function hasCurrentWorkerEvidence(
@@ -1969,22 +2166,43 @@ function validLease(lease: LeaseGrant, now: number): boolean {
 function contextPacket(
   commission: Commission,
   revision: string | null,
+  operations: readonly Operation[],
+  now: number,
+  checks: CheckObservation | null,
 ): string {
+  const attempt = activeAttempt(commission);
   const outstanding = commission.obligations.filter(
     (obligation) =>
-      !commission.evidence.some(
-        (evidence) =>
-          evidence.obligationId === obligation.id &&
-          evidence.candidateRevision === revision &&
-          evidence.specificationGeneration ===
-            commission.specificationGeneration,
-      ),
+      !obligationSatisfied(commission, obligation, revision, now, checks),
   );
+  const findings = operations
+    .filter(
+      (operation) =>
+        operation.attemptId === attempt?.id &&
+        operation.specificationGeneration ===
+          commission.specificationGeneration &&
+        operation.kind === "repair" &&
+        operation.candidateRevision === revision,
+    )
+    .flatMap(({ findingIds }) => findingIds);
+  const previousAttempts = commission.attempts
+    .filter(({ id }) => id !== attempt?.id)
+    .map(
+      ({ ordinal, strategy, lifecycle }) =>
+        `${ordinal}:${strategy} (${lifecycle})`,
+    );
   return [
+    `Campaign: ${commission.campaignId}`,
+    `Commission: ${commission.id}`,
     `Objective: ${commission.objective}`,
     `Repository: ${commission.repository}`,
     `Integration target: ${commission.integrationTarget}`,
+    `Assignment: ${attempt?.assignmentId ?? "not assigned"}`,
+    `Attempt: ${attempt === null ? "not assigned" : `${attempt.ordinal} · ${attempt.strategy}`}`,
+    `Previous attempts: ${previousAttempts.join("; ") || "none"}`,
     `Candidate: ${revision ?? "not observed"}`,
+    `Budget remaining: attempts ${Math.max(0, commission.budget.limits.maxAttempts - commission.budget.used.attempts)}, instructions ${Math.max(0, commission.budget.limits.maxInstructions - commission.budget.used.instructions)}, repairs ${Math.max(0, commission.budget.limits.maxRepairs - commission.budget.used.repairs)}, costMicros ${Math.max(0, commission.budget.limits.maxCostMicros - commission.budget.used.costMicros)}`,
+    `Known repair findings: ${[...new Set(findings)].join("; ") || "none"}`,
     `Outstanding obligations: ${outstanding.map(({ id, description }) => `${id}: ${description}`).join("; ") || "none"}`,
   ].join("\n");
 }

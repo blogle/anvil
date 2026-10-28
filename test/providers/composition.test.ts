@@ -101,7 +101,7 @@ function localProviders(world: FakeWorld) {
         return Response.json({ data: { id: "session-local-1" } });
       }
       if (url.pathname === "/api/session/active")
-        return Response.json({ data: [] });
+        return Response.json({ data: {} });
       if (url.pathname.endsWith("/model"))
         return new Response(null, { status: 204 });
       if (url.pathname.endsWith("/prompt")) {
@@ -423,7 +423,7 @@ test("composed local providers drive a Commission from Workspace provisioning th
       if (url.pathname === "/api/info")
         return Response.json({ version: "2.0.26+fixture" });
       if (url.pathname === "/api/session/active")
-        return Response.json({ data: [] });
+        return Response.json({ data: {} });
       if (url.pathname === "/api/session") {
         sessionCreates += 1;
         return Response.json({ data: { id: "session-delivery" } });

@@ -42,8 +42,17 @@ const migrationList = [
       "utf8",
     ),
   },
+  {
+    version: 4,
+    sql: readFileSync(
+      fileURLToPath(
+        new URL("./migrations/0004_watchdog_interrupt.sql", import.meta.url),
+      ),
+      "utf8",
+    ),
+  },
 ] as const;
-const latestSchemaVersion = 3;
+const latestSchemaVersion = 4;
 const commissionColumns = [
   "id",
   "campaign_id",
@@ -151,6 +160,7 @@ const operationRow = z.object({
   kind: z.enum([
     "provision_sandbox",
     "create_session",
+    "interrupt",
     "continue",
     "repair",
     "refresh_context",

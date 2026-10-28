@@ -211,10 +211,14 @@ class ActionCommand implements Command<Reference, System> {
                   kind: "running",
                   sessionId: "session-1",
                   contextPressure: false,
+                  contextTokens: null,
+                  contextLimitTokens: null,
                   repeatedToolFailures:
                     this.action.state === "active_tool_failure"
                       ? ["tool-1", "tool-2", "tool-3"]
                       : [],
+                  lastProgressAt: now,
+                  safeBoundary: this.action.state === "active_tool_failure",
                   observedAt: now,
                   expiresAt: now + 60_000,
                   source: "opencode",
@@ -455,7 +459,11 @@ test("unchanged Wait and repeated Hold transitions do not advance the durable ve
       kind: "running",
       sessionId: "session-1",
       contextPressure: false,
+      contextTokens: null,
+      contextLimitTokens: null,
       repeatedToolFailures: [],
+      lastProgressAt: epoch,
+      safeBoundary: false,
       observedAt: epoch,
       expiresAt: epoch + 10_000,
       source: "opencode",
@@ -501,7 +509,11 @@ test("domain decisions do not mutate frozen Commission or observation input", ()
         kind: "running",
         sessionId: "session-1",
         contextPressure: false,
+        contextTokens: null,
+        contextLimitTokens: null,
         repeatedToolFailures: [],
+        lastProgressAt: epoch,
+        safeBoundary: false,
         observedAt: epoch,
         expiresAt: epoch + 10_000,
         source: "opencode",
@@ -934,6 +946,256 @@ test("recording measured usage may cross the cost limit but blocks the next inst
   expect(stopped.newOperations).toHaveLength(0);
 });
 
+test("watchdog waits for a safe boundary, then reacts to context pressure, tool failures, and an active stall", () => {
+  const base = admittedCommission();
+  const busy = observation({
+    execution: {
+      kind: "running",
+      sessionId: "session-watchdog",
+      contextPressure: true,
+      contextTokens: 9_000,
+      contextLimitTokens: 10_000,
+      repeatedToolFailures: [],
+      lastProgressAt: epoch,
+      safeBoundary: false,
+      observedAt: epoch,
+      expiresAt: epoch + 30_000,
+      source: "opencode-v2",
+    },
+  });
+  if (busy.execution.kind !== "running")
+    throw new Error("Expected active watchdog observation");
+  expect(decide(base, busy, [], policy, epoch)).toMatchObject({
+    kind: "wait",
+    reason:
+      "watchdog finding observed while provider reports no safe execution boundary",
+  });
+  const pressureAtBoundary = {
+    ...busy,
+    execution: { ...busy.execution, safeBoundary: true },
+  };
+  const pressureTransition = value(
+    evolve(base, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: pressureAtBoundary,
+      operations: [],
+      policy,
+      now: epoch,
+    }),
+  );
+  expect(pressureTransition.decision).toMatchObject({
+    kind: "interrupt",
+    directive: "Watchdog interrupt cause: context-pressure",
+  });
+  const pressureInterrupt = pressureTransition.newOperations[0];
+  if (pressureInterrupt === undefined)
+    throw new Error("Safe watchdog boundary was not journaled");
+  expect(pressureInterrupt).toMatchObject({
+    kind: "interrupt",
+    target: "session:session-watchdog",
+    outcome: { kind: "prepared" },
+  });
+  const pressureResolved = value(
+    evolveOperation(
+      pressureTransition.commission,
+      pressureInterrupt,
+      lease(),
+      {
+        kind: "observed",
+        observedAt: epoch,
+        source: "local OpenCode interrupt fixture",
+        result: "applied",
+        retrySafe: false,
+        externalIdentity: "session-watchdog",
+      },
+      epoch,
+    ),
+  );
+  const resumedAfterPressure = value(
+    evolve(pressureResolved.commission, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: {
+        ...pressureAtBoundary,
+        execution: {
+          kind: "idle",
+          sessionId: "session-watchdog",
+          observedAt: epoch,
+          expiresAt: epoch + 30_000,
+          source: "opencode-v2",
+        },
+      },
+      operations: pressureResolved.updatedOperations,
+      policy,
+      now: epoch,
+    }),
+  );
+  expect(resumedAfterPressure.decision).toMatchObject({
+    kind: "refresh_context",
+  });
+
+  const candidate = observation({
+    candidateRevision: "revision-watchdog",
+    execution: {
+      kind: "running",
+      sessionId: "session-watchdog",
+      contextPressure: false,
+      contextTokens: 2_000,
+      contextLimitTokens: 10_000,
+      repeatedToolFailures: [
+        "tool:test:error",
+        "tool:test:error",
+        "tool:lint:error",
+      ],
+      lastProgressAt: epoch,
+      safeBoundary: true,
+      observedAt: epoch,
+      expiresAt: epoch + 30_000,
+      source: "opencode-v2",
+    },
+  });
+  expect(decide(base, candidate, [], policy, epoch)).toMatchObject({
+    kind: "interrupt",
+    directive: "Watchdog interrupt cause: repeated-tool-failures",
+    findingIds: ["tool:test:error", "tool:test:error", "tool:lint:error"],
+  });
+  const toolInterruption = value(
+    evolve(base, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: candidate,
+      operations: [],
+      policy,
+      now: epoch,
+    }),
+  );
+  const toolInterrupt = toolInterruption.newOperations[0];
+  if (toolInterrupt === undefined)
+    throw new Error("Tool-failure interrupt was not journaled");
+  const toolResolved = value(
+    evolveOperation(
+      toolInterruption.commission,
+      toolInterrupt,
+      lease(),
+      {
+        kind: "observed",
+        observedAt: epoch,
+        source: "local OpenCode interrupt fixture",
+        result: "applied",
+        retrySafe: false,
+        externalIdentity: "session-watchdog",
+      },
+      epoch,
+    ),
+  );
+  const afterToolInterrupt = value(
+    evolve(toolResolved.commission, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: {
+        ...candidate,
+        execution: {
+          kind: "idle",
+          sessionId: "session-watchdog",
+          observedAt: epoch,
+          expiresAt: epoch + 30_000,
+          source: "opencode-v2",
+        },
+      },
+      operations: toolResolved.updatedOperations,
+      policy,
+      now: epoch,
+    }),
+  );
+  expect(afterToolInterrupt.decision).toMatchObject({
+    kind: "repair",
+    findingIds: ["tool:test:error", "tool:test:error", "tool:lint:error"],
+  });
+  const stalled = observation({
+    execution: {
+      kind: "running",
+      sessionId: "session-watchdog",
+      contextPressure: false,
+      contextTokens: null,
+      contextLimitTokens: null,
+      repeatedToolFailures: [],
+      lastProgressAt: epoch - policy.activeTurnStuckAfterMs,
+      safeBoundary: true,
+      observedAt: epoch,
+      expiresAt: epoch + 30_000,
+      source: "opencode-v2",
+    },
+  });
+  if (stalled.execution.kind !== "running")
+    throw new Error("Expected active stalled observation");
+  expect(decide(base, stalled, [], policy, epoch)).toMatchObject({
+    kind: "interrupt",
+    directive: "Watchdog interrupt cause: stuck-active-turn",
+  });
+  expect(
+    decide(
+      base,
+      { ...stalled, execution: { ...stalled.execution, safeBoundary: false } },
+      [],
+      policy,
+      epoch,
+    ).kind,
+  ).toBe("wait");
+  const stalledTransition = value(
+    evolve(base, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: stalled,
+      operations: [],
+      policy,
+      now: epoch,
+    }),
+  );
+  const stalledInterrupt = stalledTransition.newOperations[0];
+  if (stalledInterrupt === undefined)
+    throw new Error("Stuck-turn watchdog interrupt was not journaled");
+  const stalledResolved = value(
+    evolveOperation(
+      stalledTransition.commission,
+      stalledInterrupt,
+      lease(),
+      {
+        kind: "observed",
+        observedAt: epoch,
+        source: "local OpenCode interrupt fixture",
+        result: "applied",
+        retrySafe: false,
+        externalIdentity: "session-watchdog",
+      },
+      epoch,
+    ),
+  );
+  const changedStrategy = value(
+    evolve(stalledResolved.commission, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: {
+        ...stalled,
+        execution: {
+          kind: "idle",
+          sessionId: "session-watchdog",
+          observedAt: epoch,
+          expiresAt: epoch + 30_000,
+          source: "opencode-v2",
+        },
+      },
+      operations: stalledResolved.updatedOperations,
+      policy,
+      now: epoch,
+    }),
+  );
+  expect(changedStrategy.decision).toMatchObject({
+    kind: "change_strategy",
+    nextStrategy: "recover-stuck-active-turn",
+  });
+});
+
 test("seeded fast-check state-machine commands preserve owner, budget, revision evidence, and completion invariants", () => {
   const actions: fc.Arbitrary<Action> = fc.oneof(
     fc
@@ -1078,6 +1340,123 @@ test("amendments invalidate changed criteria and retain only version-matched evi
   expect(decide(registered, merged, [], policy, epoch).kind).not.toBe(
     "conclude",
   );
+  const pressureTransition = value(
+    evolve(registered, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: {
+        ...merged,
+        execution: {
+          kind: "running",
+          sessionId: "session-1",
+          contextPressure: true,
+          contextTokens: 9_000,
+          contextLimitTokens: 10_000,
+          repeatedToolFailures: [],
+          lastProgressAt: epoch,
+          safeBoundary: true,
+          observedAt: epoch,
+          expiresAt: epoch + 30_000,
+          source: "opencode-v2",
+        },
+      },
+      operations: [],
+      policy,
+      now: epoch,
+    }),
+  );
+  expect(pressureTransition.decision?.kind).toBe("interrupt");
+  const interrupt = pressureTransition.newOperations[0];
+  if (interrupt === undefined) throw new Error("Watchdog Operation missing");
+  const resolvedInterrupt = value(
+    evolveOperation(
+      pressureTransition.commission,
+      interrupt,
+      lease(),
+      {
+        kind: "observed",
+        observedAt: epoch,
+        source: "local OpenCode interrupt fixture",
+        result: "applied",
+        retrySafe: false,
+        externalIdentity: "session-1",
+      },
+      epoch,
+    ),
+  );
+  const followup = value(
+    evolve(resolvedInterrupt.commission, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: {
+        ...merged,
+        execution: {
+          kind: "idle",
+          sessionId: "session-1",
+          observedAt: epoch,
+          expiresAt: epoch + 30_000,
+          source: "opencode-v2",
+        },
+      },
+      operations: resolvedInterrupt.updatedOperations,
+      policy,
+      now: epoch,
+    }),
+  );
+  const refresh = followup.decision;
+  expect(refresh).toMatchObject({ kind: "refresh_context" });
+  if (refresh === null || refresh.kind !== "refresh_context")
+    throw new Error("Expected watchdog context refresh");
+  expect(refresh.directive).toContain(
+    "Outstanding obligations: criterion-a: Preserve the API behavior and backward compatibility",
+  );
+  expect(refresh.directive).not.toContain("criterion-b:");
+  const refreshOperation = followup.newOperations[0];
+  if (refreshOperation === undefined)
+    throw new Error("Watchdog context refresh was not journaled");
+  const refreshResolved = value(
+    evolveOperation(
+      followup.commission,
+      refreshOperation,
+      lease(),
+      {
+        kind: "observed",
+        observedAt: epoch,
+        source: "local OpenCode context fixture",
+        result: "applied",
+        retrySafe: false,
+        externalIdentity: "message-after-refresh",
+      },
+      epoch,
+    ),
+  );
+  expect(
+    decide(
+      refreshResolved.commission,
+      {
+        ...merged,
+        execution: {
+          kind: "running",
+          sessionId: "session-1",
+          contextPressure: true,
+          contextTokens: 9_000,
+          contextLimitTokens: 10_000,
+          repeatedToolFailures: [],
+          lastProgressAt: epoch,
+          safeBoundary: true,
+          observedAt: epoch,
+          expiresAt: epoch + 30_000,
+          source: "opencode-v2",
+        },
+      },
+      [
+        ...resolvedInterrupt.updatedOperations,
+        ...refreshResolved.updatedOperations,
+      ],
+      policy,
+      epoch,
+    ),
+  ).toMatchObject({ kind: "wait" });
 
   const workerOnly = value(
     evolve(registered, {

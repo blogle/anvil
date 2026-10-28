@@ -17,6 +17,7 @@ if (bearerToken === undefined || bearerToken.length < 32) {
 const policy: Policy = {
   maxObservationAgeMs: 60_000,
   repeatedToolFailureThreshold: 3,
+  activeTurnStuckAfterMs: 5 * 60_000,
   runtimeProvisioning: true,
 };
 

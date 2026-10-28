@@ -1,22 +1,41 @@
 import { createHash } from "node:crypto";
 import type { ProviderResult } from "../application";
-import type { Operation } from "../domain";
+import type { ExecutionObservation, Operation } from "../domain";
 
 const maxResponseBytes = 2 * 1024 * 1024;
+const watchdogPollIntervalMs = 5_000;
 
 export type OpenCodeInfo = Readonly<{ version: string }>;
 export type OpenCodeSession = Readonly<{ id: string }>;
-export type OpenCodeActiveSession = Readonly<{ id: string }>;
+export type OpenCodeActiveSession = Readonly<{
+  id: string;
+  status: "busy" | "retry";
+}>;
+type OpenCodeToolState = Readonly<{
+  name: string;
+  status: "streaming" | "running" | "completed" | "error";
+  progressAt: number | null;
+}>;
 export type OpenCodeMessage = Readonly<{
   id: string;
   type: string;
   parentID?: string;
+  createdAt?: number;
+  streamedAt?: number;
+  completedAt?: number;
+  tokenCount?: number;
+  tools?: readonly OpenCodeToolState[];
 }>;
 
 export class OpenCodeAdapter {
   readonly #base: URL;
   readonly #password: string | undefined;
   readonly #timeoutMs: number;
+  #modelLimits: ReadonlyMap<string, number> | undefined;
+  readonly #executionSnapshots = new Map<
+    string,
+    Readonly<{ refreshAfter: number; observation: ExecutionObservation }>
+  >();
 
   constructor(
     options: Readonly<{
@@ -102,7 +121,7 @@ export class OpenCodeAdapter {
   async messages(
     sessionId: string,
   ): Promise<ProviderResult<readonly OpenCodeMessage[]>> {
-    const path = `api/session/${encodeURIComponent(sessionId)}/message?limit=100`;
+    const path = `api/session/${encodeURIComponent(sessionId)}/message?limit=50&order=desc`;
     const result = await this.#request(path, { method: "GET" });
     if (!result.ok) return result;
     const rows = record(result.value)?.["data"];
@@ -130,12 +149,55 @@ export class OpenCodeAdapter {
           },
         };
       }
+      const createdAt = optionalTime(record(item["time"])?.["created"]);
+      const streamedAt = optionalTime(record(item["time"])?.["streamed"]);
+      const completedAt = optionalTime(record(item["time"])?.["completed"]);
+      const tokens = record(item["tokens"]);
+      const tokenInput = optionalCount(tokens?.["input"]);
+      const toolParts = Array.isArray(item["content"]) ? item["content"] : [];
+      const tools: OpenCodeToolState[] = [];
+      for (const partValue of toolParts) {
+        const part = record(partValue);
+        if (part?.["type"] !== "tool") continue;
+        const state = record(part["state"]);
+        const status = state?.["status"];
+        const name = part["name"];
+        if (
+          typeof name !== "string" ||
+          (status !== "streaming" &&
+            status !== "running" &&
+            status !== "completed" &&
+            status !== "error")
+        ) {
+          return {
+            ok: false,
+            error: {
+              kind: "unavailable",
+              message: "OpenCode message contained an invalid tool part",
+            },
+          };
+        }
+        const time = record(part["time"]);
+        tools.push({
+          name,
+          status,
+          progressAt:
+            optionalTime(time?.["completed"]) ??
+            optionalTime(time?.["ran"]) ??
+            optionalTime(time?.["created"]),
+        });
+      }
       parsed.push({
         id: item["id"],
         type: item["type"],
         ...(typeof item["parentID"] === "string"
           ? { parentID: item["parentID"] }
           : {}),
+        ...(createdAt === null ? {} : { createdAt }),
+        ...(streamedAt === null ? {} : { streamedAt }),
+        ...(completedAt === null ? {} : { completedAt }),
+        ...(tokenInput === null ? {} : { tokenCount: tokenInput }),
+        tools,
       });
     }
     return { ok: true, value: parsed };
@@ -147,7 +209,7 @@ export class OpenCodeAdapter {
     const result = await this.#request("api/session/active", { method: "GET" });
     if (!result.ok) return result;
     const rows = record(result.value)?.["data"];
-    if (!Array.isArray(rows))
+    if (rows === null || typeof rows !== "object" || Array.isArray(rows))
       return {
         ok: false,
         error: {
@@ -157,9 +219,9 @@ export class OpenCodeAdapter {
         },
       };
     const sessions: OpenCodeActiveSession[] = [];
-    for (const row of rows) {
-      const id = typeof row === "string" ? row : record(row)?.["id"];
-      if (typeof id !== "string" || id.length === 0)
+    for (const [id, value] of Object.entries(rows)) {
+      const status = record(value)?.["type"];
+      if (id.length === 0 || (status !== "busy" && status !== "retry"))
         return {
           ok: false,
           error: {
@@ -168,9 +230,149 @@ export class OpenCodeAdapter {
               "OpenCode active-session response contained an invalid session",
           },
         };
-      sessions.push({ id });
+      sessions.push({ id, status });
     }
     return { ok: true, value: sessions };
+  }
+
+  async observeExecution(
+    sessionId: string,
+    now: number,
+    model: Readonly<{ providerId: string; modelId: string }>,
+  ): Promise<ExecutionObservation> {
+    const cached = this.#executionSnapshots.get(sessionId);
+    if (cached !== undefined && now < cached.refreshAfter)
+      return cached.observation;
+    const observation = await this.#readExecution(sessionId, now, model);
+    const snapshot = {
+      ...observation,
+      expiresAt: now + watchdogPollIntervalMs,
+    };
+    this.#executionSnapshots.set(sessionId, {
+      refreshAfter: now + watchdogPollIntervalMs,
+      observation: snapshot,
+    });
+    return snapshot;
+  }
+
+  async #readExecution(
+    sessionId: string,
+    now: number,
+    model: Readonly<{ providerId: string; modelId: string }>,
+  ): Promise<ExecutionObservation> {
+    const active = await this.activeSessions();
+    if (!active.ok)
+      return {
+        kind: "unavailable",
+        reason: active.error.message,
+        observedAt: now,
+        expiresAt: now + 1_000,
+        source: "opencode-v2",
+      };
+    if (!active.value.some(({ id }) => id === sessionId))
+      return {
+        kind: "idle",
+        sessionId,
+        observedAt: now,
+        expiresAt: now + 1_000,
+        source: "opencode-v2",
+      };
+    const messages = await this.messages(sessionId);
+    if (!messages.ok)
+      return {
+        kind: "unknown",
+        reason: messages.error.message,
+        observedAt: now,
+        expiresAt: now + 1_000,
+        source: "opencode-v2",
+      };
+    const assistants = messages.value.filter(
+      ({ type }) => type === "assistant",
+    );
+    const latest = assistants[0];
+    const contextLimit = await this.#contextLimit(
+      model.providerId,
+      model.modelId,
+    );
+    const contextTokens = latest?.tokenCount ?? null;
+    const toolParts = latest?.tools ?? [];
+    const repeatedToolFailures = toolParts
+      .filter(({ status }) => status === "error")
+      .slice(0, 12)
+      .map(({ name }) => `tool:${name}:error`);
+    const progressTimes = messages.value.flatMap((message) => [
+      ...(message.streamedAt === undefined ? [] : [message.streamedAt]),
+      ...(message.completedAt === undefined ? [] : [message.completedAt]),
+      ...(message.createdAt === undefined ? [] : [message.createdAt]),
+      ...(message.tools ?? []).flatMap(({ progressAt }) =>
+        progressAt === null ? [] : [progressAt],
+      ),
+    ]);
+    const lastProgressAt =
+      progressTimes.length === 0 ? null : Math.max(...progressTimes);
+    const hasActiveTool = toolParts.some(
+      ({ status }) => status === "running" || status === "streaming",
+    );
+    return {
+      kind: "running",
+      sessionId,
+      contextPressure:
+        contextLimit !== null &&
+        contextTokens !== null &&
+        contextTokens / contextLimit >= 0.85,
+      contextTokens,
+      contextLimitTokens: contextLimit,
+      repeatedToolFailures,
+      lastProgressAt,
+      safeBoundary: !hasActiveTool && latest?.completedAt !== undefined,
+      observedAt: now,
+      expiresAt: now + 1_000,
+      source: "opencode-v2",
+    };
+  }
+
+  async interruptSession(
+    sessionId: string,
+    model: Readonly<{ providerId: string; modelId: string }>,
+    now: number,
+  ): Promise<ProviderResult<boolean>> {
+    const current = await this.#readExecution(sessionId, now, model);
+    if (current.kind === "unknown" || current.kind === "unavailable")
+      return {
+        ok: false,
+        error: { kind: "unavailable", message: current.reason },
+      };
+    if (current.kind === "idle") return { ok: true, value: false };
+    if (current.kind !== "running")
+      return {
+        ok: false,
+        error: { kind: "unavailable", message: "OpenCode status is unknown" },
+      };
+    if (!current.safeBoundary)
+      return {
+        ok: false,
+        error: {
+          kind: "rejected",
+          message: "OpenCode no longer reports a safe interruption boundary",
+        },
+      };
+    const result = await this.#request(
+      `api/session/${encodeURIComponent(sessionId)}/interrupt?resume=false`,
+      { method: "POST" },
+    );
+    if (!result.ok) return result;
+    const response = record(result.value);
+    const payload = response?.["data"] ?? result.value;
+    const interrupted = record(payload)?.["interrupted"];
+    return typeof interrupted === "boolean"
+      ? { ok: true, value: interrupted }
+      : {
+          ok: false,
+          error: {
+            kind: "unavailable",
+            message: "OpenCode interrupt response omitted its result",
+          },
+        };
   }
 
   async dispatchInstruction(
@@ -343,6 +545,37 @@ export class OpenCodeAdapter {
       };
     }
   }
+
+  async #contextLimit(
+    providerId: string,
+    modelId: string,
+  ): Promise<number | null> {
+    if (this.#modelLimits === undefined) {
+      const result = await this.#request("api/model", { method: "GET" });
+      if (!result.ok) return null;
+      const rows = record(result.value)?.["data"];
+      const limits = new Map<string, number>();
+      if (Array.isArray(rows)) {
+        for (const row of rows) {
+          const item = record(row);
+          const provider = item?.["providerID"];
+          const model = item?.["modelID"];
+          const limit = record(item?.["limit"])?.["context"];
+          if (
+            typeof provider === "string" &&
+            typeof model === "string" &&
+            typeof limit === "number" &&
+            Number.isSafeInteger(limit) &&
+            limit > 0
+          )
+            limits.set(`${provider}/${model}`, limit);
+        }
+      }
+      if (limits.size === 0) return null;
+      this.#modelLimits = limits;
+    }
+    return this.#modelLimits.get(`${providerId}/${modelId}`) ?? null;
+  }
 }
 
 function openCodeMessageId(operationId: string): string {
@@ -352,6 +585,18 @@ function openCodeMessageId(operationId: string): string {
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
+    : null;
+}
+
+function optionalTime(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+function optionalCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
     : null;
 }
 

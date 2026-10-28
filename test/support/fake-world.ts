@@ -83,7 +83,11 @@ export class FakeWorld implements LeasePort, ProviderPort, AuthorizationPort {
                 kind: "running",
                 sessionId: "session-1",
                 contextPressure: false,
+                contextTokens: null,
+                contextLimitTokens: null,
                 repeatedToolFailures: [],
+                lastProgressAt: now,
+                safeBoundary: false,
                 observedAt: now,
                 expiresAt: now + 30_000,
                 source: "fake-opencode",
@@ -152,16 +156,20 @@ export class FakeWorld implements LeasePort, ProviderPort, AuthorizationPort {
       externalIdentity:
         operation.kind === "integrate"
           ? "github:repo/pull/1"
-          : operation.kind === "provision_sandbox"
-            ? `fake-sandbox:${operation.commissionId}`
-            : operation.kind === "create_session"
-              ? `fake-session:${operation.commissionId}`
-              : null,
+          : operation.kind === "interrupt"
+            ? operation.target.slice("session:".length)
+            : operation.kind === "provision_sandbox"
+              ? `fake-sandbox:${operation.commissionId}`
+              : operation.kind === "create_session"
+                ? `fake-session:${operation.commissionId}`
+                : null,
     };
 
     switch (operation.kind) {
       case "provision_sandbox":
       case "create_session":
+      case "interrupt":
+        this.executionKind = "idle";
         break;
       case "continue":
         this.revision ??= "revision-1";

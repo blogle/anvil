@@ -15,8 +15,10 @@ to a live OpenCode instance. Supported requests in `src/providers/opencode.ts`:
 |---|---|---|
 | Health/version | `GET /api/info` | `{ "version": "2.0.26+fixture" }` |
 | Create session | `POST /api/session` with `{}` | `{ "data": { "id": "..." } }` |
-| Active session observations | `GET /api/session/active` | `{ "data": [{ "id": "..." }] }` |
-| Read recent messages | `GET /api/session/{id}/message?limit=100` | `{ "data": [...] }` |
+| Active session observations | `GET /api/session/active` | `{ "data": { "session-id": { "type": "busy" } } }` |
+| Read recent messages | `GET /api/session/{id}/message?limit=50&order=desc` | `{ "data": [...] }` with message times, assistant token usage, and tool states |
+| Read model context limits | `GET /api/model` | `{ "data": [{ "providerID", "modelID", "limit": { "context" } }] }` |
+| Interrupt safe active execution | `POST /api/session/{id}/interrupt?resume=false` | `{ "data": { "interrupted": true } }` |
 | Select model | `POST /api/session/{id}/model` with providerID/modelID | Empty successful response |
 | Submit instruction | `POST /api/session/{id}/prompt` with deterministic `{id,text}` | `{ "data": { "id": "..." } }` |
 
@@ -27,10 +29,27 @@ as an exactly-once key. The incumbent's pinned-source research states that
 adapter sends one prompt per dispatch, treats transport failure/5xx/conflict as
 ambiguous, inspects durable V2 user/assistant messages, and never converts
 absence, duplicate replies, or a lost acknowledgement into safe-retry evidence.
-`activeSessions()` returns raw active IDs; absence from that collection is not
-by itself promoted to a definitive idle/failure result.
+The watchdog keeps each Session snapshot for at most five seconds, then refreshes
+the active-session map and recent provider messages. That bound limits observation
+traffic independently of the daemon reconcile loop. Context pressure is measured
+from the latest assistant input-token count against the selected
+OpenCode model's reported context limit. Repeated tool failures are taken from
+the latest assistant message only. A safe boundary requires that the latest
+assistant message completed and no tool is streaming or running. A stuck turn is
+derived from the provider's last message/tool progress timestamp and the local
+policy threshold. Watchdog interruption is journaled as an Anvil Operation; the
+controller re-reads active status and message/tool state immediately before the
+interrupt POST and rejects the Operation if the boundary is no longer safe.
+Ambiguous interrupt acknowledgements are inspected, never replayed. After an
+interrupted or already-idle Session is observed, the controller selects a bounded
+repair, strategy change, or context refresh. The hierarchical context packet is
+reconstructed from durable Campaign/Commission, Assignment/Attempt, budget,
+evidence, and repair Operation records; it does not include a transcript.
 
-The adapter is tested in isolation and is not wired to `src/main.ts`'s current
-unavailable provider. It does not yet implement OpenCode event-stream watchdog,
-tool/context-pressure normalization, model catalog resolution, or production
-credential management. Local fixture success is not live provider acceptance.
+The adapter is exercised through both local HTTP fixtures and the configured
+daemon process test. The fixtures pin the response shapes used by this slice but
+do not prove compatibility with the deployed OpenCode build at the incumbent's
+pinned source revision. There is no live provider acceptance. SSE event-stream
+reconnection, event-driven waking, tool output/error classification beyond the
+structured latest-message tool state, and production credential management
+remain unverified.
