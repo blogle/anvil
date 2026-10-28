@@ -369,6 +369,79 @@ test("a logical Operation and its resolution have one append-only SQL source of 
   );
 });
 
+test("submitted Operation survives restart and is inspected instead of replayed", async () => {
+  let repository = openStore();
+  repository.propose(proposal());
+  const proposed = repository.get("commission-1");
+  if (proposed === null) throw new Error("Proposal missing");
+  const admitted = value(
+    evolve(proposed, {
+      kind: "admit",
+      actor: { kind: "approver", identity: "operator" },
+      lease: lease(),
+      attemptId: "attempt-1",
+      assignmentId: "assignment-1",
+      now: epoch,
+    }),
+  );
+  repository.commitTransition(admitted);
+  const current = repository.get("commission-1");
+  if (current === null) throw new Error("Admitted Commission missing");
+  const prepared = value(
+    evolve(current, {
+      kind: "reconcile",
+      lease: lease(),
+      observation: observation(),
+      operations: [],
+      policy,
+      now: epoch,
+    }),
+  );
+  const operation = prepared.newOperations[0];
+  if (operation === undefined) throw new Error("Prepared Operation missing");
+  repository.commitTransition(prepared);
+  const submitted = value(
+    evolveOperation(
+      prepared.commission,
+      operation,
+      lease(),
+      { kind: "submitted", submittedAt: epoch + 1 },
+      epoch + 1,
+    ),
+  );
+  repository.commitTransition(submitted);
+  repository.close();
+  store = undefined;
+
+  repository = openStore();
+  const recovered = repository.operations("commission-1");
+  expect(recovered).toHaveLength(1);
+  expect(recovered[0]).toMatchObject({
+    id: operation.id,
+    logicalKey: operation.logicalKey,
+    outcome: { kind: "submitted", submittedAt: epoch + 1 },
+  });
+  const world = new FakeWorld();
+  world.unknownRecovery = true;
+  const app = new ApplicationService(
+    repository,
+    world,
+    world,
+    world,
+    "controller-1",
+    policy,
+  );
+  const result = await app.reconcile("commission-1", epoch + 2);
+  expect(result.ok).toBe(true);
+  if (result.ok)
+    expect(result.value.decision).toMatchObject({
+      kind: "wait",
+      wake: { kind: "operation", operationId: operation.id },
+    });
+  expect(world.dispatchCount.get(operation.id)).toBeUndefined();
+  expect(repository.operations("commission-1")).toHaveLength(1);
+});
+
 test("retry_authorized survives restart and replays the original Operation identity", async () => {
   let repository = openStore();
   repository.propose(proposal());
