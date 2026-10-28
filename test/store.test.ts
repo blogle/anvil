@@ -450,6 +450,7 @@ test("retry_authorized survives restart and replays the original Operation ident
   });
 
   const world = new FakeWorld();
+  world.loseRetryAcknowledgement = true;
   const app = new ApplicationService(
     repository,
     world,
@@ -460,6 +461,31 @@ test("retry_authorized survives restart and replays the original Operation ident
   );
   const recovered = await app.reconcile("commission-1", epoch + 3);
   expect(recovered.ok).toBe(true);
+  const ambiguousRetry = repository.operations("commission-1")[0];
+  expect(ambiguousRetry?.id).toBe(original.id);
+  expect(ambiguousRetry?.logicalKey).toBe(original.logicalKey);
+  expect(ambiguousRetry?.retryCount).toBe(1);
+  expect(ambiguousRetry?.outcome).toMatchObject({
+    kind: "ambiguous",
+  });
+  expect(world.dispatchCount.get(original.id)).toBe(1);
+
+  repository.close();
+  store = undefined;
+  repository = openStore();
+  const afterRetryRestart = new ApplicationService(
+    repository,
+    world,
+    world,
+    world,
+    "controller-1",
+    policy,
+  );
+  const resolvedRetry = await afterRetryRestart.reconcile(
+    "commission-1",
+    epoch + 4,
+  );
+  expect(resolvedRetry.ok).toBe(true);
   const finalOperation = repository.operations("commission-1")[0];
   expect(finalOperation?.id).toBe(original.id);
   expect(finalOperation?.logicalKey).toBe(original.logicalKey);

@@ -479,7 +479,10 @@ export class CommissionStore {
         `UPDATE commissions SET ${assignments} WHERE id = ? AND version = ?`,
       )
       .run(...values.slice(1), commission.id, expectedVersion);
-    if (result.changes !== 1) throw new AbortTransaction("conflict");
+    // SQLite may include auxiliary trigger writes in the reported change
+    // count. The version predicate is the CAS; only zero changed rows means
+    // the expected Commission version was not updated.
+    if (result.changes < 1) throw new AbortTransaction("conflict");
   }
 
   #insertObligations(commission: Commission): void {

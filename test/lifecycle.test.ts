@@ -327,6 +327,78 @@ test("a stale owner cannot resolve another controller epoch Operation", () => {
   ).toEqual({ ok: false, error: "owner_mismatch" });
 });
 
+test("a successor ApplicationService observes a predecessor's accepted turn after lost acknowledgement", async () => {
+  const repository = openStore();
+  const world = new FakeWorld();
+  world.loseFirstInstructionAcknowledgement = true;
+  const predecessor = service(repository, world);
+  expect(
+    predecessor.propose(proposalInput({ id: "commission-successor-recovery" }))
+      .ok,
+  ).toBe(true);
+  expect(
+    (
+      await predecessor.admit(
+        "commission-successor-recovery",
+        "operator-1",
+        epoch,
+      )
+    ).ok,
+  ).toBe(true);
+  const sent = await predecessor.reconcile(
+    "commission-successor-recovery",
+    epoch + 1,
+  );
+  expect(sent.ok).toBe(true);
+  const prior = repository.operations("commission-successor-recovery")[0];
+  if (prior === undefined) throw new Error("Predecessor Operation missing");
+  expect(prior.outcome.kind).toBe("ambiguous");
+  expect(world.dispatchCount.get(prior.id)).toBe(1);
+
+  world.grant = {
+    owner: { controllerId: "controller-2", epoch: 2 },
+    resourceVersion: "lease-rv-2",
+    observedAt: epoch + 2,
+    validUntil: epoch + 60_000,
+  };
+  const successor = new ApplicationService(
+    repository,
+    world,
+    world,
+    world,
+    "controller-2",
+    policy,
+  );
+  const recovered = await successor.reconcile(
+    "commission-successor-recovery",
+    epoch + 2,
+  );
+  expect(recovered.ok).toBe(true);
+  expect(repository.get("commission-successor-recovery")?.owner).toEqual({
+    controllerId: "controller-2",
+    epoch: 2,
+  });
+  expect(
+    repository.operations("commission-successor-recovery")[0],
+  ).toMatchObject({
+    id: prior.id,
+    controllerId: "controller-1",
+    ownerEpoch: 1,
+    outcome: { kind: "observed", result: "applied" },
+  });
+  expect(world.dispatchCount.get(prior.id)).toBe(1);
+
+  const stale = await predecessor.reconcile(
+    "commission-successor-recovery",
+    epoch + 3,
+  );
+  expect(stale.ok).toBe(false);
+  expect(repository.operations("commission-successor-recovery")[0]?.id).toBe(
+    prior.id,
+  );
+  expect(world.dispatchCount.get(prior.id)).toBe(1);
+});
+
 test("repeated identical Wait and Hold calls leave the durable Commission version unchanged", async () => {
   const repository = openStore();
   const world = new FakeWorld();
@@ -403,6 +475,40 @@ test("identical healthy Wait polling does not execute a durable SQL update", asy
     .query("SELECT count FROM commission_update_count")
     .get() as { count: number };
   expect(updates.count).toBe(0);
+
+  const held = await app.hold("commission-sql-noop", "pause", epoch + 11);
+  if (!held.ok)
+    throw new Error(
+      `First SQL-audited Hold failed: ${JSON.stringify({ current: repository.get("commission-sql-noop"), error: held.error })}`,
+    );
+  expect(held).toEqual({ ok: true, value: expect.any(Object) });
+  watcher.query("UPDATE commission_update_count SET count = 0").run();
+  expect((await app.hold("commission-sql-noop", "pause", epoch + 12)).ok).toBe(
+    true,
+  );
+  const holdUpdates = watcher
+    .query("SELECT count FROM commission_update_count")
+    .get() as { count: number };
+  expect(holdUpdates.count).toBe(0);
+
+  expect(
+    app.propose(proposalInput({ id: "commission-escalate-sql-noop" })).ok,
+  ).toBe(true);
+  const firstEscalation = await app.reconcile(
+    "commission-escalate-sql-noop",
+    epoch + 20,
+  );
+  expect(firstEscalation.ok).toBe(true);
+  watcher.query("UPDATE commission_update_count SET count = 0").run();
+  const secondEscalation = await app.reconcile(
+    "commission-escalate-sql-noop",
+    epoch + 20,
+  );
+  expect(secondEscalation.ok).toBe(true);
+  const escalationUpdates = watcher
+    .query("SELECT count FROM commission_update_count")
+    .get() as { count: number };
+  expect(escalationUpdates.count).toBe(0);
 });
 
 test("a worker observation cannot waive or replace an approved obligation", async () => {

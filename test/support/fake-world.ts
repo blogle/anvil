@@ -28,6 +28,8 @@ export class FakeWorld implements LeasePort, ProviderPort, AuthorizationPort {
   verificationCount = 0;
   observationCount = 0;
   loseRepairAcknowledgement = true;
+  loseFirstInstructionAcknowledgement = false;
+  loseRetryAcknowledgement = false;
   reportFirstInstructionNotApplied = false;
   unknownRecovery = false;
   readonly dispatchCount = new Map<string, number>();
@@ -218,6 +220,30 @@ export class FakeWorld implements LeasePort, ProviderPort, AuthorizationPort {
         return exhaustive(operation.kind);
     }
     this.sideEffects.set(operation.id, effect);
+    if (
+      operation.kind === "continue" &&
+      this.loseFirstInstructionAcknowledgement
+    ) {
+      this.loseFirstInstructionAcknowledgement = false;
+      return {
+        ok: false,
+        error: {
+          kind: "acknowledgement_lost",
+          message:
+            "simulated lost instruction acknowledgement after acceptance",
+        },
+      };
+    }
+    if (operation.retryCount > 0 && this.loseRetryAcknowledgement) {
+      this.loseRetryAcknowledgement = false;
+      return {
+        ok: false,
+        error: {
+          kind: "acknowledgement_lost",
+          message: "simulated lost retry acknowledgement after acceptance",
+        },
+      };
+    }
     return { ok: true, value: effect };
   }
 
