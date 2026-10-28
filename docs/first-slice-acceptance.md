@@ -1,65 +1,47 @@
 # First-slice acceptance evidence
 
-This ledger records evidence in the current local checkout. A local deterministic
-check is not evidence of deployed or live-provider acceptance. Status values:
+This ledger follows immutable requirements in [the acceptance contract](first-slice-contract.md), together with [domain semantics](spec.md) and [architecture](architecture.md). A local check proves only the behavior it measures. Permitted statuses are `NOT_STARTED`, `IN_PROGRESS`, `IMPLEMENTED_UNVERIFIED`, `VERIFIED`, `BLOCKED_EXTERNAL`, and `FAILED`. A status of `VERIFIED` requires the complete obligation's evidence, not merely implementation or a green broad test suite.
 
-- **LOCAL_EVIDENCE** — the listed local behavior has executable evidence; this
-  does not substitute for any external acceptance gate.
-- **NOT_STARTED** — implementation or acceptance evidence is outstanding.
-- **BLOCKED_EXTERNAL** — cannot be completed without separately authorized
-  external access or an unresolved provider/deployment contract.
-- **NEEDS_CRITERIA** — the FS identifier is not accompanied by its authoritative
-  acceptance text in the repository or the available task context; do not infer
-  completion from adjacent implementation.
+Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7f4076`. Incumbent source baseline inspected read-only at `origin/main` SHA `b55f9b0ecbf89309832c6dcdc9a615cbc4e15f8b`.
 
-The full normative FS-01–FS-15 criteria were not present in the checkout at the
-time this ledger was created. The repository-craft steering specifically
-requires conventional TypeScript roots; this ledger records that evidence under
-FS-01 and FS-02, without asserting that it exhausts their acceptance criteria.
-
-| ID | Status | Local evidence / remaining gap |
+| ID | Status | Evidence, executed tests, and remaining gap |
 |---|---|---|
-| FS-01 | LOCAL_EVIDENCE / NEEDS_CRITERIA | Conventional source root is `src/`; package export, Prettier scripts, and TypeScript include use `src/**/*.ts`. `package.json`, `tsconfig.json`; verified by `nix develop -c just check`. Full criterion text is needed to assess the rest of FS-01. |
-| FS-02 | LOCAL_EVIDENCE / NEEDS_CRITERIA | Conventional test root is `test/`; imports use `../src` and `./support`; Bun test discovery and Prettier include the new root. Verified by `nix develop -c just check` (19 tests, 433 assertions). Full criterion text is needed to assess the rest of FS-02. |
-| FS-03 | NEEDS_CRITERIA | Normative criterion unavailable; no acceptance claim. |
-| FS-04 | NEEDS_CRITERIA | Normative criterion unavailable; no acceptance claim. |
-| FS-05 | NEEDS_CRITERIA | Normative criterion unavailable; no acceptance claim. |
-| FS-06 | NEEDS_CRITERIA | Normative criterion unavailable; no acceptance claim. |
-| FS-07 | NEEDS_CRITERIA | Normative criterion unavailable; no acceptance claim. |
-| FS-08 | NEEDS_CRITERIA | Normative criterion unavailable; no acceptance claim. |
-| FS-09 | NEEDS_CRITERIA | Normative criterion unavailable; no acceptance claim. |
-| FS-10 | NEEDS_CRITERIA | Normative criterion unavailable; no acceptance claim. |
-| FS-11 | NEEDS_CRITERIA | Normative criterion unavailable; no acceptance claim. |
-| FS-12 | NEEDS_CRITERIA | Normative criterion unavailable; no acceptance claim. |
-| FS-13 | NEEDS_CRITERIA | Normative criterion unavailable; no acceptance claim. |
-| FS-14 | NEEDS_CRITERIA | Normative criterion unavailable; no acceptance claim. |
-| FS-15 | BLOCKED_EXTERNAL | Live deployment/namespace acceptance requires separate authorization. No cluster/dotfiles access was used; do not attempt until authorized. |
+| FS-01 | IMPLEMENTED_UNVERIFIED | Bun/Nix/SDLC configuration in `flake.nix`, `nix/bun.nix`, `bun.lock`, generated `bun.nix`, `package.json`, `justfile`; `bun.lock` is sole JS lock and no tracked Cargo/Rust/npm lock/image files remain. Added `scripts/check-bun-lock-drift.sh`, included in `just check` and `bun run check`; `nix develop -c just lock-check` passed and reported generated lock matches plus deliberate drift detected. Prior pinned `just ci-check` and `just ci-verify` passed. Must rerun full Nix after this addition, demonstrate clean-clone command/output, inventory package and GitHub checks for current head, and add/review SDLC fragment (present `.changes/local-daemon.json`). |
+| FS-02 | IMPLEMENTED_UNVERIFIED | Pure domain in `src/domain.ts`; no-op and input immutability tests in `test/domain-core.test.ts`; SQLite trigger confirms repeated Wait produces zero Commission UPDATEs in `test/lifecycle.test.ts` “identical healthy Wait polling…”; forged transition denied in `test/store.test.ts`; root layout `src/` and `test/`. Last `nix develop -c just check`: 27 tests / 480 assertions passed. Remaining: exhaustive decision coverage and persisted-row assertions for all repeated Wait/Hold/Escalate variants plus complete source review at committed checkpoint. |
+| FS-03 | IMPLEMENTED_UNVERIFIED | Typed commands/authorization in `src/application.ts`, `src/domain.ts`; tests in `test/store.test.ts` “only branded…”, “generation CAS…”, “application authorization…”; terminal amendment rejection in `test/lifecycle.test.ts`; attempted worker criterion waiver rejected by strict observation schema in test “a worker observation cannot waive…”. Remaining: changed-vs-unchanged criteria evidence retention/invalidation and authority/decision freshness beyond current test cases. |
+| FS-04 | IMPLEMENTED_UNVERIFIED | One normalized SQL Operation journal and migrations in `src/persistence/sqlite.ts`, `src/persistence/migrations/0001_core.sql`; `test/store.test.ts`: prepared Operation reopen, resolution, `retry_authorized` reopen; `test/lifecycle.test.ts`: lost repair acknowledgement/reopen and bounded provider-proven retry. Remaining required explicit failpoint matrix at before dispatch, submitted, remote effect before ack, ambiguous, during retry and recorded outcome, with duplicate counterexamples per phase. |
+| FS-05 | IMPLEMENTED_UNVERIFIED | Owner/epoch checks and predecessor resolution in `src/domain.ts`; `test/store.test.ts` successor Lease resolves predecessor Operation without replay and competing SQLite connections reject stale CAS; `test/lifecycle.test.ts` stale owner rejected. Remaining app-level two-controller dispatch/crash/takeover/remote-inspect scenario, explicit Workspace one-writer/independent verifier snapshot; actual Kubernetes Lease adapter absent. |
+| FS-06 | IMPLEMENTED_UNVERIFIED | `src/domain.ts` separates active Attempt continuation from fresh Attempt limit; tests `test/domain-core.test.ts` “maxAttempts one…” and “budget exhaustion blocks new work but not recording authoritative delivery”. Remaining zero/limit/overlimit matrices for every budget dimension, durable usage across restart and bounded nonproductive loops. |
+| FS-07 | IMPLEMENTED_UNVERIFIED | Evidence is generation/Candidate scoped; registered PR/repository/target validation in `src/domain.ts`. `test/domain-core.test.ts` authoritative merge test covers matching identity positive plus foreign repository, target, PR identity, SHA, stale/future observations, open/queued PR, pending/failing checks, required review; lifecycle test rejects revision mismatch. Last full local suite passed. Remaining exact foreign same-SHA PR and systematic evidence generation/criterion change invalidation cases. |
+| FS-08 | IN_PROGRESS | Single-step reconciliation in `src/application.ts`; recurring durable active-Commission scan in `src/daemon.ts`; `test/daemon.test.ts` initial scheduler pass/stop and `test/daemon-process.test.ts` process restart persistence. No autonomous actual provider work yet: executable's provider returns unavailable; no in-flight watchdog, safe interruption boundary, healthy provider-wait scheduling, bounded strategy runner, or transcript-free context reconstruction. |
+| FS-09 | IMPLEMENTED_UNVERIFIED | Seeded fast-check model `test/domain-core.test.ts`; real SQLite lifecycle/reopen and competing connections in `test/store.test.ts`/`test/lifecycle.test.ts`; live Bun daemon HTTP process and restart in `test/daemon-process.test.ts`; local authenticated HTTP/MCP harness `test/daemon.test.ts`. Prior `nix develop -c just check` passed 27 tests / 480 assertions. Remaining local provider HTTP fixtures, multi-process competing controller/provider recovery, randomized restart/notification-order suite, and broader persisted-state assertions. |
+| FS-10 | NOT_STARTED | Provider ports in `src/application.ts`; executable intentionally uses unavailable provider in `src/main.ts`; fakes are only in `test/support/fake-world.ts`. No production-intended OpenCode, agent-sandbox, GitHub/CI or Mergify adapters, protocol-compatible adapter servers/recorded fixtures, auth-scope tests or provider failure mappings. Live integrations must be explicitly unverified. |
+| FS-11 | IN_PROGRESS | Bun daemon `src/main.ts`; authenticated Hono HTTP and Streamable MCP `src/daemon.ts`; one SQLite store and scheduler. Tests `test/daemon.test.ts` (auth denial, HTTP persistence, MCP initialize/tools/list and shared command, scan) and `test/daemon-process.test.ts` (real process startup, authorized create/admit, SIGTERM/restart recovery). Remaining: real provider-backed unattended loop, complete Campaign/Assignment/Attempt/evidence/Findings/status/history/steer API/MCP surface, same fully authorized command/read projections, and runtime/auth/recovery hardening. MCP session is volatile across restart. |
+| FS-12 | NOT_STARTED | `docs/review-mockups.html` is static only; no React/Vite/TanStack/Tailwind operational UI, authenticated API integration, component/browser tests, or screenshots against daemon. |
+| FS-13 | NOT_STARTED | No daemon/UI Nix package or nix2container image, image-content/startup/migration/probe/config validation, sandbox image convergence, or narrow deployment interface contract. No deployment/dotfiles work allowed. |
+| FS-14 | IMPLEMENTED_UNVERIFIED | Read-only incumbent source inventory at `origin/main` SHA above. `docs/parity-matrix.md` records feature-by-feature source references, local rewrite state/gaps, and explicit cutover prohibition. Remaining runnable comparative scenarios and independent review; no evidence supports cutover. |
+| FS-15 | BLOCKED_EXTERNAL | Required separate authorized dotfiles deployment and isolated live namespace execution cannot be performed by this worker. No cluster/dotfiles actions taken. A local acceptance runbook remains to be prepared; only independent authorized execution/review can move this status. |
 
 ## G01–G06 adversarial findings
 
-| Finding | Evidence | Status |
+| Finding | Test evidence | Status |
 |---|---|---|
-| G01 — successor controller must resolve predecessor Operations without replay | `test/store.test.ts` successor-Lease recovery test; `test/lifecycle.test.ts` stale-owner rejection. | Local deterministic coverage. |
-| G02 — authorized retry must survive restart and preserve logical Operation identity | `test/store.test.ts` retry-authorized reopen test; `test/lifecycle.test.ts` provider-proof bounded retry test. | Local deterministic coverage. |
-| G03 — conclusion is bound to registered PR, repository, target, revision, and passing checks | `src/domain.ts` authoritative conclusion validation; `test/lifecycle.test.ts` mismatched-merge test; `test/domain-core.test.ts` repository/target/PR identity mismatch assertions. | Local deterministic coverage; newest identity assertions require rerun. |
-| G04 — maxAttempts=1 permits its initial Attempt but blocks another | `test/domain-core.test.ts` maxAttempts boundary test. | Local deterministic coverage. |
-| G05 — concluded Commission specifications are immutable | `test/lifecycle.test.ts` amendment-after-conclusion test. | Local deterministic coverage. |
-| G06 — idempotent Wait/Hold/Escalate decisions do not advance durable version | `test/domain-core.test.ts` and `test/lifecycle.test.ts` repeated no-op tests. | Local deterministic coverage. |
+| G01 / FS-05 predecessor operation recovery | `test/store.test.ts` “a successor Lease holder resolves a predecessor Operation without replaying it”; stale identity case in `test/lifecycle.test.ts`. | Local coverage passed. Application-level two-controller failure trace remains part of FS-05 gap. |
+| G02 / FS-04 retry recovery | `test/store.test.ts` “retry_authorized survives restart…”; `test/lifecycle.test.ts` bounded provider proof/retry and no-authoritative-outcome wait. | Local coverage passed; full crash matrix remains. |
+| G03 / FS-07 registered delivery identity | `test/domain-core.test.ts` matching registered identity vs foreign PR/repository/target, mismatched SHA, stale/future/open/queued/check/review observations. | Local adversarial cases passed; full evidence invalidation matrix remains. |
+| G04 / FS-06 active first Attempt | `test/domain-core.test.ts` “maxAttempts one admits its first Attempt but blocks a second strategy Attempt”. | Passed. |
+| G05 / FS-03 concluded specification immutability | `test/lifecycle.test.ts` terminal amendment rejection; objective retained. | Passed. |
+| G06 / FS-02 stable no-op | `test/domain-core.test.ts`, `test/lifecycle.test.ts` repeated Wait/Hold/Escalate and SQL UPDATE trigger. | Passed locally. |
 
-## Verification record
+## Latest executed verification (working tree, not yet committed)
 
-- `nix develop -c just check` — passed after the path move and fixes: formatting,
-  strict TypeScript checks, 19 deterministic Bun tests / 433 assertions.
-- `nix develop -c just ci-check` — passed on the same final code; Nix included
-  the renamed `src/` and `test/` trees.
-- `nix develop -c just ci-verify` — passed on the same final code.
-- `nix run .#sdlc -- install --check` — passed on the same final code.
-- No post-steering commit was created or pushed. PR #123 remains unmerged.
+- `nix develop -c just check` — passed: generated lock matched, deliberate drift detected, format and strict TypeScript passed, 27 Bun tests / 480 assertions.
+- `nix develop -c just ci-check` — passed: pinned Nix derivation including generated-lock comparison and `bun run check` passed.
+- `nix develop -c just ci-verify` — passed.
+- `nix run .#sdlc -- install --check` — passed.
+- Clean clone check and current-head GitHub checks have not yet been run; local source changes remain uncommitted at this ledger edit.
+- GitHub checks observed at contract fetch: SDLC check/policy/gate/pr-fast passed; verify skipped. Contract commit added docs only.
 
-## Known outstanding first-slice work
+## Next checkpoint
 
-Real OpenCode, agent-sandbox, GitHub/CI/Mergify adapters, daemon HTTP/MCP,
-React UI, multi-process/HTTP daemon integration harness, packaging/deployment
-contract, authoritative FS criterion text, and the separately authorized live
-acceptance gate remain outstanding or externally gated. The incumbent `main`
-is still the parity baseline; this evidence does not authorize cutover.
+Finish FS-01–FS-07 adversarial matrices and current-head verification, then continue local provider contract fixtures/adapters (FS-10) and extend the daemon/application API (FS-08/FS-11). Use incumbent docs/source to derive protocols; run only local protocol-compatible servers. Implement UI and declarative package as later coherent checkpoints. FS-15 remains external and does not block local work. Do not claim `LOCAL_SLICE_READY` until FS-01–FS-14 each satisfy the complete contract with reproducible evidence and independent review.

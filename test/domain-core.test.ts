@@ -491,6 +491,44 @@ test("unchanged Wait and repeated Hold transitions do not advance the durable ve
   expect(sameHold.commission.version).toBe(held.commission.version);
 });
 
+test("domain decisions do not mutate frozen Commission or observation input", () => {
+  const commission = deepFreeze(admittedCommission());
+  const world = deepFreeze(
+    observation({
+      execution: {
+        kind: "running",
+        sessionId: "session-1",
+        contextPressure: false,
+        repeatedToolFailures: [],
+        observedAt: epoch,
+        expiresAt: epoch + 10_000,
+        source: "opencode",
+      },
+    }),
+  );
+  const beforeCommission = structuredClone(commission);
+  const beforeWorld = structuredClone(world);
+  const result = evolve(commission, {
+    kind: "reconcile",
+    lease: lease(),
+    observation: world,
+    operations: [],
+    policy,
+    now: epoch,
+  });
+  expect(result.ok).toBe(true);
+  expect(commission).toEqual(beforeCommission);
+  expect(world).toEqual(beforeWorld);
+});
+
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === "object") {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
 test("maxAttempts one admits its first Attempt but blocks a second strategy Attempt", () => {
   const oneAttempt = admittedCommission({
     budget: {
@@ -537,6 +575,26 @@ test("maxAttempts one admits its first Attempt but blocks a second strategy Atte
     }),
   ).commission;
   expect(decide(state, failingCandidate, [], policy, epoch)).toEqual({
+    kind: "hold",
+    reason: "budget_exhausted",
+  });
+});
+
+test("budget exhaustion blocks new work but not recording authoritative delivery", () => {
+  const state = admittedCommission();
+  const exhausted: Commission = {
+    ...state,
+    budget: {
+      limits: state.budget.limits,
+      used: {
+        attempts: state.budget.limits.maxAttempts,
+        instructions: state.budget.limits.maxInstructions,
+        repairs: state.budget.limits.maxRepairs,
+        costMicros: state.budget.limits.maxCostMicros,
+      },
+    },
+  };
+  expect(decide(exhausted, observation(), [], policy, epoch)).toMatchObject({
     kind: "hold",
     reason: "budget_exhausted",
   });
@@ -671,6 +729,21 @@ test("a fresh authoritative merge resolves its matching unresolved integration O
     result: "accepted",
     source: "github",
   });
+  const exhaustedDeliveryState: Commission = {
+    ...evidenceState,
+    budget: {
+      limits: evidenceState.budget.limits,
+      used: {
+        attempts: evidenceState.budget.limits.maxAttempts,
+        instructions: evidenceState.budget.limits.maxInstructions,
+        repairs: evidenceState.budget.limits.maxRepairs,
+        costMicros: evidenceState.budget.limits.maxCostMicros,
+      },
+    },
+  };
+  expect(
+    decide(exhaustedDeliveryState, merged, [integration], policy, epoch).kind,
+  ).toBe("conclude");
   const matchingIntegration = merged.integration;
   if (matchingIntegration.kind !== "merged")
     throw new Error("Expected merged provider observation");
@@ -681,6 +754,13 @@ test("a fresh authoritative merge resolves its matching unresolved integration O
     },
     { ...matchingIntegration, target: "release" },
     { ...matchingIntegration, providerIdentity: "github:repo/pr/2" },
+    { ...matchingIntegration, revision: "other-revision" },
+    {
+      ...matchingIntegration,
+      observedAt: epoch - 70_000,
+      expiresAt: epoch - 1,
+    },
+    { ...matchingIntegration, observedAt: epoch + 1 },
   ]) {
     expect(
       decide(
@@ -692,4 +772,38 @@ test("a fresh authoritative merge resolves its matching unresolved integration O
       ).kind,
     ).not.toBe("conclude");
   }
+  for (const kind of ["pr_open", "queued"] as const) {
+    expect(
+      decide(
+        evidenceState,
+        {
+          ...merged,
+          integration: { ...matchingIntegration, kind },
+        },
+        [integration],
+        policy,
+        epoch,
+      ).kind,
+    ).not.toBe("conclude");
+  }
+  for (const state of ["pending", "failing"] as const) {
+    expect(
+      decide(
+        evidenceState,
+        { ...merged, checks: { ...merged.checks!, state } },
+        [integration],
+        policy,
+        epoch,
+      ).kind,
+    ).not.toBe("conclude");
+  }
+  expect(
+    decide(
+      { ...evidenceState, independentReviewRequired: true },
+      merged,
+      [integration],
+      policy,
+      epoch,
+    ).kind,
+  ).not.toBe("conclude");
 });

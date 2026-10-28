@@ -2,12 +2,14 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ApplicationService } from "../src/application";
-import { evolveOperation } from "../src/domain";
+import { Database } from "bun:sqlite";
+import { ApplicationService, type ProviderPort } from "../src/application";
+import { evolveOperation, type Observation } from "../src/domain";
 import { CommissionStore } from "../src/persistence/sqlite";
 import {
   admittedCommission,
   epoch,
+  observation,
   policy,
   proposalInput,
 } from "./support/fixtures";
@@ -15,10 +17,13 @@ import { FakeWorld } from "./support/fake-world";
 
 let directory: string | undefined;
 let store: CommissionStore | undefined;
+let watcher: Database | undefined;
 
 afterEach(() => {
   store?.close();
   store = undefined;
+  watcher?.close();
+  watcher = undefined;
   if (directory !== undefined)
     rmSync(directory, { recursive: true, force: true });
   directory = undefined;
@@ -366,4 +371,72 @@ test("repeated identical Escalate decisions leave the durable proposed Commissio
   if (!second.ok) throw new Error("Repeated escalation reconciliation failed");
   expect(second.value.decision?.kind).toBe("escalate");
   expect(repository.get("commission-escalate")?.version).toBe(version!);
+});
+
+test("identical healthy Wait polling does not execute a durable SQL update", async () => {
+  const repository = openStore();
+  const world = new FakeWorld();
+  world.executionKind = "running";
+  const app = service(repository, world);
+  expect(app.propose(proposalInput({ id: "commission-sql-noop" })).ok).toBe(
+    true,
+  );
+  expect((await app.admit("commission-sql-noop", "operator-1", epoch)).ok).toBe(
+    true,
+  );
+  watcher = new Database(databasePath());
+  watcher.exec(`
+    CREATE TABLE commission_update_count (count INTEGER NOT NULL);
+    INSERT INTO commission_update_count VALUES (0);
+    CREATE TRIGGER count_commission_updates
+    AFTER UPDATE ON commissions
+    BEGIN
+      UPDATE commission_update_count SET count = count + 1;
+    END;
+  `);
+
+  const first = await app.reconcile("commission-sql-noop", epoch + 10);
+  const second = await app.reconcile("commission-sql-noop", epoch + 10);
+  expect(first.ok && first.value.decision?.kind).toBe("wait");
+  expect(second.ok && second.value.decision?.kind).toBe("wait");
+  const updates = watcher
+    .query("SELECT count FROM commission_update_count")
+    .get() as { count: number };
+  expect(updates.count).toBe(0);
+});
+
+test("a worker observation cannot waive or replace an approved obligation", async () => {
+  const repository = openStore();
+  const world = new FakeWorld();
+  const attemptedWaiver = {
+    ...observation(),
+    obligations: [],
+  } as unknown as Observation;
+  const provider: ProviderPort = {
+    observe: async () => ({ ok: true, value: attemptedWaiver }),
+    dispatch: (operation) => world.dispatch(operation),
+    inspectOperation: (operation) => world.inspectOperation(operation),
+  };
+  const app = new ApplicationService(
+    repository,
+    world,
+    provider,
+    world,
+    "controller-1",
+    policy,
+  );
+  expect(
+    app.propose(proposalInput({ id: "commission-worker-waiver" })).ok,
+  ).toBe(true);
+  expect(
+    (await app.admit("commission-worker-waiver", "operator-1", epoch)).ok,
+  ).toBe(true);
+  const result = await app.reconcile("commission-worker-waiver", epoch + 1);
+  expect(result).toEqual({
+    ok: false,
+    error: { kind: "invalid_provider_observation" },
+  });
+  expect(repository.get("commission-worker-waiver")?.obligations).toEqual(
+    proposalInput().obligations,
+  );
 });

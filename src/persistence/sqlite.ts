@@ -311,6 +311,16 @@ export class CommissionStore {
     };
   }
 
+  list(): readonly Commission[] {
+    const rows = this.#database
+      .query("SELECT id FROM commissions ORDER BY id")
+      .all() as { id: string }[];
+    return rows.flatMap(({ id }) => {
+      const commission = this.get(id);
+      return commission === null ? [] : [commission];
+    });
+  }
+
   operations(commissionId: string): readonly Operation[] {
     const rows = this.#database
       .query(

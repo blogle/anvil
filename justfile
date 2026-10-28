@@ -6,6 +6,9 @@ default:
 deps:
     bun install --frozen-lockfile
 
+lock-check:
+    bash scripts/check-bun-lock-drift.sh
+
 fmt:
     bun run fmt
 
@@ -18,7 +21,7 @@ typecheck:
 test:
     bun test
 
-check: deps fmt-check typecheck test
+check: deps lock-check fmt-check typecheck test
 
 ci-check:
     nix flake check

@@ -26,6 +26,7 @@ export class FakeWorld implements LeasePort, ProviderPort, AuthorizationPort {
   checks: Observation["checks"] = null;
   integration: Observation["integration"] = { kind: "none" };
   verificationCount = 0;
+  observationCount = 0;
   loseRepairAcknowledgement = true;
   reportFirstInstructionNotApplied = false;
   unknownRecovery = false;
@@ -58,6 +59,7 @@ export class FakeWorld implements LeasePort, ProviderPort, AuthorizationPort {
     commission: Commission,
     now: number,
   ): Promise<ProviderResult<Observation>> {
+    this.observationCount += 1;
     return {
       ok: true,
       value: {
