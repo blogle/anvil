@@ -2,7 +2,7 @@
 
 This ledger follows immutable requirements in [the acceptance contract](first-slice-contract.md), together with [domain semantics](spec.md) and [architecture](architecture.md). A local check proves only the behavior it measures. Permitted statuses are `NOT_STARTED`, `IN_PROGRESS`, `IMPLEMENTED_UNVERIFIED`, `VERIFIED`, `BLOCKED_EXTERNAL`, and `FAILED`. A status of `VERIFIED` requires the complete obligation's evidence, not merely implementation or a green broad test suite.
 
-Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7f4076`; current branch starts at pushed checkpoint `1c81748`. The current local checkpoint adds criterion-scoped evidence validity and durable pre-dispatch Operation state. Incumbent source baseline inspected read-only at `origin/main` SHA `b55f9b0ecbf89309832c6dcdc9a615cbc4e15f8b`.
+Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7f4076`; latest pushed checkpoint is `7dc50fa` (`feat: bind evidence and operations to durable criteria`). Incumbent source baseline inspected read-only at `origin/main` SHA `b55f9b0ecbf89309832c6dcdc9a615cbc4e15f8b`.
 
 | ID | Status | Evidence, executed tests, and remaining gap |
 |---|---|---|
@@ -33,14 +33,15 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 | G05 / FS-03 concluded specification immutability | `test/lifecycle.test.ts` terminal amendment rejection; objective retained. | Passed. |
 | G06 / FS-02 stable no-op | `test/domain-core.test.ts`, `test/lifecycle.test.ts` repeated Wait/Hold/Escalate and SQL UPDATE trigger. | Passed locally. |
 
-## Latest executed verification (local candidate based on `1c81748`)
+## Latest executed verification (commit `7dc50fa`)
 
 - `nix develop -c just fmt` — passed; no formatting changes.
 - `nix develop -c just check` — passed: generated lock matched, deliberate drift detected, format and strict TypeScript passed, 72 Bun tests / 819 assertions.
 - `nix develop -c just ci-check` — passed; Nix TypeScript derivation and flake checks passed.
 - `nix develop -c just ci-verify` — passed.
 - `nix run .#sdlc -- install --check` — passed.
-- The exact candidate is staged locally but not yet committed or pushed; clean-clone and PR checks remain to be run on its final commit.
+- Clean clone at exact commit `7dc50fa`: `nix develop -c just check`, `just ci-check`, `just ci-verify`, and `nix run .#sdlc -- install --check` all passed (72 tests / 819 assertions).
+- GitHub checks for `7dc50fa` remain to be queried after push.
 
 ## Next checkpoint
 
