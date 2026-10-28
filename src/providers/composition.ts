@@ -461,13 +461,18 @@ export class ProviderComposition implements ProviderPort {
     const controller = new AbortController();
     this.#executionWatchers.set(commissionId, { sessionId, controller });
     void this.#openCode(sandboxResourceName)
-      .watchActivity(() => {
-        if (
-          this.#executionWatchers.get(commissionId)?.controller !== controller
-        )
-          return;
-        for (const listener of this.#executionListeners) listener(commissionId);
-      }, controller.signal)
+      .watchActivity(
+        sessionId,
+        () => {
+          if (
+            this.#executionWatchers.get(commissionId)?.controller !== controller
+          )
+            return;
+          for (const listener of this.#executionListeners)
+            listener(commissionId);
+        },
+        controller.signal,
+      )
       .catch(() => {});
   }
 

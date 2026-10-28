@@ -53,7 +53,9 @@ test("OpenCode V2 adapter follows the pinned session/model/prompt API with bound
     if (url.pathname === "/api/session" && request.method === "POST")
       return Response.json({ data: { id: "session-fixture" } });
     if (url.pathname === "/api/session/active")
-      return Response.json({ data: { "session-fixture": { type: "busy" } } });
+      return Response.json({
+        data: { "session-fixture": { type: "running" } },
+      });
     if (url.pathname === "/api/session/session-fixture/model")
       return new Response(null, { status: 204 });
     if (url.pathname === "/api/session/session-fixture/prompt")
@@ -76,7 +78,7 @@ test("OpenCode V2 adapter follows the pinned session/model/prompt API with bound
   });
   expect(await adapter.activeSessions()).toEqual({
     ok: true,
-    value: [{ id: "session-fixture", status: "busy" }],
+    value: [{ id: "session-fixture", status: "running" }],
   });
   const sent = await adapter.dispatchInstruction("session-fixture", operation, {
     providerId: "fixture-provider",
@@ -117,7 +119,7 @@ test("OpenCode watchdog derives active failures, progress, boundary, and token p
     const url = new URL(request.url);
     if (url.pathname === "/api/session/active")
       return Response.json({
-        data: { "session-watchdog": { type: "busy" } },
+        data: { "session-watchdog": { type: "running" } },
       });
     if (url.pathname === "/api/session/session-watchdog/message")
       return Response.json({
@@ -227,7 +229,9 @@ test("OpenCode interrupt uses the provider endpoint and reports whether it inter
     const url = new URL(request.url);
     paths.push(`${request.method} ${url.pathname}${url.search}`);
     if (url.pathname === "/api/session/active")
-      return Response.json({ data: { "session-fixture": { type: "busy" } } });
+      return Response.json({
+        data: { "session-fixture": { type: "running" } },
+      });
     if (url.pathname === "/api/session/session-fixture/message")
       return Response.json({
         data: [
@@ -284,7 +288,9 @@ test("OpenCode refuses to interrupt when a tool is still running at dispatch tim
   const baseUrl = startFixture((request) => {
     const url = new URL(request.url);
     if (url.pathname === "/api/session/active")
-      return Response.json({ data: { "session-fixture": { type: "busy" } } });
+      return Response.json({
+        data: { "session-fixture": { type: "running" } },
+      });
     if (url.pathname === "/api/session/session-fixture/message")
       return Response.json({
         data: [
@@ -343,12 +349,12 @@ test("OpenCode event activity invalidates cached watchdog state and triggers a r
   const now = 1_800_000_000_000;
   let tokenInput = 1_000;
   let activeReads = 0;
-  let eventTypes: string[] = [];
+  let eventRequestPath = "";
   const baseUrl = startFixture((request) => {
     const url = new URL(request.url);
     if (url.pathname === "/api/session/active") {
       activeReads += 1;
-      return Response.json({ data: { "session-events": { type: "busy" } } });
+      return Response.json({ data: { "session-events": { type: "running" } } });
     }
     if (url.pathname === "/api/session/session-events/message")
       return Response.json({
@@ -379,13 +385,13 @@ test("OpenCode event activity invalidates cached watchdog state and triggers a r
         ],
       });
     if (url.pathname === "/api/event") {
-      eventTypes = url.searchParams.getAll("types");
+      eventRequestPath = `${url.pathname}${url.search}`;
       tokenInput = 9_000;
       const body = new ReadableStream<Uint8Array>({
         start(controller) {
           controller.enqueue(
             new TextEncoder().encode(
-              'event: message\ndata: {"type":"session.tool.failed"}\n\n',
+              'data: {"type":"session.tool.failed","sessionID":"session-events"}\n\n',
             ),
           );
           controller.close();
@@ -404,12 +410,16 @@ test("OpenCode event activity invalidates cached watchdog state and triggers a r
   ).toBe("running");
   const controller = new AbortController();
   let wakes = 0;
-  await adapter.watchActivity(() => {
-    wakes += 1;
-    if (wakes === 2) controller.abort();
-  }, controller.signal);
+  await adapter.watchActivity(
+    "session-events",
+    () => {
+      wakes += 1;
+      if (wakes === 2) controller.abort();
+    },
+    controller.signal,
+  );
   expect(wakes).toBe(2);
-  expect(eventTypes).toContain("session.tool.failed");
+  expect(eventRequestPath).toBe("/api/event");
   const refreshed = await adapter.observeExecution(
     "session-events",
     now,
@@ -424,19 +434,19 @@ test("OpenCode event activity invalidates cached watchdog state and triggers a r
 
 test("OpenCode event disconnects reconnect with backoff and force a fresh observation", async () => {
   let connections = 0;
-  let subscribedTypes: string[] = [];
+  let eventRequestPath = "";
   const baseUrl = startFixture((request) => {
     const url = new URL(request.url);
     if (url.pathname !== "/api/event")
       return Response.json({ message: "not found" }, { status: 404 });
     connections += 1;
-    subscribedTypes = url.searchParams.getAll("types");
+    eventRequestPath = `${url.pathname}${url.search}`;
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
         if (connections === 1) {
           controller.enqueue(
             new TextEncoder().encode(
-              'event: message\ndata: {"type":"session.tool.failed"}\n\n',
+              'data: {"type":"session.tool.failed","sessionID":"other-session"}\n\ndata: {"type":"session.tool.failed","sessionID":"session-reconnect"}\n\n',
             ),
           );
         }
@@ -450,13 +460,17 @@ test("OpenCode event disconnects reconnect with backoff and force a fresh observ
   const adapter = new OpenCodeAdapter({ baseUrl });
   const controller = new AbortController();
   let wakes = 0;
-  await adapter.watchActivity(() => {
-    wakes += 1;
-    if (wakes === 4) controller.abort();
-  }, controller.signal);
+  await adapter.watchActivity(
+    "session-reconnect",
+    () => {
+      wakes += 1;
+      if (wakes === 4) controller.abort();
+    },
+    controller.signal,
+  );
   expect(connections).toBe(2);
   expect(wakes).toBe(4);
-  expect(subscribedTypes).toContain("session.tool.failed");
+  expect(eventRequestPath).toBe("/api/event");
 });
 
 test("an acknowledged-lost prompt is reconciled by message identity and never automatically replayed", async () => {

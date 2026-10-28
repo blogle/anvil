@@ -10,8 +10,13 @@ const watchdogEventTypes = [
   "session.execution.succeeded",
   "session.execution.failed",
   "session.execution.interrupted",
+  "session.status",
+  "session.idle",
+  "session.step.started",
+  "session.step.streamed",
   "session.step.failed",
   "session.step.ended",
+  "session.tool.called",
   "session.tool.failed",
   "session.tool.success",
   "session.tool.progress",
@@ -24,7 +29,7 @@ export type OpenCodeInfo = Readonly<{ version: string }>;
 export type OpenCodeSession = Readonly<{ id: string }>;
 export type OpenCodeActiveSession = Readonly<{
   id: string;
-  status: "busy" | "retry";
+  status: "busy" | "running" | "retry";
 }>;
 type OpenCodeToolState = Readonly<{
   name: string;
@@ -236,7 +241,10 @@ export class OpenCodeAdapter {
     const sessions: OpenCodeActiveSession[] = [];
     for (const [id, value] of Object.entries(rows)) {
       const status = record(value)?.["type"];
-      if (id.length === 0 || (status !== "busy" && status !== "retry"))
+      if (
+        id.length === 0 ||
+        (status !== "busy" && status !== "running" && status !== "retry")
+      )
         return {
           ok: false,
           error: {
@@ -391,12 +399,11 @@ export class OpenCodeAdapter {
   }
 
   async watchActivity(
+    sessionId: string,
     onActivity: () => void,
     signal: AbortSignal,
   ): Promise<void> {
     const url = new URL("api/event", this.#base);
-    for (const type of watchdogEventTypes)
-      url.searchParams.append("types", type);
     const headers = new Headers({ accept: "text/event-stream" });
     if (this.#password !== undefined) {
       const credentials = Buffer.from(`opencode:${this.#password}`).toString(
@@ -441,7 +448,7 @@ export class OpenCodeAdapter {
           while (boundary >= 0) {
             const frame = buffer.slice(0, boundary);
             buffer = buffer.slice(boundary + 2);
-            if (frame.split("\n").some((line) => line.startsWith("data:"))) {
+            if (eventWakesSession(frame, sessionId)) {
               this.#executionSnapshots.clear();
               onActivity();
             }
@@ -683,6 +690,33 @@ function optionalCount(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value
     : null;
+}
+
+function eventWakesSession(frame: string, sessionId: string): boolean {
+  const data = frame
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice("data:".length).trimStart())
+    .join("\n");
+  if (data.length === 0) return false;
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(data);
+  } catch {
+    return true;
+  }
+  const event = record(decoded);
+  if (event === null) return true;
+  const type = event["type"];
+  if (type === "server.connected") return true;
+  if (
+    typeof type !== "string" ||
+    !watchdogEventTypes.includes(type as (typeof watchdogEventTypes)[number])
+  )
+    return false;
+  return (
+    typeof event["sessionID"] !== "string" || event["sessionID"] === sessionId
+  );
 }
 
 async function reconnectDelay(

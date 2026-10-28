@@ -267,7 +267,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
                     .filter(([sandboxName]) =>
                       sandboxName.startsWith("anvil-configured-commission-"),
                     )
-                    .map(([, sessionId]) => [sessionId, { type: "busy" }]),
+                    .map(([, sessionId]) => [sessionId, { type: "running" }]),
                 )
               : {},
         });
@@ -477,10 +477,13 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   )
     await Bun.sleep(10);
   expect(openCodeEventSubscribers.size).toBeGreaterThan(0);
+  const watchdogSessionId = sessions.get(configuredSandbox);
+  if (watchdogSessionId === undefined)
+    throw new Error("Configured watchdog Session identity missing");
   for (const subscriber of openCodeEventSubscribers)
     subscriber.enqueue(
       new TextEncoder().encode(
-        'event: message\ndata: {"type":"session.tool.failed"}\n\n',
+        `data: ${JSON.stringify({ type: "session.tool.failed", sessionID: watchdogSessionId })}\n\n`,
       ),
     );
   const watchdogOperations = await waitForOperationKind(

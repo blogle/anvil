@@ -15,13 +15,22 @@ to a live OpenCode instance. Supported requests in `src/providers/opencode.ts`:
 |---|---|---|
 | Health/version | `GET /api/info` | `{ "version": "2.0.26+fixture" }` |
 | Create session | `POST /api/session` with `{}` | `{ "data": { "id": "..." } }` |
-| Active session observations | `GET /api/session/active` | `{ "data": { "session-id": { "type": "busy" } } }` |
+| Active session observations | `GET /api/session/active` | `{ "data": { "session-id": { "type": "running" } }` |
 | Read recent messages | `GET /api/session/{id}/message?limit=50&order=desc` | `{ "data": [...] }` with message times, assistant token usage, and tool states |
 | Read model context limits | `GET /api/model` | `{ "data": [{ "providerID", "modelID", "limit": { "context" } }] }` |
 | Interrupt safe active execution | `POST /api/session/{id}/interrupt?resume=false` | `{ "data": { "interrupted": true } }` |
-| Subscribe to execution wakeups | `GET /api/event?types=session.tool.failed&types=...` | `text/event-stream` frames; payload wakes reconciliation, which then re-reads authoritative state |
+| Subscribe to execution wakeups | `GET /api/event` | `text/event-stream` `data: {event JSON}` frames; client filters event type and `sessionID` before waking reconciliation |
 | Select model | `POST /api/session/{id}/model` with providerID/modelID | Empty successful response |
 | Submit instruction | `POST /api/session/{id}/prompt` with deterministic `{id,text}` | `{ "data": { "id": "..." } }` |
+
+At the pinned `2.0.26` source commit, `packages/server/src/handlers/session.ts`
+returns the active-session map with status `running`; `packages/server/src/event-feed.ts`
+frames events as `data: ${JSON.stringify(event)}\n\n`; and
+`packages/server/src/handlers/event.ts` exposes the unfiltered event feed.
+`packages/schema/src/session-event.ts` and `session-message.ts` define the
+`sessionID`, message progress timestamps, token usage, and tool-state fields used
+by this watchdog. These source contracts informed the local fixture shapes; the
+deployed OpenCode binary and its full behavior remain unverified.
 
 The deterministic provider message ID is a short SHA-256-derived identity from
 the durable Operation ID. It allows postcondition lookup; it is **not** claimed
@@ -46,9 +55,9 @@ interrupted or already-idle Session is observed, the controller selects a bounde
 repair, strategy change, or context refresh. The hierarchical context packet is
 reconstructed from durable Campaign/Commission, Assignment/Attempt, budget,
 evidence, and repair Operation records; it does not include a transcript.
-The filtered SSE subscription is volatile by provider contract: event activity
-wakes the owning Commission, disconnects use bounded exponential backoff, and
-each reconnect forces a fresh provider observation. The daemon's bounded periodic
+The SSE subscription is volatile by provider contract: locally filtered event
+activity wakes the owning Commission, disconnects use bounded exponential backoff,
+and each reconnect forces a fresh provider observation. The daemon's bounded periodic
 reconciliation remains the fallback when `/api/event` is unavailable or events
 are lost.
 
