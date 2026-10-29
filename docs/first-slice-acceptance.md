@@ -43,7 +43,7 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 - `nix develop -c just ci-check` — passed; `nix develop -c just ci-verify` — passed; `nix run .#sdlc -- install --check` — passed.
 - Clean clone at exact commit `7a8b71b`: all four repository check commands passed (83 tests / 978 assertions).
 - The first focused test run exposed a test setup error: the new Verify Operation was in `newOperations`, not `updatedOperations`; the test was corrected and rerun successfully. This did not indicate a production failure.
-- GitHub checks at this implementation head are pending; query after push. Required/optional check policy remains incomplete as recorded under FS-07/FS-10.
+- GitHub checks at PR head `cf068ea` passed: `sdlc/check`, `check/gate`, `pr-fast`, `evaluate`, `policy`, and Mergify Summary. Release `gate`, SDLC `verify`/matrix, and Mergify queue/protections were skipped. Required-status policy remains incomplete as recorded under FS-07/FS-10.
 
 ## Next checkpoint
 
