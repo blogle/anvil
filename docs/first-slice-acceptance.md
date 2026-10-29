@@ -2,7 +2,7 @@
 
 This ledger follows immutable requirements in [the acceptance contract](first-slice-contract.md), together with [domain semantics](spec.md) and [architecture](architecture.md). A local check proves only the behavior it measures. Permitted statuses are `NOT_STARTED`, `IN_PROGRESS`, `IMPLEMENTED_UNVERIFIED`, `VERIFIED`, `BLOCKED_EXTERNAL`, and `FAILED`. A status of `VERIFIED` requires the complete obligation's evidence, not merely implementation or a green broad test suite.
 
-Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7f4076`; latest implementation checkpoint is `7a8b71b` (`feat: verify candidate delivery through GitHub`). Incumbent source baseline inspected read-only at `origin/main` SHA `b55f9b0ecbf89309832c6dcdc9a615cbc4e15f8b`.
+Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7f4076`; latest implementation checkpoint is `c54c698` (`fix: require configured GitHub status contexts`). Incumbent source baseline inspected read-only at `origin/main` SHA `b55f9b0ecbf89309832c6dcdc9a615cbc4e15f8b`.
 
 | ID | Status | Evidence, executed tests, and remaining gap |
 |---|---|---|
@@ -33,17 +33,15 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 | G05 / FS-03 concluded specification immutability | `test/lifecycle.test.ts` terminal amendment rejection; objective retained. | Passed. |
 | G06 / FS-02 stable no-op | `test/domain-core.test.ts`, `test/lifecycle.test.ts` repeated Wait/Hold/Escalate and SQL UPDATE trigger. | Passed locally. |
 
-## Latest complete verification (prior commit `7a8b71b`); current check hardening is in progress
+## Latest complete verification (commit `c54c698`)
 
-- `nix develop -c just fmt` — passed; Prettier applied with no further diff.
-- `nix develop -c just check` — passed: generated lock matched, deliberate drift detected, formatting and strict TypeScript passed, 83 Bun tests / 978 assertions locally.
-- `nix develop -c just ci-check` — passed; Nix TypeScript derivation and flake checks passed.
+- `nix develop -c just fmt` — passed; no formatting changes remained.
+- `nix develop -c just check` — passed: lock match and deliberate drift-negative probe, formatting, strict TypeScript, 92 tests / 1014 assertions locally.
+- `nix develop -c just ci-check` — passed; Nix flake and TypeScript checks passed.
 - `nix develop -c just ci-verify` — passed.
-- `nix run .#sdlc -- install --check` — passed, including the new SDLC change fragment.
-- `nix develop -c just ci-check` — passed; `nix develop -c just ci-verify` — passed; `nix run .#sdlc -- install --check` — passed.
-- Clean clone at exact commit `7a8b71b`: all four repository check commands passed (83 tests / 978 assertions).
-- The first focused test run exposed a test setup error: the new Verify Operation was in `newOperations`, not `updatedOperations`; the test was corrected and rerun successfully. This did not indicate a production failure.
-- GitHub checks at PR head `cf068ea` passed: `sdlc/check`, `check/gate`, `pr-fast`, `evaluate`, `policy`, and Mergify Summary. Release `gate`, SDLC `verify`/matrix, and Mergify queue/protections were skipped. Required-status policy remains incomplete as recorded under FS-07/FS-10.
+- `nix run .#sdlc -- install --check` — passed, including `.changes/github-required-checks.json`.
+- Clean clone at exact commit `c54c698`: all four repository check commands passed; 92 tests / 975 assertions.
+- GitHub checks at PR head `c54c698`: `sdlc/check`, `check/gate`, `pr-fast`, `evaluate`, `policy`, and Mergify Summary passed. Release `gate`, SDLC `verify`/matrix, and Mergify queue/protections were skipped.
 
 ## New finding F-NEW-01 — fail-closed required CI evidence
 
@@ -51,8 +49,7 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 - Fixed in `src/providers/github-delivery.ts` and `src/providers/github-world.ts`: resolve effective branch rules plus classic protection contexts on the Commission's integration target; match app/context identity and exact Candidate SHA; read combined commit statuses for legacy contexts. Only `success` counts as passing. Missing is `missing`; pending is `pending`; failures are `failing`; skipped/neutral, incomplete results, and an empty policy are `unknown`; transport/auth failure propagates as unavailable/rejected. Mergify queue state is separate.
 - Domain guard in `src/domain.ts` returns `Wait` for missing required evidence; `test/domain-core.test.ts` “a missing required check blocks integration despite otherwise green Candidate evidence” proves no integration Operation is prepared.
 - Broker boundary in `src/providers/github-app.ts`: removed `workflows:write` from Git-purpose token; GitHub read profile adds only `administration:read` and `statuses:read` for branch rules and commit-status reads. Tests assert per-repository contents-only write token scope and mismatch rejection.
-- Current bounded test command: `nix develop -c bun test test/providers/github-world.test.ts test/providers/github-app.test.ts test/providers/github-delivery.test.ts test/providers/composition.test.ts test/domain-core.test.ts` — passed 40 tests / 551 assertions.
-- Current full checks after F-NEW-01: `nix develop -c just fmt`, `nix develop -c just check` — passed (92 tests / 1014 assertions), `nix develop -c just ci-check`, `nix develop -c just ci-verify`, and `nix run .#sdlc -- install --check` — all passed. Clean-clone verification and current-commit GitHub checks remain after commit/push.
+- Current bounded test command: `nix develop -c bun test test/providers/github-world.test.ts test/providers/github-app.test.ts test/providers/github-delivery.test.ts test/providers/composition.test.ts test/domain-core.test.ts` — passed 40 tests / 551 assertions; full and clean-clone results are recorded above.
 - Still open: no actual Assignment-bound credential channel into OpenCode/Sandbox was found in the repository; do not expose Git token to prompt/env/config until a non-leaking worker Git credential helper contract is established. The full configured-daemon delivery test is also still missing. This fix does not make FS-07 or FS-10 VERIFIED.
 
 ## Next checkpoint
