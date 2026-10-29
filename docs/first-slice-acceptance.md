@@ -33,14 +33,15 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 | G05 / FS-03 concluded specification immutability | `test/lifecycle.test.ts` terminal amendment rejection; objective retained. | Passed. |
 | G06 / FS-02 stable no-op | `test/domain-core.test.ts`, `test/lifecycle.test.ts` repeated Wait/Hold/Escalate and SQL UPDATE trigger. | Passed locally. |
 
-## Latest complete local verification (credential-helper checkpoint; code commit pending)
+## Latest complete verification (commit `f054feb`)
 
 - `nix develop -c just fmt` — passed; no formatting changes remained.
-- `nix develop -c just check` — passed: lock match and deliberate drift-negative probe, formatting, strict TypeScript, 94 tests / 1120 assertions locally.
+- `nix develop -c just check` — passed: lock match and deliberate drift-negative probe, formatting, strict TypeScript, 94 tests / 1121 assertions locally.
 - `nix develop -c just ci-check` — passed; Nix flake and TypeScript checks passed.
 - `nix develop -c just ci-verify` — passed.
 - `nix run .#sdlc -- install --check` — passed, including `.changes/worker-git-credentials.json`.
-- Clean-clone verification and current-commit GitHub checks are pending commit/push of the push-fixture update; previous clean clone `f054feb` passed all four commands.
+- Clean clone at exact commit `f054feb`: all four prescribed commands passed; 94 tests / 1131 assertions.
+- GitHub checks at PR head `f054feb`: SDLC `check`, `check/flake`, `check/gate`, `pr-fast`, `evaluate`, `policy`, and Mergify Summary passed; release `gate`, SDLC `verify`, and Mergify queue/protections were skipped.
 
 ## New finding F-NEW-01 — fail-closed required CI evidence
 
