@@ -2,12 +2,12 @@
 
 This ledger follows immutable requirements in [the acceptance contract](first-slice-contract.md), together with [domain semantics](spec.md) and [architecture](architecture.md). A local check proves only the behavior it measures. Permitted statuses are `NOT_STARTED`, `IN_PROGRESS`, `IMPLEMENTED_UNVERIFIED`, `VERIFIED`, `BLOCKED_EXTERNAL`, and `FAILED`. A status of `VERIFIED` requires the complete obligation's evidence, not merely implementation or a green broad test suite.
 
-Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7f4076`; latest pushed checkpoint is `aaeca16` (cost-overrun evidence ledger), based on implementation/test checkpoint `270d120`. Incumbent source baseline inspected read-only at `origin/main` SHA `b55f9b0ecbf89309832c6dcdc9a615cbc4e15f8b`.
+Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7f4076`; latest implementation checkpoint is `7a8b71b` (`feat: verify candidate delivery through GitHub`). Incumbent source baseline inspected read-only at `origin/main` SHA `b55f9b0ecbf89309832c6dcdc9a615cbc4e15f8b`.
 
 | ID | Status | Evidence, executed tests, and remaining gap |
 |---|---|---|
 | FS-01 | IMPLEMENTED_UNVERIFIED | Bun/Nix/SDLC config in `flake.nix`, `nix/bun.nix`, `bun.lock`, generated `bun.nix`, `package.json`, `justfile`; bun.lock sole JS lock; no tracked Cargo/Rust/npm lock/image files. `scripts/check-bun-lock-drift.sh` runs in `just check`/`bun run check`; generated lock match and deliberate drift detection passed. Clean-clone verification at prior checkpoints is recorded below; current candidate's complete Nix/SDLC verification passed. This candidate adds patch/minor fragment `.changes/opencode-watchdog.json`. External release-policy review remains. |
-| FS-02 | IMPLEMENTED_UNVERIFIED | Pure domain in `src/domain.ts`; frozen-input test and no-op decisions in `test/domain-core.test.ts`; SQL trigger test `test/lifecycle.test.ts` proves identical Wait, Hold, and Escalate polling execute zero Commission UPDATEs; forged transition denied in `test/store.test.ts`; roots `src/` and `test/`. Current suite: 81 tests. Remaining: exhaustive decision coverage and independent source review. |
+| FS-02 | IMPLEMENTED_UNVERIFIED | Pure domain in `src/domain.ts`; frozen-input test and no-op decisions in `test/domain-core.test.ts`; SQL trigger test `test/lifecycle.test.ts` proves identical Wait, Hold, and Escalate polling execute zero Commission UPDATEs; forged transition denied in `test/store.test.ts`; roots `src/` and `test/`. Current suite: 83 tests. Remaining: exhaustive decision coverage and independent source review. |
 | FS-03 | IMPLEMENTED_UNVERIFIED | `src/domain.ts` compares approved amendments by semantic obligation ID/content/policy and treats identical (including reordered) amendments as no-ops. `test/domain-core.test.ts` “an identical amendment is a no-op and a stale generation is rejected”; `test/store.test.ts` “application authorization port rejects objective/criterion replacement…” and “application rejects a stale approved amendment…”; `test/lifecycle.test.ts` terminal amendment in “one unattended lifecycle converges…” remains rejected. Current `just check` passed 81 tests. Remaining: authority freshness beyond the exact generation-CAS and wrong-principal cases. |
 | FS-04 | IMPLEMENTED_UNVERIFIED | SQLite schema v3 adds criterion provenance and v4 adds durable `interrupt` Operations; SQL Operation journal persists `submitted` before provider dispatch in `src/application.ts`. `test/lifecycle.test.ts`: “a prepared Operation is dispatched once after restart and observed outcomes are not replayed”; “submitted Operation survives a provider effect followed by lost controller acknowledgement”; “ambiguous outcome with no authoritative result waits…”; “a retry follows provider proof…”; `test/store.test.ts`: “retry_authorized survives restart and replays the original Operation identity”. Watchdog interrupt dispatch and lost-ack restart recovery are verified in `test/daemon-configured-process.test.ts`. Across cuts, tests check durable outcome, original ID/logical key, and exact fake-provider count; ambiguous/unknown state never replays. Remaining: process-kill failpoints between each SQLite transaction and provider call, and a larger randomized crash matrix. |
 | FS-05 | IMPLEMENTED_UNVERIFIED | Owner/epoch checks and predecessor resolution in `src/domain.ts`; `test/store.test.ts` “a successor Lease holder resolves a predecessor Operation…”; `test/lifecycle.test.ts` “a successor ApplicationService observes a predecessor's accepted turn after lost acknowledgement” closes/reopens SQLite before B takes over and inspects, then proves stale A cannot reconcile or dispatch and the original dispatch count remains one. Competing SQLite connection CAS is tested by “two SQLite controller connections cannot both mutate one Commission version”. Remaining: Workspace single-writer/independent verifier snapshot and actual Kubernetes Lease adapter. |
@@ -33,7 +33,7 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 | G05 / FS-03 concluded specification immutability | `test/lifecycle.test.ts` terminal amendment rejection; objective retained. | Passed. |
 | G06 / FS-02 stable no-op | `test/domain-core.test.ts`, `test/lifecycle.test.ts` repeated Wait/Hold/Escalate and SQL UPDATE trigger. | Passed locally. |
 
-## Latest complete verification (working tree after `6cd9fb8`, implementation changes pending checkpoint)
+## Latest complete verification (commit `7a8b71b`)
 
 - `nix develop -c just fmt` — passed; Prettier applied with no further diff.
 - `nix develop -c just check` — passed: generated lock matched, deliberate drift detected, formatting and strict TypeScript passed, 83 Bun tests / 978 assertions locally.
@@ -41,7 +41,9 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 - `nix develop -c just ci-verify` — passed.
 - `nix run .#sdlc -- install --check` — passed, including the new SDLC change fragment.
 - `nix develop -c just ci-check` — passed; `nix develop -c just ci-verify` — passed; `nix run .#sdlc -- install --check` — passed.
-- This working-tree candidate has not yet been clean-clone verified or pushed; its PR checks are therefore pending a coherent commit.
+- Clean clone at exact commit `7a8b71b`: all four repository check commands passed (83 tests / 978 assertions).
+- The first focused test run exposed a test setup error: the new Verify Operation was in `newOperations`, not `updatedOperations`; the test was corrected and rerun successfully. This did not indicate a production failure.
+- GitHub checks at this implementation head are pending; query after push. Required/optional check policy remains incomplete as recorded under FS-07/FS-10.
 
 ## Next checkpoint
 
