@@ -366,7 +366,10 @@ export class OpenCodeAdapter {
         ok: false,
         error: { kind: "unavailable", message: current.reason },
       };
-    if (current.kind === "idle") return { ok: true, value: false };
+    if (current.kind === "idle") {
+      this.#executionSnapshots.delete(sessionId);
+      return { ok: true, value: false };
+    }
     if (current.kind !== "running")
       return {
         ok: false,
@@ -380,6 +383,7 @@ export class OpenCodeAdapter {
           message: "OpenCode no longer reports a safe interruption boundary",
         },
       };
+    this.#executionSnapshots.delete(sessionId);
     const result = await this.#request(
       `api/session/${encodeURIComponent(sessionId)}/interrupt?resume=false`,
       { method: "POST" },

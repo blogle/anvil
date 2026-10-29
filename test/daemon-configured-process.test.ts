@@ -193,7 +193,8 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   const openCodeEventSubscribers = new Set<
     ReadableStreamDefaultController<Uint8Array>
   >();
-  const watchdogProgressAt = Date.now() - 30_000;
+  let watchdogProgressAt = Date.now() - 30_000;
+  let watchdogTokenInput = 9_000;
   provisionCount = 0;
   sessionCreateCount = 0;
   promptCount = 0;
@@ -265,7 +266,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
               ? Object.fromEntries(
                   [...sessions]
                     .filter(([sandboxName]) =>
-                      sandboxName.startsWith("anvil-configured-commission-"),
+                      sandboxName.startsWith("anvil-configured-"),
                     )
                     .map(([, sessionId]) => [sessionId, { type: "running" }]),
                 )
@@ -337,7 +338,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
                             completed: watchdogProgressAt,
                           },
                           tokens: {
-                            input: 9_000,
+                            input: watchdogTokenInput,
                             output: 100,
                             reasoning: 0,
                             cache: { read: 0, write: 0 },
@@ -550,6 +551,88 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
       ({ kind }) => kind === "interrupt" || kind === "refresh_context",
     ),
   ).toHaveLength(2);
+
+  const stuckId = "configured-stuck-watchdog";
+  const stuckCreated = await fetch(`${baseUrl}/api/commissions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(
+      proposalInput({
+        id: stuckId,
+        repository: "https://github.com/acme/demo",
+        budget: { ...proposalInput().budget, maxAttempts: 1 },
+      }),
+    ),
+  });
+  expect(stuckCreated.status).toBe(201);
+  const stuckAdmitted = await fetch(
+    `${baseUrl}/api/commissions/${stuckId}/admit`,
+    {
+      method: "POST",
+      headers,
+      body: "{}",
+    },
+  );
+  expect(stuckAdmitted.status).toBe(200);
+  await waitForBootstrapOperations(baseUrl, stuckId);
+  const stuckSandbox = [...sessions.keys()].find((name) =>
+    name.startsWith("anvil-configured-stuck-watchdog-"),
+  );
+  if (stuckSandbox === undefined)
+    throw new Error("Stuck-turn Sandbox fixture missing");
+  const stuckSessionId = sessions.get(stuckSandbox);
+  if (stuckSessionId === undefined)
+    throw new Error("Stuck-turn Session fixture missing");
+  for (
+    let attempt = 0;
+    attempt < 100 && openCodeEventSubscribers.size < 2;
+    attempt += 1
+  )
+    await Bun.sleep(10);
+  expect(openCodeEventSubscribers.size).toBeGreaterThanOrEqual(2);
+  watchdogTokenInput = 1_000;
+  watchdogProgressAt = Date.now() - 10 * 60_000;
+  watchdogMode = true;
+  for (const subscriber of openCodeEventSubscribers)
+    subscriber.enqueue(
+      new TextEncoder().encode(
+        `data: ${JSON.stringify({ type: "session.step.ended", sessionID: stuckSessionId })}\n\n`,
+      ),
+    );
+  const stuckOperations = await waitForOperationKind(
+    baseUrl,
+    stuckId,
+    "interrupt",
+    "observed",
+  );
+  expect(
+    stuckOperations.find(({ kind }) => kind === "interrupt")?.directive,
+  ).toContain("stuck-active-turn");
+  expect(interruptCount).toBe(2);
+  expect(promptCount).toBe(3);
+  const exhausted = await fetch(
+    `${baseUrl}/api/commissions/${stuckId}/reconcile`,
+    {
+      method: "POST",
+      headers,
+      body: "{}",
+    },
+  ).then((response) => response.json());
+  expect(exhausted).toMatchObject({
+    decision: { kind: "hold", reason: "budget_exhausted" },
+  });
+
+  daemonProcess.kill("SIGTERM");
+  await daemonProcess.exited;
+  daemonProcess = undefined;
+  daemonProcess = startDaemon(runtimeEnvironment);
+  await waitUntilReady(baseUrl);
+  await Bun.sleep(100);
+  expect(provisionCount).toBe(2);
+  expect(sessionCreateCount).toBe(2);
+  expect(promptCount).toBe(3);
+  expect(interruptCount).toBe(2);
+
   const ambiguousId = "configured-ambiguous-session";
   loseNextSessionCreateAck = true;
   const ambiguousCreated = await fetch(`${baseUrl}/api/commissions`, {
@@ -569,10 +652,10 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   );
   expect(ambiguousAdmitted.status).toBe(200);
   await waitForAmbiguousSessionCreate(baseUrl, ambiguousId);
-  expect(provisionCount).toBe(2);
-  expect(sessionCreateCount).toBe(2);
-  expect(promptCount).toBe(2);
-  expect(interruptCount).toBe(1);
+  expect(provisionCount).toBe(3);
+  expect(sessionCreateCount).toBe(3);
+  expect(promptCount).toBe(3);
+  expect(interruptCount).toBe(2);
 
   daemonProcess.kill("SIGTERM");
   await daemonProcess.exited;
@@ -580,9 +663,9 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   daemonProcess = startDaemon(runtimeEnvironment);
   await waitUntilReady(baseUrl);
   await Bun.sleep(100);
-  expect(provisionCount).toBe(2);
-  expect(sessionCreateCount).toBe(2);
-  expect(promptCount).toBe(2);
+  expect(provisionCount).toBe(3);
+  expect(sessionCreateCount).toBe(3);
+  expect(promptCount).toBe(3);
   const unresolved = await fetch(
     `${baseUrl}/api/commissions/${ambiguousId}/operations`,
     { headers },
