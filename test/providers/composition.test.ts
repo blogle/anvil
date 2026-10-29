@@ -236,6 +236,7 @@ test("ProviderComposition creates and reobserves a GitHub PR without duplicate c
     .toString();
   let pullRequest: Record<string, unknown> | null = null;
   let writes = 0;
+  let branchRevision = "candidate-from-another-worker";
   githubServer = Bun.serve({
     port: 0,
     async fetch(request) {
@@ -253,6 +254,11 @@ test("ProviderComposition creates and reobserves a GitHub PR without duplicate c
           { status: 201 },
         );
       }
+      if (url.pathname === "/api/repos/acme/demo/branches/anvil%2Fruntime-work")
+        return Response.json({
+          name: "anvil/runtime-work",
+          commit: { sha: branchRevision },
+        });
       if (
         url.pathname === "/api/repos/acme/demo/pulls" &&
         request.method === "GET"
@@ -339,6 +345,14 @@ test("ProviderComposition creates and reobserves a GitHub PR without duplicate c
     createdAt: epoch,
     outcome: { kind: "prepared" },
   };
+  expect(
+    await composition.dispatch(commission, operation, epoch + 1),
+  ).toMatchObject({
+    ok: false,
+    error: { kind: "rejected" },
+  });
+  expect(writes).toBe(0);
+  branchRevision = "candidate-runtime-sha";
   const dispatched = await composition.dispatch(
     commission,
     operation,
@@ -368,6 +382,135 @@ test("ProviderComposition creates and reobserves a GitHub PR without duplicate c
   expect(writes).toBe(1);
 });
 
+test("ProviderComposition verifies only the immutable Candidate SHA and reobserves without a write", async () => {
+  const keyPair = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const privateKey = keyPair.privateKey
+    .export({ type: "pkcs8", format: "pem" })
+    .toString();
+  let checkReads = 0;
+  githubServer = Bun.serve({
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (url.pathname === "/api/app/installations/42/access_tokens") {
+        const body = (await request.json()) as {
+          permissions: Record<string, string>;
+        };
+        return Response.json(
+          {
+            token: `ghs_${body.permissions["checks"]}`,
+            expires_at: new Date(epoch + 3_600_000).toISOString(),
+            permissions: body.permissions,
+          },
+          { status: 201 },
+        );
+      }
+      if (
+        url.pathname ===
+        "/api/repos/acme/demo/commits/candidate-verify-sha/check-runs"
+      ) {
+        expect(request.method).toBe("GET");
+        checkReads += 1;
+        return Response.json({
+          total_count: 1,
+          check_runs: [
+            {
+              id: 81,
+              name: "required / unit",
+              head_sha: "candidate-verify-sha",
+              status: "queued",
+              conclusion: null,
+              details_url: null,
+            },
+          ],
+        });
+      }
+      return Response.json(
+        { message: "unexpected fixture route" },
+        { status: 404 },
+      );
+    },
+  });
+  const apiUrl = `http://127.0.0.1:${githubServer.port}/api/`;
+  const github = new GitHubDeliveryClient(
+    new GitHubAppBroker({
+      appId: "fixture-app",
+      installationId: 42,
+      privateKey,
+      apiUrl,
+      now: () => epoch,
+    }),
+    { apiUrl, now: () => epoch + 1 },
+  );
+  const composition = new ProviderComposition({
+    sandbox: new AgentSandboxClient({
+      apiServerUrl: "http://127.0.0.1:1/",
+      namespace: "test",
+      bearerToken: "unused-local-token",
+    }),
+    world: {
+      observe: async () => {
+        const { execution: _execution, ...facts } = observation();
+        return { ok: true, value: facts };
+      },
+    },
+    openCodeForSandbox: () =>
+      new OpenCodeAdapter({ baseUrl: "http://127.0.0.1:1/" }),
+    sandboxIntent: () => {
+      throw new Error("Verify Operation must not provision a Sandbox");
+    },
+    github,
+    workBranch: () => "anvil/verify-work",
+    model: { providerId: "fixture-provider", modelId: "fixture-model" },
+  });
+  const commission = proposal({
+    id: "commission-github-verify",
+    repository: "https://github.com/acme/demo",
+  }).commission;
+  const operation: Operation = {
+    id: "verify-op-1",
+    logicalKey: "verify-op-1",
+    commissionId: commission.id,
+    kind: "verify",
+    target: "checks:https://github.com/acme/demo:candidate-verify-sha",
+    controllerId: "controller-1",
+    ownerEpoch: 1,
+    specificationGeneration: 1,
+    assignmentId: "assignment-1",
+    attemptId: "attempt-1",
+    instructionSequence: 1,
+    retryCount: 0,
+    candidateRevision: "candidate-verify-sha",
+    findingIds: [],
+    directive: "verify candidate-verify-sha",
+    createdAt: epoch,
+    outcome: { kind: "prepared" },
+  };
+
+  expect(
+    await composition.dispatch(commission, operation, epoch + 1),
+  ).toMatchObject({
+    ok: true,
+    value: {
+      kind: "observed",
+      result: "applied",
+      source: "github-check-runs-rest",
+      externalIdentity: "github-checkset:candidate-verify-sha:81",
+    },
+  });
+  expect(
+    await composition.inspectOperation(commission, operation, epoch + 2),
+  ).toMatchObject({
+    ok: true,
+    value: {
+      kind: "observed",
+      result: "applied",
+      externalIdentity: "github-checkset:candidate-verify-sha:81",
+    },
+  });
+  expect(checkReads).toBe(2);
+});
+
 test("composed local providers drive a Commission from Workspace provisioning through queue and authoritative merge", async () => {
   const keyPair = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const privateKey = keyPair.privateKey
@@ -376,8 +519,8 @@ test("composed local providers drive a Commission from Workspace provisioning th
   let sandboxResource: Record<string, unknown> | null = null;
   let sessionCreates = 0;
   let prompts = 0;
-  let branchReady = false;
-  let checkPassing = false;
+  let candidateRevision: string | null = null;
+  let checkState: "failing" | "pending" | "passing" = "failing";
   let pullRequest: Record<string, unknown> | null = null;
   let pullRequestCreates = 0;
   let queued = false;
@@ -432,7 +575,9 @@ test("composed local providers drive a Commission from Workspace provisioning th
         return new Response(null, { status: 204 });
       if (url.pathname.endsWith("/prompt")) {
         prompts += 1;
-        branchReady = true;
+        candidateRevision =
+          prompts === 1 ? "candidate-delivery" : "candidate-delivery-repaired";
+        if (prompts > 1) checkState = "pending";
         const body = (await request.json()) as { id: string; text: string };
         return Response.json({ data: { id: body.id } });
       }
@@ -462,26 +607,31 @@ test("composed local providers drive a Commission from Workspace provisioning th
         );
       }
       if (url.pathname.endsWith("/branches/anvil%2Fcommission-delivery")) {
-        return branchReady
+        return candidateRevision !== null
           ? Response.json({
               name: "anvil/commission-delivery",
-              commit: { sha: "candidate-delivery" },
+              commit: { sha: candidateRevision },
             })
           : Response.json(
               { message: "branch has not been published" },
               { status: 404 },
             );
       }
-      if (url.pathname.endsWith("/commits/candidate-delivery/check-runs"))
+      if (url.pathname.includes("/check-runs"))
         return Response.json({
           total_count: 1,
           check_runs: [
             {
               id: 51,
               name: "ci / required",
-              head_sha: "candidate-delivery",
-              status: checkPassing ? "completed" : "queued",
-              conclusion: checkPassing ? "success" : null,
+              head_sha: candidateRevision,
+              status: checkState === "pending" ? "queued" : "completed",
+              conclusion:
+                checkState === "passing"
+                  ? "success"
+                  : checkState === "failing"
+                    ? "failure"
+                    : null,
               details_url: "https://github.com/acme/demo/actions/51",
             },
           ],
@@ -498,7 +648,7 @@ test("composed local providers drive a Commission from Workspace provisioning th
           merged,
           head: {
             ref: body.head.split(":").slice(1).join(":"),
-            sha: "candidate-delivery",
+            sha: candidateRevision,
           },
           base: { ref: body.base },
         };
@@ -649,7 +799,7 @@ test("composed local providers drive a Commission from Workspace provisioning th
     const kind = result.value.decision?.kind;
     if (kind !== undefined) decisions.push(kind);
     if (kind === "wait" && result.value.decision?.wake.kind === "check_run") {
-      checkPassing = true;
+      checkState = "passing";
     }
     if (kind === "wait" && result.value.decision?.wake.kind === "merge_queue") {
       if (queued) merged = true;
@@ -675,6 +825,7 @@ test("composed local providers drive a Commission from Workspace provisioning th
     "provision_sandbox",
     "create_session",
     "continue",
+    "repair",
     "wait",
     "integrate",
     "wait",
@@ -682,14 +833,14 @@ test("composed local providers drive a Commission from Workspace provisioning th
     "conclude",
   ]);
   expect(repository.get(commissionId)?.deliveryEvidence).toMatchObject({
-    revision: "candidate-delivery",
+    revision: "candidate-delivery-repaired",
     repository: "https://github.com/acme/demo",
     integrationTarget: "main",
     providerIdentity: "https://github.com/acme/demo/pull/52",
   });
   expect(sandboxResource).not.toBeNull();
   expect(sessionCreates).toBe(1);
-  expect(prompts).toBe(1);
+  expect(prompts).toBe(2);
   expect(pullRequestCreates).toBe(1);
   expect(unusedFacts.candidateRevision).toBeNull();
 });

@@ -1611,6 +1611,82 @@ test("an identical amendment is a no-op and a stale generation is rejected", () 
   ).toEqual({ ok: false, error: "stale_generation" });
 });
 
+test("an unchanged unknown check snapshot waits after one Verify Operation instead of dispatching repeatedly", () => {
+  const commission = admittedCommission();
+  const revision = "candidate-unknown-checks";
+  const world = observation({
+    candidateRevision: revision,
+    checks: {
+      runId: "github-checkset:candidate-unknown-checks:",
+      revision,
+      state: "unknown",
+      failureIds: [],
+      observedAt: epoch,
+      expiresAt: epoch + 60_000,
+      source: "github-check-runs-rest",
+    },
+    workerClaims: [
+      {
+        id: "worker-claim-unknown-checks",
+        obligationId: "acceptance-1",
+        claim: "Candidate work is ready for verification",
+        observedAt: epoch,
+        expiresAt: epoch + 60_000,
+        sourceIdentity: "session-1",
+      },
+    ],
+  });
+  const first = evolve(commission, {
+    kind: "reconcile",
+    lease: lease(),
+    observation: world,
+    operations: [],
+    policy,
+    now: epoch + 1,
+  });
+  expect(first.ok).toBe(true);
+  if (!first.ok) throw new Error("Initial Verify decision was rejected");
+  expect(first.value.decision).toEqual({
+    kind: "verify",
+    candidateRevision: revision,
+  });
+  const prepared = first.value.newOperations[0];
+  expect(prepared?.kind).toBe("verify");
+  if (prepared === undefined)
+    throw new Error("Verify Operation was not prepared");
+  const completed = evolveOperation(
+    first.value.commission,
+    prepared,
+    lease(),
+    {
+      kind: "observed",
+      observedAt: epoch + 1,
+      source: "github-check-runs-rest",
+      result: "applied",
+      retrySafe: false,
+      externalIdentity: "github-checkset:candidate-unknown-checks:",
+    },
+    epoch + 1,
+  );
+  expect(completed.ok).toBe(true);
+  if (!completed.ok) throw new Error("Verify outcome was rejected");
+  const second = evolve(completed.value.commission, {
+    kind: "reconcile",
+    lease: lease(),
+    observation: world,
+    operations: completed.value.updatedOperations,
+    policy,
+    now: epoch + 2,
+  });
+  expect(second.ok).toBe(true);
+  if (!second.ok) throw new Error("Repeated check observation was rejected");
+  expect(second.value.decision).toMatchObject({
+    kind: "wait",
+    reason: "the same check evidence remains unknown after verification",
+  });
+  expect(second.value.updatedOperations).toHaveLength(0);
+});
+
 test("a fresh authoritative merge resolves its matching unresolved integration Operation", () => {
   const base = admittedCommission();
   const worker = observation({

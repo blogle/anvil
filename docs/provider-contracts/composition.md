@@ -16,13 +16,26 @@ caller-selected idempotent Session identity; it is not automatically replayed.
 OpenCode turn dispatch uses deterministic message identity plus message
 inspection, never assuming that a repeated message ID is exactly-once.
 
+After a worker publishes its Candidate branch, the controller observes its
+immutable SHA from GitHub. Before creating/finding a PR, composition rereads that
+branch and rejects a changed SHA; the resulting PR must report the same head
+SHA, worker branch, and approved target. The controller does not push commits.
+`verify` is a read-only check-runs observation bound to the Operation's Candidate
+SHA. Its stable check-set identity is recorded in the Operation and reobserved
+after an ambiguous acknowledgement; it does not call a check-trigger API.
+Unchanged unknown check evidence waits instead of repeatedly creating Verify
+Operations. This is fixture-verified behavior, not a claim of required-status
+branch policy or freshness completeness.
+
 `test/providers/composition.test.ts` runs this composition through the real
-`ApplicationService` and SQLite store, with local HTTP fixtures for both
-providers and application/store reconstruction between provisioning stages. It
-proves only the local protocol path. `src/providers/runtime.ts` composes the
+`ApplicationService` and SQLite store, with local HTTP fixtures for providers,
+application/store reconstruction, failing-CI repair and changed Candidate,
+pending/pass checks, PR, queue and merge. It proves only the local protocol
+path. `src/providers/runtime.ts` composes the
 provider clients and `src/main.ts` exposes them behind explicit
 `ANVIL_PROVIDER_MODE=configured`; the default remains unavailable. Configured
-daemon mode itself has not been run. Git branch publication, verification
-initiation, worker credential handoff, safe Session-create recovery and
-multi-controller Lease integration remain outstanding. No live API or
-Kubernetes calls are part of these tests.
+daemon mode has process-level watchdog tests, but not yet the full delivery
+lifecycle. Worker Git credential handoff/publication, required branch-protection
+check discovery, safe Session-create recovery and multi-controller Lease
+integration remain outstanding. No live API or Kubernetes calls are part of
+these tests.

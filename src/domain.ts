@@ -999,8 +999,25 @@ export function decide(
       wake: { kind: "check_run", runId: checks.runId },
     };
   }
-  if (checks.state === "unknown")
-    return { kind: "verify", candidateRevision: candidate };
+  if (checks.state === "unknown") {
+    const priorVerify = operations.find(
+      (operation) =>
+        operation.kind === "verify" &&
+        operation.candidateRevision === candidate &&
+        operation.specificationGeneration ===
+          commission.specificationGeneration &&
+        operation.outcome.kind === "observed" &&
+        operation.outcome.result === "applied" &&
+        operation.outcome.externalIdentity === checks.runId,
+    );
+    return priorVerify === undefined
+      ? { kind: "verify", candidateRevision: candidate }
+      : {
+          kind: "wait",
+          reason: "the same check evidence remains unknown after verification",
+          wake: { kind: "provider_refresh", provider: "checks" },
+        };
+  }
   if (checks.state === "failing") {
     const previousRepair = operations.find(
       (operation) =>

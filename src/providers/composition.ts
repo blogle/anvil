@@ -305,12 +305,48 @@ export class ProviderComposition implements ProviderPort {
             : result,
         );
     }
+    if (operation.kind === "verify") {
+      if (
+        this.#config.github === undefined ||
+        operation.candidateRevision === null
+      )
+        return rejected("Candidate verification is not configured");
+      const checks = await this.#config.github.checkRuns(
+        commission.repository,
+        operation.candidateRevision,
+      );
+      if (!checks.ok) return { ok: false, error: githubFailure(checks.error) };
+      if (checks.value.revision !== operation.candidateRevision)
+        return rejected(
+          "GitHub checks response differs from the verified Candidate",
+        );
+      return {
+        ok: true,
+        value: {
+          kind: "observed",
+          observedAt: now,
+          source: "github-check-runs-rest",
+          result: "applied",
+          retrySafe: false,
+          externalIdentity: checkSnapshotIdentity(checks.value),
+        },
+      };
+    }
     if (operation.kind === "integrate") {
       if (
         this.#config.github === undefined ||
         this.#config.workBranch === undefined
       )
         return rejected("GitHub pull request integration is not configured");
+      const branch = await this.#config.github.branch(
+        commission.repository,
+        this.#config.workBranch(commission),
+      );
+      if (!branch.ok) return { ok: false, error: githubFailure(branch.error) };
+      if (branch.value.revision !== operation.candidateRevision)
+        return rejected(
+          "Worker branch no longer points at the authorized Candidate",
+        );
       const pullRequest = await this.#config.github.createOrFindPullRequest({
         repositoryUrl: commission.repository,
         headRef: this.#config.workBranch(commission),
@@ -320,6 +356,14 @@ export class ProviderComposition implements ProviderPort {
       });
       if (!pullRequest.ok)
         return { ok: false, error: githubFailure(pullRequest.error) };
+      if (
+        pullRequest.value.headSha !== operation.candidateRevision ||
+        pullRequest.value.headRef !== this.#config.workBranch(commission) ||
+        pullRequest.value.baseRef !== commission.integrationTarget
+      )
+        return rejected(
+          "Observed pull request head or target differs from the authorized Candidate",
+        );
       return {
         ok: true,
         value: {
@@ -409,6 +453,30 @@ export class ProviderComposition implements ProviderPort {
       );
     }
     if (
+      operation.kind === "verify" &&
+      this.#config.github !== undefined &&
+      operation.candidateRevision !== null
+    ) {
+      const checks = await this.#config.github.checkRuns(
+        commission.repository,
+        operation.candidateRevision,
+      );
+      if (!checks.ok) return { ok: false, error: githubFailure(checks.error) };
+      if (checks.value.revision !== operation.candidateRevision)
+        return { ok: true, value: null };
+      return {
+        ok: true,
+        value: {
+          kind: "observed",
+          observedAt: now,
+          source: "github-check-runs-inspection",
+          result: "applied",
+          retrySafe: false,
+          externalIdentity: checkSnapshotIdentity(checks.value),
+        },
+      };
+    }
+    if (
       operation.kind === "integrate" &&
       this.#config.github !== undefined &&
       this.#config.workBranch !== undefined
@@ -422,7 +490,9 @@ export class ProviderComposition implements ProviderPort {
         return { ok: false, error: githubFailure(pullRequest.error) };
       if (
         pullRequest.value === null ||
-        pullRequest.value.headSha !== operation.candidateRevision
+        pullRequest.value.headSha !== operation.candidateRevision ||
+        pullRequest.value.headRef !== this.#config.workBranch(commission) ||
+        pullRequest.value.baseRef !== commission.integrationTarget
       ) {
         return { ok: true, value: null };
       }
@@ -480,6 +550,17 @@ export class ProviderComposition implements ProviderPort {
     this.#executionWatchers.get(commissionId)?.controller.abort();
     this.#executionWatchers.delete(commissionId);
   }
+}
+
+function checkSnapshotIdentity(snapshot: {
+  revision: string;
+  checkRuns: readonly Readonly<{ id: number; headSha: string }>[];
+}): string {
+  return `github-checkset:${snapshot.revision}:${snapshot.checkRuns
+    .filter(({ headSha }) => headSha === snapshot.revision)
+    .map(({ id }) => id)
+    .sort()
+    .join(",")}`;
 }
 
 function completedOperation(
