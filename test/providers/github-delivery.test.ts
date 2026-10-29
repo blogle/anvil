@@ -35,11 +35,13 @@ test("GitHub read adapter preserves PR, branch, check and truncation facts from 
         expect(payload).toEqual({
           repositories: ["demo"],
           permissions: {
+            administration: "read",
             actions: "read",
             checks: "read",
             contents: "read",
             metadata: "read",
             pull_requests: "read",
+            statuses: "read",
           },
         });
         return Response.json(

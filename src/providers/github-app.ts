@@ -47,13 +47,15 @@ export type GitHubAppBrokerConfig = Readonly<{
 const permissionProfiles: Readonly<
   Record<GitHubCredentialPurpose, Readonly<Record<string, GitHubPermission>>>
 > = {
-  git: { contents: "write", workflows: "write" },
+  git: { contents: "write" },
   gh_read: {
+    administration: "read",
     actions: "read",
     checks: "read",
     contents: "read",
     metadata: "read",
     pull_requests: "read",
+    statuses: "read",
   },
   gh: {
     actions: "read",

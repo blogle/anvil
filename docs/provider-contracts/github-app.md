@@ -12,8 +12,8 @@ repository and one declared purpose:
 
 | Purpose | Requested permissions |
 |---|---|
-| `git` | `contents:write`, `workflows:write` |
-| `gh_read` | `actions:read`, `checks:read`, `contents:read`, `metadata:read`, `pull_requests:read` |
+| `git` | `contents:write` |
+| `gh_read` | `administration:read`, `actions:read`, `checks:read`, `contents:read`, `metadata:read`, `pull_requests:read`, `statuses:read` |
 | `gh` | `actions:read`, `checks:read`, `contents:read`, `metadata:read`, `pull_requests:write` |
 
 The response's effective permission map must be present and no broader than the
@@ -23,15 +23,20 @@ separated by normalized repository and purpose and refreshed inside a bounded
 expiry margin. Errors retain safe code/status/request-ID diagnostics but do
 not return upstream body text or credential material.
 
-This checkpoint does not wire the broker into worker Git/`gh` processes. The
+The `git` profile no longer requests `workflows:write`: content pushes do not
+need workflow-definition authority. Broker tests assert repository isolation
+and this contents-only profile. The broker token is still not wired into worker
+Git/`gh` processes or bound to an Assignment. The
 `GitHubDeliveryClient` adds repository branch, PR and check-run reads with the
 `gh_read` profile, and governed PR create-or-observe with the `gh` profile.
 After a lost PR-create acknowledgement it queries by owner/branch and only
 records a discovered postcondition; absence remains ambiguous and is never
 blindly replayed. `test/providers/github-delivery.test.ts` uses local fixtures
 for repository-scoped auth, identity/revision mapping, check pagination, and
-PR postcondition recovery. It does not implement branch push or commit-status
-contexts. `GitHubWorldObserver` in `src/providers/github-world.ts` combines
-Candidate, check, registered-PR and Mergify queue observations without defining
-repository check policy. Worker/controller credential handoff and live GitHub
-integration remain unverified.
+PR postcondition recovery. It does not implement branch push. `GitHubWorldObserver`
+resolves required contexts from branch rules and classic branch protection,
+then matches Check Runs or legacy commit statuses to the exact Candidate SHA.
+No required profile, missing context, incomplete evidence, skipped/neutral
+check, or unavailable policy can become green. Mergify queue state remains
+separate from source-PR CI. Worker/controller credential handoff and live
+GitHub integration remain unverified.

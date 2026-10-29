@@ -26,15 +26,18 @@ value). OpenCode HTTP is restricted to loopback fixture hosts; configured
 non-loopback OpenCode endpoints must use HTTPS.
 
 The runtime computes a stable work-branch name from Commission identity. The
-local `GitHubWorldObserver` observes branch SHA, check runs, registered PR, and
-Mergify queue. Integration creates or finds a PR for the work branch and
-re-observes after ambiguous acknowledgements. Check-run observations are
-conservative when pagination is incomplete or no checks exist.
+local `GitHubWorldObserver` observes branch SHA, required contexts from branch
+rulesets/classic branch protection, SHA-bound Check Runs and commit statuses,
+registered PR, and Mergify queue. Missing or unavailable required-check policy
+and missing contexts cannot become passing; neutral/skipped runs are unknown.
+Merge-queue health remains separate from source-PR CI. Integration creates or
+finds a PR for the work branch and re-observes after ambiguous acknowledgements.
 
 Known scope limits: `main.ts` still uses a single-process local Lease adapter,
-the composition has no runtime Lease fencing, Git push is performed by the
-worker rather than an adapter, commit-status contexts are not read, verification
-does not initiate a CI run, OpenCode Session-create lost acknowledgements stay
+the composition has no runtime Lease fencing, and actual worker Git credential
+handoff/push is not wired. The broker Git profile is repository-scoped but not
+Assignment-bound and is not delivered to the worker. Verification observes CI
+but does not initiate a run. OpenCode Session-create lost acknowledgements stay
 unknown, and GitHub/Mergify/Sandbox credentials have not been validated against
 live services. Never enable this mode against a cluster without the separately
 authorized FS-15 workflow and independently reviewed isolation.

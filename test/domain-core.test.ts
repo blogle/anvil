@@ -1687,6 +1687,47 @@ test("an unchanged unknown check snapshot waits after one Verify Operation inste
   expect(second.value.updatedOperations).toHaveLength(0);
 });
 
+test("a missing required check blocks integration despite otherwise green Candidate evidence", () => {
+  const commission = admittedCommission();
+  const revision = "candidate-missing-required-check";
+  const result = evolve(commission, {
+    kind: "reconcile",
+    lease: lease(),
+    observation: observation({
+      candidateRevision: revision,
+      checks: {
+        runId: "github-required-checks:missing-fixture",
+        revision,
+        state: "missing",
+        failureIds: ["required / unit"],
+        observedAt: epoch,
+        expiresAt: epoch + 60_000,
+        source: "github-required-status-checks",
+      },
+      workerClaims: [
+        {
+          id: "worker-claim-missing-check",
+          obligationId: "acceptance-1",
+          claim: "Implementation claims the Candidate is complete",
+          observedAt: epoch,
+          expiresAt: epoch + 60_000,
+          sourceIdentity: "session-1",
+        },
+      ],
+    }),
+    operations: [],
+    policy,
+    now: epoch + 1,
+  });
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error("Missing-check observation was rejected");
+  expect(result.value.decision).toMatchObject({
+    kind: "wait",
+    reason: "required status checks have not been reported for this Candidate",
+  });
+  expect(result.value.newOperations).toHaveLength(0);
+});
+
 test("a fresh authoritative merge resolves its matching unresolved integration Operation", () => {
   const base = admittedCommission();
   const worker = observation({

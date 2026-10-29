@@ -9,7 +9,6 @@ import type { WorldObservationPort } from "./composition";
 import { parseGitHubRepository } from "./github-app";
 import {
   GitHubDeliveryClient,
-  type GitHubCheckSnapshot,
   type GitHubPullRequestFact,
 } from "./github-delivery";
 import { MergifyQueueClient } from "./mergify";
@@ -65,18 +64,16 @@ export class GitHubWorldObserver implements WorldObservationPort {
     const candidateRevision = branch.ok ? branch.value.revision : null;
     let checks: CheckObservation | null = null;
     if (candidateRevision !== null) {
-      const result = await this.#delivery.checkRuns(
+      const result = await this.#delivery.requiredChecksForCandidate(
         commission.repository,
-        candidateRevision,
-      );
-      if (!result.ok)
-        return { ok: false, error: deliveryFailure(result.error) };
-      checks = checkObservation(
-        result.value,
+        commission.integrationTarget,
         candidateRevision,
         now,
         expiresAt,
       );
+      if (!result.ok)
+        return { ok: false, error: deliveryFailure(result.error) };
+      checks = result.value;
     }
 
     const integration = await this.#integration(
@@ -202,44 +199,6 @@ export class GitHubWorldObserver implements WorldObservationPort {
       },
     };
   }
-}
-
-function checkObservation(
-  snapshot: GitHubCheckSnapshot,
-  revision: string,
-  observedAt: number,
-  expiresAt: number,
-): CheckObservation {
-  const relevant = snapshot.checkRuns.filter(
-    (check) => check.headSha === revision,
-  );
-  const failures = relevant.filter(
-    (check) =>
-      check.status === "completed" &&
-      check.conclusion !== "success" &&
-      check.conclusion !== "neutral" &&
-      check.conclusion !== "skipped",
-  );
-  const state =
-    !snapshot.complete || relevant.length === 0
-      ? "unknown"
-      : failures.length > 0
-        ? "failing"
-        : relevant.some((check) => check.status !== "completed")
-          ? "pending"
-          : "passing";
-  return {
-    runId: `github-checkset:${revision}:${relevant
-      .map(({ id }) => id)
-      .sort()
-      .join(",")}`,
-    revision,
-    state,
-    failureIds: failures.map(({ id, name }) => `${name}:${id}`),
-    observedAt,
-    expiresAt,
-    source: "github-check-runs-rest",
-  };
 }
 
 function parseRegisteredPullRequest(

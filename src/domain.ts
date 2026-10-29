@@ -179,7 +179,7 @@ export type ExecutionObservation =
 export type CheckObservation = Readonly<{
   runId: string;
   revision: string;
-  state: "pending" | "failing" | "passing" | "unknown";
+  state: "missing" | "pending" | "failing" | "passing" | "unknown";
   failureIds: readonly string[];
   observedAt: number;
   expiresAt: number;
@@ -996,6 +996,14 @@ export function decide(
     return {
       kind: "wait",
       reason: "required CI check is pending",
+      wake: { kind: "check_run", runId: checks.runId },
+    };
+  }
+  if (checks.state === "missing") {
+    return {
+      kind: "wait",
+      reason:
+        "required status checks have not been reported for this Candidate",
       wake: { kind: "check_run", runId: checks.runId },
     };
   }

@@ -144,7 +144,7 @@ const observationSchema = z
       .object({
         runId: z.string().min(1),
         revision: z.string().min(1),
-        state: z.enum(["pending", "failing", "passing", "unknown"]),
+        state: z.enum(["missing", "pending", "failing", "passing", "unknown"]),
         failureIds: z.array(z.string()),
         observedAt: z.number().int(),
         expiresAt: z.number().int(),

@@ -20,12 +20,15 @@ After a worker publishes its Candidate branch, the controller observes its
 immutable SHA from GitHub. Before creating/finding a PR, composition rereads that
 branch and rejects a changed SHA; the resulting PR must report the same head
 SHA, worker branch, and approved target. The controller does not push commits.
-`verify` is a read-only check-runs observation bound to the Operation's Candidate
-SHA. Its stable check-set identity is recorded in the Operation and reobserved
-after an ambiguous acknowledgement; it does not call a check-trigger API.
-Unchanged unknown check evidence waits instead of repeatedly creating Verify
-Operations. This is fixture-verified behavior, not a claim of required-status
-branch policy or freshness completeness.
+`verify` is a read-only observation bound to the Operation's Candidate SHA. The
+observer combines effective branch rules, classic branch-protection contexts,
+Check Runs, and legacy commit statuses. It distinguishes missing, pending,
+failing, passing and unknown required evidence; only exact-context, exact-SHA
+success can pass, while skipped/neutral and incomplete evidence remain unknown.
+The stable required-evidence identity is recorded in the Operation and
+reobserved after an ambiguous acknowledgement; it does not trigger CI. An
+unconfigured or unavailable required-check policy fails closed. Mergify queue
+health is observed separately from source-PR checks.
 
 `test/providers/composition.test.ts` runs this composition through the real
 `ApplicationService` and SQLite store, with local HTTP fixtures for providers,
@@ -35,7 +38,8 @@ path. `src/providers/runtime.ts` composes the
 provider clients and `src/main.ts` exposes them behind explicit
 `ANVIL_PROVIDER_MODE=configured`; the default remains unavailable. Configured
 daemon mode has process-level watchdog tests, but not yet the full delivery
-lifecycle. Worker Git credential handoff/publication, required branch-protection
-check discovery, safe Session-create recovery and multi-controller Lease
+lifecycle. The Git-purpose App token is repository-scoped and contents-only but
+is not wired to a worker or bound to an Assignment. Worker Git credential
+handoff/publication, configured-daemon delivery trace, safe Session-create recovery and multi-controller Lease
 integration remain outstanding. No live API or Kubernetes calls are part of
 these tests.

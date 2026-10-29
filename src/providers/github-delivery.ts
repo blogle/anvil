@@ -4,6 +4,7 @@ import {
   type GitHubBrokerError,
   type GitHubCredentialPurpose,
 } from "./github-app";
+import type { CheckObservation } from "../domain";
 
 export type GitHubPullRequestFact = Readonly<{
   number: number;
@@ -24,6 +25,7 @@ export type GitHubCheckRun = Readonly<{
   status: "queued" | "in_progress" | "completed" | "unknown";
   conclusion: string | null;
   detailsUrl: string | null;
+  appId: number | null;
 }>;
 
 export type GitHubCheckSnapshot = Readonly<{
@@ -38,6 +40,26 @@ export type GitHubCheckSnapshot = Readonly<{
 export type GitHubBranchFact = Readonly<{
   name: string;
   revision: string;
+  observedAt: number;
+  source: "github-rest";
+}>;
+
+export type GitHubRequiredCheck = Readonly<{
+  context: string;
+  appId: number | null;
+}>;
+
+export type GitHubCommitStatus = Readonly<{
+  id: number;
+  context: string;
+  state: "error" | "failure" | "pending" | "success" | "unknown";
+}>;
+
+export type GitHubCommitStatusSnapshot = Readonly<{
+  revision: string;
+  complete: boolean;
+  totalCount: number;
+  statuses: readonly GitHubCommitStatus[];
   observedAt: number;
   source: "github-rest";
 }>;
@@ -414,11 +436,14 @@ export class GitHubDeliveryClient {
       const status = item?.["status"];
       const conclusion = item?.["conclusion"];
       const detailsUrl = item?.["details_url"];
+      const application = asRecord(item?.["app"]);
+      const appId = item?.["app_id"] ?? application?.["id"] ?? null;
       if (
         !Number.isSafeInteger(id) ||
         typeof name !== "string" ||
         typeof headSha !== "string" ||
         typeof status !== "string" ||
+        !(appId === null || Number.isSafeInteger(appId)) ||
         !(conclusion === null || typeof conclusion === "string") ||
         !(detailsUrl === null || typeof detailsUrl === "string")
       ) {
@@ -442,6 +467,7 @@ export class GitHubDeliveryClient {
             : "unknown",
         conclusion,
         detailsUrl,
+        appId: appId as number | null,
       });
     }
     return {
@@ -505,6 +531,201 @@ export class GitHubDeliveryClient {
             message: "GitHub branch response was malformed",
           },
         };
+  }
+
+  async requiredChecksForCandidate(
+    repositoryUrl: string,
+    targetBranch: string,
+    revision: string,
+    observedAt: number,
+    expiresAt: number,
+  ): Promise<GitHubDeliveryResult<CheckObservation>> {
+    if (!validGitRef(targetBranch))
+      return {
+        ok: false,
+        error: {
+          kind: "invalid_response",
+          message: "Required-check target branch is invalid",
+        },
+      };
+    const repository = parseGitHubRepository(repositoryUrl);
+    if (!repository.ok)
+      return {
+        ok: false,
+        error: {
+          kind: "invalid_response",
+          message: repository.error.diagnostic.message,
+        },
+      };
+    const required = await this.#requiredCheckProfile(
+      repositoryUrl,
+      targetBranch,
+    );
+    if (!required.ok) return required;
+    const checkRuns = await this.checkRuns(repositoryUrl, revision);
+    if (!checkRuns.ok) return checkRuns;
+    if (checkRuns.value.revision !== revision)
+      return {
+        ok: false,
+        error: {
+          kind: "invalid_response",
+          message: "GitHub check-run response differs from Candidate SHA",
+        },
+      };
+    const statuses = await this.#commitStatuses(repositoryUrl, revision);
+    if (!statuses.ok) return statuses;
+    if (statuses.value.revision !== revision)
+      return {
+        ok: false,
+        error: {
+          kind: "invalid_response",
+          message: "GitHub commit-status response differs from Candidate SHA",
+        },
+      };
+    return {
+      ok: true,
+      value: evaluateRequiredChecks(
+        revision,
+        targetBranch,
+        required.value,
+        checkRuns.value,
+        statuses.value,
+        observedAt,
+        expiresAt,
+      ),
+    };
+  }
+
+  async #requiredCheckProfile(
+    repositoryUrl: string,
+    targetBranch: string,
+  ): Promise<GitHubDeliveryResult<readonly GitHubRequiredCheck[]>> {
+    const rules = await this.#get(
+      repositoryUrl,
+      `rules/branches/${encodeURIComponent(targetBranch)}`,
+      "gh_read",
+    );
+    if (!rules.ok) return rules;
+    if (!Array.isArray(rules.value))
+      return invalidResponse("GitHub branch-rule response was malformed");
+    const required: GitHubRequiredCheck[] = [];
+    for (const value of rules.value) {
+      const rule = asRecord(value);
+      if (rule?.["type"] !== "required_status_checks") continue;
+      const parameters = asRecord(rule["parameters"]);
+      const checks = parameters?.["required_status_checks"];
+      if (!Array.isArray(checks))
+        return invalidResponse("GitHub required-status rule was malformed");
+      for (const check of checks) {
+        const parsed = parseRequiredCheck(check);
+        if (!parsed.ok) return parsed;
+        required.push(parsed.value);
+      }
+    }
+
+    const protection = await this.#get(
+      repositoryUrl,
+      `branches/${encodeURIComponent(targetBranch)}/protection/required_status_checks`,
+      "gh_read",
+    );
+    if (!protection.ok && protection.error.kind !== "not_found")
+      return protection;
+    if (protection.ok) {
+      const data = asRecord(protection.value);
+      const contexts = data?.["contexts"];
+      const checks = data?.["checks"];
+      if (!Array.isArray(contexts) || !Array.isArray(checks))
+        return invalidResponse(
+          "GitHub required-status protection response was malformed",
+        );
+      const protectionChecks: GitHubRequiredCheck[] = [];
+      for (const value of checks) {
+        const parsed = parseRequiredCheck(value);
+        if (!parsed.ok) return parsed;
+        protectionChecks.push(parsed.value);
+      }
+      for (const context of contexts) {
+        if (typeof context !== "string" || context.trim().length === 0)
+          return invalidResponse(
+            "GitHub required status context was malformed",
+          );
+        const appChecks = protectionChecks.filter(
+          (check) => check.context === context,
+        );
+        required.push(
+          ...(appChecks.length === 0 ? [{ context, appId: null }] : appChecks),
+        );
+      }
+      required.push(
+        ...protectionChecks.filter(
+          ({ context }) =>
+            !contexts.includes(context) &&
+            !required.some((check) => check.context === context),
+        ),
+      );
+    }
+    return {
+      ok: true,
+      value: deduplicateRequiredChecks(required),
+    };
+  }
+
+  async #commitStatuses(
+    repositoryUrl: string,
+    revision: string,
+  ): Promise<GitHubDeliveryResult<GitHubCommitStatusSnapshot>> {
+    const result = await this.#get(
+      repositoryUrl,
+      `commits/${encodeURIComponent(revision)}/status`,
+      "gh_read",
+    );
+    if (!result.ok) return result;
+    const data = asRecord(result.value);
+    const sha = data?.["sha"];
+    const rows = data?.["statuses"];
+    const totalCount = data?.["total_count"];
+    if (
+      sha !== revision ||
+      !Array.isArray(rows) ||
+      !Number.isSafeInteger(totalCount) ||
+      (totalCount as number) < 0
+    )
+      return invalidResponse("GitHub commit-status response was malformed");
+    const parsedStatuses: GitHubCommitStatus[] = [];
+    for (const row of rows) {
+      const item = asRecord(row);
+      const id = item?.["id"];
+      const context = item?.["context"];
+      const state = item?.["state"];
+      if (
+        !Number.isSafeInteger(id) ||
+        typeof context !== "string" ||
+        typeof state !== "string"
+      )
+        return invalidResponse("GitHub commit status was malformed");
+      parsedStatuses.push({
+        id: id as number,
+        context,
+        state:
+          state === "error" ||
+          state === "failure" ||
+          state === "pending" ||
+          state === "success"
+            ? state
+            : "unknown",
+      });
+    }
+    return {
+      ok: true,
+      value: {
+        revision,
+        complete: (totalCount as number) === parsedStatuses.length,
+        totalCount: totalCount as number,
+        statuses: parsedStatuses,
+        observedAt: this.#now(),
+        source: "github-rest",
+      },
+    };
   }
 
   async #get(
@@ -619,6 +840,130 @@ export class GitHubDeliveryClient {
     }
     return { ok: true, value };
   }
+}
+
+function parseRequiredCheck(
+  value: unknown,
+): GitHubDeliveryResult<GitHubRequiredCheck> {
+  const item = asRecord(value);
+  const context = item?.["context"];
+  const appId = item?.["app_id"] ?? item?.["integration_id"] ?? null;
+  if (
+    typeof context !== "string" ||
+    context.trim().length === 0 ||
+    !(appId === null || Number.isSafeInteger(appId))
+  )
+    return invalidResponse("GitHub required-check descriptor was malformed");
+  return { ok: true, value: { context, appId: appId as number | null } };
+}
+
+function deduplicateRequiredChecks(
+  checks: readonly GitHubRequiredCheck[],
+): readonly GitHubRequiredCheck[] {
+  const unique = new Map<string, GitHubRequiredCheck>();
+  for (const check of checks)
+    unique.set(`${check.context}\0${check.appId ?? "any"}`, check);
+  return [...unique.values()].sort(
+    (left, right) =>
+      left.context.localeCompare(right.context) ||
+      (left.appId ?? -1) - (right.appId ?? -1),
+  );
+}
+
+function evaluateRequiredChecks(
+  revision: string,
+  targetBranch: string,
+  requiredChecks: readonly GitHubRequiredCheck[],
+  checkSnapshot: GitHubCheckSnapshot,
+  statusSnapshot: GitHubCommitStatusSnapshot,
+  observedAt: number,
+  expiresAt: number,
+): CheckObservation {
+  const evidence = requiredChecks.map((required) => {
+    const matchingRuns = checkSnapshot.checkRuns
+      .filter(
+        (run) =>
+          run.headSha === revision &&
+          run.name === required.context &&
+          (required.appId === null || run.appId === required.appId),
+      )
+      .sort((left, right) => right.id - left.id);
+    const run = matchingRuns[0];
+    if (run !== undefined) {
+      if (run.status === "queued" || run.status === "in_progress")
+        return { context: required.context, state: "pending", id: run.id };
+      if (run.status !== "completed" || run.conclusion === null)
+        return { context: required.context, state: "unknown", id: run.id };
+      if (run.conclusion === "success")
+        return { context: required.context, state: "passing", id: run.id };
+      if (run.conclusion === "neutral" || run.conclusion === "skipped")
+        return { context: required.context, state: "unknown", id: run.id };
+      return { context: required.context, state: "failing", id: run.id };
+    }
+    if (required.appId === null) {
+      const matchingStatuses = statusSnapshot.statuses
+        .filter((status) => status.context === required.context)
+        .sort((left, right) => right.id - left.id);
+      const status = matchingStatuses[0];
+      if (status !== undefined)
+        return {
+          context: required.context,
+          state:
+            status.state === "success"
+              ? "passing"
+              : status.state === "pending"
+                ? "pending"
+                : status.state === "failure" || status.state === "error"
+                  ? "failing"
+                  : "unknown",
+          id: status.id,
+        };
+    }
+    return { context: required.context, state: "missing", id: null };
+  });
+  const failures = evidence.filter(({ state }) => state === "failing");
+  const missing = evidence.filter(({ state }) => state === "missing");
+  const pending = evidence.filter(({ state }) => state === "pending");
+  const unknown = evidence.filter(({ state }) => state === "unknown");
+  const incomplete = !checkSnapshot.complete || !statusSnapshot.complete;
+  const state =
+    requiredChecks.length === 0 ||
+    (incomplete && missing.length > 0) ||
+    unknown.length > 0
+      ? "unknown"
+      : failures.length > 0
+        ? "failing"
+        : missing.length > 0
+          ? "missing"
+          : pending.length > 0
+            ? "pending"
+            : "passing";
+  const runId = `github-required-checks:${encodeURIComponent(
+    JSON.stringify([
+      revision,
+      targetBranch,
+      requiredChecks,
+      evidence,
+      checkSnapshot.complete,
+      statusSnapshot.complete,
+    ]),
+  )}`;
+  return {
+    runId,
+    revision,
+    state,
+    failureIds:
+      failures.length > 0
+        ? failures.map(({ context, id }) => `${context}:${id}`)
+        : missing.map(({ context }) => context),
+    observedAt,
+    expiresAt,
+    source: "github-required-status-checks",
+  };
+}
+
+function invalidResponse<T = never>(message: string): GitHubDeliveryResult<T> {
+  return { ok: false, error: { kind: "invalid_response", message } };
 }
 
 function credentialError(

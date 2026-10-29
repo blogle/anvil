@@ -32,14 +32,16 @@ function startFixture(
 function permissionProfile(purpose: GitHubCredentialPurpose) {
   switch (purpose) {
     case "git":
-      return { contents: "write", workflows: "write" };
+      return { contents: "write" };
     case "gh_read":
       return {
+        administration: "read",
         actions: "read",
         checks: "read",
         contents: "read",
         metadata: "read",
         pull_requests: "read",
+        statuses: "read",
       };
     case "gh":
       return {
@@ -130,6 +132,61 @@ test("GitHub App broker signs short-lived JWTs, requests repository-scoped least
   expect(requests).toBe(3);
 });
 
+test("Git-purpose App credential is repository-scoped contents-only and excludes PR authority", async () => {
+  const requestsSeen: {
+    repositories: string[];
+    permissions: Record<string, string>;
+  }[] = [];
+  let tokenNumber = 0;
+  const baseUrl = startFixture(async (request) => {
+    const body = (await request.json()) as {
+      repositories: string[];
+      permissions: Record<string, string>;
+    };
+    requestsSeen.push(body);
+    tokenNumber += 1;
+    return Response.json(
+      {
+        token: `ghs_git_${tokenNumber}`,
+        expires_at: new Date(epoch + 3_600_000).toISOString(),
+        permissions: body.permissions,
+      },
+      { status: 201 },
+    );
+  });
+  const broker = new GitHubAppBroker({
+    appId: "app-123",
+    installationId: 42,
+    privateKey,
+    apiUrl: baseUrl,
+    now: () => epoch,
+  });
+  const repoToken = await broker.credential(
+    "https://github.com/acme/demo",
+    "git",
+  );
+  const otherRepoToken = await broker.credential(
+    "https://github.com/acme/other",
+    "git",
+  );
+  expect(repoToken).toMatchObject({
+    ok: true,
+    value: {
+      repository: "acme/demo",
+      permissions: { contents: "write" },
+    },
+  });
+  expect(otherRepoToken).toMatchObject({
+    ok: true,
+    value: { repository: "acme/other" },
+  });
+  expect(requestsSeen).toEqual([
+    { repositories: ["demo"], permissions: { contents: "write" } },
+    { repositories: ["other"], permissions: { contents: "write" } },
+  ]);
+  expect(JSON.stringify(repoToken)).not.toContain("privateKey");
+});
+
 test("GitHub repository binding rejects non-GitHub URLs, extra paths, query credentials, and malformed names", () => {
   expect(parseGitHubRepository("https://github.com/Acme/demo.git")).toEqual({
     ok: true,
@@ -211,5 +268,50 @@ test("overbroad installation permissions are rejected instead of returned to a w
       kind: "scope_mismatch",
       diagnostic: { code: "github_token_scope_mismatch" },
     },
+  });
+});
+
+test("expired and unavailable GitHub installation credentials are never returned", async () => {
+  let responseMode: "expired" | "unavailable" = "expired";
+  const baseUrl = startFixture(async (request) => {
+    if (responseMode === "unavailable")
+      return Response.json({ message: "temporary error" }, { status: 503 });
+    const body = (await request.json()) as {
+      permissions: Record<string, string>;
+    };
+    return Response.json(
+      {
+        token: "ghs_expired_fixture",
+        expires_at: new Date(epoch - 1).toISOString(),
+        permissions: body.permissions,
+      },
+      { status: 201 },
+    );
+  });
+  const broker = new GitHubAppBroker({
+    appId: "app-123",
+    installationId: 42,
+    privateKey,
+    apiUrl: baseUrl,
+    now: () => epoch,
+  });
+  const expired = await broker.credential(
+    "https://github.com/acme/demo",
+    "git",
+  );
+  expect(expired).toMatchObject({
+    ok: false,
+    error: { kind: "malformed_response" },
+  });
+  expect(JSON.stringify(expired)).not.toContain("ghs_expired_fixture");
+
+  responseMode = "unavailable";
+  const unavailable = await broker.credential(
+    "https://github.com/acme/demo",
+    "git",
+  );
+  expect(unavailable).toMatchObject({
+    ok: false,
+    error: { kind: "upstream", diagnostic: { upstreamStatus: 503 } },
   });
 });

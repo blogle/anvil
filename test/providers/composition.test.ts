@@ -425,6 +425,31 @@ test("ProviderComposition verifies only the immutable Candidate SHA and reobserv
           ],
         });
       }
+      if (url.pathname === "/api/repos/acme/demo/rules/branches/main")
+        return Response.json([
+          {
+            type: "required_status_checks",
+            parameters: {
+              required_status_checks: [
+                { context: "required / unit", integration_id: 7 },
+              ],
+            },
+          },
+        ]);
+      if (
+        url.pathname ===
+        "/api/repos/acme/demo/branches/main/protection/required_status_checks"
+      )
+        return Response.json({ contexts: [], checks: [] });
+      if (
+        url.pathname ===
+        "/api/repos/acme/demo/commits/candidate-verify-sha/status"
+      )
+        return Response.json({
+          sha: "candidate-verify-sha",
+          total_count: 0,
+          statuses: [],
+        });
       return Response.json(
         { message: "unexpected fixture route" },
         { status: 404 },
@@ -449,8 +474,23 @@ test("ProviderComposition verifies only the immutable Candidate SHA and reobserv
       bearerToken: "unused-local-token",
     }),
     world: {
-      observe: async () => {
-        const { execution: _execution, ...facts } = observation();
+      observe: async (_commission, now) => {
+        const checks = await github.requiredChecksForCandidate(
+          "https://github.com/acme/demo",
+          "main",
+          "candidate-verify-sha",
+          now,
+          now + 60_000,
+        );
+        if (!checks.ok)
+          return {
+            ok: false,
+            error: { kind: "unavailable", message: checks.error.message },
+          };
+        const { execution: _execution, ...facts } = observation({
+          candidateRevision: "candidate-verify-sha",
+          checks: checks.value,
+        });
         return { ok: true, value: facts };
       },
     },
@@ -487,17 +527,19 @@ test("ProviderComposition verifies only the immutable Candidate SHA and reobserv
     outcome: { kind: "prepared" },
   };
 
-  expect(
-    await composition.dispatch(commission, operation, epoch + 1),
-  ).toMatchObject({
+  const verified = await composition.dispatch(commission, operation, epoch + 1);
+  expect(verified).toMatchObject({
     ok: true,
     value: {
       kind: "observed",
       result: "applied",
-      source: "github-check-runs-rest",
-      externalIdentity: "github-checkset:candidate-verify-sha:81",
+      source: "github-required-status-checks",
+      externalIdentity: expect.stringContaining("github-required-checks:"),
     },
   });
+  if (!verified.ok) throw new Error("Candidate verification failed");
+  if (verified.value.kind !== "observed")
+    throw new Error("Candidate Verify Operation was not observed");
   expect(
     await composition.inspectOperation(commission, operation, epoch + 2),
   ).toMatchObject({
@@ -505,7 +547,7 @@ test("ProviderComposition verifies only the immutable Candidate SHA and reobserv
     value: {
       kind: "observed",
       result: "applied",
-      externalIdentity: "github-checkset:candidate-verify-sha:81",
+      externalIdentity: verified.value.externalIdentity,
     },
   });
   expect(checkReads).toBe(2);
@@ -636,6 +678,29 @@ test("composed local providers drive a Commission from Workspace provisioning th
             },
           ],
         });
+      if (url.pathname === "/api/repos/acme/demo/rules/branches/main")
+        return Response.json([
+          {
+            type: "required_status_checks",
+            parameters: {
+              required_status_checks: [
+                { context: "ci / required", integration_id: null },
+              ],
+            },
+          },
+        ]);
+      if (
+        url.pathname ===
+        "/api/repos/acme/demo/branches/main/protection/required_status_checks"
+      )
+        return Response.json({ contexts: [], checks: [] });
+      if (
+        url.pathname.includes("/commits/") &&
+        url.pathname.endsWith("/status")
+      ) {
+        const sha = url.pathname.split("/commits/")[1]?.split("/")[0];
+        return Response.json({ sha, total_count: 0, statuses: [] });
+      }
       if (url.pathname.endsWith("/pulls") && request.method === "GET")
         return Response.json(pullRequest === null ? [] : [pullRequest]);
       if (url.pathname.endsWith("/pulls") && request.method === "POST") {

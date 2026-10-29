@@ -306,29 +306,29 @@ export class ProviderComposition implements ProviderPort {
         );
     }
     if (operation.kind === "verify") {
-      if (
-        this.#config.github === undefined ||
-        operation.candidateRevision === null
-      )
+      if (operation.candidateRevision === null)
         return rejected("Candidate verification is not configured");
-      const checks = await this.#config.github.checkRuns(
-        commission.repository,
-        operation.candidateRevision,
-      );
-      if (!checks.ok) return { ok: false, error: githubFailure(checks.error) };
-      if (checks.value.revision !== operation.candidateRevision)
+      const world = await this.#config.world.observe(commission, now);
+      if (!world.ok) return world;
+      if (
+        world.value.candidateRevision !== operation.candidateRevision ||
+        world.value.checks?.revision !== operation.candidateRevision
+      )
         return rejected(
-          "GitHub checks response differs from the verified Candidate",
+          "Observed required-check evidence differs from the verified Candidate",
         );
+      const checks = world.value.checks;
+      if (checks === null)
+        return rejected("Required-check evidence is unavailable for Candidate");
       return {
         ok: true,
         value: {
           kind: "observed",
           observedAt: now,
-          source: "github-check-runs-rest",
+          source: checks.source,
           result: "applied",
           retrySafe: false,
-          externalIdentity: checkSnapshotIdentity(checks.value),
+          externalIdentity: checks.runId,
         },
       };
     }
@@ -452,27 +452,25 @@ export class ProviderComposition implements ProviderPort {
         now,
       );
     }
-    if (
-      operation.kind === "verify" &&
-      this.#config.github !== undefined &&
-      operation.candidateRevision !== null
-    ) {
-      const checks = await this.#config.github.checkRuns(
-        commission.repository,
-        operation.candidateRevision,
-      );
-      if (!checks.ok) return { ok: false, error: githubFailure(checks.error) };
-      if (checks.value.revision !== operation.candidateRevision)
+    if (operation.kind === "verify" && operation.candidateRevision !== null) {
+      const world = await this.#config.world.observe(commission, now);
+      if (!world.ok) return world;
+      if (
+        world.value.candidateRevision !== operation.candidateRevision ||
+        world.value.checks?.revision !== operation.candidateRevision ||
+        world.value.checks === null
+      )
         return { ok: true, value: null };
+      const checks = world.value.checks;
       return {
         ok: true,
         value: {
           kind: "observed",
           observedAt: now,
-          source: "github-check-runs-inspection",
+          source: checks.source,
           result: "applied",
           retrySafe: false,
-          externalIdentity: checkSnapshotIdentity(checks.value),
+          externalIdentity: checks.runId,
         },
       };
     }
@@ -550,17 +548,6 @@ export class ProviderComposition implements ProviderPort {
     this.#executionWatchers.get(commissionId)?.controller.abort();
     this.#executionWatchers.delete(commissionId);
   }
-}
-
-function checkSnapshotIdentity(snapshot: {
-  revision: string;
-  checkRuns: readonly Readonly<{ id: number; headSha: string }>[];
-}): string {
-  return `github-checkset:${snapshot.revision}:${snapshot.checkRuns
-    .filter(({ headSha }) => headSha === snapshot.revision)
-    .map(({ id }) => id)
-    .sort()
-    .join(",")}`;
 }
 
 function completedOperation(
