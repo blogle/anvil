@@ -45,6 +45,7 @@ export type OpenCodeMessage = Readonly<{
   streamedAt?: number;
   completedAt?: number;
   tokenCount?: number;
+  text?: string;
   tools?: readonly OpenCodeToolState[];
 }>;
 
@@ -176,6 +177,7 @@ export class OpenCodeAdapter {
       const tokens = record(item["tokens"]);
       const tokenInput = optionalCount(tokens?.["input"]);
       const toolParts = Array.isArray(item["content"]) ? item["content"] : [];
+      const messageText = visibleMessageText(item, toolParts);
       const tools: OpenCodeToolState[] = [];
       for (const partValue of toolParts) {
         const part = record(partValue);
@@ -218,6 +220,7 @@ export class OpenCodeAdapter {
         ...(streamedAt === null ? {} : { streamedAt }),
         ...(completedAt === null ? {} : { completedAt }),
         ...(tokenInput === null ? {} : { tokenCount: tokenInput }),
+        ...(messageText === null ? {} : { text: messageText }),
         tools,
       });
     }
@@ -676,6 +679,20 @@ export class OpenCodeAdapter {
     }
     return this.#modelLimits.get(`${providerId}/${modelId}`) ?? null;
   }
+}
+
+function visibleMessageText(
+  message: Record<string, unknown>,
+  parts: readonly unknown[],
+): string | null {
+  if (typeof message["text"] === "string") return message["text"];
+  const texts = parts.flatMap((value) => {
+    const part = record(value);
+    return part?.["type"] === "text" && typeof part["text"] === "string"
+      ? [part["text"]]
+      : [];
+  });
+  return texts.length === 0 ? null : texts.join("\n");
 }
 
 function openCodeMessageId(operationId: string): string {

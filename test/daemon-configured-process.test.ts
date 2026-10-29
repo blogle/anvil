@@ -133,6 +133,73 @@ async function waitForAmbiguousSessionCreate(
   );
 }
 
+async function waitForLifecycle(
+  baseUrl: string,
+  commissionId: string,
+  lifecycle: string,
+): Promise<Record<string, unknown>> {
+  let commission: Record<string, unknown> = {};
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const response = await fetch(`${baseUrl}/api/commissions/${commissionId}`, {
+      headers: { authorization: `Bearer ${apiToken}` },
+    });
+    if (response.ok) {
+      const body = (await response.json()) as {
+        commission: Record<string, unknown>;
+      };
+      commission = body.commission;
+      if (commission["lifecycle"] === lifecycle) return commission;
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error(
+    `Daemon did not reach ${lifecycle} for ${commissionId}: ${JSON.stringify(commission)}`,
+  );
+}
+
+async function waitForOperationCount(
+  baseUrl: string,
+  commissionId: string,
+  kind: string,
+  count: number,
+): Promise<
+  readonly {
+    kind: string;
+    candidateRevision: string | null;
+    outcome: { kind: string };
+  }[]
+> {
+  let operations: readonly {
+    kind: string;
+    candidateRevision: string | null;
+    outcome: { kind: string };
+  }[] = [];
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const response = await fetch(
+      `${baseUrl}/api/commissions/${commissionId}/operations`,
+      { headers: { authorization: `Bearer ${apiToken}` } },
+    );
+    if (response.ok) {
+      operations = (
+        (await response.json()) as {
+          operations: typeof operations;
+        }
+      ).operations;
+      if (
+        operations.filter(
+          (operation) =>
+            operation.kind === kind && operation.outcome.kind === "observed",
+        ).length >= count
+      )
+        return operations;
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error(
+    `Configured daemon did not record ${count} ${kind} Operations: ${JSON.stringify(operations)}`,
+  );
+}
+
 async function waitForOperationKind(
   baseUrl: string,
   commissionId: string,
@@ -185,11 +252,25 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   const sandboxResources = new Map<string, Record<string, unknown>>();
   const sessions = new Map<string, string>();
   const userMessageIds = new Map<string, string>();
+  const assistantEvidenceTexts = new Map<string, string>();
   let loseNextSessionCreateAck = false;
   let watchdogMode = false;
   let interruptCount = 0;
   let loseNextInterruptAck = false;
   let interruptInspectionBusy = false;
+  let deliveryRevision: string | null = null;
+  let deliveryPromptCount = 0;
+  let deliveryCheckState: "failing" | "pending" | "passing" = "failing";
+  let staleDeliveryChecks = false;
+  let deliveryBranchName: string | null = null;
+  let deliveryCheckRunId = 0;
+  let deliveryPullRequest: Record<string, unknown> | null = null;
+  let deliveryPullRequestCreates = 0;
+  let deliveryQueued = false;
+  let loseDeliveryPullRequestAck = true;
+  let deliveryMerged = false;
+  let deliveryPullRequestUrl = "https://github.com/acme/demo/pull/52";
+  let deliveryPullRequestHeadSha: string | null = null;
   const openCodeEventSubscribers = new Set<
     ReadableStreamDefaultController<Uint8Array>
   >();
@@ -316,7 +397,19 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
       if (url.pathname.endsWith("/prompt")) {
         promptCount += 1;
         const prompt = (await request.json()) as { id: string; text: string };
-        userMessageIds.set(url.pathname.split("/")[1]!, prompt.id);
+        const sandboxName = url.pathname.split("/")[1]!;
+        userMessageIds.set(sandboxName, prompt.id);
+        if (sandboxName.startsWith("anvil-configured-delivery-")) {
+          deliveryPromptCount += 1;
+          deliveryRevision = `worker-commit-${deliveryPromptCount}`;
+          const reportedRevision =
+            deliveryPromptCount === 2 ? "worker-commit-1" : deliveryRevision;
+          assistantEvidenceTexts.set(
+            sandboxName,
+            `ANVIL_EVIDENCE acceptance-1 ${reportedRevision}: Implemented and repaired the requested behavior.`,
+          );
+          if (deliveryPromptCount > 1) deliveryCheckState = "pending";
+        }
         return Response.json({ data: { id: prompt.id } });
       }
       if (url.pathname.endsWith("/message")) {
@@ -327,6 +420,27 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
               ? []
               : [
                   { id: userMessageId, type: "user" },
+                  ...(assistantEvidenceTexts.has(url.pathname.split("/")[1]!)
+                    ? [
+                        {
+                          id: `assistant-${userMessageId}`,
+                          type: "assistant",
+                          parentID: userMessageId,
+                          time: {
+                            created: Date.now() - 100,
+                            completed: Date.now(),
+                          },
+                          content: [
+                            {
+                              type: "text",
+                              text: assistantEvidenceTexts.get(
+                                url.pathname.split("/")[1]!,
+                              ),
+                            },
+                          ],
+                        },
+                      ]
+                    : []),
                   ...(watchdogMode
                     ? [
                         {
@@ -371,19 +485,140 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
           { status: 201 },
         );
       }
-      if (url.pathname.endsWith("/branches/anvil%2Fconfigured-commission"))
+      const branchPath = "/api/repos/acme/demo/branches/";
+      if (url.pathname.startsWith(branchPath)) {
+        const branch = decodeURIComponent(
+          url.pathname.slice(branchPath.length),
+        );
+        if (
+          branch.startsWith("anvil/configured-delivery-") &&
+          deliveryRevision !== null
+        ) {
+          deliveryBranchName = branch;
+          return Response.json({
+            name: branch,
+            commit: { sha: deliveryRevision },
+          });
+        }
         return Response.json({ message: "branch not found" }, { status: 404 });
-      if (url.pathname.endsWith("/pulls")) return Response.json([]);
+      }
+      if (url.pathname === "/api/repos/acme/demo/rules/branches/main")
+        return Response.json([
+          {
+            type: "required_status_checks",
+            parameters: {
+              required_status_checks: [
+                { context: "ci / required", integration_id: 7 },
+              ],
+            },
+          },
+        ]);
+      if (
+        url.pathname ===
+        "/api/repos/acme/demo/branches/main/protection/required_status_checks"
+      )
+        return Response.json(
+          { message: "no classic protection" },
+          { status: 404 },
+        );
+      if (
+        url.pathname.includes("/commits/") &&
+        url.pathname.endsWith("/check-runs")
+      ) {
+        const sha = url.pathname.split("/commits/")[1]?.split("/")[0] ?? "";
+        deliveryCheckRunId += 1;
+        return Response.json({
+          total_count: 1,
+          check_runs: [
+            {
+              id: deliveryCheckRunId,
+              name: "ci / required",
+              head_sha:
+                staleDeliveryChecks && sha === deliveryRevision
+                  ? "stale-worker-commit"
+                  : sha,
+              app_id: 7,
+              status:
+                deliveryCheckState === "pending" ? "in_progress" : "completed",
+              conclusion:
+                deliveryCheckState === "passing"
+                  ? "success"
+                  : deliveryCheckState === "failing"
+                    ? "failure"
+                    : null,
+              details_url: "https://github.com/acme/demo/actions/701",
+            },
+          ],
+        });
+      }
+      if (
+        url.pathname.includes("/commits/") &&
+        url.pathname.endsWith("/status")
+      ) {
+        const sha = url.pathname.split("/commits/")[1]?.split("/")[0] ?? "";
+        return Response.json({ sha, total_count: 0, statuses: [] });
+      }
+      if (url.pathname.endsWith("/pulls") && request.method === "GET")
+        return Response.json(
+          deliveryPullRequest === null ? [] : [deliveryPullRequest],
+        );
+      if (url.pathname.endsWith("/pulls") && request.method === "POST") {
+        deliveryPullRequestCreates += 1;
+        const body = (await request.json()) as { head: string; base: string };
+        deliveryBranchName ??= body.head.split(":").slice(1).join(":");
+        deliveryPullRequest = {
+          number: 52,
+          html_url: "https://github.com/acme/demo/pull/52",
+          state: "open",
+          merged: false,
+          head: {
+            ref: deliveryBranchName,
+            sha: deliveryRevision,
+          },
+          base: { ref: body.base },
+        };
+        deliveryQueued = true;
+        if (loseDeliveryPullRequestAck) {
+          loseDeliveryPullRequestAck = false;
+          return Response.json(
+            { message: "PR created but acknowledgement lost" },
+            { status: 504 },
+          );
+        }
+        return Response.json(deliveryPullRequest, { status: 201 });
+      }
+      if (url.pathname.endsWith("/pulls/52"))
+        return deliveryPullRequest === null
+          ? Response.json({ message: "PR not found" }, { status: 404 })
+          : Response.json({
+              ...deliveryPullRequest,
+              state: deliveryMerged ? "closed" : "open",
+              merged: deliveryMerged,
+              head: {
+                ...(deliveryPullRequest["head"] as Record<string, unknown>),
+                sha: deliveryPullRequestHeadSha ?? deliveryRevision,
+              },
+              html_url: deliveryPullRequestUrl,
+            });
       return Response.json({ message: "not found" }, { status: 404 });
     },
   });
   mergifyServer = Bun.serve({
     port: mergifyPort,
     fetch: () =>
-      Response.json(
-        { error_code: "PULL_REQUEST_NOT_QUEUED", detail: "not queued" },
-        { status: 404 },
-      ),
+      deliveryQueued
+        ? Response.json({
+            number: 52,
+            queued_at: new Date().toISOString(),
+            position: 0,
+            ci_state: "pending",
+            state: "waiting_for_checks",
+            checks: [{ name: "merge-group", state: "pending" }],
+          })
+        : Response.json(
+            { error_code: "PULL_REQUEST_NOT_QUEUED", detail: "not queued" },
+            { status: 404 },
+          ),
   });
   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const privateKeyPath = join(directory, "github-app.pem");
@@ -633,6 +868,195 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   expect(promptCount).toBe(3);
   expect(interruptCount).toBe(2);
 
+  const deliveryId = "configured-delivery";
+  const deliveryCreated = await fetch(`${baseUrl}/api/commissions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(
+      proposalInput({
+        id: deliveryId,
+        repository: "https://github.com/acme/demo",
+        integrationTarget: "main",
+        budget: { ...proposalInput().budget, maxAttempts: 1 },
+      }),
+    ),
+  });
+  expect(deliveryCreated.status).toBe(201);
+  const deliveryAdmitted = await fetch(
+    `${baseUrl}/api/commissions/${deliveryId}/admit`,
+    { method: "POST", headers, body: "{}" },
+  );
+  expect(deliveryAdmitted.status).toBe(200);
+  await waitForBootstrapOperations(baseUrl, deliveryId);
+  const afterRepair = await waitForOperationKind(baseUrl, deliveryId, "repair");
+  const afterStaleEvidence = await waitForOperationCount(
+    baseUrl,
+    deliveryId,
+    "continue",
+    2,
+  );
+  expect(deliveryPromptCount).toBe(3);
+  expect(String(deliveryRevision)).toBe("worker-commit-3");
+  expect(
+    afterStaleEvidence
+      .filter(({ kind }) => kind === "continue")
+      .map(({ candidateRevision }) => candidateRevision),
+  ).toEqual([null, "worker-commit-2"]);
+  expect(
+    afterRepair.find(({ kind }) => kind === "repair")?.directive,
+  ).toContain("ci / required");
+
+  // Stale SHA success must not substitute for the required check on the new Candidate.
+  staleDeliveryChecks = true;
+  const staleCheck = await fetch(
+    `${baseUrl}/api/commissions/${deliveryId}/reconcile`,
+    {
+      method: "POST",
+      headers,
+      body: "{}",
+    },
+  ).then((response) => response.json());
+  expect(staleCheck).toMatchObject({
+    decision: {
+      kind: "wait",
+      reason:
+        "required status checks have not been reported for this Candidate",
+    },
+  });
+  staleDeliveryChecks = false;
+  const pendingCheck = await fetch(
+    `${baseUrl}/api/commissions/${deliveryId}/reconcile`,
+    { method: "POST", headers, body: "{}" },
+  ).then((response) => response.json());
+  expect(pendingCheck).toMatchObject({
+    decision: { kind: "wait", reason: "required CI check is pending" },
+  });
+
+  // Reopen SQLite in a new daemon process while required CI remains pending.
+  daemonProcess.kill("SIGTERM");
+  await daemonProcess.exited;
+  daemonProcess = undefined;
+  daemonProcess = startDaemon(runtimeEnvironment);
+  await waitUntilReady(baseUrl);
+  const pendingAfterRestart = await fetch(
+    `${baseUrl}/api/commissions/${deliveryId}/reconcile`,
+    { method: "POST", headers, body: "{}" },
+  ).then((response) => response.json());
+  expect(pendingAfterRestart).toMatchObject({
+    decision: { kind: "wait", reason: "required CI check is pending" },
+  });
+  expect(deliveryPromptCount).toBe(3);
+  expect(deliveryPullRequestCreates).toBe(0);
+
+  // CI advances independently; the daemon observes success and creates one PR.
+  deliveryCheckState = "passing";
+  let deliveryOperations: readonly {
+    kind: string;
+    candidateRevision: string | null;
+    outcome: {
+      kind: string;
+      result?: string;
+      externalIdentity?: string | null;
+    };
+  }[] = [];
+  let integrateObserved = false;
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const response = await fetch(
+      `${baseUrl}/api/commissions/${deliveryId}/operations`,
+      { headers },
+    );
+    if (response.ok) {
+      deliveryOperations = (
+        (await response.json()) as {
+          operations: typeof deliveryOperations;
+        }
+      ).operations;
+      integrateObserved = deliveryOperations.some(
+        (operation) =>
+          operation.kind === "integrate" &&
+          operation.outcome.kind === "observed" &&
+          operation.outcome.result === "accepted",
+      );
+      if (integrateObserved) break;
+    }
+    await Bun.sleep(25);
+  }
+  expect(integrateObserved).toBe(true);
+  expect(deliveryPullRequestCreates).toBe(1);
+  expect(deliveryPromptCount).toBe(3);
+  expect(
+    deliveryOperations.filter(({ kind }) => kind === "continue"),
+  ).toHaveLength(2);
+  expect(
+    deliveryOperations.filter(({ kind }) => kind === "repair"),
+  ).toHaveLength(1);
+  expect(
+    deliveryOperations.filter(({ kind }) => kind === "integrate"),
+  ).toHaveLength(1);
+  expect(deliveryPullRequest).toMatchObject({
+    number: 52,
+    html_url: "https://github.com/acme/demo/pull/52",
+    head: { ref: deliveryBranchName, sha: "worker-commit-3" },
+    base: { ref: "main" },
+  });
+  const integrateOperation = deliveryOperations.find(
+    ({ kind }) => kind === "integrate",
+  );
+  expect(integrateOperation).toMatchObject({
+    candidateRevision: "worker-commit-3",
+    outcome: {
+      kind: "observed",
+      result: "accepted",
+      externalIdentity: "https://github.com/acme/demo/pull/52",
+    },
+  });
+
+  const queueWait = await fetch(
+    `${baseUrl}/api/commissions/${deliveryId}/reconcile`,
+    { method: "POST", headers, body: "{}" },
+  ).then((response) => response.json());
+  expect(queueWait).toMatchObject({
+    decision: { kind: "wait", wake: { kind: "merge_queue" } },
+  });
+
+  // A different PR identity with the same Candidate SHA cannot conclude.
+  deliveryPullRequestUrl = "https://github.com/acme/demo/pull/999";
+  const foreignPullRequest = await fetch(
+    `${baseUrl}/api/commissions/${deliveryId}/reconcile`,
+    { method: "POST", headers, body: "{}" },
+  ).then((response) => response.json());
+  expect(foreignPullRequest).toMatchObject({
+    decision: { kind: "escalate" },
+  });
+  expect(foreignPullRequest).not.toMatchObject({
+    commission: { lifecycle: "concluded" },
+  });
+
+  // The registered PR with the wrong head SHA also cannot conclude.
+  deliveryPullRequestUrl = "https://github.com/acme/demo/pull/52";
+  deliveryPullRequestHeadSha = "worker-commit-1";
+  const staleHead = await fetch(
+    `${baseUrl}/api/commissions/${deliveryId}/reconcile`,
+    { method: "POST", headers, body: "{}" },
+  ).then((response) => response.json());
+  expect(staleHead).not.toMatchObject({
+    commission: { lifecycle: "concluded" },
+  });
+  deliveryPullRequestHeadSha = null;
+  deliveryMerged = true;
+  const delivered = await waitForLifecycle(baseUrl, deliveryId, "concluded");
+  expect(delivered["deliveryEvidence"]).toMatchObject({
+    revision: "worker-commit-3",
+    repository: "https://github.com/acme/demo",
+    integrationTarget: "main",
+    providerIdentity: "https://github.com/acme/demo/pull/52",
+  });
+  expect(deliveryPullRequestCreates).toBe(1);
+  expect(deliveryPromptCount).toBe(3);
+  expect(
+    afterStaleEvidence.filter(({ kind }) => kind === "repair"),
+  ).toHaveLength(1);
+
   const ambiguousId = "configured-ambiguous-session";
   loseNextSessionCreateAck = true;
   const ambiguousCreated = await fetch(`${baseUrl}/api/commissions`, {
@@ -652,9 +1076,9 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   );
   expect(ambiguousAdmitted.status).toBe(200);
   await waitForAmbiguousSessionCreate(baseUrl, ambiguousId);
-  expect(provisionCount).toBe(3);
-  expect(sessionCreateCount).toBe(3);
-  expect(promptCount).toBe(3);
+  expect(provisionCount).toBe(4);
+  expect(sessionCreateCount).toBe(4);
+  expect(promptCount).toBe(6);
   expect(interruptCount).toBe(2);
 
   daemonProcess.kill("SIGTERM");
@@ -663,9 +1087,9 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   daemonProcess = startDaemon(runtimeEnvironment);
   await waitUntilReady(baseUrl);
   await Bun.sleep(100);
-  expect(provisionCount).toBe(3);
-  expect(sessionCreateCount).toBe(3);
-  expect(promptCount).toBe(3);
+  expect(provisionCount).toBe(4);
+  expect(sessionCreateCount).toBe(4);
+  expect(promptCount).toBe(6);
   const unresolved = await fetch(
     `${baseUrl}/api/commissions/${ambiguousId}/operations`,
     { headers },
@@ -676,4 +1100,4 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
       { kind: "create_session", outcome: { kind: "ambiguous" } },
     ],
   });
-}, 20_000);
+}, 45_000);

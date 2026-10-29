@@ -8,6 +8,7 @@ import type {
   Observation,
   Operation,
   OperationOutcome,
+  WorkerClaim,
 } from "../domain";
 import { AgentSandboxClient, type SandboxIntent } from "./agent-sandbox";
 import { GitHubDeliveryClient } from "./github-delivery";
@@ -194,11 +195,25 @@ export class ProviderComposition implements ProviderPort {
     const execution = await this.#openCode(
       sandboxResourceName,
     ).observeExecution(openCodeSessionId, now, this.#config.model);
+    const messages =
+      await this.#openCode(sandboxResourceName).messages(openCodeSessionId);
+    if (!messages.ok) return messages;
     return {
       ok: true,
       value: {
         ...world.value,
         execution,
+        workerClaims: [
+          ...world.value.workerClaims,
+          ...workerClaimsFromMessages(
+            commission,
+            openCodeSessionId,
+            world.value.candidateRevision,
+            messages.value,
+            now,
+            now + 60_000,
+          ),
+        ],
       },
     };
   }
@@ -283,10 +298,17 @@ export class ProviderComposition implements ProviderPort {
         return rejected(
           "No observed OpenCode Session is bound to the Commission",
         );
+      const instruction =
+        operation.kind === "continue" || operation.kind === "repair"
+          ? {
+              ...operation,
+              directive: `${operation.directive}\n\nAfter publishing a Candidate, include one final line per completed approved obligation in this exact format: ANVIL_EVIDENCE <obligation-id> <full-candidate-sha>: <short factual worker claim>. The SHA must be the commit you published. This is submitted worker evidence, not independent acceptance.`,
+            }
+          : operation;
       return this.#openCode(binding.sandboxResourceName)
         .dispatchInstruction(
           binding.openCodeSessionId,
-          operation,
+          instruction,
           this.#config.model,
         )
         .then((result) =>
@@ -573,6 +595,52 @@ function completedOperation(
         item.outcome.externalIdentity !== null,
     ) ?? null
   );
+}
+
+function workerClaimsFromMessages(
+  commission: Commission,
+  sessionId: string,
+  candidateRevision: string | null,
+  messages: readonly Readonly<{
+    id: string;
+    type: string;
+    completedAt?: number;
+    text?: string;
+  }>[],
+  observedAt: number,
+  expiresAt: number,
+): readonly WorkerClaim[] {
+  if (candidateRevision === null) return [];
+  const obligations = new Set(commission.obligations.map(({ id }) => id));
+  const claims: WorkerClaim[] = [];
+  const line =
+    /^ANVIL_EVIDENCE ([A-Za-z0-9_.:-]{1,128}) ([A-Za-z0-9._-]{1,128}): ([^\r\n]{1,1000})$/gm;
+  for (const message of messages) {
+    if (message.type !== "assistant" || message.completedAt === undefined)
+      continue;
+    for (const match of message.text?.matchAll(line) ?? []) {
+      const obligationId = match[1];
+      const claimedRevision = match[2];
+      const claim = match[3]?.trim();
+      if (
+        obligationId === undefined ||
+        claimedRevision !== candidateRevision ||
+        !obligations.has(obligationId) ||
+        claim === undefined ||
+        claim.length === 0
+      )
+        continue;
+      claims.push({
+        id: `opencode-claim:${sessionId}:${message.id}:${obligationId}`,
+        obligationId,
+        claim,
+        observedAt,
+        expiresAt,
+        sourceIdentity: `opencode-session:${sessionId}`,
+      });
+    }
+  }
+  return claims.slice(-commission.obligations.length);
 }
 
 function sandboxFailure(error: {

@@ -15,6 +15,12 @@ remains unknown because the pinned V2 create contract does not expose a
 caller-selected idempotent Session identity; it is not automatically replayed.
 OpenCode turn dispatch uses deterministic message identity plus message
 inspection, never assuming that a repeated message ID is exactly-once.
+For `continue` and `repair`, the directive requests explicit
+`ANVIL_EVIDENCE <obligation-id> <candidate-sha>: <claim>` lines. Composition
+accepts only completed assistant text for an approved obligation whose stated
+SHA matches the observed Candidate, as submitted worker evidence attributed to
+the OpenCode Session. Old-SHA reports are ignored. It is never independent
+review or delivery acceptance.
 
 After a worker publishes its Candidate branch, the controller observes its
 immutable SHA from GitHub. Before creating/finding a PR, composition rereads that

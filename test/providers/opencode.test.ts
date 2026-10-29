@@ -113,6 +113,46 @@ test("OpenCode V2 adapter follows the pinned session/model/prompt API with bound
   });
 });
 
+test("OpenCode message projection preserves visible assistant text for worker claim parsing only", async () => {
+  const baseUrl = startFixture((request) => {
+    const url = new URL(request.url);
+    if (url.pathname === "/api/session/session-evidence/message")
+      return Response.json({
+        data: [
+          {
+            id: "assistant-evidence",
+            type: "assistant",
+            time: { created: 100, completed: 200 },
+            content: [
+              {
+                type: "text",
+                text: "ANVIL_EVIDENCE acceptance-1 abc123: changed behavior",
+              },
+              { type: "reasoning", text: "not visible worker evidence" },
+            ],
+          },
+        ],
+      });
+    return Response.json({ message: "not found" }, { status: 404 });
+  });
+  const messages = await new OpenCodeAdapter({ baseUrl }).messages(
+    "session-evidence",
+  );
+  expect(messages).toEqual({
+    ok: true,
+    value: [
+      {
+        id: "assistant-evidence",
+        type: "assistant",
+        createdAt: 100,
+        completedAt: 200,
+        text: "ANVIL_EVIDENCE acceptance-1 abc123: changed behavior",
+        tools: [],
+      },
+    ],
+  });
+});
+
 test("OpenCode watchdog derives active failures, progress, boundary, and token pressure from provider state", async () => {
   const now = 1_800_000_000_000;
   const baseUrl = startFixture((request) => {
