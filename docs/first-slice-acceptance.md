@@ -2,7 +2,7 @@
 
 This ledger follows immutable requirements in [the acceptance contract](first-slice-contract.md), together with [domain semantics](spec.md) and [architecture](architecture.md). A local check proves only the behavior it measures. Permitted statuses are `NOT_STARTED`, `IN_PROGRESS`, `IMPLEMENTED_UNVERIFIED`, `VERIFIED`, `BLOCKED_EXTERNAL`, and `FAILED`. A status of `VERIFIED` requires the complete obligation's evidence, not merely implementation or a green broad test suite.
 
-Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7f4076`; latest implementation checkpoint is `7868c3d` (`feat: record candidate-bound OpenCode worker evidence`). Incumbent source baseline inspected read-only at `origin/main` SHA `b55f9b0ecbf89309832c6dcdc9a615cbc4e15f8b`.
+Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7f4076`; latest implementation checkpoint is `99d0980` (`test: verify Git helper push to protected local ref`). Incumbent source baseline inspected read-only at `origin/main` SHA `b55f9b0ecbf89309832c6dcdc9a615cbc4e15f8b`.
 
 | ID | Status | Evidence, executed tests, and remaining gap |
 |---|---|---|
@@ -41,7 +41,7 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 - `nix develop -c just ci-verify` — passed.
 - `nix run .#sdlc -- install --check` — passed, including `.changes/worker-git-credentials.json`.
 - Clean clone at exact code commit `99d0980`: all four prescribed commands passed; 94 tests / 1130 assertions.
-- GitHub checks at PR head `fb0d5bf`: SDLC `check`, `check/flake`, `check/gate`, `pr-fast`, `evaluate`, `policy`, and Mergify Summary passed; release `gate`, SDLC `verify`, and Mergify queue/protections were skipped.
+- GitHub checks at PR head `45f7f2d`: SDLC `check`, `check/flake`, `check/gate`, `pr-fast`, `evaluate`, `policy`, and Mergify Summary passed; release `gate`, SDLC `verify`, and Mergify queue/protections were skipped.
 
 ## New finding F-NEW-01 — fail-closed required CI evidence
 
