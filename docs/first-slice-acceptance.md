@@ -2,7 +2,7 @@
 
 This ledger follows immutable requirements in [the acceptance contract](first-slice-contract.md), together with [domain semantics](spec.md) and [architecture](architecture.md). A local check proves only the behavior it measures. Permitted statuses are `NOT_STARTED`, `IN_PROGRESS`, `IMPLEMENTED_UNVERIFIED`, `VERIFIED`, `BLOCKED_EXTERNAL`, and `FAILED`. A status of `VERIFIED` requires the complete obligation's evidence, not merely implementation or a green broad test suite.
 
-Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7f4076`; latest pushed checkpoint is `270d120` (`test: preserve cost exhaustion across restart`), based on implementation `153e858`. Incumbent source baseline inspected read-only at `origin/main` SHA `b55f9b0ecbf89309832c6dcdc9a615cbc4e15f8b`.
+Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7f4076`; latest pushed checkpoint is `aaeca16` (cost-overrun evidence ledger), based on implementation/test checkpoint `270d120`. Incumbent source baseline inspected read-only at `origin/main` SHA `b55f9b0ecbf89309832c6dcdc9a615cbc4e15f8b`.
 
 | ID | Status | Evidence, executed tests, and remaining gap |
 |---|---|---|
@@ -41,7 +41,7 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 - `nix develop -c just ci-verify` — passed.
 - `nix run .#sdlc -- install --check` — passed, including the new SDLC change fragment.
 - Clean clone at exact commit `270d120`: all four repository check commands passed (81 tests / 896 assertions).
-- GitHub checks at PR head `270d120`: `sdlc/check`, `check/gate`, `pr-fast`, `evaluate`, `policy`, and Mergify Summary passed. Release `gate`, SDLC `verify`/matrix, and Mergify queue/protections were skipped.
+- GitHub checks at PR head `aaeca16`: `sdlc/check`, `check/gate`, `pr-fast`, `evaluate`, `policy`, and Mergify Summary passed. Release `gate`, SDLC `verify`/matrix, and Mergify queue/protections were skipped.
 
 ## Next checkpoint
 
