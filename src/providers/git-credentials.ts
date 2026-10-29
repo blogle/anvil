@@ -226,15 +226,32 @@ export async function runGitCredentialHelper(
   if (action === "store" || action === "erase") return "";
   if (action !== "get") throw new Error("unsupported Git credential operation");
   const fields = parseCredentialInput(input);
-  if (fields.get("protocol") !== "https" || fields.get("host") !== "github.com")
-    throw new Error("only HTTPS github.com credentials are supported");
+  const protocol = fields.get("protocol");
+  const host = fields.get("host");
+  if (protocol === undefined || host === undefined)
+    throw new Error("Git credential protocol and host are required");
   const path = fields.get("path");
-  if (
-    path === undefined ||
-    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?$/.test(path)
-  )
-    throw new Error("GitHub repository path is invalid");
-  const repository = path.replace(/\.git$/i, "");
+  if (path === undefined) throw new Error("GitHub repository path is invalid");
+  let repositoryUrl: string;
+  if (protocol === "https" && host === "github.com") {
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?$/.test(path))
+      throw new Error("GitHub repository path is invalid");
+    repositoryUrl = `https://github.com/${path.replace(/\.git$/i, "")}`;
+  } else if (protocol === "http" && isLoopbackHost(host)) {
+    const fixtureRepositoryUrl = requiredEnvironment(
+      environment,
+      "ANVIL_GIT_FIXTURE_REPOSITORY_URL",
+    );
+    const fixture = parseGitHubRepository(fixtureRepositoryUrl);
+    const fixturePath = fixture.ok ? `git/${fixture.value}.git` : "";
+    if (!fixture.ok || path.toLowerCase() !== fixturePath.toLowerCase())
+      throw new Error("Loopback Git fixture repository path is invalid");
+    repositoryUrl = fixtureRepositoryUrl;
+  } else {
+    throw new Error("only HTTPS github.com credentials are supported");
+  }
+  const repository = parseGitHubRepository(repositoryUrl);
+  if (!repository.ok) throw new Error("GitHub repository URL is invalid");
   const endpoint = requiredEnvironment(environment, "ANVIL_GIT_CREDENTIAL_URL");
   const capabilityPath = requiredEnvironment(
     environment,
@@ -257,10 +274,7 @@ export async function runGitCredentialHelper(
         authorization: `Bearer ${capability}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({
-        repositoryUrl: `https://github.com/${repository}`,
-        targetRef,
-      }),
+      body: JSON.stringify({ repositoryUrl, targetRef }),
       signal: AbortSignal.timeout(5_000),
     });
   } catch {
@@ -292,10 +306,10 @@ export async function runGitCredentialHelper(
     .safeParse(value);
   if (
     !result.success ||
-    result.data.repository.toLowerCase() !== repository.toLowerCase()
+    result.data.repository.toLowerCase() !== repository.value.toLowerCase()
   )
     throw new Error("Anvil Git credential service returned an invalid scope");
-  return `protocol=https\nhost=github.com\nusername=x-access-token\npassword=${result.data.token}\n\n`;
+  return `protocol=${protocol}\nhost=${host}\nusername=x-access-token\npassword=${result.data.token}\n\n`;
 }
 
 function parseCredentialInput(input: string): ReadonlyMap<string, string> {
@@ -317,6 +331,22 @@ function validTargetRef(value: string): boolean {
     !value.endsWith("/") &&
     !value.endsWith(".")
   );
+}
+
+function isLoopbackHost(host: string): boolean {
+  try {
+    const url = new URL(`http://${host}`);
+    return (
+      url.username === "" &&
+      url.password === "" &&
+      url.pathname === "/" &&
+      url.search === "" &&
+      url.hash === "" &&
+      ["localhost", "127.0.0.1", "::1"].includes(url.hostname)
+    );
+  } catch {
+    return false;
+  }
 }
 
 function requiredEnvironment(

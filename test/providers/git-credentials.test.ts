@@ -1,6 +1,12 @@
 import { afterEach, expect, test } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -26,11 +32,14 @@ const signingSecret = "test-worker-capability-signing-secret-32-bytes";
 let directory: string | undefined;
 let githubServer: ReturnType<typeof Bun.serve> | undefined;
 let apiServer: ReturnType<typeof Bun.serve> | undefined;
+let gitReceiverServer: ReturnType<typeof Bun.serve> | undefined;
 let store: CommissionStore | undefined;
 
 afterEach(() => {
   apiServer?.stop(true);
   apiServer = undefined;
+  gitReceiverServer?.stop(true);
+  gitReceiverServer = undefined;
   githubServer?.stop(true);
   githubServer = undefined;
   store?.close();
@@ -46,7 +55,20 @@ function runGitCredentialFill(
   credentialUrl: string,
   targetRef: string,
   repositoryPath = "acme/demo.git",
+  fixtureRepositoryUrl?: string,
 ) {
+  const environment = {
+    ...process.env,
+    ANVIL_GIT_CREDENTIAL_URL: credentialUrl,
+    ANVIL_GIT_CAPABILITY_FILE: capabilityFile,
+    ANVIL_GIT_TARGET_REF: targetRef,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_TERMINAL_PROMPT: "0",
+    ...(fixtureRepositoryUrl === undefined
+      ? {}
+      : { ANVIL_GIT_FIXTURE_REPOSITORY_URL: fixtureRepositoryUrl }),
+  };
   const child = Bun.spawn(
     [
       "git",
@@ -58,15 +80,7 @@ function runGitCredentialFill(
       "fill",
     ],
     {
-      env: {
-        ...process.env,
-        ANVIL_GIT_CREDENTIAL_URL: credentialUrl,
-        ANVIL_GIT_CAPABILITY_FILE: capabilityFile,
-        ANVIL_GIT_TARGET_REF: targetRef,
-        GIT_CONFIG_NOSYSTEM: "1",
-        GIT_CONFIG_GLOBAL: "/dev/null",
-        GIT_TERMINAL_PROMPT: "0",
-      },
+      env: environment,
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
@@ -83,7 +97,127 @@ function runGitCredentialFill(
   ]);
 }
 
-test("Git credential helper uses current Assignment authority, repository-scoped App token and refresh after controller restart", async () => {
+function runGit(
+  arguments_: readonly string[],
+  cwd?: string,
+  environment: Record<string, string> = {},
+): string {
+  const result = Bun.spawnSync(["git", ...arguments_], {
+    ...(cwd === undefined ? {} : { cwd }),
+    env: {
+      ...(process.env as Record<string, string>),
+      GIT_CONFIG_NOSYSTEM: "1",
+      ...environment,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (result.exitCode !== 0)
+    throw new Error(`git ${arguments_.join(" ")} failed: ${result.stderr.toString()}`);
+  return result.stdout.toString().trim();
+}
+
+function runGitResult(
+  arguments_: readonly string[],
+  cwd: string,
+  environment: Record<string, string>,
+) {
+  const result = Bun.spawnSync(["git", ...arguments_], {
+    cwd,
+    env: {
+      ...(process.env as Record<string, string>),
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_TERMINAL_PROMPT: "0",
+      ...environment,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  return {
+    exitCode: result.exitCode,
+    stdout: result.stdout.toString(),
+    stderr: result.stderr.toString(),
+  };
+}
+
+async function serveGitHttpBackend(
+  request: Request,
+  options: Readonly<{
+    projectRoot: string;
+    allowedRef: string;
+    expectedToken: string;
+  }>,
+): Promise<Response> {
+  const expectedAuthorization = `Basic ${Buffer.from(
+    `x-access-token:${options.expectedToken}`,
+  ).toString("base64")}`;
+  if (request.headers.get("authorization") !== expectedAuthorization)
+    return new Response(null, {
+      status: 401,
+      headers: { "www-authenticate": 'Basic realm="Anvil Git fixture"' },
+    });
+  const url = new URL(request.url);
+  if (!url.pathname.startsWith("/git/"))
+    return Response.json({ error: "not_found" }, { status: 404 });
+  const body = new Uint8Array(await request.arrayBuffer());
+  const child = Bun.spawn(["git", "http-backend"], {
+    env: {
+      ...(process.env as Record<string, string>),
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_HTTP_EXPORT_ALL: "1",
+      GIT_PROJECT_ROOT: options.projectRoot,
+      PATH_INFO: url.pathname.slice("/git".length),
+      QUERY_STRING: url.search.slice(1),
+      REQUEST_METHOD: request.method,
+      REQUEST_URI: `${url.pathname}${url.search}`,
+      SERVER_PROTOCOL: "HTTP/1.1",
+      SERVER_NAME: url.hostname,
+      SERVER_PORT: url.port,
+      REMOTE_ADDR: "127.0.0.1",
+      REMOTE_USER: "x-access-token",
+      HTTP_AUTHORIZATION: expectedAuthorization,
+      ANVIL_ALLOWED_GIT_REF: options.allowedRef,
+      ...(request.headers.get("content-type") === null
+        ? {}
+        : { CONTENT_TYPE: request.headers.get("content-type")! }),
+      CONTENT_LENGTH: String(body.byteLength),
+    },
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (body.byteLength > 0) child.stdin.write(body);
+  child.stdin.end();
+  const [exitCode, stdout] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).arrayBuffer(),
+  ]);
+  if (exitCode !== 0) return Response.json({ error: "git_backend_failed" }, { status: 500 });
+  const output = new Uint8Array(stdout);
+  const delimiter = new Uint8Array([13, 10, 13, 10]);
+  let split = -1;
+  for (let index = 0; index <= output.length - delimiter.length; index += 1) {
+    if (delimiter.every((byte, offset) => output[index + offset] === byte)) {
+      split = index;
+      break;
+    }
+  }
+  if (split < 0) return Response.json({ error: "invalid_cgi_response" }, { status: 500 });
+  const headerText = new TextDecoder().decode(output.subarray(0, split));
+  const headers = new Headers();
+  let status = 200;
+  for (const line of headerText.split("\r\n")) {
+    if (line.startsWith("Status:")) {
+      status = Number(line.slice("Status:".length).trim().split(" ")[0]);
+      continue;
+    }
+    const colon = line.indexOf(":");
+    if (colon > 0) headers.set(line.slice(0, colon).trim(), line.slice(colon + 1).trim());
+  }
+  return new Response(output.subarray(split + delimiter.length), { status, headers });
+}
+
+test("Git helper pushes a protected local ref through Assignment authority and rejects scope, expiry and restart adversaries", async () => {
   directory = mkdtempSync(join(tmpdir(), "anvil-git-credential-"));
   const dbPath = join(directory, "state.sqlite");
   store = new CommissionStore(dbPath);
@@ -375,6 +509,114 @@ test("Git credential helper uses current Assignment authority, repository-scoped
   );
   expect(restartExit).toBe(0);
   expect(restartOutput).toContain("password=ghs_worker_3");
+
+  // Run ordinary Git over the helper against a real git-http-backend receiver.
+  const projectRoot = join(directory, "github");
+  const bareRepository = join(projectRoot, "acme", "demo.git");
+  mkdirSync(join(projectRoot, "acme"), { recursive: true });
+  runGit(["init", "--bare", bareRepository]);
+  runGit(["--git-dir", bareRepository, "config", "http.receivepack", "true"]);
+  const hookPath = join(bareRepository, "hooks", "pre-receive");
+  writeFileSync(
+    hookPath,
+    "#!/bin/sh\nwhile read old_sha new_sha ref; do\n  [ \"$ref\" = \"$ANVIL_ALLOWED_GIT_REF\" ] || exit 1\ndone\n",
+  );
+  chmodSync(hookPath, 0o755);
+  let authenticatedGitRequests = 0;
+  const fixtureToken = "ghs_worker_3";
+  const expectedBasic = `Basic ${Buffer.from(`x-access-token:${fixtureToken}`).toString("base64")}`;
+  gitReceiverServer = Bun.serve({
+    port: 0,
+    fetch: async (request) => {
+      if (request.headers.get("authorization") !== expectedBasic)
+        return new Response(null, {
+          status: 401,
+          headers: { "www-authenticate": 'Basic realm="local protected Git"' },
+        });
+      authenticatedGitRequests += 1;
+      return serveGitHttpBackend(request, {
+        projectRoot,
+        allowedRef: targetRef,
+        expectedToken: fixtureToken,
+      });
+    },
+  });
+  const workerRepository = join(directory, "worker");
+  runGit(["init", workerRepository]);
+  runGit(["-C", workerRepository, "config", "user.name", "Local Worker"]);
+  runGit(["-C", workerRepository, "config", "user.email", "worker@example.test"]);
+  runGit(["-C", workerRepository, "switch", "-c", workBranchFor(commission)]);
+  writeFileSync(join(workerRepository, "delivery.txt"), "local pushed commit\n");
+  runGit(["-C", workerRepository, "add", "delivery.txt"]);
+  runGit(["-C", workerRepository, "commit", "-m", "publish candidate"]);
+  const workerSha = runGit(["-C", workerRepository, "rev-parse", "HEAD"]);
+  const remoteUrl = `http://127.0.0.1:${gitReceiverServer.port}/git/acme/demo.git`;
+  runGit(["-C", workerRepository, "remote", "add", "origin", remoteUrl]);
+  runGit(
+    [
+      "-C",
+      workerRepository,
+      "config",
+      "credential.helper",
+      `!${process.execPath} run ${helperPath}`,
+    ],
+  );
+  runGit(["-C", workerRepository, "config", "credential.useHttpPath", "true"]);
+  const pushEnvironment = {
+    ANVIL_GIT_CREDENTIAL_URL: restartedUrl,
+    ANVIL_GIT_CAPABILITY_FILE: capabilityFile,
+    ANVIL_GIT_TARGET_REF: targetRef,
+    ANVIL_GIT_FIXTURE_REPOSITORY_URL: "https://github.com/acme/demo",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+  };
+  const allowedPush = runGitResult(
+    ["-C", workerRepository, "push", "origin", `HEAD:${targetRef}`],
+    workerRepository,
+    pushEnvironment,
+  );
+  expect(allowedPush.exitCode).toBe(0);
+  expect(runGit(["--git-dir", bareRepository, "rev-parse", targetRef])).toBe(
+    workerSha,
+  );
+  expect(runGit(["-C", workerRepository, "remote", "get-url", "origin"])).toBe(
+    remoteUrl,
+  );
+  expect(runGit(["-C", workerRepository, "config", "--local", "--list"])).not.toContain(
+    fixtureToken,
+  );
+
+  const wrongBranchPush = runGitResult(
+    ["-C", workerRepository, "push", "origin", "HEAD:refs/heads/not-authorized"],
+    workerRepository,
+    pushEnvironment,
+  );
+  expect(wrongBranchPush.exitCode).not.toBe(0);
+  const wrongBranchRef = runGitResult(
+    ["--git-dir", bareRepository, "show-ref", "--verify", "refs/heads/not-authorized"],
+    directory,
+    pushEnvironment,
+  );
+  expect(wrongBranchRef.exitCode).not.toBe(0);
+  const multiRefPush = runGitResult(
+    [
+      "-C",
+      workerRepository,
+      "push",
+      "origin",
+      `HEAD:${targetRef}`,
+      "HEAD:refs/heads/not-authorized",
+    ],
+    workerRepository,
+    pushEnvironment,
+  );
+  expect(multiRefPush.exitCode).not.toBe(0);
+  expect(runGit(["--git-dir", bareRepository, "rev-parse", targetRef])).toBe(
+    workerSha,
+  );
+  expect(authenticatedGitRequests).toBeGreaterThan(0);
+  expect(appTokenRequests).toBe(3);
 
   const held = await application.hold(
     commissionId,
