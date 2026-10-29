@@ -2,7 +2,7 @@
 
 This ledger follows immutable requirements in [the acceptance contract](first-slice-contract.md), together with [domain semantics](spec.md) and [architecture](architecture.md). A local check proves only the behavior it measures. Permitted statuses are `NOT_STARTED`, `IN_PROGRESS`, `IMPLEMENTED_UNVERIFIED`, `VERIFIED`, `BLOCKED_EXTERNAL`, and `FAILED`. A status of `VERIFIED` requires the complete obligation's evidence, not merely implementation or a green broad test suite.
 
-Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7f4076`; latest pushed checkpoint is `671a3cf` (`docs: record fallback and release-gate evidence`), based on implementation/test checkpoint `0fbf9a4`. Incumbent source baseline inspected read-only at `origin/main` SHA `b55f9b0ecbf89309832c6dcdc9a615cbc4e15f8b`.
+Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7f4076`; latest implementation checkpoint is `d1ec301` (`fix: bound OpenCode watchdog polling`). Incumbent source baseline inspected read-only at `origin/main` SHA `b55f9b0ecbf89309832c6dcdc9a615cbc4e15f8b`.
 
 | ID | Status | Evidence, executed tests, and remaining gap |
 |---|---|---|
@@ -33,14 +33,15 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 | G05 / FS-03 concluded specification immutability | `test/lifecycle.test.ts` terminal amendment rejection; objective retained. | Passed. |
 | G06 / FS-02 stable no-op | `test/domain-core.test.ts`, `test/lifecycle.test.ts` repeated Wait/Hold/Escalate and SQL UPDATE trigger. | Passed locally. |
 
-## Latest executed verification (local candidate based on pushed `0fbf9a4`)
+## Latest executed verification (commit `d1ec301`)
 
 - `nix develop -c just fmt` — passed; Prettier applied with no further diff.
-- `nix develop -c just check` — passed: generated lock matched, deliberate drift detected, formatting and strict TypeScript passed, 80 Bun tests / 888 assertions.
+- `nix develop -c just check` — passed: generated lock matched, deliberate drift detected, formatting and strict TypeScript passed, 80 Bun tests / 888 assertions locally.
 - `nix develop -c just ci-check` — passed; Nix TypeScript derivation and flake checks passed.
 - `nix develop -c just ci-verify` — passed.
 - `nix run .#sdlc -- install --check` — passed, including the new SDLC change fragment.
-- The latest event-wake and SSE-fallback tests have passed locally; clean-clone and GitHub checks for this exact candidate remain after commit.
+- Clean clone at exact commit `d1ec301`: all four repository check commands passed (80 tests / 869 assertions).
+- GitHub checks for `d1ec301` remain to be queried after push.
 
 ## Next checkpoint
 
