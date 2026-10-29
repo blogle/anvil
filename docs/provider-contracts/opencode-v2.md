@@ -42,8 +42,8 @@ absence, duplicate replies, or a lost acknowledgement into safe-retry evidence.
 The watchdog keeps each Session snapshot for at most five seconds, then refreshes
 the active-session map and recent provider messages. That bound limits observation
 traffic independently of the daemon reconcile loop. Context pressure is measured
-from the latest assistant input-token count against the selected
-OpenCode model's reported context limit. Repeated tool failures are taken from
+at 85% of the latest assistant input-token count against the selected OpenCode
+model's reported context limit. Repeated tool failures are taken from
 the latest assistant message only. A safe boundary requires that the latest
 assistant message completed and no tool is streaming or running. A stuck turn is
 derived from the provider's last message/tool progress timestamp and the local

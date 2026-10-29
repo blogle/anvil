@@ -2,6 +2,9 @@
 
 The Bun daemon runs SQLite migrations, serves the authenticated HTTP/MCP
 application surface, and scans durable active Commissions on a bounded interval.
+The default reconciliation interval is 5 seconds (`ANVIL_RECONCILE_INTERVAL_MS`
+accepts 250–60000 ms); OpenCode V2 execution events can wake the affected
+Commission earlier. Session watchdog observations are cached for at most 5s.
 It defaults to the explicit unavailable provider. An opt-in configured mode
 composes Agent Sandbox, OpenCode V2, GitHub App/REST, and Mergify clients; exact
 settings and provider limits are documented in

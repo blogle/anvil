@@ -5,6 +5,7 @@ import type { ExecutionObservation, Operation } from "../domain";
 const maxResponseBytes = 2 * 1024 * 1024;
 const maxEventFrameBytes = 2 * 1024 * 1024;
 const watchdogPollIntervalMs = 5_000;
+const contextPressureRatio = 0.85;
 const watchdogEventTypes = [
   "session.execution.started",
   "session.execution.succeeded",
@@ -342,7 +343,7 @@ export class OpenCodeAdapter {
       contextPressure:
         contextLimit !== null &&
         contextTokens !== null &&
-        contextTokens / contextLimit >= 0.85,
+        contextTokens / contextLimit >= contextPressureRatio,
       contextTokens,
       contextLimitTokens: contextLimit,
       repeatedToolFailures,
@@ -421,7 +422,10 @@ export class OpenCodeAdapter {
         retryDelayMs = await reconnectDelay(retryDelayMs, signal);
         continue;
       }
-      if (response.status === 404) return;
+      if ([400, 401, 403, 404].includes(response.status)) {
+        await response.body?.cancel();
+        return;
+      }
       if (!response.ok || response.body === null) {
         await response.body?.cancel();
         retryDelayMs = await reconnectDelay(retryDelayMs, signal);
