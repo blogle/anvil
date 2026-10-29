@@ -319,6 +319,72 @@ test("budget usage remains monotonic across SQLite reopen", () => {
   expect(repository.get("commission-1")?.budget.used.costMicros).toBe(20);
 });
 
+test("cost overrun is retained across SQLite reopen and blocks new provider work", async () => {
+  let repository = openStore();
+  const initial = proposal({
+    budget: {
+      maxAttempts: 3,
+      maxInstructions: 12,
+      maxRepairs: 3,
+      maxCostMicros: 10,
+      deadlineAt: epoch + 60_000,
+    },
+  });
+  expect(repository.propose(initial)).toEqual({ ok: true, value: undefined });
+  const admitted = value(
+    evolve(initial.commission, {
+      kind: "admit",
+      actor: { kind: "approver", identity: "operator-1" },
+      lease: lease(),
+      attemptId: "attempt-1",
+      assignmentId: "assignment-1",
+      now: epoch,
+    }),
+  );
+  expect(repository.commitTransition(admitted).ok).toBe(true);
+  const nearLimit = value(
+    evolve(admitted.commission, {
+      kind: "record_usage",
+      lease: lease(),
+      costMicros: 9,
+      now: epoch + 1,
+    }),
+  );
+  expect(repository.commitTransition(nearLimit).ok).toBe(true);
+  const measured = value(
+    evolve(nearLimit.commission, {
+      kind: "record_usage",
+      lease: lease(),
+      costMicros: 2,
+      now: epoch + 2,
+    }),
+  );
+  expect(repository.commitTransition(measured).ok).toBe(true);
+  repository.close();
+  store = undefined;
+
+  repository = openStore();
+  expect(repository.get(initial.commission.id)?.budget.used.costMicros).toBe(
+    11,
+  );
+  const world = new FakeWorld();
+  const app = new ApplicationService(
+    repository,
+    world,
+    world,
+    world,
+    "controller-1",
+    policy,
+  );
+  const reconciled = await app.reconcile(initial.commission.id, epoch + 3);
+  expect(reconciled).toMatchObject({
+    ok: true,
+    value: { decision: { kind: "hold", reason: "budget_exhausted" } },
+  });
+  expect(world.dispatchCount.size).toBe(0);
+  expect(repository.operations(initial.commission.id)).toHaveLength(0);
+});
+
 test("only branded domain proposals and transitions can mutate durable state", () => {
   const repository = openStore();
   const initial = proposal();
