@@ -113,7 +113,9 @@ function runGit(
     stderr: "pipe",
   });
   if (result.exitCode !== 0)
-    throw new Error(`git ${arguments_.join(" ")} failed: ${result.stderr.toString()}`);
+    throw new Error(
+      `git ${arguments_.join(" ")} failed: ${result.stderr.toString()}`,
+    );
   return result.stdout.toString().trim();
 }
 
@@ -192,7 +194,8 @@ async function serveGitHttpBackend(
     child.exited,
     new Response(child.stdout).arrayBuffer(),
   ]);
-  if (exitCode !== 0) return Response.json({ error: "git_backend_failed" }, { status: 500 });
+  if (exitCode !== 0)
+    return Response.json({ error: "git_backend_failed" }, { status: 500 });
   const output = new Uint8Array(stdout);
   const delimiter = new Uint8Array([13, 10, 13, 10]);
   let split = -1;
@@ -202,7 +205,8 @@ async function serveGitHttpBackend(
       break;
     }
   }
-  if (split < 0) return Response.json({ error: "invalid_cgi_response" }, { status: 500 });
+  if (split < 0)
+    return Response.json({ error: "invalid_cgi_response" }, { status: 500 });
   const headerText = new TextDecoder().decode(output.subarray(0, split));
   const headers = new Headers();
   let status = 200;
@@ -212,9 +216,13 @@ async function serveGitHttpBackend(
       continue;
     }
     const colon = line.indexOf(":");
-    if (colon > 0) headers.set(line.slice(0, colon).trim(), line.slice(colon + 1).trim());
+    if (colon > 0)
+      headers.set(line.slice(0, colon).trim(), line.slice(colon + 1).trim());
   }
-  return new Response(output.subarray(split + delimiter.length), { status, headers });
+  return new Response(output.subarray(split + delimiter.length), {
+    status,
+    headers,
+  });
 }
 
 test("Git helper pushes a protected local ref through Assignment authority and rejects scope, expiry and restart adversaries", async () => {
@@ -519,7 +527,7 @@ test("Git helper pushes a protected local ref through Assignment authority and r
   const hookPath = join(bareRepository, "hooks", "pre-receive");
   writeFileSync(
     hookPath,
-    "#!/bin/sh\nwhile read old_sha new_sha ref; do\n  [ \"$ref\" = \"$ANVIL_ALLOWED_GIT_REF\" ] || exit 1\ndone\n",
+    '#!/bin/sh\nwhile read old_sha new_sha ref; do\n  [ "$ref" = "$ANVIL_ALLOWED_GIT_REF" ] || exit 1\ndone\n',
   );
   chmodSync(hookPath, 0o755);
   let authenticatedGitRequests = 0;
@@ -544,23 +552,30 @@ test("Git helper pushes a protected local ref through Assignment authority and r
   const workerRepository = join(directory, "worker");
   runGit(["init", workerRepository]);
   runGit(["-C", workerRepository, "config", "user.name", "Local Worker"]);
-  runGit(["-C", workerRepository, "config", "user.email", "worker@example.test"]);
+  runGit([
+    "-C",
+    workerRepository,
+    "config",
+    "user.email",
+    "worker@example.test",
+  ]);
   runGit(["-C", workerRepository, "switch", "-c", workBranchFor(commission)]);
-  writeFileSync(join(workerRepository, "delivery.txt"), "local pushed commit\n");
+  writeFileSync(
+    join(workerRepository, "delivery.txt"),
+    "local pushed commit\n",
+  );
   runGit(["-C", workerRepository, "add", "delivery.txt"]);
   runGit(["-C", workerRepository, "commit", "-m", "publish candidate"]);
   const workerSha = runGit(["-C", workerRepository, "rev-parse", "HEAD"]);
   const remoteUrl = `http://127.0.0.1:${gitReceiverServer.port}/git/acme/demo.git`;
   runGit(["-C", workerRepository, "remote", "add", "origin", remoteUrl]);
-  runGit(
-    [
-      "-C",
-      workerRepository,
-      "config",
-      "credential.helper",
-      `!${process.execPath} run ${helperPath}`,
-    ],
-  );
+  runGit([
+    "-C",
+    workerRepository,
+    "config",
+    "credential.helper",
+    `!${process.execPath} run ${helperPath}`,
+  ]);
   runGit(["-C", workerRepository, "config", "credential.useHttpPath", "true"]);
   const pushEnvironment = {
     ANVIL_GIT_CREDENTIAL_URL: restartedUrl,
@@ -583,18 +598,30 @@ test("Git helper pushes a protected local ref through Assignment authority and r
   expect(runGit(["-C", workerRepository, "remote", "get-url", "origin"])).toBe(
     remoteUrl,
   );
-  expect(runGit(["-C", workerRepository, "config", "--local", "--list"])).not.toContain(
-    fixtureToken,
-  );
+  expect(
+    runGit(["-C", workerRepository, "config", "--local", "--list"]),
+  ).not.toContain(fixtureToken);
 
   const wrongBranchPush = runGitResult(
-    ["-C", workerRepository, "push", "origin", "HEAD:refs/heads/not-authorized"],
+    [
+      "-C",
+      workerRepository,
+      "push",
+      "origin",
+      "HEAD:refs/heads/not-authorized",
+    ],
     workerRepository,
     pushEnvironment,
   );
   expect(wrongBranchPush.exitCode).not.toBe(0);
   const wrongBranchRef = runGitResult(
-    ["--git-dir", bareRepository, "show-ref", "--verify", "refs/heads/not-authorized"],
+    [
+      "--git-dir",
+      bareRepository,
+      "show-ref",
+      "--verify",
+      "refs/heads/not-authorized",
+    ],
     directory,
     pushEnvironment,
   );

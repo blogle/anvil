@@ -33,15 +33,14 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 | G05 / FS-03 concluded specification immutability | `test/lifecycle.test.ts` terminal amendment rejection; objective retained. | Passed. |
 | G06 / FS-02 stable no-op | `test/domain-core.test.ts`, `test/lifecycle.test.ts` repeated Wait/Hold/Escalate and SQL UPDATE trigger. | Passed locally. |
 
-## Latest local verification (working-tree implementation based on `efc95a1`)
+## Latest complete local verification (credential-helper checkpoint; code commit pending)
 
 - `nix develop -c just fmt` — passed; no formatting changes remained.
-- `nix develop -c just check` — passed: lock match and deliberate drift-negative probe, formatting, strict TypeScript, 94 tests / 1121 assertions locally.
+- `nix develop -c just check` — passed: lock match and deliberate drift-negative probe, formatting, strict TypeScript, 94 tests / 1120 assertions locally.
 - `nix develop -c just ci-check` — passed; Nix flake and TypeScript checks passed.
 - `nix develop -c just ci-verify` — passed.
 - `nix run .#sdlc -- install --check` — passed, including `.changes/worker-git-credentials.json`.
-- Clean clone at exact prior implementation `7868c3d`: all four prescribed checks passed; current credential subset clean-clone verification remains.
-- GitHub checks at prior PR head `efc95a1` passed. Checks for this credential subset are pending commit/push; heavy verify remains skipped on this PR.
+- Clean-clone verification and current-commit GitHub checks are pending commit/push of the push-fixture update; previous clean clone `f054feb` passed all four commands.
 
 ## New finding F-NEW-01 — fail-closed required CI evidence
 
@@ -67,8 +66,8 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 - `test/providers/git-credentials.test.ts` runs actual `git credential fill` in a separate pinned Git process against the Hono endpoint and a loopback GitHub App token service. It asserts broker-minted `contents:write` output, refresh near token expiry, controller/service+SQLite restart, and denial for wrong repository/Commission/Assignment/Attempt/Session/Workspace/controller epoch/ref, stale/expired Lease, expired capability, held/concluded Commission, `gh` purpose escalation, unsupported method, and insecure capability-file mode. App signing key/capability are not in Git's helper output or error text; raw token is absent from remote URL, durable Commission/Operations, and helper errors.
 - `nix develop -c bun test test/providers/git-credentials.test.ts` — passed 1 test / 58 assertions. Full local checks: `just check` 94 tests / 1121 assertions; `just ci-check`, `just ci-verify`, `nix run .#sdlc -- install --check` passed. Clean-clone results for this credential-service commit are pending.
 - The test runs real `git push` through the helper into a loopback `git-http-backend` bare repository and verifies the updated ref/SHA with `git rev-parse`. A receiver pre-receive hook rejects wrong and multi-ref updates. This is local branch-policy fixture evidence, not a deployed GitHub ruleset or an Anvil ref-enforcing proxy.
-- Limits: Git credential fill necessarily returns an extractable repo-wide installation token to that worker process until GitHub expires it; a signed target ref checks issuance but does not confine later token use. Protected branch rules protect only configured refs. The Sandbox has no capability-file bootstrap or bundled helper image yet; the configured-daemon flow still uses fixture publication. FS-10 remains IN_PROGRESS.
+- Limits: Git credential fill necessarily returns an extractable repo-wide installation token to that worker process until GitHub expires it; a signed target ref checks issuance but does not confine later token use. Protected branch rules protect only configured refs. The actual push uses a loopback `git-http-backend` fixture with a local pre-receive hook, not live GitHub. The Sandbox has no capability-file bootstrap or bundled helper image yet; the configured-daemon flow still uses fixture publication. FS-10 remains IN_PROGRESS.
 
 ## Next checkpoint
 
-Next: bootstrap the tested capability file and helper into the actual Sandbox image/Workspace contract, verify allowed/denied pushes in the configured daemon process trace, and decide whether repository branch rules suffice for this Commission or an agreed ref-enforcing proxy is required. Then continue FS-13 local Nix image/build inspection before any K8s-specific request. FS-08/09 randomized/multiprocess traces, FS-11 projections, FS-12 UI and FS-14 parity remain. FS-15 stays BLOCKED_EXTERNAL. No live K8s subgate has been reached; no K8S_ACCEPTANCE_REQUEST is warranted yet. Do not claim LOCAL_SLICE_READY.
+Next: bootstrap the helper and capability into the actual Sandbox contract without exposing the capability in prompt/environment/remote URLs, then replace the configured-daemon branch simulation with a real Git worker push and restart trace. Decide whether repository branch protection suffices or a separate ref-restricting transport is needed. Build/inspect sandbox and daemon Nix artifacts locally afterward. FS-08/09 randomized/multiprocess traces, FS-11 projections, FS-12 UI and FS-14 parity remain. FS-15 stays BLOCKED_EXTERNAL. No current local subgate requires live K8s; do not request or perform deployment yet, and do not claim LOCAL_SLICE_READY.
