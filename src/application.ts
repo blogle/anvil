@@ -24,6 +24,18 @@ export type ProviderResult<T> =
   | Readonly<{ ok: true; value: T }>
   | Readonly<{ ok: false; error: ProviderFailure }>;
 
+export type WorkerGitCapabilityScope = Readonly<{
+  commissionId: string;
+  assignmentId: string;
+  attemptId: string;
+  sessionId: string;
+  workspaceId: string;
+  repository: string;
+  targetRef: string;
+  controllerId: string;
+  ownerEpoch: number;
+}>;
+
 export interface LeasePort {
   current(
     commissionId: string,
@@ -569,6 +581,69 @@ export class ApplicationService {
     );
   }
 
+  async authorizeWorkerGitCapability(
+    scope: WorkerGitCapabilityScope,
+    expectedTargetRef: string,
+    now: number,
+  ): Promise<boolean> {
+    const commission = this.#store.get(scope.commissionId);
+    if (
+      commission === null ||
+      commission.lifecycle !== "active" ||
+      githubRepositoryIdentity(commission.repository) !==
+        scope.repository.toLowerCase() ||
+      scope.targetRef !== expectedTargetRef ||
+      commission.activeAttemptId !== scope.attemptId ||
+      commission.owner?.controllerId !== scope.controllerId ||
+      commission.owner.epoch !== scope.ownerEpoch ||
+      commission.budget.limits.deadlineAt <= now
+    )
+      return false;
+    const attempt = commission.attempts.find(
+      ({ id }) => id === scope.attemptId,
+    );
+    if (
+      attempt === undefined ||
+      attempt.lifecycle !== "active" ||
+      attempt.assignmentId !== scope.assignmentId
+    )
+      return false;
+    const lease = await this.#currentLease(commission.id, now);
+    if (
+      !lease.ok ||
+      lease.value.validUntil <= now ||
+      !hasOwner(commission, lease.value) ||
+      lease.value.owner.controllerId !== scope.controllerId ||
+      lease.value.owner.epoch !== scope.ownerEpoch
+    )
+      return false;
+    const operations = this.#store.operations(commission.id);
+    const workspace = operations.find(
+      (operation) =>
+        operation.kind === "provision_sandbox" &&
+        operation.attemptId === scope.attemptId &&
+        operation.assignmentId === scope.assignmentId &&
+        operation.specificationGeneration ===
+          commission.specificationGeneration &&
+        operation.outcome.kind === "observed" &&
+        operation.outcome.result === "applied" &&
+        operation.outcome.externalIdentity === scope.workspaceId,
+    );
+    const session = operations.find(
+      (operation) =>
+        operation.kind === "create_session" &&
+        operation.attemptId === scope.attemptId &&
+        operation.assignmentId === scope.assignmentId &&
+        operation.specificationGeneration ===
+          commission.specificationGeneration &&
+        operation.target === `opencode:${scope.workspaceId}` &&
+        operation.outcome.kind === "observed" &&
+        operation.outcome.result === "applied" &&
+        operation.outcome.externalIdentity === scope.sessionId,
+    );
+    return workspace !== undefined && session !== undefined;
+  }
+
   async amendSpecification(
     commissionId: string,
     principalId: string,
@@ -740,4 +815,26 @@ function isPending(operation: Operation): boolean {
     operation.outcome.kind === "ambiguous" ||
     operation.outcome.kind === "retry_authorized"
   );
+}
+
+function githubRepositoryIdentity(repositoryUrl: string): string | null {
+  try {
+    const url = new URL(repositoryUrl);
+    if (
+      url.protocol !== "https:" ||
+      url.hostname.toLowerCase() !== "github.com" ||
+      url.username !== "" ||
+      url.password !== "" ||
+      url.port !== "" ||
+      url.search !== "" ||
+      url.hash !== ""
+    )
+      return null;
+    const parts = url.pathname.split("/").filter((part) => part.length > 0);
+    if (parts.length !== 2) return null;
+    const name = parts[1]!.replace(/\.git$/i, "");
+    return name.length === 0 ? null : `${parts[0]}/${name}`.toLowerCase();
+  } catch {
+    return null;
+  }
 }

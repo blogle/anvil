@@ -16,6 +16,7 @@ import type { Commission, Operation, OperationOutcome } from "../domain";
 
 export function createProviderPort(
   environment: NodeJS.ProcessEnv,
+  onGitHubBroker?: (broker: GitHubAppBroker) => void,
 ): ProviderPort {
   const mode = environment["ANVIL_PROVIDER_MODE"] ?? "unavailable";
   if (mode === "unavailable") return new UnavailableProvider();
@@ -90,6 +91,7 @@ export function createProviderPort(
     privateKey,
     ...(githubApiUrl === undefined ? {} : { apiUrl: githubApiUrl }),
   });
+  onGitHubBroker?.(githubCredentials);
   const github = new GitHubDeliveryClient(
     githubCredentials,
     githubApiUrl === undefined ? {} : { apiUrl: githubApiUrl },
@@ -161,7 +163,7 @@ export function createProviderPort(
   });
 }
 
-function workBranchFor(commission: Commission): string {
+export function workBranchFor(commission: Commission): string {
   const slug = commission.id
     .toLowerCase()
     .replace(/[^a-z0-9-]+/g, "-")

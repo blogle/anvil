@@ -622,11 +622,16 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   });
   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const privateKeyPath = join(directory, "github-app.pem");
+  const gitCapabilitySecretPath = join(directory, "git-capability-secret");
   const mergifyTokenPath = join(directory, "mergify-token");
   const kubernetesTokenPath = join(directory, "kubernetes-token");
   writeFileSync(
     privateKeyPath,
     privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+  );
+  writeFileSync(
+    gitCapabilitySecretPath,
+    "local-git-capability-signing-secret-32-bytes",
   );
   writeFileSync(mergifyTokenPath, "local-mergify-token");
   writeFileSync(kubernetesTokenPath, "local-kubernetes-token");
@@ -648,6 +653,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
     ANVIL_GITHUB_APP_ID: "fixture-app",
     ANVIL_GITHUB_INSTALLATION_ID: "42",
     ANVIL_GITHUB_PRIVATE_KEY_FILE: privateKeyPath,
+    ANVIL_GIT_CAPABILITY_SECRET_FILE: gitCapabilitySecretPath,
     ANVIL_GITHUB_API_URL: `http://127.0.0.1:${githubPort}/api/`,
     ANVIL_MERGIFY_TOKEN_FILE: mergifyTokenPath,
     ANVIL_MERGIFY_API_URL: `http://127.0.0.1:${mergifyPort}/v1/`,

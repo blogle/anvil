@@ -34,6 +34,7 @@
               bun
               bun2nixPackage
               bun2nixPackage.hook
+              pkgs.gitMinimal
             ];
             bunDeps = bun2nixPackage.fetchBunDeps { bunNix = ./bun.nix; };
             bunInstallFlags = [ "--linker=hoisted" "--backend=copyfile" ];
@@ -99,6 +100,7 @@
             packages = [
               bun
               bun2nix.packages.${system}.default
+              pkgs.gitMinimal
               pkgs.just
               pkgs.nix
             ];

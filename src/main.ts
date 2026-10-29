@@ -3,7 +3,13 @@ import { createDaemonApp, startReconciliationLoop } from "./daemon";
 import type { LeasePort } from "./application";
 import type { Policy } from "./domain";
 import { CommissionStore } from "./persistence/sqlite";
-import { createProviderPort } from "./providers/runtime";
+import { readFileSync } from "node:fs";
+import { GitHubAppBroker } from "./providers/github-app";
+import {
+  WorkerGitCapabilitySigner,
+  WorkerGitCredentialService,
+} from "./providers/git-credentials";
+import { createProviderPort, workBranchFor } from "./providers/runtime";
 
 const bearerToken = process.env["ANVIL_API_TOKEN"];
 const databasePath = process.env["ANVIL_DATABASE"] ?? "./anvil.sqlite";
@@ -51,7 +57,10 @@ const lease: LeasePort = {
   },
 };
 
-const provider = createProviderPort(process.env);
+let githubBroker: GitHubAppBroker | undefined;
+const provider = createProviderPort(process.env, (broker) => {
+  githubBroker = broker;
+});
 const store = new CommissionStore(databasePath);
 const application = new ApplicationService(
   store,
@@ -61,11 +70,40 @@ const application = new ApplicationService(
   controllerId,
   policy,
 );
+let gitCredentialService: WorkerGitCredentialService | undefined;
+if ((process.env["ANVIL_PROVIDER_MODE"] ?? "unavailable") === "configured") {
+  const capabilitySecretPath = process.env["ANVIL_GIT_CAPABILITY_SECRET_FILE"];
+  if (capabilitySecretPath === undefined || githubBroker === undefined)
+    throw new Error(
+      "Configured provider mode requires the Git capability secret and GitHub App broker",
+    );
+  let capabilitySecret: string;
+  try {
+    capabilitySecret = readFileSync(capabilitySecretPath, "utf8").trim();
+  } catch {
+    throw new Error("ANVIL_GIT_CAPABILITY_SECRET_FILE could not be read");
+  }
+  const signer = new WorkerGitCapabilitySigner(capabilitySecret, 300);
+  gitCredentialService = new WorkerGitCredentialService({
+    signer,
+    github: githubBroker,
+    authorize: async (scope, now) => {
+      const commission = store.get(scope.commissionId);
+      if (commission === null) return false;
+      return application.authorizeWorkerGitCapability(
+        scope,
+        `refs/heads/${workBranchFor(commission)}`,
+        now,
+      );
+    },
+  });
+}
 const app = createDaemonApp({
   application,
   store,
   config: { bearerToken, principalId: operatorId },
   policy,
+  ...(gitCredentialService === undefined ? {} : { gitCredentialService }),
 });
 const port = Number(process.env["PORT"] ?? "8080");
 const server = Bun.serve({ port, fetch: app.fetch });

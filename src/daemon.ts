@@ -6,6 +6,7 @@ import { z } from "zod";
 import type { ApplicationService, ApplicationError } from "./application";
 import type { CommissionProposalInput, Policy } from "./domain";
 import type { CommissionStore } from "./persistence/sqlite";
+import type { WorkerGitCredentialService } from "./providers/git-credentials";
 
 export type DaemonConfig = Readonly<{
   bearerToken: string;
@@ -18,6 +19,7 @@ export type DaemonDependencies = Readonly<{
   config: DaemonConfig;
   policy: Policy;
   now?: () => number;
+  gitCredentialService?: WorkerGitCredentialService;
 }>;
 
 const obligationSchema = z
@@ -95,6 +97,12 @@ export function createDaemonApp(dependencies: DaemonDependencies): Hono {
     } catch {
       return context.json({ status: "not_ready" }, 503);
     }
+  });
+
+  app.all("/v1/git/credentials", async (context) => {
+    if (dependencies.gitCredentialService === undefined)
+      return context.json({ error: "git_credentials_unavailable" }, 503);
+    return dependencies.gitCredentialService.handle(context.req.raw);
   });
 
   app.use("/api/*", async (context, next) => {
