@@ -1,9 +1,17 @@
 import { afterEach, expect, test } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OpenCodeAdapter } from "../src/providers/opencode";
+import { WorkerGitCapabilitySigner } from "../src/providers/git-credentials";
+import { workBranchFor } from "../src/providers/runtime";
 import { proposalInput } from "./support/fixtures";
 
 type Child = Readonly<{
@@ -17,10 +25,12 @@ let daemonProcess: Child | undefined;
 let sandboxServer: ReturnType<typeof Bun.serve> | undefined;
 let openCodeServer: ReturnType<typeof Bun.serve> | undefined;
 let githubServer: ReturnType<typeof Bun.serve> | undefined;
+let gitReceiverServer: ReturnType<typeof Bun.serve> | undefined;
 let mergifyServer: ReturnType<typeof Bun.serve> | undefined;
 let provisionCount = 0;
 let sessionCreateCount = 0;
 let promptCount = 0;
+const gitCapabilitySecret = "local-git-capability-signing-secret-32-bytes";
 
 afterEach(async () => {
   if (daemonProcess !== undefined) {
@@ -32,12 +42,14 @@ afterEach(async () => {
     sandboxServer,
     openCodeServer,
     githubServer,
+    gitReceiverServer,
     mergifyServer,
   ])
     server?.stop(true);
   sandboxServer = undefined;
   openCodeServer = undefined;
   githubServer = undefined;
+  gitReceiverServer = undefined;
   mergifyServer = undefined;
   if (directory !== undefined)
     rmSync(directory, { recursive: true, force: true });
@@ -57,6 +69,93 @@ function startDaemon(environment: Record<string, string>): Child {
     env: { ...(process.env as Record<string, string>), ...environment },
     stdout: "ignore",
     stderr: "inherit",
+  });
+}
+
+function git(arguments_: readonly string[], cwd?: string) {
+  const result = Bun.spawnSync(["git", ...arguments_], {
+    ...(cwd === undefined ? {} : { cwd }),
+    env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  return {
+    exitCode: result.exitCode,
+    stdout: result.stdout.toString().trim(),
+    stderr: result.stderr.toString(),
+  };
+}
+
+async function serveGitBackend(
+  request: Request,
+  projectRoot: string,
+  allowedRef: string,
+  authorization: string,
+): Promise<Response> {
+  if (request.headers.get("authorization") !== authorization)
+    return new Response(null, {
+      status: 401,
+      headers: { "www-authenticate": 'Basic realm="Anvil local Git fixture"' },
+    });
+  const url = new URL(request.url);
+  const body = new Uint8Array(await request.arrayBuffer());
+  const child = Bun.spawn(["git", "http-backend"], {
+    env: {
+      ...process.env,
+      GIT_HTTP_EXPORT_ALL: "1",
+      GIT_PROJECT_ROOT: projectRoot,
+      PATH_INFO: url.pathname.slice("/git".length),
+      QUERY_STRING: url.search.slice(1),
+      REQUEST_METHOD: request.method,
+      REQUEST_URI: `${url.pathname}${url.search}`,
+      SERVER_PROTOCOL: "HTTP/1.1",
+      SERVER_NAME: url.hostname,
+      SERVER_PORT: url.port,
+      REMOTE_ADDR: "127.0.0.1",
+      REMOTE_USER: "x-access-token",
+      HTTP_AUTHORIZATION: authorization,
+      ANVIL_ALLOWED_GIT_REF: allowedRef,
+      ...(request.headers.get("content-type") === null
+        ? {}
+        : { CONTENT_TYPE: request.headers.get("content-type")! }),
+      CONTENT_LENGTH: String(body.byteLength),
+    },
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (body.byteLength > 0) child.stdin.write(body);
+  child.stdin.end();
+  const [exitCode, output] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).arrayBuffer(),
+  ]);
+  if (exitCode !== 0) return new Response(null, { status: 500 });
+  const bytes = new Uint8Array(output);
+  const delimiter = new Uint8Array([13, 10, 13, 10]);
+  let split = -1;
+  for (let index = 0; index <= bytes.length - delimiter.length; index += 1)
+    if (delimiter.every((byte, offset) => bytes[index + offset] === byte)) {
+      split = index;
+      break;
+    }
+  if (split < 0) return new Response(null, { status: 500 });
+  const headers = new Headers();
+  let status = 200;
+  for (const line of new TextDecoder()
+    .decode(bytes.subarray(0, split))
+    .split("\r\n")) {
+    if (line.startsWith("Status:")) {
+      status = Number(line.slice(7).trim().split(" ")[0]);
+    } else {
+      const colon = line.indexOf(":");
+      if (colon > 0)
+        headers.set(line.slice(0, colon).trim(), line.slice(colon + 1).trim());
+    }
+  }
+  return new Response(bytes.subarray(split + delimiter.length), {
+    status,
+    headers,
   });
 }
 
@@ -259,6 +358,14 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   let loseNextInterruptAck = false;
   let interruptInspectionBusy = false;
   let deliveryRevision: string | null = null;
+  const deliveryRevisions: string[] = [];
+  let deliveryBareRepository: string | null = null;
+  let deliveryPushEnvironment: Record<string, string> | null = null;
+  let deliveryWorkerRepository: string | null = null;
+  let deliveryCapabilityReady: (() => void) | undefined;
+  const deliveryCapabilityGate = new Promise<void>((resolve) => {
+    deliveryCapabilityReady = resolve;
+  });
   let deliveryPromptCount = 0;
   let deliveryCheckState: "failing" | "pending" | "passing" = "failing";
   let staleDeliveryChecks = false;
@@ -401,9 +508,83 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
         userMessageIds.set(sandboxName, prompt.id);
         if (sandboxName.startsWith("anvil-configured-delivery-")) {
           deliveryPromptCount += 1;
-          deliveryRevision = `worker-commit-${deliveryPromptCount}`;
+          if (deliveryPromptCount === 1) {
+            await deliveryCapabilityGate;
+            if (
+              deliveryWorkerRepository === null ||
+              deliveryPushEnvironment === null ||
+              deliveryBranchName === null
+            )
+              throw new Error("Delivery Git fixture was not bootstrapped");
+          }
+          const commit = Bun.spawnSync(
+            [
+              "git",
+              "-C",
+              deliveryWorkerRepository!,
+              "commit",
+              "--allow-empty",
+              "-m",
+              `publish Candidate ${deliveryPromptCount}`,
+            ],
+            { stdout: "pipe", stderr: "pipe" },
+          );
+          if (commit.exitCode !== 0) throw new Error(commit.stderr.toString());
+          deliveryRevision = Bun.spawnSync(
+            ["git", "-C", deliveryWorkerRepository!, "rev-parse", "HEAD"],
+            { stdout: "pipe", stderr: "pipe" },
+          )
+            .stdout.toString()
+            .trim();
+          deliveryRevisions.push(deliveryRevision);
+          const credentials = Bun.spawn(
+            ["git", "-C", deliveryWorkerRepository!, "credential", "fill"],
+            {
+              env: { ...process.env, ...deliveryPushEnvironment! },
+              stdin: "pipe",
+              stdout: "pipe",
+              stderr: "pipe",
+            },
+          );
+          credentials.stdin.write(
+            `protocol=http\nhost=127.0.0.1:${gitReceiverServer!.port}\npath=git/acme/demo.git\n\n`,
+          );
+          credentials.stdin.end();
+          const [credentialExit, credentialText, credentialError] =
+            await Promise.all([
+              credentials.exited,
+              new Response(credentials.stdout).text(),
+              new Response(credentials.stderr).text(),
+            ]);
+          if (credentialExit !== 0)
+            throw new Error(
+              `Fixture credential fill failed: ${credentialError}`,
+            );
+          if (!credentialText.includes("password=ghs_write"))
+            throw new Error(
+              "Fixture helper did not return the scoped Git credential",
+            );
+          const push = Bun.spawnSync(
+            [
+              "git",
+              "-C",
+              deliveryWorkerRepository!,
+              "push",
+              "origin",
+              `HEAD:refs/heads/${deliveryBranchName}`,
+            ],
+            {
+              env: { ...process.env, ...deliveryPushEnvironment! },
+              stdout: "pipe",
+              stderr: "pipe",
+            },
+          );
+          if (push.exitCode !== 0)
+            throw new Error(`Candidate push failed: ${push.stderr.toString()}`);
           const reportedRevision =
-            deliveryPromptCount === 2 ? "worker-commit-1" : deliveryRevision;
+            deliveryPromptCount === 2
+              ? deliveryRevisions[0]!
+              : deliveryRevision;
           assistantEvidenceTexts.set(
             sandboxName,
             `ANVIL_EVIDENCE acceptance-1 ${reportedRevision}: Implemented and repaired the requested behavior.`,
@@ -478,7 +659,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
         };
         return Response.json(
           {
-            token: `ghs_${body.permissions["pull_requests"]}`,
+            token: `ghs_${body.permissions["contents"]}`,
             expires_at: new Date(Date.now() + 3_600_000).toISOString(),
             permissions: body.permissions,
           },
@@ -492,9 +673,25 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
         );
         if (
           branch.startsWith("anvil/configured-delivery-") &&
-          deliveryRevision !== null
+          deliveryBareRepository !== null
         ) {
           deliveryBranchName = branch;
+          const observed = Bun.spawnSync(
+            [
+              "git",
+              "--git-dir",
+              deliveryBareRepository,
+              "rev-parse",
+              `refs/heads/${branch}`,
+            ],
+            { stdout: "pipe", stderr: "pipe" },
+          );
+          if (observed.exitCode !== 0)
+            return Response.json(
+              { message: "branch not found" },
+              { status: 404 },
+            );
+          deliveryRevision = observed.stdout.toString().trim();
           return Response.json({
             name: branch,
             commit: { sha: deliveryRevision },
@@ -629,10 +826,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
     privateKeyPath,
     privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
   );
-  writeFileSync(
-    gitCapabilitySecretPath,
-    "local-git-capability-signing-secret-32-bytes",
-  );
+  writeFileSync(gitCapabilitySecretPath, gitCapabilitySecret);
   writeFileSync(mergifyTokenPath, "local-mergify-token");
   writeFileSync(kubernetesTokenPath, "local-kubernetes-token");
   const runtimeEnvironment = {
@@ -893,6 +1087,202 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
     { method: "POST", headers, body: "{}" },
   );
   expect(deliveryAdmitted.status).toBe(200);
+  // Hold the first worker prompt until its persisted Assignment, Workspace and
+  // Session identities have been observed and a short-lived helper capability
+  // has been installed as a 0600 fixture file.
+  let deliveryBootstrapOperations: readonly {
+    kind: string;
+    assignmentId: string | null;
+    attemptId: string | null;
+    outcome: {
+      kind: string;
+      result?: string;
+      externalIdentity?: string | null;
+    };
+  }[] = [];
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const response = await fetch(
+      `${baseUrl}/api/commissions/${deliveryId}/operations`,
+      { headers },
+    );
+    if (response.ok) {
+      deliveryBootstrapOperations = (
+        (await response.json()) as {
+          operations: typeof deliveryBootstrapOperations;
+        }
+      ).operations;
+      if (
+        deliveryBootstrapOperations.some(
+          (item) =>
+            item.kind === "provision_sandbox" &&
+            item.outcome.kind === "observed",
+        ) &&
+        deliveryBootstrapOperations.some(
+          (item) =>
+            item.kind === "create_session" && item.outcome.kind === "observed",
+        )
+      )
+        break;
+    }
+    await Bun.sleep(25);
+  }
+  const workspaceOperation = deliveryBootstrapOperations.find(
+    (item) => item.kind === "provision_sandbox",
+  );
+  const sessionOperation = deliveryBootstrapOperations.find(
+    (item) => item.kind === "create_session",
+  );
+  if (
+    workspaceOperation?.outcome.externalIdentity == null ||
+    sessionOperation?.outcome.externalIdentity == null ||
+    sessionOperation.assignmentId === null ||
+    sessionOperation.attemptId === null
+  )
+    throw new Error(
+      "Delivery Workspace and Session operations were not persisted",
+    );
+  const deliveryResponse = await fetch(
+    `${baseUrl}/api/commissions/${deliveryId}`,
+    { headers },
+  );
+  const deliveryCommission = (
+    (await deliveryResponse.json()) as {
+      commission: import("../src/domain").Commission;
+    }
+  ).commission;
+  deliveryBranchName = workBranchFor(deliveryCommission);
+  const deliveryTargetRef = `refs/heads/${deliveryBranchName}`;
+  const capabilityFile = join(directory, "delivery-git-capability");
+  const deliveryCapability = new WorkerGitCapabilitySigner(
+    gitCapabilitySecret,
+    300,
+  ).mint(
+    {
+      commissionId: deliveryId,
+      assignmentId: sessionOperation.assignmentId,
+      attemptId: sessionOperation.attemptId,
+      sessionId: sessionOperation.outcome.externalIdentity,
+      workspaceId: workspaceOperation.outcome.externalIdentity,
+      repository: "acme/demo",
+      targetRef: deliveryTargetRef,
+      controllerId: "anvil-local-controller",
+      ownerEpoch: deliveryCommission.owner?.epoch ?? 1,
+    },
+    Date.now(),
+    300,
+  );
+  writeFileSync(capabilityFile, deliveryCapability, { mode: 0o600 });
+  chmodSync(capabilityFile, 0o600);
+  const projectRoot = join(directory, "delivery-github");
+  deliveryBareRepository = join(projectRoot, "acme", "demo.git");
+  mkdirSync(join(projectRoot, "acme"), { recursive: true });
+  const initBare = git(["init", "--bare", deliveryBareRepository]);
+  if (initBare.exitCode !== 0) throw new Error(initBare.stderr);
+  git([
+    "--git-dir",
+    deliveryBareRepository,
+    "config",
+    "http.receivepack",
+    "true",
+  ]);
+  const hook = join(deliveryBareRepository, "hooks", "pre-receive");
+  writeFileSync(
+    hook,
+    '#!/bin/sh\nwhile read old_sha new_sha ref; do\n  [ "$ref" = "$ANVIL_ALLOWED_GIT_REF" ] || exit 1\ndone\n',
+  );
+  chmodSync(hook, 0o755);
+  const expectedGitAuthorization = `Basic ${Buffer.from("x-access-token:ghs_write").toString("base64")}`;
+  gitReceiverServer = Bun.serve({
+    port: 0,
+    fetch: (request) =>
+      serveGitBackend(
+        request,
+        projectRoot,
+        deliveryTargetRef,
+        expectedGitAuthorization,
+      ),
+  });
+  deliveryWorkerRepository = join(directory, "delivery-worker");
+  const initWorker = git(["init", deliveryWorkerRepository]);
+  if (initWorker.exitCode !== 0) throw new Error(initWorker.stderr);
+  for (const args of [
+    ["-C", deliveryWorkerRepository, "config", "user.name", "Local Worker"],
+    [
+      "-C",
+      deliveryWorkerRepository,
+      "config",
+      "user.email",
+      "worker@example.test",
+    ],
+    ["-C", deliveryWorkerRepository, "switch", "-c", deliveryBranchName],
+  ]) {
+    const result = git(args);
+    if (result.exitCode !== 0) throw new Error(result.stderr);
+  }
+  writeFileSync(
+    join(deliveryWorkerRepository, "delivery.txt"),
+    "first real Candidate\n",
+  );
+  git(["-C", deliveryWorkerRepository, "add", "delivery.txt"]);
+  const firstCommit = git([
+    "-C",
+    deliveryWorkerRepository,
+    "commit",
+    "-m",
+    "create first Candidate",
+  ]);
+  if (firstCommit.exitCode !== 0) throw new Error(firstCommit.stderr);
+  const localRemote = `http://127.0.0.1:${gitReceiverServer.port}/git/acme/demo.git`;
+  git(["-C", deliveryWorkerRepository, "remote", "add", "origin", localRemote]);
+  const helperPath = join(process.cwd(), "src/providers/git-credentials.ts");
+  git([
+    "-C",
+    deliveryWorkerRepository,
+    "config",
+    "credential.helper",
+    `!${process.execPath} run ${helperPath}`,
+  ]);
+  git([
+    "-C",
+    deliveryWorkerRepository,
+    "config",
+    "credential.useHttpPath",
+    "true",
+  ]);
+  deliveryPushEnvironment = {
+    ANVIL_GIT_CREDENTIAL_URL: `${baseUrl}/v1/git/credentials`,
+    ANVIL_GIT_CAPABILITY_FILE: capabilityFile,
+    ANVIL_GIT_TARGET_REF: deliveryTargetRef,
+    ANVIL_GIT_FIXTURE_REPOSITORY_URL: "https://github.com/acme/demo",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+  };
+  deliveryPushEnvironment["ANVIL_GIT_CAPABILITY_FILE"] = join(
+    directory,
+    "absent-capability",
+  );
+  const deniedPush = git([
+    "-C",
+    deliveryWorkerRepository,
+    "push",
+    "origin",
+    `HEAD:${deliveryTargetRef}`,
+  ]);
+  expect(deniedPush.exitCode).not.toBe(0);
+  const absentCandidate = git([
+    "--git-dir",
+    deliveryBareRepository,
+    "rev-parse",
+    deliveryTargetRef,
+  ]);
+  expect(absentCandidate.exitCode).not.toBe(0);
+  const absentBranchObservation = await fetch(
+    `http://127.0.0.1:${githubPort}/api/repos/acme/demo/branches/${encodeURIComponent(deliveryBranchName)}`,
+  );
+  expect(absentBranchObservation.status).toBe(404);
+  deliveryPushEnvironment["ANVIL_GIT_CAPABILITY_FILE"] = capabilityFile;
+  deliveryCapabilityReady?.();
   await waitForBootstrapOperations(baseUrl, deliveryId);
   const afterRepair = await waitForOperationKind(baseUrl, deliveryId, "repair");
   const afterStaleEvidence = await waitForOperationCount(
@@ -902,12 +1292,13 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
     2,
   );
   expect(deliveryPromptCount).toBe(3);
-  expect(String(deliveryRevision)).toBe("worker-commit-3");
+  expect(deliveryRevisions).toHaveLength(3);
+  expect(String(deliveryRevision)).toBe(deliveryRevisions[2]!);
   expect(
     afterStaleEvidence
       .filter(({ kind }) => kind === "continue")
       .map(({ candidateRevision }) => candidateRevision),
-  ).toEqual([null, "worker-commit-2"]);
+  ).toEqual([null as string | null, deliveryRevisions[1]!]);
   expect(
     afterRepair.find(({ kind }) => kind === "repair")?.directive,
   ).toContain("ci / required");
@@ -1002,14 +1393,14 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   expect(deliveryPullRequest).toMatchObject({
     number: 52,
     html_url: "https://github.com/acme/demo/pull/52",
-    head: { ref: deliveryBranchName, sha: "worker-commit-3" },
+    head: { ref: deliveryBranchName, sha: deliveryRevisions[2] },
     base: { ref: "main" },
   });
   const integrateOperation = deliveryOperations.find(
     ({ kind }) => kind === "integrate",
   );
   expect(integrateOperation).toMatchObject({
-    candidateRevision: "worker-commit-3",
+    candidateRevision: deliveryRevisions[2],
     outcome: {
       kind: "observed",
       result: "accepted",
@@ -1040,7 +1431,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
 
   // The registered PR with the wrong head SHA also cannot conclude.
   deliveryPullRequestUrl = "https://github.com/acme/demo/pull/52";
-  deliveryPullRequestHeadSha = "worker-commit-1";
+  deliveryPullRequestHeadSha = deliveryRevisions[0]!;
   const staleHead = await fetch(
     `${baseUrl}/api/commissions/${deliveryId}/reconcile`,
     { method: "POST", headers, body: "{}" },
@@ -1052,7 +1443,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   deliveryMerged = true;
   const delivered = await waitForLifecycle(baseUrl, deliveryId, "concluded");
   expect(delivered["deliveryEvidence"]).toMatchObject({
-    revision: "worker-commit-3",
+    revision: deliveryRevisions[2],
     repository: "https://github.com/acme/demo",
     integrationTarget: "main",
     providerIdentity: "https://github.com/acme/demo/pull/52",
