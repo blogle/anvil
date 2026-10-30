@@ -86,6 +86,24 @@ function git(arguments_: readonly string[], cwd?: string) {
   };
 }
 
+async function gitProcess(
+  arguments_: readonly string[],
+  environment: Record<string, string>,
+) {
+  const child = Bun.spawn(["git", ...arguments_], {
+    cwd: process.cwd(),
+    env: environment,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { exitCode, stdout: stdout.trim(), stderr };
+}
+
 async function serveGitBackend(
   request: Request,
   projectRoot: string,
@@ -361,6 +379,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   const deliveryRevisions: string[] = [];
   let deliveryBareRepository: string | null = null;
   let deliveryPushEnvironment: Record<string, string> | null = null;
+  let deliveryPushArguments: readonly string[] | null = null;
   let deliveryWorkerRepository: string | null = null;
   let deliveryCapabilityReady: (() => void) | undefined;
   const deliveryCapabilityGate = new Promise<void>((resolve) => {
@@ -564,23 +583,22 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
             throw new Error(
               "Fixture helper did not return the scoped Git credential",
             );
-          const push = Bun.spawnSync(
-            [
-              "git",
-              "-C",
-              deliveryWorkerRepository!,
-              "push",
-              "origin",
-              `HEAD:refs/heads/${deliveryBranchName}`,
-            ],
-            {
-              env: { ...process.env, ...deliveryPushEnvironment! },
-              stdout: "pipe",
-              stderr: "pipe",
-            },
-          );
+          if (deliveryPushArguments === null)
+            throw new Error("Delivery Git push command was not configured");
+          const push = await gitProcess(deliveryPushArguments, {
+            ...(process.env as Record<string, string>),
+            ...deliveryPushEnvironment!,
+          });
           if (push.exitCode !== 0)
-            throw new Error(`Candidate push failed: ${push.stderr.toString()}`);
+            throw new Error(`Candidate push failed: ${push.stderr}`);
+          const receiverRevision = git([
+            "--git-dir",
+            deliveryBareRepository!,
+            "rev-parse",
+            `refs/heads/${deliveryBranchName}`,
+          ]).stdout;
+          if (receiverRevision !== deliveryRevision)
+            throw new Error("Pushed Candidate does not match the bare Git ref");
           const reportedRevision =
             deliveryPromptCount === 2
               ? deliveryRevisions[0]!
@@ -1258,18 +1276,22 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_CONFIG_GLOBAL: "/dev/null",
   };
-  deliveryPushEnvironment["ANVIL_GIT_CAPABILITY_FILE"] = join(
-    directory,
-    "absent-capability",
-  );
-  const deniedPush = git([
+  const absentCapabilityFile = join(directory, "absent-capability");
+  deliveryPushEnvironment["ANVIL_GIT_CAPABILITY_FILE"] = absentCapabilityFile;
+  deliveryPushArguments = [
     "-C",
     deliveryWorkerRepository,
     "push",
     "origin",
     `HEAD:${deliveryTargetRef}`,
-  ]);
+  ];
+  const deniedPush = await gitProcess(deliveryPushArguments, {
+    ...(process.env as Record<string, string>),
+    ...deliveryPushEnvironment,
+  });
   expect(deniedPush.exitCode).not.toBe(0);
+  expect(deniedPush.stderr).toContain("ENOENT");
+  expect(deniedPush.stderr).toContain(absentCapabilityFile);
   const absentCandidate = git([
     "--git-dir",
     deliveryBareRepository,
