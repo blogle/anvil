@@ -413,6 +413,11 @@
               ${pkgs.nix}/bin/nix ${image} ${imageClosure}/store-paths \
               ${runtimeManifest} ${preflight}/bin/anvil-verify-worker-store-closure
           '';
+          signatureProof = pkgs.writeShellScriptBin "anvil-sandbox-worker-store-signature-proof" ''
+            exec ${bun}/bin/bun ${./.}/scripts/prove-sandbox-worker-store-signatures.ts \
+              ${pkgs.nix}/bin/nix ${self.packages.${system}.sandboxWorkerClosureManifest} \
+              ${runtimeManifest} ${preflight}/bin/anvil-verify-worker-store-closure
+          '';
         in {
           docs = {
             type = "app";
@@ -421,6 +426,10 @@
           sandboxWorkerStoreSeed = {
             type = "app";
             program = "${seedProof}/bin/anvil-sandbox-worker-store-seed-proof";
+          };
+          sandboxWorkerStoreSignatures = {
+            type = "app";
+            program = "${signatureProof}/bin/anvil-sandbox-worker-store-signature-proof";
           };
         });
 
