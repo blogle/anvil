@@ -419,6 +419,31 @@ export function buildSandboxResource(
       spec: {
         initContainers: [
           {
+            name: "verify-worker-store-closure",
+            image: intent.imageDigest,
+            command: ["/bin/anvil-verify-worker-store-closure"],
+            args: [
+              "daemon",
+              "/etc/anvil/worker-image-closure.paths",
+              "/run/anvil/shared-nix/store",
+              "/bin/nix",
+            ],
+            volumeMounts: [
+              {
+                name: "shared-nix",
+                mountPath: "/run/anvil/shared-nix/store",
+                subPath: "store",
+                readOnly: true,
+              },
+              {
+                name: "shared-nix",
+                mountPath: "/nix/var/nix/daemon-socket",
+                subPath: "var/nix/daemon-socket",
+                readOnly: true,
+              },
+            ],
+          },
+          {
             name: "initialize-workspace",
             image: intent.imageDigest,
             command: ["/bin/bash", "-c"],

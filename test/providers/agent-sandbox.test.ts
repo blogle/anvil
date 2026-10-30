@@ -190,6 +190,7 @@ test("Sandbox resource contract creates a namespaced agent-sandbox with persiste
   const spec = manifest["spec"] as Record<string, unknown>;
   const template = spec["podTemplate"] as Record<string, unknown>;
   const podSpec = template["spec"] as Record<string, unknown>;
+  const initContainers = podSpec["initContainers"] as Record<string, unknown>[];
   const container = (podSpec["containers"] as Record<string, unknown>[])[0]!;
   expect(manifest).toMatchObject({
     apiVersion: "agents.x-k8s.io/v1beta1",
@@ -201,6 +202,43 @@ test("Sandbox resource contract creates a namespaced agent-sandbox with persiste
     spec: { service: true },
   });
   expect(metadata["name"]).toBe(sandboxName(intent.commissionId));
+  expect(initContainers.map(({ name }) => name)).toEqual([
+    "verify-worker-store-closure",
+    "initialize-workspace",
+  ]);
+  expect(initContainers[0]).toMatchObject({
+    image: intent.imageDigest,
+    command: ["/bin/anvil-verify-worker-store-closure"],
+    args: [
+      "daemon",
+      "/etc/anvil/worker-image-closure.paths",
+      "/run/anvil/shared-nix/store",
+      "/bin/nix",
+    ],
+  });
+  const preflightMounts = initContainers[0]?.["volumeMounts"] as Record<
+    string,
+    unknown
+  >[];
+  expect(preflightMounts).toContainEqual({
+    name: "shared-nix",
+    mountPath: "/run/anvil/shared-nix/store",
+    subPath: "store",
+    readOnly: true,
+  });
+  expect(preflightMounts).toContainEqual({
+    name: "shared-nix",
+    mountPath: "/nix/var/nix/daemon-socket",
+    subPath: "var/nix/daemon-socket",
+    readOnly: true,
+  });
+  expect(
+    preflightMounts.some(({ mountPath }) => mountPath === "/nix/store"),
+  ).toBe(false);
+  expect(initContainers[1]).toMatchObject({
+    name: "initialize-workspace",
+    securityContext: { runAsUser: 0, runAsGroup: 0 },
+  });
   expect(spec["volumeClaimTemplates"]).toMatchObject([
     {
       metadata: { name: "workspace" },

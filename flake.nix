@@ -134,6 +134,7 @@
               pkgs.gitMinimal
               pkgs.gnugrep
               pkgs.gnused
+              pkgs.nix
               pkgs.ripgrep
             ];
             pathsToLink = [ "/bin" ];
@@ -148,6 +149,93 @@
             printf '%s\n' 'anvil:x:1000:1000:Anvil worker:/home/anvil:/bin/bash' > "$out/etc/passwd"
             printf '%s\n' 'anvil:x:1000:' > "$out/etc/group"
             chmod 0444 "$out/etc/passwd" "$out/etc/group"
+          '';
+          workerRuntimeClosure = pkgs.closureInfo {
+            rootPaths = [
+              workerTools
+              workerWritablePaths
+              workerIdentity
+              workerEntrypoint
+              pkgs.opencode
+              pkgs.cacert
+            ];
+          };
+          workerClosureManifest = pkgs.runCommand "anvil-sandbox-worker-closure-manifest" { } ''
+            cp ${workerRuntimeClosure}/store-paths "$out"
+            chmod 0444 "$out"
+          '';
+          workerStorePreflight = pkgs.runCommand "anvil-sandbox-worker-store-preflight" { } ''
+            manifest_sha256="$(${pkgs.coreutils}/bin/sha256sum ${workerClosureManifest} | ${pkgs.coreutils}/bin/cut -d ' ' -f 1)"
+            mkdir -p "$out/bin"
+            printf '#!%s\nexpected_manifest_sha256="%s"\n' \
+              "${pkgs.bash}/bin/bash" "$manifest_sha256" > "$out/bin/anvil-verify-worker-store-closure"
+            cat >> "$out/bin/anvil-verify-worker-store-closure" <<'EOF'
+            set -euo pipefail
+
+            store_uri="''${1:-daemon}"
+            manifest="''${2:-/etc/anvil/worker-image-closure.paths}"
+            shared_store_root="''${3:-/run/anvil/shared-nix/store}"
+            nix_executable="''${4:-/bin/nix}"
+            if [ ! -d "$shared_store_root" ] || [ ! -r "$shared_store_root" ]; then
+              printf '%s\n' "shared Nix store mount is unavailable" >&2
+              exit 78
+            fi
+            if [ ! -r "$manifest" ]; then
+              printf '%s\n' "worker closure manifest is unavailable" >&2
+              exit 78
+            fi
+            actual_manifest_sha256="$("${pkgs.coreutils}/bin/sha256sum" "$manifest" | "${pkgs.coreutils}/bin/cut" -d ' ' -f 1)"
+            if [ "$actual_manifest_sha256" != "$expected_manifest_sha256" ]; then
+              printf '%s\n' "BLOCKED: worker closure manifest does not match the image-pinned digest" >&2
+              exit 78
+            fi
+            mapfile -t required_paths < "$manifest"
+            if [ "''${#required_paths[@]}" -eq 0 ]; then
+              printf '%s\n' "worker closure manifest is empty" >&2
+              exit 78
+            fi
+            for store_path in "''${required_paths[@]}"; do
+              case "$store_path" in
+                /nix/store/*) ;;
+                *)
+                  printf '%s\n' "worker closure manifest contains a non-store path" >&2
+                  exit 78
+                  ;;
+              esac
+            done
+
+            preflight_home="$("${pkgs.coreutils}/bin/mktemp" -d "''${TMPDIR:-/tmp}/anvil-store-preflight.XXXXXX")"
+            trap '"${pkgs.coreutils}/bin/rm" -rf "$preflight_home"' EXIT
+            export HOME="$preflight_home"
+            export XDG_CACHE_HOME="$HOME/.cache"
+            export XDG_CONFIG_HOME="$HOME/.config"
+            export XDG_DATA_HOME="$HOME/.local/share"
+            export XDG_STATE_HOME="$HOME/.local/state"
+            "${pkgs.coreutils}/bin/mkdir" -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
+
+            if ! "$nix_executable" --offline path-info --store "$store_uri" \
+              "''${required_paths[@]}" >/dev/null 2>&1; then
+              printf '%s\n' "BLOCKED: required worker closure paths are missing or unregistered" >&2
+              exit 78
+            fi
+            if ! "$nix_executable" --offline store verify --store "$store_uri" \
+              --no-trust "''${required_paths[@]}" >/dev/null 2>&1; then
+              printf '%s\n' "BLOCKED: shared Nix store failed content verification for the worker closure" >&2
+              exit 78
+            fi
+            printf 'worker shared-store preflight passed (%s paths)\n' "''${#required_paths[@]}"
+            EOF
+            chmod 0555 "$out/bin/anvil-verify-worker-store-closure"
+          '';
+          workerPreflightRoot = pkgs.buildEnv {
+            name = "anvil-sandbox-worker-preflight-command";
+            paths = [ workerStorePreflight ];
+            pathsToLink = [ "/bin" ];
+          };
+          workerClosureManifestRoot = pkgs.runCommand "anvil-sandbox-worker-closure-manifest-root" { } ''
+            mkdir -p "$out/etc/anvil"
+            cp ${workerClosureManifest} "$out/etc/anvil/worker-image-closure.paths"
+            chmod 0444 "$out/etc/anvil/worker-image-closure.paths"
           '';
           workerEntrypoint = pkgs.writeShellScriptBin "anvil-opencode-server" ''
             set -euo pipefail
@@ -214,14 +302,28 @@
               comment = "Non-root OpenCode server entrypoint";
             };
           };
+          workerPreflightLayer = nix2containerPackage.buildLayer {
+            deps = [ workerPreflightRoot workerStorePreflight ];
+            metadata = {
+              created_by = "Anvil sandbox worker runtime";
+              comment = "Fail-closed shared-store closure preflight";
+            };
+          };
           sandboxWorkerImage = nix2containerPackage.buildImage {
             name = "anvil-sandbox-worker";
             tag = "opencode-${pkgs.opencode.version}";
-            copyToRoot = [ workerTools workerWritablePaths workerIdentity ];
+            copyToRoot = [
+              workerTools
+              workerPreflightRoot
+              workerWritablePaths
+              workerIdentity
+              workerClosureManifestRoot
+            ];
             layers = [
               workerToolsLayer
               workerOpenCodeLayer
               workerEntrypointLayer
+              workerPreflightLayer
             ];
             perms = [
               {
@@ -254,8 +356,16 @@
               WorkingDir = "/home/anvil/workspace";
             };
           };
+          sandboxWorkerStorePreflight = workerStorePreflight;
+          sandboxWorkerClosureManifest = workerClosureManifest;
         in {
-          inherit daemon opencodeRuntime sandboxWorkerImage;
+          inherit
+            daemon
+            opencodeRuntime
+            sandboxWorkerImage
+            sandboxWorkerStorePreflight
+            sandboxWorkerClosureManifest
+            ;
           sdlc = sdlc.packages.${system}.sdlc;
           nix-eval-jobs = sdlc.packages.${system}.nix-eval-jobs;
         });
@@ -266,9 +376,12 @@
           bun = import ./nix/bun.nix { inherit pkgs; };
           image = self.packages.${system}.sandboxWorkerImage;
           imageClosure = pkgs.closureInfo { rootPaths = [ image ]; };
+          runtimeManifest = self.packages.${system}.sandboxWorkerClosureManifest;
+          preflight = self.packages.${system}.sandboxWorkerStorePreflight;
           seedProof = pkgs.writeShellScriptBin "anvil-sandbox-worker-store-seed-proof" ''
             exec ${bun}/bin/bun ${./.}/scripts/prove-sandbox-worker-store-seed.ts \
-              ${pkgs.nix}/bin/nix ${image} ${imageClosure}/store-paths
+              ${pkgs.nix}/bin/nix ${image} ${imageClosure}/store-paths \
+              ${runtimeManifest} ${preflight}/bin/anvil-verify-worker-store-closure
           '';
         in {
           docs = {

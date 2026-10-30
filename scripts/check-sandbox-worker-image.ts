@@ -6,6 +6,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { buildSandboxResource } from "../src/providers/agent-sandbox";
@@ -67,9 +68,18 @@ const workerIdentityPath = closurePaths.find((path) =>
 const workerToolsPath = closurePaths.find((path) =>
   path.includes("anvil-sandbox-worker-tools"),
 );
+const preflightPath = closurePaths.find((path) =>
+  path.includes("anvil-sandbox-worker-store-preflight"),
+);
+const closureManifestRoot = closurePaths.find((path) =>
+  path.includes("anvil-sandbox-worker-closure-manifest-root"),
+);
 assert(
-  workerIdentityPath !== undefined && workerToolsPath !== undefined,
-  "worker identity or tools are absent from the image closure",
+  workerIdentityPath !== undefined &&
+    workerToolsPath !== undefined &&
+    preflightPath !== undefined &&
+    closureManifestRoot !== undefined,
+  "worker identity, tools, preflight, or closure manifest are absent from the image closure",
 );
 const identityLayerPath = imageLayers
   .flatMap((layerValue) => array(record(layerValue)?.["paths"]))
@@ -110,6 +120,35 @@ assert(
     ),
   "OCI layer does not carry non-root writable HOME/workspace and sticky TMPDIR permissions",
 );
+const preflightText = readFileSync(
+  join(preflightPath, "bin/anvil-verify-worker-store-closure"),
+  "utf8",
+);
+const runtimeManifestBytes = readFileSync(
+  join(closureManifestRoot, "etc/anvil/worker-image-closure.paths"),
+);
+const runtimeManifestHash = createHash("sha256")
+  .update(runtimeManifestBytes)
+  .digest("hex");
+assert(
+  preflightText.includes(runtimeManifestHash) &&
+    preflightText.includes("path-info") &&
+    preflightText.includes("store verify") &&
+    preflightText.includes("manifest does not match"),
+  "preflight does not pin the image-specific closure manifest and verify registered content",
+);
+const rootLayerPaths = imageLayers.flatMap((layerValue) =>
+  array(record(layerValue)?.["paths"]).map(record),
+);
+for (const rootLayerPath of [
+  workerIdentityPath,
+  workerToolsPath,
+  closureManifestRoot,
+])
+  assert(
+    rootLayerPaths.some((entry) => entry?.["path"] === rootLayerPath),
+    `image root layer omits ${basename(rootLayerPath)}`,
+  );
 assert(
   readFileSync(join(workerIdentityPath, "etc/passwd"), "utf8").includes(
     "anvil:x:1000:1000:",
@@ -188,6 +227,11 @@ assert(
   sandboxContainer !== undefined && sandboxContainer !== null,
   "Sandbox container is missing",
 );
+const expectedSandboxImage = `registry.invalid/worker@sha256:${"a".repeat(64)}`;
+assert(
+  sandboxContainer["image"] === expectedSandboxImage,
+  "main container does not use the preflighted immutable Sandbox image",
+);
 const mounts = array(sandboxContainer["volumeMounts"]).map(record);
 const sharedStoreMount = mounts.find(
   (mount) => mount?.["mountPath"] === "/nix/store",
@@ -200,14 +244,39 @@ assert(
 );
 
 const initContainers = array(podSpec["initContainers"]).map(record);
-const initPopulatesSharedStore = initContainers.some((container) =>
-  array(container?.["volumeMounts"]).some(
-    (mountValue) => record(mountValue)?.["name"] === "shared-nix",
-  ),
+const preflightInit = initContainers[0];
+const workspaceInit = initContainers[1];
+const preflightMounts = array(preflightInit?.["volumeMounts"]).map(record);
+const preflightStoreMount = preflightMounts.find(
+  (mount) => mount?.["mountPath"] === "/run/anvil/shared-nix/store",
+);
+const preflightSocketMount = preflightMounts.find(
+  (mount) => mount?.["mountPath"] === "/nix/var/nix/daemon-socket",
 );
 assert(
-  !initPopulatesSharedStore,
-  "Sandbox spec changed to mount shared Nix in init; review whether closure is guaranteed",
+  preflightInit?.["name"] === "verify-worker-store-closure" &&
+    preflightInit["image"] === expectedSandboxImage &&
+    array(preflightInit["command"]).includes(
+      "/bin/anvil-verify-worker-store-closure",
+    ) &&
+    JSON.stringify(array(preflightInit["args"])) ===
+      JSON.stringify([
+        "daemon",
+        "/etc/anvil/worker-image-closure.paths",
+        "/run/anvil/shared-nix/store",
+        "/bin/nix",
+      ]) &&
+    preflightStoreMount?.["name"] === "shared-nix" &&
+    preflightStoreMount["subPath"] === "store" &&
+    preflightStoreMount["readOnly"] === true &&
+    preflightSocketMount?.["name"] === "shared-nix" &&
+    !preflightMounts.some((mount) => mount?.["mountPath"] === "/nix/store") &&
+    workspaceInit?.["name"] === "initialize-workspace",
+  "Sandbox preflight ordering or distinct read-only shared-store/socket mounts are not fail-closed",
+);
+assert(
+  mounts.some((mount) => mount?.["mountPath"] === "/nix/store"),
+  "main Sandbox container no longer exposes the current shared-store overlay",
 );
 
 const runtimeStoreRelativePath = openCodePath.replace(/^\/nix\/store\//, "");
@@ -244,7 +313,7 @@ try {
     !existsSync(overlaidExecutable),
     "empty shared-store overlay unexpectedly exposes the baked OpenCode path",
   );
-  const blockedReason = `BLOCKED/INCOMPATIBLE: current Sandbox mounts shared-nix subPath store over /nix/store, no init contract guarantees ${basename(openCodePath)} exists there, and an empty-volume overlay hides the baked executable`;
+  const blockedReason = `BLOCKED/INCOMPATIBLE: the preflight rejects missing ${basename(openCodePath)} paths, but no pre-provision contract guarantees the required closure is present; the main Sandbox mount overlays /nix/store and an empty-volume overlay hides the baked executable`;
   console.log(blockedReason);
   throw new Error(blockedReason);
 } finally {
