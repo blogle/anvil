@@ -2,6 +2,10 @@ import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import type {
+  DecisionHistoryEntry,
+  ReconciliationRecord,
+} from "../operational";
 import {
   isCommissionProposal,
   isDomainTransition,
@@ -51,8 +55,17 @@ const migrationList = [
       "utf8",
     ),
   },
+  {
+    version: 5,
+    sql: readFileSync(
+      fileURLToPath(
+        new URL("./migrations/0005_operational_views.sql", import.meta.url),
+      ),
+      "utf8",
+    ),
+  },
 ] as const;
-const latestSchemaVersion = 4;
+const latestSchemaVersion = 5;
 const commissionColumns = [
   "id",
   "campaign_id",
@@ -387,6 +400,90 @@ export class CommissionStore {
         outcome: operationOutcome(row),
       } satisfies Operation;
     });
+  }
+
+  reconciliation(commissionId: string): ReconciliationRecord | null {
+    const row = this.#database
+      .query("SELECT payload FROM reconciliation_views WHERE commission_id = ?")
+      .get(commissionId) as { payload: string } | null;
+    return row === null
+      ? null
+      : (JSON.parse(row.payload) as ReconciliationRecord);
+  }
+
+  decisionHistory(
+    commissionId: string,
+    beforeSequence?: number,
+  ): readonly DecisionHistoryEntry[] {
+    const rows = this.#database
+      .query(
+        "SELECT sequence, commission_version, recorded_at, result FROM decision_history WHERE commission_id = ? AND sequence < ? ORDER BY sequence DESC LIMIT 100",
+      )
+      .all(commissionId, beforeSequence ?? Number.MAX_SAFE_INTEGER) as {
+      sequence: number;
+      commission_version: number;
+      recorded_at: number;
+      result: string;
+    }[];
+    return rows.map((row) => ({
+      sequence: row.sequence,
+      commissionVersion: row.commission_version,
+      recordedAt: row.recorded_at,
+      result: JSON.parse(row.result) as ReconciliationRecord["result"],
+    }));
+  }
+
+  recordReconciliation(
+    commissionId: string,
+    record: ReconciliationRecord,
+  ): boolean {
+    // A late completion must never overwrite a newer controller's projection.
+    // This derived record is deliberately separate from Commission versioning:
+    // healthy polling still performs zero authoritative Commission UPDATEs.
+    let recorded = false;
+    this.#database
+      .transaction(() => {
+        const current = this.get(commissionId);
+        if (current === null || current.version !== record.commissionVersion)
+          return;
+        const previous = this.reconciliation(commissionId);
+        if (previous !== null && previous.recordedAt > record.recordedAt)
+          return;
+        if (JSON.stringify(previous) === JSON.stringify(record)) {
+          recorded = true;
+          return;
+        }
+        const result = JSON.stringify(record.result);
+        if (
+          previous === null ||
+          JSON.stringify(previous.result) !== result ||
+          previous.commissionVersion !== record.commissionVersion
+        ) {
+          this.#database
+            .query(
+              "INSERT INTO decision_history(commission_id, commission_version, recorded_at, result) VALUES (?, ?, ?, ?)",
+            )
+            .run(
+              commissionId,
+              record.commissionVersion,
+              record.recordedAt,
+              result,
+            );
+        }
+        this.#database
+          .query(
+            "INSERT INTO reconciliation_views(commission_id, commission_version, recorded_at, payload) VALUES (?, ?, ?, ?) ON CONFLICT(commission_id) DO UPDATE SET commission_version = excluded.commission_version, recorded_at = excluded.recorded_at, payload = excluded.payload",
+          )
+          .run(
+            commissionId,
+            record.commissionVersion,
+            record.recordedAt,
+            JSON.stringify(record),
+          );
+        recorded = true;
+      })
+      .immediate();
+    return recorded;
   }
 
   propose(proposal: Proposal): StoreResult<void> {

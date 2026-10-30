@@ -7,6 +7,8 @@ import type { ApplicationService, ApplicationError } from "./application";
 import type { CommissionProposalInput, Policy } from "./domain";
 import type { CommissionStore } from "./persistence/sqlite";
 import type { WorkerGitCredentialService } from "./providers/git-credentials";
+import { projectCommission } from "./operational";
+import { resolve } from "node:path";
 
 export type DaemonConfig = Readonly<{
   bearerToken: string;
@@ -20,6 +22,7 @@ export type DaemonDependencies = Readonly<{
   policy: Policy;
   now?: () => number;
   gitCredentialService?: WorkerGitCredentialService;
+  uiDirectory?: string;
 }>;
 
 const obligationSchema = z
@@ -71,6 +74,18 @@ export function createDaemonApp(dependencies: DaemonDependencies): Hono {
   const now = dependencies.now ?? Date.now;
   const sessions = new Map<string, McpSession>();
   const app = new Hono();
+  const projection = (id: string) => {
+    const commission = store.get(id);
+    return commission === null
+      ? null
+      : projectCommission(
+          commission,
+          store.operations(id),
+          store.reconciliation(id),
+          now(),
+          dependencies.policy,
+        );
+  };
   const authenticate = async (
     request: Request,
   ): Promise<Response | undefined> => {
@@ -106,6 +121,7 @@ export function createDaemonApp(dependencies: DaemonDependencies): Hono {
   });
 
   app.use("/api/*", async (context, next) => {
+    context.header("Cache-Control", "no-store");
     const rejected = await authenticate(context.req.raw);
     if (rejected !== undefined) return rejected;
     await next();
@@ -138,6 +154,31 @@ export function createDaemonApp(dependencies: DaemonDependencies): Hono {
     if (store.get(id) === null)
       return context.json({ error: "not_found" }, 404);
     return context.json({ operations: store.operations(id) });
+  });
+  app.get("/api/commissions/:id/projection", (context) => {
+    const view = projection(context.req.param("id"));
+    return view === null
+      ? context.json({ error: "not_found" }, 404)
+      : context.json(view);
+  });
+  app.get("/api/commissions/:id/history", (context) => {
+    const id = context.req.param("id");
+    if (store.get(id) === null)
+      return context.json({ error: "not_found" }, 404);
+    const cursor = context.req.query("before");
+    if (
+      cursor !== undefined &&
+      (!/^\d+$/.test(cursor) ||
+        !Number.isSafeInteger(Number(cursor)) ||
+        Number(cursor) < 1)
+    )
+      return context.json({ error: "invalid_cursor" }, 400);
+    return context.json({
+      history: store.decisionHistory(
+        id,
+        cursor === undefined ? undefined : Number(cursor),
+      ),
+    });
   });
   app.post("/api/commissions/:id/admit", async (context) => {
     const result = await application.admit(
@@ -214,6 +255,36 @@ export function createDaemonApp(dependencies: DaemonDependencies): Hono {
     return session.transport.handleRequest(raw);
   });
 
+  if (dependencies.uiDirectory !== undefined) {
+    const root = resolve(dependencies.uiDirectory);
+    const uiHeaders = {
+      "Cache-Control": "no-cache",
+      "X-Content-Type-Options": "nosniff",
+      "Content-Security-Policy":
+        "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+    };
+    app.get("/assets/:file", async (context) => {
+      const name = context.req.param("file");
+      if (!/^[a-zA-Z0-9_-]+\.(js|css)$/.test(name)) return context.notFound();
+      const file = Bun.file(resolve(root, "assets", name));
+      return (await file.exists())
+        ? new Response(file, { headers: uiHeaders })
+        : context.notFound();
+    });
+    for (const route of ["/", "/inbox/:id", "/campaigns", "/operations"]) {
+      app.get(
+        route,
+        () =>
+          new Response(Bun.file(resolve(root, "index.html")), {
+            headers: {
+              ...uiHeaders,
+              "Content-Type": "text/html; charset=utf-8",
+            },
+          }),
+      );
+    }
+  }
+
   app.onError((error, context) => {
     console.error(
       JSON.stringify({ event: "http_request_failed", message: error.message }),
@@ -261,6 +332,45 @@ async function createMcpSession(
           : { commission, operations: store.operations(commissionId) },
       );
     },
+  );
+  server.registerTool(
+    "get_commission_projection",
+    {
+      description:
+        "Read durable provider observations, freshness, evidence, acceptance gaps and pending Operations. This is not a new provider poll.",
+      inputSchema: { commissionId: z.string().min(1) },
+    },
+    async ({ commissionId }) => {
+      const commission = store.get(commissionId);
+      return text(
+        commission === null
+          ? { error: "not_found" }
+          : projectCommission(
+              commission,
+              store.operations(commissionId),
+              store.reconciliation(commissionId),
+              now(),
+              dependencies.policy,
+            ),
+      );
+    },
+  );
+  server.registerTool(
+    "get_history",
+    {
+      description:
+        "Read up to 100 durable reconciliation decisions or errors, newest first; paginate using the last sequence.",
+      inputSchema: {
+        commissionId: z.string().min(1),
+        before: z.number().int().positive().optional(),
+      },
+    },
+    async ({ commissionId, before }) =>
+      text(
+        store.get(commissionId) === null
+          ? { error: "not_found" }
+          : { history: store.decisionHistory(commissionId, before) },
+      ),
   );
   server.registerTool(
     "admit_commission",

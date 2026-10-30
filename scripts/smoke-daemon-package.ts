@@ -109,6 +109,40 @@ try {
   );
   daemon = startDaemon();
   await waitUntilReady();
+  const ui = await fetch(baseUrl);
+  assert(
+    ui.ok && ui.headers.get("content-type")?.includes("text/html"),
+    "packaged daemon did not serve its built UI",
+  );
+  assert(
+    ui.headers
+      .get("content-security-policy")
+      ?.includes("frame-ancestors 'none'"),
+    "UI lacks its frame isolation policy",
+  );
+  const html = await ui.text();
+  const asset = html.match(/src="(\/assets\/[a-zA-Z0-9_-]+\.js)"/)?.[1];
+  assert(
+    asset !== undefined,
+    "UI HTML does not reference the built JavaScript asset",
+  );
+  const javascript = await fetch(`${baseUrl}${asset}`);
+  assert(
+    javascript.ok && (await javascript.text()).includes("Controller decision"),
+    "built operational UI asset is unavailable",
+  );
+  assert(
+    (await fetch(`${baseUrl}/api/commissions`)).status === 401,
+    "static UI accidentally bypasses API authentication",
+  );
+  assert(
+    (await fetch(`${baseUrl}/assets/package.json`)).status === 404,
+    "static handler exposes non-asset files",
+  );
+  assert(
+    (await fetch(`${baseUrl}/api/unknown`)).status === 401,
+    "API fallback bypasses authentication",
+  );
   const createCommission = await fetch(`${baseUrl}/api/commissions`, {
     method: "POST",
     headers: {
@@ -144,7 +178,7 @@ try {
   );
   const initialFacts = databaseFacts();
   assert(
-    initialFacts.migrationVersion === 4,
+    initialFacts.migrationVersion === 5,
     "SQLite schema migrations did not reach the current version",
   );
   assert(
@@ -174,7 +208,7 @@ try {
   );
   await stopDaemon();
   console.log(
-    "packaged daemon smoke passed: health, readiness, SQLite, SIGTERM, restart",
+    "packaged daemon smoke passed: built UI/assets, auth, health, readiness, SQLite, SIGTERM, restart",
   );
 } finally {
   await stopDaemon();

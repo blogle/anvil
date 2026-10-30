@@ -35,7 +35,7 @@ function openStore(): CommissionStore {
 
 test("runs versioned schema migrations once and reopens the normalized Commission projection", () => {
   const repository = openStore();
-  expect(repository.migrationVersion()).toBe(4);
+  expect(repository.migrationVersion()).toBe(5);
   expect(repository.propose(proposal())).toEqual({
     ok: true,
     value: undefined,
@@ -44,7 +44,7 @@ test("runs versioned schema migrations once and reopens the normalized Commissio
   store = undefined;
 
   const reopened = openStore();
-  expect(reopened.migrationVersion()).toBe(4);
+  expect(reopened.migrationVersion()).toBe(5);
   expect(reopened.get("commission-1")).toEqual(proposal().commission);
   expect(reopened.operations("commission-1")).toEqual([]);
 });
@@ -157,7 +157,7 @@ test("versioned migrations preserve an existing version one Operation journal", 
   legacy.close();
 
   const upgraded = openStore();
-  expect(upgraded.migrationVersion()).toBe(4);
+  expect(upgraded.migrationVersion()).toBe(5);
   const probe = new Database(path);
   const migratedRows = probe
     .query("SELECT id, commission_id FROM operations")

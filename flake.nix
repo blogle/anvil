@@ -95,6 +95,25 @@
           bun = import ./nix/bun.nix { inherit pkgs; };
           bun2nixPackage = bun2nix.packages.${system}.default;
           nix2containerPackage = nix2container.packages.${system}.nix2container;
+          ui = pkgs.stdenvNoCC.mkDerivation {
+            pname = "anvil-ui";
+            version = "0.1.0";
+            src = ./.;
+            nativeBuildInputs = [ bun bun2nixPackage bun2nixPackage.hook ];
+            bunDeps = bun2nixPackage.fetchBunDeps { bunNix = ./bun.nix; };
+            bunInstallFlags = [ "--linker=hoisted" "--backend=copyfile" ];
+            dontUseBunBuild = true;
+            dontUseBunCheck = true;
+            buildPhase = ''
+              runHook preBuild
+              bun run ui:build
+              runHook postBuild
+            '';
+            installPhase = ''
+              mkdir -p "$out"
+              cp -R dist/ui/. "$out/"
+            '';
+          };
           daemon = pkgs.stdenvNoCC.mkDerivation {
             pname = "anvil-daemon";
             version = "0.1.0";
@@ -105,7 +124,7 @@
               bun2nixPackage.hook
             ];
             bunDeps = bun2nixPackage.fetchBunDeps { bunNix = ./bun.nix; };
-            bunInstallFlags = [ "--linker=hoisted" "--backend=copyfile" ];
+            bunInstallFlags = [ "--production" "--linker=hoisted" "--backend=copyfile" ];
             dontUseBunBuild = true;
             dontUseBunCheck = true;
             installPhase = ''
@@ -114,8 +133,10 @@
               cp -R src "$out/lib/anvil/src"
               cp package.json "$out/lib/anvil/package.json"
               cp -R node_modules "$out/lib/anvil/node_modules"
+              cp -R ${ui} "$out/lib/anvil/ui"
               cat > "$out/bin/anvil-daemon" <<EOF
               #!${pkgs.runtimeShell}
+              export ANVIL_UI_DIRECTORY="$out/lib/anvil/ui"
               exec ${bun}/bin/bun run "$out/lib/anvil/src/main.ts" "\$@"
               EOF
               chmod 0555 "$out/bin/anvil-daemon"
@@ -391,6 +412,7 @@
         in {
           inherit
             daemon
+            ui
             opencodeRuntime
             sandboxWorkerImage
             sandboxWorkerStorePreflight

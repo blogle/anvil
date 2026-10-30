@@ -14,6 +14,7 @@ import {
   type Result,
 } from "./domain";
 import { CommissionStore, type StoreError } from "./persistence/sqlite";
+import type { ReconciliationRecord } from "./operational";
 
 export type ProviderFailure = Readonly<{
   kind: "unavailable" | "acknowledgement_lost" | "rejected";
@@ -334,6 +335,39 @@ export class ApplicationService {
     commissionId: string,
     now: number,
   ): Promise<Result<ReconcileResult, ApplicationError>> {
+    const before = this.#store.get(commissionId);
+    let observation: ReconciliationRecord["observation"] = null;
+    const result = await this.#reconcile(
+      commissionId,
+      now,
+      (commission, value) => {
+        observation = {
+          commissionVersion: commission.version,
+          specificationGeneration: commission.specificationGeneration,
+          value,
+        };
+      },
+    );
+    const version = result.ok
+      ? result.value.commission.version
+      : before?.version;
+    if (version !== undefined)
+      this.#store.recordReconciliation(commissionId, {
+        commissionVersion: version,
+        recordedAt: this.#now?.() ?? now,
+        observation,
+        result: result.ok
+          ? { kind: "decision", decision: result.value.decision }
+          : { kind: "error", error: result.error },
+      });
+    return result;
+  }
+
+  async #reconcile(
+    commissionId: string,
+    now: number,
+    onObservation: (commission: Commission, observation: Observation) => void,
+  ): Promise<Result<ReconcileResult, ApplicationError>> {
     for (let conflict = 0; conflict < 3; conflict += 1) {
       const loaded = this.#load(commissionId);
       if (!loaded.ok) return loaded;
@@ -372,6 +406,7 @@ export class ApplicationService {
       const parsed = observationSchema.safeParse(rawObservation.value);
       if (!parsed.success)
         return { ok: false, error: { kind: "invalid_provider_observation" } };
+      onObservation(current, parsed.data);
       // Observation may have waited on several remote providers. Its starting
       // Lease is not authority to write after that I/O completes.
       now = this.#now?.() ?? now;

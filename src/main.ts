@@ -105,6 +105,9 @@ const app = createDaemonApp({
   config: { bearerToken, principalId: operatorId },
   policy,
   ...(gitCredentialService === undefined ? {} : { gitCredentialService }),
+  ...(process.env["ANVIL_UI_DIRECTORY"] === undefined
+    ? {}
+    : { uiDirectory: process.env["ANVIL_UI_DIRECTORY"] }),
 });
 const port = Number(process.env["PORT"] ?? "8080");
 const server = Bun.serve({ port, fetch: app.fetch });

@@ -1558,6 +1558,43 @@ export function evolveOperation(
   if (JSON.stringify(operation.outcome) === JSON.stringify(outcome)) {
     return ok(transition(current.version, current));
   }
+  if (outcome.kind === "submitted") {
+    // Prepared intent reserves budget; it does not grant permanent permission
+    // to execute after a hold, amendment, Candidate change or deadline. Outcome
+    // inspection/recording below remains possible after any of these changes.
+    if (operation.kind !== "interrupt" && current.lifecycle !== "active")
+      return err("invalid_lifecycle");
+    if (operation.specificationGeneration !== current.specificationGeneration)
+      return err("stale_generation");
+    const active = activeAttempt(current);
+    const original = current.attempts.find(
+      ({ id }) => id === operation.attemptId,
+    );
+    const strategyReplacement =
+      operation.kind === "change_strategy" &&
+      original?.lifecycle === "superseded" &&
+      active?.ordinal === original.ordinal + 1;
+    if (
+      active === null ||
+      active.assignmentId !== operation.assignmentId ||
+      (operation.attemptId !== active.id && !strategyReplacement)
+    )
+      return err("invalid_operation_transition");
+    if (
+      operation.candidateRevision !== null &&
+      operation.candidateRevision !== current.candidateRevision
+    )
+      return err("invalid_operation_transition");
+    if (
+      operation.kind !== "interrupt" &&
+      (now >= current.budget.limits.deadlineAt ||
+        current.budget.used.costMicros >= current.budget.limits.maxCostMicros ||
+        current.budget.used.instructions >
+          current.budget.limits.maxInstructions ||
+        current.budget.used.repairs > current.budget.limits.maxRepairs)
+    )
+      return err("budget_exhausted");
+  }
   if (!validOperationOutcome(outcome, now)) return err("invalid_observation");
   if (!allowedOutcome(operation.outcome, outcome))
     return err("invalid_operation_transition");
@@ -1968,6 +2005,25 @@ function observationValidFor(
       return false;
   }
   return true;
+}
+
+export function acceptanceGaps(
+  commission: Commission,
+  now: number,
+  checks: CheckObservation | null,
+): readonly string[] {
+  return commission.obligations
+    .filter(
+      (obligation) =>
+        !obligationSatisfied(
+          commission,
+          obligation,
+          commission.candidateRevision,
+          now,
+          checks,
+        ),
+    )
+    .map(({ id }) => id);
 }
 
 function obligationsSatisfied(

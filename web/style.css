@@ -1,0 +1,273 @@
+@import "tailwindcss";
+@theme {
+  --color-mud: #211c18;
+  --color-panel: #302922;
+  --color-line: #51483b;
+  --color-stone: #d7cebf;
+  --color-wheat: #d9bc82;
+}
+:root {
+  color: var(--color-stone);
+  background: var(--color-mud);
+  font:
+    14px/1.5 system-ui,
+    sans-serif;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+h1,
+h2 {
+  color: #e7dbc6;
+  font-family: Georgia, serif;
+  font-weight: 500;
+}
+h1 {
+  font-size: 2rem;
+  margin: 0.2rem 0 1rem;
+}
+h2 {
+  font-size: 1.35rem;
+}
+h3 {
+  font-weight: 650;
+  margin-bottom: 0.6rem;
+}
+a {
+  color: var(--color-wheat);
+  text-underline-offset: 3px;
+}
+header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 1rem 1.4rem;
+  border-bottom: 1px solid var(--color-line);
+}
+header > span {
+  flex: 1;
+  color: #a99d8e;
+}
+.brand {
+  font:
+    700 1rem Georgia,
+    serif;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--color-wheat);
+}
+.frame {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr);
+  min-height: calc(100vh - 72px);
+}
+nav {
+  padding: 1rem;
+  border-right: 1px solid var(--color-line);
+  background: #26211c;
+}
+nav a {
+  display: block;
+  padding: 0.6rem;
+  margin: 0.2rem 0;
+  border-radius: 4px;
+}
+nav a:hover {
+  background: var(--color-panel);
+}
+main {
+  min-width: 0;
+  padding: 1.2rem;
+}
+.workspace {
+  min-width: 0;
+}
+.with-inspector {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 43%);
+  gap: 1rem;
+  align-items: start;
+}
+.primary,
+aside {
+  min-width: 0;
+  padding: 1rem;
+  border: 1px solid #463c31;
+  border-radius: 7px;
+  background: #28231e;
+}
+.primary {
+  min-height: 75vh;
+}
+aside {
+  resize: horizontal;
+  overflow: auto;
+  max-width: 100%;
+}
+.eyebrow {
+  color: #bba675;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  margin-bottom: 0.5rem;
+}
+.muted,
+small {
+  color: #a99d8e;
+  font-size: 0.8rem;
+}
+small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.toolbar,
+.tabs {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin: 0.8rem 0;
+  align-items: end;
+}
+.tabs {
+  border-bottom: 1px solid var(--color-line);
+  padding-bottom: 0.7rem;
+}
+[aria-selected="true"] {
+  color: var(--color-wheat);
+  border-color: var(--color-wheat);
+}
+.field {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0.8rem 0;
+}
+input,
+select,
+textarea {
+  display: block;
+  width: 100%;
+  border: 1px solid #574b3c;
+  border-radius: 4px;
+  background: #211d19;
+  color: #e4d8c6;
+  padding: 0.55rem;
+}
+input:focus,
+textarea:focus,
+select:focus {
+  outline: 2px solid var(--color-wheat);
+  outline-offset: 1px;
+}
+.commission-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(100px, 0.5fr);
+  gap: 0.7rem;
+  border-bottom: 1px solid #41372e;
+  padding: 0.9rem 0.4rem;
+  text-decoration: none;
+  color: inherit;
+}
+.commission-row:hover {
+  background: #332b23;
+}
+.commission-row strong {
+  color: #e2d5c0;
+}
+.state {
+  display: inline-block;
+  border: 1px solid #66563d;
+  border-radius: 20px;
+  padding: 0.15rem 0.5rem;
+  color: #dac38e;
+  font-size: 0.75rem;
+}
+.state.held {
+  color: #e2b08c;
+  border-color: #825c42;
+}
+.state.concluded {
+  color: #c3cda9;
+  border-color: #58644e;
+}
+.panel {
+  padding: 0.8rem;
+  border: 1px solid #483e33;
+  border-radius: 5px;
+  margin: 0.8rem 0;
+  background: #2d2721;
+}
+.decision {
+  border-left: 2px solid var(--color-wheat);
+}
+.evidence {
+  padding: 0.6rem 0;
+  border-top: 1px solid #483e33;
+}
+.notice,
+[role="alert"] {
+  padding: 0.7rem;
+  border-left: 2px solid #b69b64;
+  background: #332b21;
+  color: #e0c98f;
+  margin: 0.8rem 0;
+}
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font:
+    0.75rem/1.5 ui-monospace,
+    monospace;
+  max-height: 35rem;
+  overflow: auto;
+}
+.empty {
+  padding: 2rem 0;
+  color: #a99d8e;
+}
+.login {
+  max-width: 540px;
+  margin: 10vh auto;
+}
+.back {
+  display: block;
+  margin-bottom: 0.8rem;
+}
+@media (max-width: 1050px) {
+  .with-inspector {
+    display: block;
+  }
+  .with-inspector > .primary {
+    display: none;
+  }
+  aside {
+    resize: none;
+  }
+}
+@media (max-width: 700px) {
+  .frame {
+    display: block;
+  }
+  nav {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    border-bottom: 1px solid var(--color-line);
+    padding: 0.4rem;
+  }
+  nav p {
+    display: none;
+  }
+  header {
+    flex-wrap: wrap;
+    padding: 0.8rem;
+  }
+  main {
+    padding: 0.6rem;
+  }
+  .commission-row {
+    grid-template-columns: 1fr;
+  }
+}

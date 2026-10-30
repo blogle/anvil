@@ -16,8 +16,8 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 | FS-08 | IN_PROGRESS | `src/providers/opencode.ts` extracts visible assistant text; `src/providers/composition.ts` accepts only explicit obligation claims that state the exact currently observed Candidate SHA. Continue/Repair directives specify that contract; worker claims remain non-independent. The configured daemon test autonomously drives Continue→failing required check→Repair→stale worker-claim rejection→Continue→stale-check Wait→pending-check Wait→Integrate→queue wait→Conclude across restart. Its delivery worker fixture now creates commits and publishes them through the real Git credential helper into a local bare HTTP receiver; the GitHub branch adapter reads that receiver ref with `git rev-parse`. Remaining: actual Sandbox helper/capability bootstrap, pinned deployed OpenCode compatibility, randomized SSE loss/order/restart and broader tool-boundary/context traces. |
 | FS-09 | IMPLEMENTED_UNVERIFIED | `test/daemon-configured-process.test.ts` “configured Bun daemon composes local HTTP providers and recovers bindings without replay” exercises actual Bun child + SQLite + Sandbox/OpenCode/GitHub/Mergify HTTP services. After persisted Workspace and Session Operations, its fixture writes an Assignment-scoped capability with mode 0600. A missing capability causes `git push` to fail; the bare ref remains absent and GitHub branch GET returns 404. The worker then creates and pushes actual Git commits via `src/providers/git-credentials.ts`; GitHub branch GET derives the observed SHA from bare-repository `git rev-parse`. The daemon drives failing required CI→Repair→stale worker claim rejection→new pushed Candidate→stale-check Wait→pending-check Wait→restart→pass→PR #52→queue Wait→foreign PR Escalate→wrong-head non-conclusion→Conclude. The first PR create loses its ack; remote re-observation records one create. Assertions include three delivery prompts, two Continue, one Repair, one Integrate and one PR create. Git commits/pushes and branch observation are now real local process/HTTP fixture effects; Sandbox/OpenCode provisioning, CI/check results, PR creation/observation, Mergify queue/merge remain local fixtures. Local Lease expiry cannot be advanced via the daemon test port; randomized/multiprocess crash ordering remains. |
 | FS-10 | IN_PROGRESS | `src/providers/git-credentials.ts` reuses the GitHubAppBroker `contents:write` profile, signs Commission/Assignment/Attempt/Session/Workspace/repo/ref/controller-epoch/expiry claims, provides `/v1/git/credentials` and the Bun helper. `ApplicationService.authorizeWorkerGitCapability` checks active Commission/Attempt, exact Assignment and persisted provision/Session Operations, canonical repository/ref, owner epoch and live unexpired Lease on every issuance. `test/providers/git-credentials.test.ts` launches actual `git credential fill` and `git push` from a separate Git process through Hono and local GitHub App/Git HTTP fixtures; the resulting commit SHA is verified in a real bare repo via `git rev-parse`, and wrong/multi-ref pushes are rejected by the fixture's pre-receive branch rule. It also denies other repository/Commission/Assignment/Attempt/Session/Workspace/controller epoch/ref, stale/expired Lease, expired capability, held/concluded Commission, and unauthorized `gh` purpose; tests token refresh, service+SQLite restart, 0600 capability file, and secret redaction. Local ref enforcement here is receiver branch-policy fixture evidence, not a controller proxy. Limit: Git credential fill returns an extractable repository-wide token until provider expiry. Missing: actual Sandbox capability/helper bootstrap and live provider validation. |
-| FS-11 | IN_PROGRESS | Bun daemon `src/main.ts`; authenticated Hono HTTP/Streamable MCP `src/daemon.ts`; SQLite migrations/scheduler and opt-in provider factory `src/providers/runtime.ts`. `/v1/git/credentials` is capability-authenticated, not protected by the operator API token, and delegates current owner/session checks to ApplicationService. Configured process trace covers delivery through Conclude. Remaining Campaign/Assignment/Attempt/evidence/Findings/history/steer projections/tools, full command/auth parity, actual capability bootstrap into Sandbox and deployment hardening. MCP session is volatile across restart. |
-| FS-12 | NOT_STARTED | `docs/review-mockups.html` is static only; no React/Vite/TanStack/Tailwind operational UI, authenticated API integration, component/browser tests, or screenshots against daemon. |
+| FS-11 | IN_PROGRESS | Bun daemon `src/main.ts`; authenticated Hono HTTP/Streamable MCP `src/daemon.ts`; SQLite migrations/scheduler and configured provider factory. Schema v5 durable operational projection and paginated decision/error history are shared by HTTP and MCP (`test/operational.test.ts`); evidence/attempt/pending Operation details are included. `/v1/git/credentials` uses Assignment capability authentication and ApplicationService authorization. Configured process trace covers delivery through Conclude. Remaining: Campaign graph/commands, full Assignment/Findings/steering surface, command audit, complete auth parity, real Sandbox capability bootstrap and deployment hardening. MCP sessions are volatile across restart. |
+| FS-12 | IN_PROGRESS | Actual React/Vite/TanStack Router+Query/Tailwind Ledger UI in `web/`; Nix `ui` artifact served by the packaged daemon. `test/ui.test.tsx` exercises authenticated data, hold/resume/amend and stale-generation rejection against real Hono/ApplicationService/SQLite; package smoke fetches actual compiled assets. Inbox filters and Commission decision/evidence/Operation/Finding-reference/history/Attempt views exist. Remaining: Campaign specification/graph, richer Findings/review/diff flows, serialized steering, external OpenCode/preview links, complete visual/accessibility/browser/screenshot review. This is operational partial implementation, not FS-12 acceptance. |
 | FS-13 | IN_PROGRESS | Implementation commit `cb65ebf` exposes `packages.x86_64-linux.daemon`; OpenCode runtime commit `2a18c16` (smoke corrections `4ac7fe4`, `1d8174a`) pins OpenCode 2.0.32. Sandbox image commit `6171c8c`, image guard `286535d`, isolated-store proof `3a4d3a3`, ordered preflight `1c6982c`, NAR comparison, temporary Unix-daemon/signature proof, and main-container socket isolation add a pinned nix2container worker image and NAR-checking preflight. Signed closure import/preflight pass locally; arbitrary untrusted `derivation add` remains BLOCKED, and preflight socket operations are not protocol-read-only. Sandbox overlay compatibility remains BLOCKED/INCOMPATIBLE and `sandboxImageGate` intentionally fails. No Sandbox seeding or runtime acceptance is claimed. |
 | FS-14 | IMPLEMENTED_UNVERIFIED | Read-only incumbent source inventory at `origin/main` SHA above. `docs/parity-matrix.md` records feature-by-feature source references, local rewrite state/gaps, and explicit cutover prohibition. Remaining runnable comparative scenarios and independent review; no evidence supports cutover. |
 | FS-15 | BLOCKED_EXTERNAL | Required separate authorized dotfiles deployment and isolated live namespace execution cannot be performed by this worker. No cluster/dotfiles actions taken. Preparatory runbook is at `docs/first-slice-live-acceptance-runbook.md`; it is not approval or acceptance evidence. Only independently authorized execution/review can move this status. |
@@ -135,8 +135,6 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 - The test runs real `git push` through the helper into a loopback `git-http-backend` bare repository and verifies the updated ref/SHA with `git rev-parse`. A receiver pre-receive hook rejects wrong and multi-ref updates. This is local branch-policy fixture evidence, not a deployed GitHub ruleset or an Anvil ref-enforcing proxy.
 - Limits: Git credential fill necessarily returns an extractable repo-wide installation token to that worker process until GitHub expires it; a signed target ref checks issuance but does not confine later token use. Protected branch rules protect only configured refs. The actual pushes use a loopback `git-http-backend` fixture with a local pre-receive hook, not live GitHub. The Sandbox has no capability-file bootstrap or bundled helper image yet. FS-10 remains IN_PROGRESS.
 
-## Next checkpoint
-
 ## Successor checkpoint — authority across asynchronous boundaries
 
 Successor branch `anvil/anvil-first-slice-completion-58824672` starts at the
@@ -166,4 +164,55 @@ with `git fetch origin` and `gh pr view 123`). The predecessor branch is preserv
   Lease reads cannot fence already accepted remote writes. No FS status is
   promoted and the image/shared-Nix failing gates are preserved.
 
-Next: bootstrap the helper and capability into the actual Sandbox contract without exposing the capability in prompt/environment/remote URLs. Decide whether repository branch protection suffices or a separate ref-restricting transport is needed. Build/inspect sandbox and daemon Nix artifacts locally afterward. FS-08/09 randomized/multiprocess traces, FS-11 projections, FS-12 UI and FS-14 parity remain. FS-15 stays BLOCKED_EXTERNAL. No current local subgate requires live K8s; do not request or perform deployment yet, and do not claim LOCAL_SLICE_READY.
+## Successor checkpoint — operational Ledger and submission preconditions
+
+- Schema v5 (`src/persistence/migrations/0005_operational_views.sql`) retains the
+  last provider observation/result and changed-decision/error history. Generation,
+  state version, timestamps and sources remain inspectable; stale-version or
+  reordered records cannot overwrite newer views. Polling does not increment the
+  Commission version or append duplicate history. These derived records are not
+  another Operation journal and are not dispatch/acceptance inputs.
+- `src/operational.ts` and domain-owned `acceptanceGaps` provide read-only views;
+  HTTP `/api/commissions/:id/projection`, paginated `/history`, MCP
+  `get_commission_projection` and `get_history` use the same source. Existing
+  Commission/Operation endpoints retain their contracts.
+- Real operational UI in `web/` uses authenticated same-origin daemon data and
+  typed hold/resume/amend commands, with an in-memory token and no mock telemetry.
+  Campaign grouping, missing steering/preview links and unavailable metrics are
+  labeled. `test/ui.test.tsx` uses React component interactions through real
+  Hono/ApplicationService/SQLite; it is not a rendered-browser/screenshot review.
+- New source-review finding: persisted prepared/retry intent previously retained
+  submission permission after an operator hold, changed generation/Candidate,
+  inactive Attempt or exhausted deadline/cost. `evolveOperation` now revalidates
+  these preconditions for submission while allowing inspection/outcome recording.
+  `test/submission-preconditions.test.ts` includes durable held-prepared→resume
+  execution with zero effects while held and one original-ID dispatch on resume;
+  it also preserves the final reserved instruction at the exact instruction limit.
+  Invalidated prepared intent fails closed; governed cancellation/replacement of
+  that intent is still an open recovery gap.
+- `nix develop -c just check` passed: **105 tests / 1251 assertions**, locked
+  dependencies/drift-negative probe, formatting and strict TypeScript.
+- `nix develop -c just ci-verify` passed (the Nix-sandboxed full TypeScript/test
+  derivation); `nix run .#sdlc -- install --check` passed.
+- `nix develop -c just ci-check` **failed**, exit 1, at the retained
+  `sandboxImageGate`: `PASS IMAGE-CONTENT` then `BLOCKED/INCOMPATIBLE` because no
+  pre-provision contract guarantees the closure before the shared `/nix/store`
+  overlay. The signature/derivation-add security finding is also still open.
+- `nix build .#ui .#daemon .#checks.x86_64-linux.daemonSmoke --no-link -L`
+  passed after an initial dependency-fetch command exceeded its 120s tool timeout
+  and was rerun with 300s. Current inspected outputs were
+  `/nix/store/8h062ddhvy39cl4avn7hwfa3mvdi4syf-anvil-ui-0.1.0` and
+  `/nix/store/wmm97skz24c9v3rjw85vl8j0lhb2qq4d-anvil-daemon-0.1.0` (subsequent
+  source/document changes may change input-addressed store paths). The daemon
+  installs production dependencies only and embeds the built UI. Non-root smoke
+  verifies built HTML/JS, CSP, denied unauthenticated API, no non-asset file exposure,
+  health/readiness, schema v5, SIGTERM and SQLite restart persistence. No OCI
+  daemon/UI image, read-only-container process or Kubernetes execution is claimed.
+
+## Remaining local work / stopping status
+
+This session has not reached `LOCAL_SLICE_READY`. No complete FS-01–FS-14
+obligation is promoted to VERIFIED from these narrower checks. See
+[the successor handoff](first-slice-successor-handoff.md) for the exact remaining
+work and why a deployment acceptance request is not yet executable. FS-15 remains
+`BLOCKED_EXTERNAL`; unresolved local implementation is not an external blocker.
