@@ -373,6 +373,65 @@ export class AgentSandboxClient {
   }
 }
 
+const nixDaemonSocketSubPath = "var/nix/daemon-socket/socket";
+
+function isPathPrefix(
+  prefix: readonly string[],
+  path: readonly string[],
+): boolean {
+  return (
+    prefix.length <= path.length &&
+    prefix.every((segment, index) => segment === path[index])
+  );
+}
+
+export function assertOpenCodeCannotMountSharedNixDaemonSocket(
+  volumes: readonly Readonly<Record<string, unknown>>[],
+  volumeMounts: readonly Readonly<Record<string, unknown>>[],
+  sharedNixClaim: string,
+): void {
+  const sharedNixVolumeNames = new Set(
+    volumes.flatMap((volume) => {
+      const claim = volume["persistentVolumeClaim"] as
+        | Readonly<Record<string, unknown>>
+        | undefined;
+      const name = volume["name"];
+      return claim?.["claimName"] === sharedNixClaim && typeof name === "string"
+        ? [name]
+        : [];
+    }),
+  );
+  const socketPath = nixDaemonSocketSubPath.split("/");
+  for (const mount of volumeMounts) {
+    if (
+      typeof mount["name"] !== "string" ||
+      !sharedNixVolumeNames.has(mount["name"])
+    )
+      continue;
+    if ("subPathExpr" in mount)
+      throw new Error(
+        "OpenCode main container cannot mount the shared Nix daemon socket",
+      );
+    const subPath = mount["subPath"];
+    if (typeof subPath !== "string")
+      throw new Error(
+        "OpenCode main container cannot mount the shared Nix daemon socket",
+      );
+    const sourcePath = subPath === "" ? [] : subPath.split("/");
+    if (
+      sourcePath.some(
+        (segment) =>
+          segment.length === 0 || segment === "." || segment === "..",
+      ) ||
+      isPathPrefix(sourcePath, socketPath) ||
+      isPathPrefix(socketPath, sourcePath)
+    )
+      throw new Error(
+        "OpenCode main container cannot mount the shared Nix daemon socket",
+      );
+  }
+}
+
 export function buildSandboxResource(
   intent: SandboxIntent,
   namespace: string,
@@ -491,12 +550,6 @@ export function buildSandboxResource(
                 subPath: "store",
                 readOnly: true,
               },
-              {
-                name: "shared-nix",
-                mountPath: "/nix/var/nix/daemon-socket",
-                subPath: "var/nix/daemon-socket",
-                readOnly: true,
-              },
             ],
           },
         ],
@@ -522,6 +575,16 @@ export function buildSandboxResource(
       },
     ],
   };
+  const mainContainer = spec.podTemplate.spec.containers[0];
+  if (mainContainer === undefined)
+    throw new Error(
+      "Sandbox PodTemplate is missing the OpenCode main container",
+    );
+  assertOpenCodeCannotMountSharedNixDaemonSocket(
+    spec.podTemplate.spec.volumes,
+    mainContainer.volumeMounts,
+    intent.sharedNixClaim,
+  );
   const specHash = createHash("sha256")
     .update(
       JSON.stringify({

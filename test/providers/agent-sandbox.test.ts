@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import {
   AgentSandboxClient,
+  assertOpenCodeCannotMountSharedNixDaemonSocket,
   buildSandboxResource,
   sandboxName,
   type SandboxIntent,
@@ -249,11 +250,37 @@ test("Sandbox resource contract creates a namespaced agent-sandbox with persiste
     },
   ]);
   const mounts = container["volumeMounts"] as Record<string, unknown>[];
+  expect(mounts).toContainEqual({
+    name: "workspace",
+    mountPath: "/home/anvil",
+  });
+  expect(mounts).toContainEqual({
+    name: "shared-profile",
+    mountPath: "/anvil/profile",
+  });
+  expect(mounts.filter(({ name }) => name === "shared-nix")).toEqual([
+    {
+      name: "shared-nix",
+      mountPath: "/nix/store",
+      subPath: "store",
+      readOnly: true,
+    },
+  ]);
+  expect(() =>
+    assertOpenCodeCannotMountSharedNixDaemonSocket(
+      podSpec["volumes"] as Record<string, unknown>[],
+      mounts,
+      intent.sharedNixClaim,
+    ),
+  ).not.toThrow();
   expect(
-    mounts
-      .filter(({ name }) => name === "shared-nix")
-      .every(({ readOnly }) => readOnly === true),
-  ).toBe(true);
+    mounts.some(
+      ({ mountPath }) =>
+        typeof mountPath === "string" &&
+        (mountPath === "/nix/var/nix/daemon-socket" ||
+          mountPath.startsWith("/nix/var/nix/daemon-socket/")),
+    ),
+  ).toBe(false);
   const environment = container["env"] as Record<string, unknown>[];
   expect(environment).toContainEqual({ name: "ANVIL_PROJECT", value: "anvil" });
   expect(environment).toContainEqual({ name: "ANVIL_REF", value: "main" });
@@ -288,6 +315,61 @@ test("Sandbox resource contract creates a namespaced agent-sandbox with persiste
       "anvil-test",
     ),
   ).toThrow("Anvil-owned runtime identity");
+});
+
+test("main-container socket guard rejects direct and parent shared-Nix mounts", () => {
+  const manifest = buildSandboxResource(intent, "anvil-test");
+  const spec = manifest["spec"] as Record<string, unknown>;
+  const template = spec["podTemplate"] as Record<string, unknown>;
+  const podSpec = template["spec"] as Record<string, unknown>;
+  const volumes = podSpec["volumes"] as Record<string, unknown>[];
+  const container = (podSpec["containers"] as Record<string, unknown>[])[0]!;
+  const safeMounts = container["volumeMounts"] as Record<string, unknown>[];
+
+  const directSocketMount = [
+    ...safeMounts,
+    {
+      name: "shared-nix",
+      mountPath: "/nix/var/nix/daemon-socket",
+      subPath: "var/nix/daemon-socket",
+      readOnly: true,
+    },
+  ];
+  expect(() =>
+    assertOpenCodeCannotMountSharedNixDaemonSocket(
+      volumes,
+      directSocketMount,
+      intent.sharedNixClaim,
+    ),
+  ).toThrow(
+    "OpenCode main container cannot mount the shared Nix daemon socket",
+  );
+
+  const aliasedParentVolume = [
+    ...volumes,
+    {
+      name: "shared-nix-parent",
+      persistentVolumeClaim: { claimName: intent.sharedNixClaim },
+    },
+  ];
+  const parentSocketMount = [
+    ...safeMounts,
+    {
+      name: "shared-nix-parent",
+      mountPath: "/nix/var/nix",
+      subPath: "var/nix",
+      readOnly: true,
+    },
+  ];
+  expect(() =>
+    assertOpenCodeCannotMountSharedNixDaemonSocket(
+      aliasedParentVolume,
+      parentSocketMount,
+      intent.sharedNixClaim,
+    ),
+  ).toThrow(
+    "OpenCode main container cannot mount the shared Nix daemon socket",
+  );
 });
 
 test("Agent Sandbox client creates, observes, suspends, resumes, and deletes only its own resource", async () => {
