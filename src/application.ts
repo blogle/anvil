@@ -2,6 +2,7 @@ import { z } from "zod";
 import {
   evolve,
   evolveOperation,
+  steeringBoundaryIsIdle,
   proposeCommission,
   type Commission,
   type CommissionProposalInput,
@@ -12,6 +13,7 @@ import {
   type OperationOutcome,
   type Policy,
   type Result,
+  type SteeringRequest,
 } from "./domain";
 import { CommissionStore, type StoreError } from "./persistence/sqlite";
 import type { ReconciliationRecord } from "./operational";
@@ -50,7 +52,7 @@ export interface AuthorizationPort {
     request: Readonly<{
       commissionId: string;
       principalId: string;
-      action: "admit" | "amend_specification";
+      action: "admit" | "amend_specification" | "steer";
     }>,
   ): Promise<boolean>;
 }
@@ -68,6 +70,7 @@ export interface ProviderPort {
     commission: Commission,
     operation: Operation,
     now: number,
+    authorizeEffect?: () => Promise<boolean>,
   ): Promise<ProviderResult<Exclude<OperationOutcome, { kind: "prepared" }>>>;
   inspectOperation(
     commission: Commission,
@@ -89,6 +92,16 @@ export type ReconcileResult = Readonly<{
   commission: Commission;
   decision: Decision | null;
 }>;
+
+export const steeringRequestSchema = z
+  .object({
+    idempotencyKey: z.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/),
+    assignmentId: z.string().min(1),
+    expectedVersion: z.number().int().nonnegative(),
+    expectedGeneration: z.number().int().positive(),
+    instruction: z.string().min(1).max(8000),
+  })
+  .strict() satisfies z.ZodType<SteeringRequest>;
 
 const ownerSchema = z
   .object({
@@ -331,6 +344,65 @@ export class ApplicationService {
     return this.#commit(transition.value);
   }
 
+  async steerAssignment(
+    commissionId: string,
+    principalId: string,
+    request: SteeringRequest,
+    now: number,
+  ): Promise<Result<Operation, ApplicationError>> {
+    if (
+      !(await this.#authorization.approve({
+        commissionId,
+        principalId,
+        action: "steer",
+      }))
+    )
+      return { ok: false, error: { kind: "unauthorized" } };
+    const parsed = steeringRequestSchema.safeParse(request);
+    if (!parsed.success)
+      return {
+        ok: false,
+        error: { kind: "domain", error: "invalid_steering" },
+      };
+    for (let conflict = 0; conflict < 2; conflict += 1) {
+      const current = this.#load(commissionId);
+      if (!current.ok) return current;
+      const lease = await this.#currentLease(
+        commissionId,
+        this.#now?.() ?? now,
+      );
+      if (!lease.ok) return lease;
+      now = this.#now?.() ?? now;
+      const result = evolve(current.value, {
+        kind: "steer",
+        actor: { kind: "approver", identity: principalId },
+        request: parsed.data,
+        operations: this.#store.operations(commissionId),
+        lease: lease.value,
+        now,
+      });
+      if (!result.ok)
+        return { ok: false, error: { kind: "domain", error: result.error } };
+      const committed = this.#commit(result.value);
+      if (
+        !committed.ok &&
+        committed.error.kind === "store" &&
+        committed.error.error === "conflict"
+      )
+        continue;
+      if (!committed.ok) return committed;
+      const operation = this.#store
+        .operations(commissionId)
+        .find(
+          (item) => item.steering?.idempotencyKey === request.idempotencyKey,
+        );
+      if (operation === undefined)
+        throw new Error("Committed steering has no Operation");
+      return { ok: true, value: operation };
+    }
+    return { ok: false, error: { kind: "store", error: "conflict" } };
+  }
+
   async reconcile(
     commissionId: string,
     now: number,
@@ -453,11 +525,29 @@ export class ApplicationService {
       const pending = operations.find(isPending);
       if (pending !== undefined) {
         if (pending.outcome.kind === "prepared") {
+          if (
+            pending.kind === "steer" &&
+            !steeringBoundaryIsIdle(pending, parsed.data, this.#policy, now)
+          ) {
+            return {
+              ok: true,
+              value: {
+                commission: current,
+                decision: {
+                  kind: "wait",
+                  reason:
+                    "Steering deferred until the bound Session is freshly observed idle; no interruption authorized",
+                  wake: { kind: "operation", operationId: pending.id },
+                },
+              },
+            };
+          }
           const dispatched = await this.#dispatchAndRecord(
             current,
             pending,
             lease.value,
             now,
+            parsed.data,
           );
           if (!dispatched.ok) return dispatched;
           return {
@@ -466,7 +556,7 @@ export class ApplicationService {
               commission: dispatched.value,
               decision: {
                 kind: "wait",
-                reason: "prepared Operation was submitted after restart",
+                reason: "prepared Operation was submitted",
                 wake: { kind: "operation", operationId: pending.id },
               },
             },
@@ -729,6 +819,7 @@ export class ApplicationService {
     operation: Operation,
     lease: LeaseGrant,
     now: number,
+    observation?: Observation,
   ): Promise<Result<Commission, ApplicationError>> {
     // Recheck immediately before persisting submission, including recovered
     // prepared Operations and provider-proven retries. CAS rejects a concurrent
@@ -746,6 +837,9 @@ export class ApplicationService {
       lease,
       { kind: "submitted", submittedAt: now },
       now,
+      observation === undefined
+        ? undefined
+        : { observation, policy: this.#policy },
     );
     if (!submitted.ok)
       return { ok: false, error: { kind: "domain", error: submitted.error } };
@@ -763,6 +857,28 @@ export class ApplicationService {
       submittedCommission,
       submittedOperation,
       now,
+      async () => {
+        // Providers with multi-request instructions must reauthorize immediately
+        // before the prompt, not reuse permission from before model/status I/O.
+        const grant = await this.#currentLease(
+          commission.id,
+          this.#now?.() ?? now,
+        );
+        if (!grant.ok) return false;
+        const latest = this.#store.get(commission.id);
+        if (latest === null || latest.version !== submittedCommission.version)
+          return false;
+        return evolveOperation(
+          latest,
+          operation,
+          grant.value,
+          { kind: "submitted", submittedAt: this.#now?.() ?? now },
+          this.#now?.() ?? now,
+          observation === undefined
+            ? undefined
+            : { observation, policy: this.#policy },
+        ).ok;
+      },
     );
     let outcome: OperationOutcome;
     if (dispatched.ok) {
@@ -786,9 +902,16 @@ export class ApplicationService {
     now = this.#now?.() ?? now;
     const outcomeLease = await this.#currentLease(commission.id, now);
     if (!outcomeLease.ok) return outcomeLease;
+    const latest = this.#load(commission.id);
+    if (!latest.ok) return latest;
+    const persisted = this.#store
+      .operations(commission.id)
+      .find(({ id }) => id === operation.id);
+    if (persisted === undefined)
+      return { ok: false, error: { kind: "not_found" } };
     const transition = evolveOperation(
-      submittedCommission,
-      submittedOperation,
+      latest.value,
+      persisted,
       outcomeLease.value,
       outcome,
       now,

@@ -180,6 +180,9 @@ export class FakeWorld implements LeasePort, ProviderPort, AuthorizationPort {
     };
 
     switch (operation.kind) {
+      case "steer":
+        this.executionKind = "running";
+        break;
       case "provision_sandbox":
       case "create_session":
       case "interrupt":

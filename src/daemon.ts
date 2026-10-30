@@ -4,6 +4,7 @@ import { timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import { z } from "zod";
 import type { ApplicationService, ApplicationError } from "./application";
+import { steeringRequestSchema } from "./application";
 import type { CommissionProposalInput, Policy } from "./domain";
 import type { CommissionStore } from "./persistence/sqlite";
 import type { WorkerGitCredentialService } from "./providers/git-credentials";
@@ -230,6 +231,21 @@ export function createDaemonApp(dependencies: DaemonDependencies): Hono {
     const result = await application.reconcile(context.req.param("id"), now());
     return result.ok ? context.json(result.value) : errorResponse(result.error);
   });
+  app.post("/api/commissions/:id/steer", async (context) => {
+    const body = steeringRequestSchema.safeParse(
+      await readJson(context.req.raw),
+    );
+    if (!body.success) return context.json({ error: "invalid_request" }, 400);
+    const result = await application.steerAssignment(
+      context.req.param("id"),
+      config.principalId,
+      body.data,
+      now(),
+    );
+    return result.ok
+      ? context.json({ operation: result.value }, 202)
+      : errorResponse(result.error);
+  });
   app.all("/mcp", async (context) => {
     const raw = context.req.raw;
     const method = await raw
@@ -438,6 +454,28 @@ async function createMcpSession(
     },
     async ({ commissionId }) =>
       text(await application.reconcile(commissionId, now())),
+  );
+  server.registerTool(
+    "steer_assignment",
+    {
+      description:
+        "Journal one governed implementation instruction for an existing Assignment. Deferred until idle; does not amend requirements. Retry the identical request/key to inspect the original Operation.",
+      inputSchema: z
+        .object({
+          commissionId: z.string().min(1),
+          ...steeringRequestSchema.shape,
+        })
+        .strict(),
+    },
+    async ({ commissionId, ...request }) =>
+      text(
+        await application.steerAssignment(
+          commissionId,
+          config.principalId,
+          request,
+          now(),
+        ),
+      ),
   );
 
   let transport: WebStandardStreamableHTTPServerTransport;

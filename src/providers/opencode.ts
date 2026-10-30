@@ -266,9 +266,10 @@ export class OpenCodeAdapter {
     sessionId: string,
     now: number,
     model: Readonly<{ providerId: string; modelId: string }>,
+    forceRefresh = false,
   ): Promise<ExecutionObservation> {
     const cached = this.#executionSnapshots.get(sessionId);
-    if (cached !== undefined && now < cached.refreshAfter)
+    if (!forceRefresh && cached !== undefined && now < cached.refreshAfter)
       return cached.observation;
     const observation = await this.#readExecution(sessionId, now, model);
     const snapshot = {
@@ -482,8 +483,10 @@ export class OpenCodeAdapter {
     sessionId: string,
     operation: Operation,
     model: Readonly<{ providerId: string; modelId: string }>,
+    authorizeEffect?: () => Promise<boolean>,
   ): Promise<ProviderResult<Readonly<{ messageId: string }>>> {
     if (
+      operation.kind !== "steer" &&
       operation.kind !== "continue" &&
       operation.kind !== "repair" &&
       operation.kind !== "refresh_context" &&
@@ -499,6 +502,38 @@ export class OpenCodeAdapter {
     }
     const id = openCodeMessageId(operation.id);
     const sessionPath = `api/session/${encodeURIComponent(sessionId)}`;
+    const steeringPermission = async (): Promise<ProviderResult<true>> => {
+      if (operation.kind !== "steer") return { ok: true, value: true };
+      const active = await this.activeSessions();
+      if (!active.ok) return active;
+      if (
+        operation.target !== `session:${sessionId}` ||
+        active.value.some(({ id }) => id === sessionId)
+      )
+        return {
+          ok: false,
+          error: {
+            kind: "rejected",
+            message:
+              "Steering boundary changed: bound OpenCode Session is not idle",
+          },
+        };
+      if (authorizeEffect === undefined || !(await authorizeEffect()))
+        return {
+          ok: false,
+          error: {
+            kind: "rejected",
+            message:
+              "Steering authority or submission preconditions changed before OpenCode effect",
+          },
+        };
+      return { ok: true, value: true };
+    };
+    const permitted = await steeringPermission();
+    if (!permitted.ok) return permitted;
+    // An accepted prompt can start work before a new event arrives. Never reuse
+    // a pre-dispatch idle cache entry to authorize another autonomous turn.
+    this.#executionSnapshots.delete(sessionId);
     const selected = await this.#request(`${sessionPath}/model`, {
       method: "POST",
       body: JSON.stringify({
@@ -507,6 +542,9 @@ export class OpenCodeAdapter {
       }),
     });
     if (!selected.ok) return selected;
+
+    const stillPermitted = await steeringPermission();
+    if (!stillPermitted.ok) return stillPermitted;
 
     const prompt = await this.#request(`${sessionPath}/prompt`, {
       method: "POST",
@@ -531,6 +569,7 @@ export class OpenCodeAdapter {
     observedAt = Date.now(),
   ): Promise<ProviderResult<Operation["outcome"] | null>> {
     if (
+      operation.kind !== "steer" &&
       operation.kind !== "continue" &&
       operation.kind !== "repair" &&
       operation.kind !== "refresh_context" &&

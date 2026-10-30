@@ -17,6 +17,7 @@ Maintain it under [repository-root PLANS.md](https://github.com/blogle/anvil/blo
 - [Deployment execution gate](#k8s_acceptance_request-not_executable)
 - [Prepared live acceptance sequence and evidence](#live-acceptance)
 - [Migration decisions, verification and outcome](#migration-checkpoint)
+- [Governed Assignment steering checkpoint](#governed-assignment-steering)
 
 No complete FS-01–FS-14 obligation is VERIFIED. **FS-15: BLOCKED_EXTERNAL**;
 **K8S_ACCEPTANCE_REQUEST: NOT_EXECUTABLE**. The `sandboxImageGate` still fails;
@@ -26,6 +27,9 @@ Historical checkpoint counts, findings and limitations below retain their origin
 scope and chronology; later evidence does not retroactively rewrite earlier results.
 In particular, the parity matrix contains stale rows (including Git/CI/provider
 handoff assessments); refreshing and independently comparing them remains work.
+Latest engineering progress is the [governed Assignment steering checkpoint](#governed-assignment-steering).
+Its local steering path supersedes the earlier missing-steering residual for this
+bounded interface; historical evidence and wider API/UI parity gaps remain.
 
 <a id="evidence-ledger"></a>
 ## Evidence ledger
@@ -721,3 +725,155 @@ validation, not new FS acceptance evidence:
 This documentation checkpoint does not establish `LOCAL_SLICE_READY`.
 Next controller turns should pursue the engineering milestones above and maintain
 this plan rather than repeat documentation migrations.
+
+<a id="governed-assignment-steering"></a>
+## Governed Assignment steering checkpoint — 2026-10-30
+
+**Implemented locally; checkpoint for independent controller review.** Baseline reconciled clean with
+draft PR #124 at `b0ef495bd8d601ed58d7f087dd7f2e02feaee807`; predecessor PR #123
+`f6723b79d5a938a86c6770660969a1298abde148` remains preserved. Operator authorized
+one bounded engineering checkpoint for FS-03/04/08/11/12; FS criteria and statuses
+remain unchanged. No live provider, cluster, dotfiles, merge/release or cutover
+actions are authorized. FS-15 is `BLOCKED_EXTERNAL` and
+K8S_ACCEPTANCE_REQUEST is `NOT_EXECUTABLE`.
+
+### Design decisions and concrete progress
+
+- `src/domain.ts` admits a typed, approved `steer` intent against the existing
+  active Assignment/Attempt and its durably recorded Session, exact Commission
+  version/specification generation, current controller Lease and remaining budget.
+  It reserves one instruction and advances its sequence without changing scope,
+  policy, evidence or Attempt identity. Immutable actor/request metadata lives on
+  the Operation; there is no second mutation journal or unjournaled prompt path.
+- The existing Operation table gains `steer` and immutable JSON request metadata
+  via ordered migration `0006_assignment_steering.sql`. SQLite CAS, original
+  Operation identity/owner, prepared/submitted/ambiguous/observed outcomes and
+  message-ID reobservation remain authoritative. A single pending intent is the
+  bounded contract: distinct requests are rejected while any Operation is
+  unresolved, while identical retries return the original record. Conflicting
+  reuse of a key fails; worker JSON cannot inject acceptance/specification fields.
+- `ApplicationService.steerAssignment` is the one HTTP/MCP authorization path.
+  It journals only; reconciliation dispatches after a fresh bound-Session idle
+  observation. A running turn remains deferred even if it reports `safeBoundary`;
+  steering never interrupts an active tool. Submission CAS arbitrates concurrent
+  requests/autonomous observation, and Lease authority is rechecked around I/O.
+- `ProviderComposition` and `OpenCodeAdapter` dispatch/inspect steering through
+  the existing instruction/message-ID protocol. They verify the exact Session,
+  bypass pending-steering execution caches, invalidate snapshots on prompts and
+  journal-version changes, and recheck active state and application authority
+  before model selection and prompt submission. This also prevents another
+  composition instance from using pre-steer idle cache to authorize Continue.
+- HTTP `POST /api/commissions/:id/steer`, MCP `steer_assignment`, and authenticated
+  `steeringCommands` projections expose the same durable intent/audit/disposition.
+  Ledger Overview provides the active Assignment form, version/generation,
+  in-memory retry key, visible typed rejection and durable actor/time/target/status.
+  A dropped HTTP response can be retried with the identical key; no automatic
+  silent rebase/resubmission occurs after stale generation/CAS errors. Ledger
+  styling and both prototype screens are retained. Stable interface/procedures
+  are maintained in `docs/operations.md#governed-assignment-steering`.
+
+### Findings and bounded limitations
+
+- Found that the prior five-second execution cache could retain an idle snapshot
+  across a newly accepted prompt. Cleared on prompt dispatch and refreshed on
+  journal-version changes, including another composition instance's dispatch.
+- Found that outcome recording against the pre-dispatch Commission version lost
+  a known rejection when a hold arrived during model I/O. Recording now reloads
+  current state and the original journal row under current Lease/CAS; the hold is
+  preserved and the rejected intent remains inspectable. This does not fence a
+  prompt already accepted by an external provider.
+- If authority expires after submission and no message can be observed, the
+  original submitted identity stays unresolved: absence is not safe retry proof.
+  Invalidated prepared intents (amendment, deadline/budget, inactive Assignment)
+  fail closed. Governed cancellation/replacement remains an open recovery gap.
+- Accepted commands have durable attribution and provider disposition; rejected
+  admissions do not create an audit record. This is one authenticated configured
+  operator identity, not a new multi-principal identity/role system. Generalized
+  command audit, browser/screenshot/accessibility review, actual Kubernetes Lease,
+  exclusive Workspace/verifier isolation, and live OpenCode compatibility remain
+  unverified. No whole FS obligation is promoted.
+
+### Executed verification and outcome
+
+- Initial `nix develop -c just typecheck` exited 2 because FakeWorld's exhaustive
+  Operation switch lacked `steer`; added the explicit fixture case. A subsequent
+  typecheck caught an optional audit-value assertion in the test, corrected with
+  its known admitted fixture value. No application failure was hidden.
+- `nix develop -c just fmt` and `nix develop -c just typecheck` — exit 0.
+- `nix develop -c bun test test/steering.test.ts test/steering-protocol.test.ts test/ui.test.tsx`
+  — exit 0: **16 tests / 209 assertions**. The 12 steering tests cover pure
+  scope/budget/identity invariants; running/stale/future/foreign-Session deferral;
+  SQLite reopen and lost-ack inspection/unknown absence; two SQLite writers and
+  identical/conflicting requests; steering during autonomous observation; held,
+  wrong-actor/forged payload/stale version/generation rejection; final reserved
+  instruction; deadline/Lease expiry; hold or new busy state during model I/O;
+  and cross-composition cache invalidation. Two protocol tests use an actual
+  loopback daemon HTTP server and MCP JSON-RPC with production provider composition
+  over local OpenCode/Sandbox fixtures. Two React integration tests use the real
+  authenticated Hono/ApplicationService/SQLite path, including dropped HTTP
+  response, retry-key preservation, audit/outcome and stale-generation errors.
+- Full first replay of `nix develop -c just check` — exit 0: **120 tests / 1371
+  assertions**, locked dependency install, generated-lock match/drift-negative,
+  formatting and strict TypeScript. `ci-verify`, SDLC install check and UI/daemon
+  builds/process smoke also exited 0; `ci-check` exited 1 at the preserved Sandbox
+  gate. Final review then removed the misleading “after restart” wording for a
+  newly queued Operation's submission and allowed reuse of the Assignment's
+  recorded Session across strategy Attempts (the steering Operation still binds
+  the current Attempt). The pure test now covers this reuse explicitly. Added no
+  permission to change Assignment, generation or Session identity.
+- Final prescribed replay on staged implementation sources (all new files
+  included by Nix):
+
+  | Exact command | Exit | Exact result / scope |
+  |---|---|---|
+  | `nix develop -c just check` | 0 | Locked install, deliberate lock-drift negative, formatting, strict TypeScript; **120 tests / 1372 assertions**, 21 files. |
+  | `nix develop -c just ci-verify` | 0 | Pinned full TypeScript/test derivation `/nix/store/vchhmnzgb3144ciw25msixvalrxg1wyg-anvil-typescript-check-0.1.0.drv`. |
+  | `nix run .#sdlc -- install --check` | 0 | `SDLC adapters match the locked contract`; fragment `.changes/assignment-steering.json` included. |
+  | `nix develop -c just ci-check` | 1 | Retained `sandboxImageGate` failure; no check disabled or marked green. |
+  | `nix build .#ui .#daemon .#checks.x86_64-linux.daemonSmoke --no-link -L` | 0 | UI 155 modules, embedded assets; non-root packaged daemon smoke verifies built UI/assets, auth, health/readiness, SQLite **schema v6**, SIGTERM and restart. |
+
+  Current inspected outputs were
+  `/nix/store/w52nczsacddpqhy09qnjwjwdpfwhyazg-anvil-ui-0.1.0` and
+  `/nix/store/a6r5b233vkwnfyb4yscccv9cm6yipazj-anvil-daemon-0.1.0`;
+  source/document changes can change input-addressed output paths. The final
+  local proof source snapshot was
+  `/nix/store/g8gnm54qzxkgpc9yzfaywimrxh0bgh9g-z5ya21hq1xa5zpa6c6zhv9r3agqq7hi0-source`.
+
+  The failing gate printed:
+
+  ```text
+  PASS IMAGE-CONTENT: 5 OCI layers and closure include OpenCode 2.0.32, Git, and the configured non-root entrypoint
+  BLOCKED/INCOMPATIBLE: the preflight rejects missing 9ysv2ynpka84idp745mcd8l0ayc2f102-opencode-2.0.32 paths, but no pre-provision contract guarantees the required closure is present; the main Sandbox mount overlays /nix/store and an empty-volume overlay hides the baked executable
+  ```
+
+- Tests demonstrate explicit provider POST counts and persisted journal/audit,
+  not only Decisions. Running/deferred and unauthorized/rejected paths submit
+  zero prompts; admitted idle steering and its concurrent/identical retries
+  produce exactly one. Lost-ack/restart inspection retains that one prompt and
+  original message ID; hidden/absent messages never produce a second submission.
+  Concluded rejection is covered in the pure domain; whole-process kill failpoints
+  and randomized steering/controller takeover schedules are not newly tested.
+  The steering-specific HTTP/MCP tests run Hono through a real loopback Bun HTTP
+  server, with explicit reconcile calls; they are not a new configured child-daemon
+  steering/process-kill acceptance trace. Existing child-daemon lifecycle tests
+  and packaged startup/restart smoke still pass.
+- Final read-only Bun assertion against `git show b0ef495:docs/plans/active/autonomous-first-slice.md`
+  compared all 15 complete `### FS-xx` sections and all 15 ID/status cells with the
+  working plan: exit 0, byte-identical criteria/statuses and unchanged
+  NOT_EXECUTABLE deployment gate. `git diff --exit-code HEAD -- scripts/check-sandbox-worker-image.ts scripts/prove-sandbox-worker-store-signatures.ts`
+  exited 0 (the failing compatibility/security proofs are unchanged).
+  `git diff --check` and `git diff --cached --check` exited 0.
+
+This completes the requested bounded local implementation checkpoint, not
+`LOCAL_SLICE_READY` or independent acceptance. FS-03/04/08/11/12 gain steering
+evidence; every whole-FS status is retained. Acceptance evidence remains local
+fixtures/components and deterministic SQLite recovery, not live provider or
+browser acceptance. FS-15 remains `BLOCKED_EXTERNAL` and
+K8S_ACCEPTANCE_REQUEST remains `NOT_EXECUTABLE`. Sandbox image compatibility and
+the untrusted Nix protocol/derivation-add findings remain failed/open.
+
+Next action: independent controller review of this checkpoint and its fail-closed
+residuals, then separately steer the remaining local core work. Broader Campaign,
+Findings/review, provider bootstrap/Lease/Workspace, generalized command audit,
+governed invalidated-intent resolution and browser acceptance remain the gaps
+listed above; this checkpoint does not begin another implementation milestone.

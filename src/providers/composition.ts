@@ -40,6 +40,7 @@ export class ProviderComposition implements ProviderPort {
   readonly #config: ProviderCompositionConfig;
   readonly #bindings = new Map<string, RuntimeBinding>();
   readonly #openCodeAdapters = new Map<string, OpenCodeAdapter>();
+  readonly #executionVersions = new Map<string, number>();
   readonly #executionListeners = new Set<(commissionId: string) => void>();
   readonly #executionWatchers = new Map<
     string,
@@ -87,6 +88,7 @@ export class ProviderComposition implements ProviderPort {
     );
     if (sandboxOperation === null) {
       this.#bindings.delete(commission.id);
+      this.#executionVersions.delete(commission.id);
       return {
         ok: true,
         value: {
@@ -194,7 +196,17 @@ export class ProviderComposition implements ProviderPort {
     );
     const execution = await this.#openCode(
       sandboxResourceName,
-    ).observeExecution(openCodeSessionId, now, this.#config.model);
+    ).observeExecution(
+      openCodeSessionId,
+      now,
+      this.#config.model,
+      this.#executionVersions.get(commission.id) !== commission.version ||
+        operations.some(
+          (operation) =>
+            operation.kind === "steer" && operation.outcome.kind === "prepared",
+        ),
+    );
+    this.#executionVersions.set(commission.id, commission.version);
     const messages =
       await this.#openCode(sandboxResourceName).messages(openCodeSessionId);
     if (!messages.ok) return messages;
@@ -222,6 +234,7 @@ export class ProviderComposition implements ProviderPort {
     commission: Commission,
     operation: Operation,
     now: number,
+    authorizeEffect?: () => Promise<boolean>,
   ): Promise<ProviderResult<Exclude<OperationOutcome, { kind: "prepared" }>>> {
     if (operation.kind === "provision_sandbox") {
       const result = await this.#config.sandbox.create(
@@ -288,6 +301,7 @@ export class ProviderComposition implements ProviderPort {
       };
     }
     if (
+      operation.kind === "steer" ||
       operation.kind === "continue" ||
       operation.kind === "repair" ||
       operation.kind === "refresh_context" ||
@@ -297,6 +311,13 @@ export class ProviderComposition implements ProviderPort {
       if (binding?.openCodeSessionId === null || binding === undefined)
         return rejected(
           "No observed OpenCode Session is bound to the Commission",
+        );
+      if (
+        operation.kind === "steer" &&
+        operation.target !== `session:${binding.openCodeSessionId}`
+      )
+        return rejected(
+          "Steering does not target the recorded OpenCode Session",
         );
       const instruction =
         operation.kind === "continue" || operation.kind === "repair"
@@ -310,6 +331,7 @@ export class ProviderComposition implements ProviderPort {
           binding.openCodeSessionId,
           instruction,
           this.#config.model,
+          authorizeEffect,
         )
         .then((result) =>
           result.ok
@@ -460,6 +482,7 @@ export class ProviderComposition implements ProviderPort {
       };
     }
     if (
+      operation.kind === "steer" ||
       operation.kind === "continue" ||
       operation.kind === "repair" ||
       operation.kind === "refresh_context" ||
@@ -467,6 +490,11 @@ export class ProviderComposition implements ProviderPort {
     ) {
       const binding = this.#bindings.get(commission.id);
       if (binding?.openCodeSessionId === null || binding === undefined)
+        return { ok: true, value: null };
+      if (
+        operation.kind === "steer" &&
+        operation.target !== `session:${binding.openCodeSessionId}`
+      )
         return { ok: true, value: null };
       return this.#openCode(binding.sandboxResourceName).inspectInstruction(
         binding.openCodeSessionId,

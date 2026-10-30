@@ -18,6 +18,7 @@ import {
   type OperationOutcome,
   type Proposal,
   type Transition,
+  type SteeringRequest,
 } from "../domain";
 
 const migrationList = [
@@ -64,8 +65,17 @@ const migrationList = [
       "utf8",
     ),
   },
+  {
+    version: 6,
+    sql: readFileSync(
+      fileURLToPath(
+        new URL("./migrations/0006_assignment_steering.sql", import.meta.url),
+      ),
+      "utf8",
+    ),
+  },
 ] as const;
-const latestSchemaVersion = 5;
+const latestSchemaVersion = 6;
 const commissionColumns = [
   "id",
   "campaign_id",
@@ -171,6 +181,7 @@ const operationRow = z.object({
   logical_key: z.string(),
   commission_id: z.string(),
   kind: z.enum([
+    "steer",
     "provision_sandbox",
     "create_session",
     "interrupt",
@@ -209,6 +220,7 @@ const operationRow = z.object({
   external_identity: z.string().nullable(),
   outcome_reason: z.string().nullable(),
   retry_safe: z.number(),
+  steering_request: z.string().nullable(),
 });
 const operationFindingRow = z.object({ finding_id: z.string() });
 
@@ -398,6 +410,13 @@ export class CommissionStore {
         directive: row.directive,
         createdAt: row.created_at,
         outcome: operationOutcome(row),
+        ...(row.steering_request === null
+          ? {}
+          : {
+              steering: JSON.parse(row.steering_request) as SteeringRequest & {
+                principalId: string;
+              },
+            }),
       } satisfies Operation;
     });
   }
@@ -676,8 +695,8 @@ export class CommissionStore {
       id, logical_key, commission_id, kind, target, controller_id, owner_epoch,
       specification_generation, assignment_id, attempt_id, instruction_sequence,
       candidate_revision, directive, created_at, retry_count, outcome_kind, outcome_at,
-      retry_authorized_at, outcome_source, outcome_result, external_identity, outcome_reason, retry_safe
-    ) VALUES (${new Array(23).fill("?").join(",")})`);
+      retry_authorized_at, outcome_source, outcome_result, external_identity, outcome_reason, retry_safe, steering_request
+    ) VALUES (${new Array(24).fill("?").join(",")})`);
     const insertFinding = this.#database.query(
       "INSERT INTO operation_findings(operation_id, finding_id) VALUES (?, ?)",
     );
@@ -700,6 +719,9 @@ export class CommissionStore {
         operation.createdAt,
         operation.retryCount,
         ...row,
+        operation.steering === undefined
+          ? null
+          : JSON.stringify(operation.steering),
       );
       for (const findingId of operation.findingIds)
         insertFinding.run(operation.id, findingId);

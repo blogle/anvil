@@ -65,6 +65,16 @@ export function projectCommission(
             ? ("stale" as const)
             : ("fresh" as const),
     pendingOperations: pending,
+    steeringCommands: operations
+      .filter((operation) => operation.kind === "steer")
+      .map((operation) => ({
+        operationId: operation.id,
+        target: operation.target,
+        requestedAt: operation.createdAt,
+        request: operation.steering,
+        disposition: operation.outcome,
+        pending: pending.some(({ id }) => id === operation.id),
+      })),
     attempts: commission.attempts.map((attempt) => ({
       ...attempt,
       operations: operations.filter(

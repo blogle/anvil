@@ -1,0 +1,5 @@
+{
+  "type": "feat",
+  "semver": "minor",
+  "summary": "Journal authorized Assignment steering with idempotent audit, idle-boundary serialization and shared HTTP, MCP and Ledger controls"
+}

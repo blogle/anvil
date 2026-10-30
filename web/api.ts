@@ -1,4 +1,4 @@
-import type { Commission } from "../src/domain";
+import type { Commission, Operation, SteeringRequest } from "../src/domain";
 import type {
   DecisionHistoryEntry,
   projectCommission,
@@ -24,12 +24,20 @@ export class AnvilApi {
         : { method: "POST", body: JSON.stringify(body) }),
       cache: "no-store",
     });
-    if (!response.ok)
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => null)) as {
+        error?: { kind?: string; error?: string };
+      } | null;
+      const detail =
+        typeof payload?.error === "object"
+          ? (payload.error.error ?? payload.error.kind)
+          : undefined;
       throw new Error(
         response.status === 401
           ? "Authentication required. Reconnect with an authorized token."
-          : `Command or query rejected (HTTP ${response.status}). Refresh authoritative state before retrying.`,
+          : `Command or query rejected (HTTP ${response.status}${detail ? `: ${detail}` : ""}). Refresh authoritative state before retrying.`,
       );
+    }
     return (await response.json()) as T;
   }
   async commissions(): Promise<readonly Commission[]> {
@@ -57,6 +65,15 @@ export class AnvilApi {
     return this.request(
       `/api/commissions/${encodeURIComponent(id)}/${command}`,
       body,
+    );
+  }
+  steer(
+    id: string,
+    request: SteeringRequest,
+  ): Promise<{ operation: Operation }> {
+    return this.request(
+      `/api/commissions/${encodeURIComponent(id)}/steer`,
+      request,
     );
   }
 }

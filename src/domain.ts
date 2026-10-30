@@ -93,6 +93,7 @@ export type Commission = Readonly<{
 }>;
 
 export type OperationKind =
+  | "steer"
   | "provision_sandbox"
   | "create_session"
   | "interrupt"
@@ -145,6 +146,15 @@ export type Operation = Readonly<{
   directive: string;
   createdAt: number;
   outcome: OperationOutcome;
+  steering?: Readonly<SteeringRequest & { principalId: string }>;
+}>;
+
+export type SteeringRequest = Readonly<{
+  idempotencyKey: string;
+  assignmentId: string;
+  expectedVersion: number;
+  expectedGeneration: number;
+  instruction: string;
 }>;
 
 export type ExecutionObservation =
@@ -300,6 +310,14 @@ export type ReconcileInput = Readonly<{
 export type AuthorizedInput =
   | ReconcileInput
   | Readonly<{
+      kind: "steer";
+      actor: Readonly<{ kind: "approver"; identity: string }>;
+      request: SteeringRequest;
+      operations: readonly Operation[];
+      lease: LeaseGrant;
+      now: number;
+    }>
+  | Readonly<{
       kind: "takeover";
       lease: LeaseGrant;
       now: number;
@@ -365,7 +383,12 @@ export type DomainError =
   | "invalid_operation_transition"
   | "unresolved_operation"
   | "invalid_usage"
-  | "invalid_amendment";
+  | "invalid_amendment"
+  | "invalid_steering"
+  | "stale_version"
+  | "idempotency_conflict"
+  | "invalid_assignment"
+  | "execution_not_idle";
 
 export type Result<T, E> =
   | Readonly<{ ok: true; value: T }>
@@ -1133,11 +1156,141 @@ export function decide(
   return { kind: "integrate", candidateRevision: candidate };
 }
 
+function prepareSteering(
+  current: Commission,
+  input: Extract<AuthorizedInput, { kind: "steer" }>,
+): Result<Transition, DomainError> {
+  const request = input.request;
+  if (
+    input.actor.kind !== "approver" ||
+    !input.actor.identity.trim() ||
+    !/^[A-Za-z0-9_.:-]{1,128}$/.test(request.idempotencyKey) ||
+    !request.instruction.trim() ||
+    request.instruction.length > 8000 ||
+    !Number.isSafeInteger(request.expectedVersion) ||
+    request.expectedVersion < 0 ||
+    !Number.isSafeInteger(request.expectedGeneration) ||
+    request.expectedGeneration < 1 ||
+    !Number.isSafeInteger(input.now) ||
+    input.now < 0
+  )
+    return err("invalid_steering");
+  const existing = input.operations.find(
+    (operation) =>
+      operation.commissionId === current.id &&
+      operation.steering?.idempotencyKey === request.idempotencyKey,
+  );
+  if (existing !== undefined) {
+    const audit = existing.steering!;
+    if (
+      audit.principalId !== input.actor.identity ||
+      audit.assignmentId !== request.assignmentId ||
+      audit.expectedVersion !== request.expectedVersion ||
+      audit.expectedGeneration !== request.expectedGeneration ||
+      audit.instruction !== request.instruction
+    )
+      return err("idempotency_conflict");
+    return ok(transition(current.version, current));
+  }
+  if (!authorizedOwner(current, input.lease, input.now))
+    return err("owner_mismatch");
+  if (request.expectedGeneration !== current.specificationGeneration)
+    return err("stale_generation");
+  if (request.expectedVersion !== current.version) return err("stale_version");
+  if (current.lifecycle !== "active") return err("invalid_lifecycle");
+  const attempt = activeAttempt(current);
+  if (
+    attempt === null ||
+    attempt.lifecycle !== "active" ||
+    attempt.assignmentId !== request.assignmentId
+  )
+    return err("invalid_assignment");
+  if (budgetExhausted(current, input.now)) return err("budget_exhausted");
+  if (input.operations.some(isUnresolved)) return err("unresolved_operation");
+  const session = input.operations.find(
+    (operation) =>
+      operation.commissionId === current.id &&
+      operation.kind === "create_session" &&
+      operation.assignmentId === attempt.assignmentId &&
+      operation.specificationGeneration === current.specificationGeneration &&
+      operation.outcome.kind === "observed" &&
+      operation.outcome.result === "applied" &&
+      Boolean(operation.outcome.externalIdentity?.trim()),
+  );
+  if (
+    session?.outcome.kind !== "observed" ||
+    session.outcome.externalIdentity === null
+  )
+    return err("invalid_assignment");
+  const id = JSON.stringify([current.id, "steer", request.idempotencyKey]);
+  const operation: Operation = {
+    id,
+    logicalKey: id,
+    commissionId: current.id,
+    kind: "steer",
+    target: `session:${session.outcome.externalIdentity}`,
+    controllerId: input.lease.owner.controllerId,
+    ownerEpoch: input.lease.owner.epoch,
+    specificationGeneration: current.specificationGeneration,
+    assignmentId: attempt.assignmentId,
+    attemptId: attempt.id,
+    instructionSequence: attempt.nextInstructionSequence,
+    retryCount: 0,
+    candidateRevision: null,
+    findingIds: [],
+    createdAt: input.now,
+    steering: { ...request, principalId: input.actor.identity },
+    directive: `${contextPacket(current, current.candidateRevision, input.operations, input.now, null)}\n\nAuthorized implementation steering from ${input.actor.identity}:\n${request.instruction}\n\nThis instruction does not amend the approved objective, repository, target, obligations, evidence policy, budget or authority. Requirements changes require a separate governed amendment.`,
+    outcome: { kind: "prepared" },
+  };
+  return ok(
+    transition(
+      current.version,
+      {
+        ...current,
+        version: current.version + 1,
+        budget: {
+          ...current.budget,
+          used: {
+            ...current.budget.used,
+            instructions: current.budget.used.instructions + 1,
+          },
+        },
+        attempts: current.attempts.map((item) =>
+          item.id === attempt.id
+            ? {
+                ...item,
+                nextInstructionSequence: item.nextInstructionSequence + 1,
+              }
+            : item,
+        ),
+      },
+      [operation],
+    ),
+  );
+}
+
+export function steeringBoundaryIsIdle(
+  operation: Operation,
+  observation: Observation,
+  policy: Policy,
+  now: number,
+): boolean {
+  const execution = observation.execution;
+  return (
+    execution.kind === "idle" &&
+    operation.target === `session:${execution.sessionId}` &&
+    isCurrent(execution.observedAt, execution.expiresAt, policy, now)
+  );
+}
+
 export function evolve(
   current: Commission,
   input: AuthorizedInput,
 ): Result<Transition, DomainError> {
   switch (input.kind) {
+    case "steer":
+      return prepareSteering(current, input);
     case "admit": {
       if (current.lifecycle !== "proposed") return err("already_admitted");
       if (!validLease(input.lease, input.now)) return err("lease_expired");
@@ -1545,6 +1698,7 @@ export function evolveOperation(
   lease: LeaseGrant,
   outcome: OperationOutcome,
   now: number,
+  submission?: Readonly<{ observation: Observation; policy: Policy }>,
 ): Result<Transition, DomainError> {
   if (!authorizedOwner(current, lease, now)) return err("owner_mismatch");
   if (operation.commissionId !== current.id || current.owner === null)
@@ -1559,6 +1713,17 @@ export function evolveOperation(
     return ok(transition(current.version, current));
   }
   if (outcome.kind === "submitted") {
+    if (
+      operation.kind === "steer" &&
+      (submission === undefined ||
+        !steeringBoundaryIsIdle(
+          operation,
+          submission.observation,
+          submission.policy,
+          now,
+        ))
+    )
+      return err("execution_not_idle");
     // Prepared intent reserves budget; it does not grant permanent permission
     // to execute after a hold, amendment, Candidate change or deadline. Outcome
     // inspection/recording below remains possible after any of these changes.

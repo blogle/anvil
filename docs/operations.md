@@ -62,8 +62,9 @@ data. Inspector tabs expose Overview, Obligations, Operations, Finding reference
 Activity and Attempts. Hold/resume and specification amendment use the existing
 authorized application commands. Campaigns currently group registered Campaign
 IDs; they do not invent Campaign specifications or dependency graphs. Operations
-does not report invented fleet, performance or cost telemetry. Steering and
-external OpenCode/preview links remain unavailable. The read-only detail view
+does not report invented fleet, performance or cost telemetry. Assignment steering
+is available in the selected Commission's Overview. External OpenCode/preview
+links remain unavailable. The read-only detail view
 includes raw provider and Operation records to preserve inspectable provenance.
 Browser screenshot review remains unperformed; the active plan tracks acceptance.
 
@@ -86,11 +87,14 @@ auth, migrations, persistence and restart; it is not a browser rendering test.
 - `POST /api/commissions/:id/resume`
 - `POST /api/commissions/:id/amend` with expected generation and typed criteria
 - `POST /api/commissions/:id/reconcile`
+- `POST /api/commissions/:id/steer` (governed Assignment instruction; see below)
 - Streamable MCP at `/mcp`: `list_commissions`, `get_commission`,
   `admit_commission`, `hold_commission`, and `resume_commission` use the same
   `ApplicationService` commands and SQLite projections as HTTP.
 - MCP `get_commission_projection` and `get_history` return the same projections
   as HTTP, with an optional positive integer `before` history cursor.
+- MCP `steer_assignment` accepts `commissionId` plus the same steering request
+  fields as HTTP and uses the same ApplicationService authorization path.
 
 Schema v5 stores the latest reconciliation record and a changed-decision/error
 history separately from Commission state and the single authoritative Operation
@@ -101,9 +105,78 @@ read models: a crash between the authoritative commit and projection recording
 can leave the projection missing/superseded until the next reconcile. They are
 never consumed as acceptance authority or used to dispatch effects.
 
-Campaign and Assignment commands, full typed Findings, steer, and command audit
-history remain gaps in the current surface. MCP
+Broader Campaign/Assignment commands, full typed Findings and generalized command
+audit remain gaps. Accepted steering commands have durable attribution in the
+Operation journal; rejected admission attempts do not create journal records. MCP
 session state is process-local and clients must reinitialize after daemon restart.
+
+## Governed Assignment steering
+
+Read the authenticated Commission projection to obtain its current state version,
+specification generation and active Assignment. HTTP accepts a strict request:
+
+```json
+{
+  "idempotencyKey": "operator-request-unique-key",
+  "assignmentId": "existing-active-assignment-id",
+  "expectedVersion": 7,
+  "expectedGeneration": 1,
+  "instruction": "Inspect the retry boundary within the approved implementation scope."
+}
+```
+
+Keys contain 1–128 ASCII letters, digits, `_`, `.`, `:` or `-`; instructions are
+nonblank and at most 8000 characters. The server derives actor identity from its
+authenticated operator configuration, never from request JSON. It requires
+ApplicationService approval for `steer`, a current controller Lease, exact
+version/generation, active Assignment and recorded Session, active Commission and
+remaining instruction/cost/deadline budget. The command cannot amend policy,
+scope, repository, integration target, obligations or acceptance evidence.
+
+Admission atomically records one prepared `steer` Operation and immutable
+actor/time/target/request metadata with Commission CAS, reserving one instruction.
+That reservation remains consumed even if later submission is rejected; this
+interface adds no refund or cancellation mechanism. A Session recorded for the
+same Assignment and generation can be reused across strategy Attempts, while the
+steering Operation binds the current active Attempt.
+HTTP returns 202 with that Operation; MCP returns the ApplicationService result.
+The request performs no provider dispatch. Identical retries under the same
+Commission/key return the original record without another reservation, even when
+its expected version has since advanced. Reusing a key with different fields is
+an `idempotency_conflict`. A distinct request is rejected while any Operation is
+unresolved; this interface is a single pending intent, not a multi-command queue.
+
+The reconciler defers prepared steering while the bound Session is running,
+unknown or stale. Only a fresh idle observation permits submission; a running
+turn's `safeBoundary` does not permit steering or interruption. The production
+OpenCode adapter rechecks active-session state and application authority before
+model selection and again before the prompt. If that boundary changes during I/O,
+the prompt is not sent and the intent fails closed. Session target, Attempt,
+generation, budget and Lease are revalidated. Autonomous dispatch sees the same
+journal/CAS, and journal-version changes invalidate execution caches across
+composition instances.
+
+Inspect `steeringCommands` in HTTP/MCP projections or the Ledger's Steering audit
+and status section. `prepared` is pending, not executed; `submitted`/`ambiguous`
+requires remote observation. `observed/applied` proves the prompt's provider
+identity was accepted/observed, not that its requested work or acceptance criteria
+are complete. The projection retains actor, request time, Assignment, Session
+target, idempotency key, exact request and provider disposition. `/history` remains
+the separate derived reconciliation-decision/error view.
+
+After a lost HTTP response, retry the identical request/key; the Ledger retains
+it in memory across retries. After reload, inspect durable audit before creating
+a new request. After a lost OpenCode acknowledgement, reconciliation inspects the
+original message ID and never blindly replays it. An absent message is not safe
+retry proof. If Lease loss leaves a submitted Operation with no observable effect,
+it remains unresolved pending evidence or a future governed resolution contract.
+Invalidated prepared intent likewise fails closed; this slice adds no cancellation
+or replacement command. Hold/resume does not waive its generation or budget checks.
+
+Schema v6 adds steering to the existing Operation table and preserves its existing
+rows/findings. Back up SQLite before upgrading; a pre-v6 binary cannot reopen v6
+state. Local fixtures validate this path; live OpenCode/Lease/Workspace isolation
+and browser/visual acceptance remain separate evidence gates.
 
 ## Packaging and runtime prerequisites
 

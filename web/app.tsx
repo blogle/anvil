@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import type { Commission } from "../src/domain";
+import type { Commission, SteeringRequest } from "../src/domain";
 import { AnvilApi, type CommissionView } from "./api";
 import { Button } from "./components/button";
 
@@ -296,6 +296,7 @@ export function Inspector({ id, api }: { id: string; api: AnvilApi }) {
                   <Json value={view.commission.budget} />
                 </section>
                 <Interventions api={api} view={view} />
+                <AssignmentSteering api={api} view={view} />
               </>
             )}
             {tab === "Obligations" &&
@@ -515,9 +516,150 @@ function Interventions({ api, view }: { api: AnvilApi; view: CommissionView }) {
         </form>
       )}
       <p className="muted">
-        Interactive Assignment steering and external preview/session URLs are
-        unavailable in this runtime contract.
+        External preview/session URLs are unavailable in this runtime contract.
       </p>
+    </section>
+  );
+}
+
+function AssignmentSteering({
+  api,
+  view,
+}: {
+  api: AnvilApi;
+  view: CommissionView;
+}) {
+  const client = useQueryClient();
+  const c = view.commission;
+  const attempt = c.attempts.find(
+    (a) => a.id === c.activeAttemptId && a.lifecycle === "active",
+  );
+  const [instruction, setInstruction] = useState("");
+  const [request, setRequest] = useState<SteeringRequest | null>(null);
+  const mutation = useMutation({
+    mutationFn: (command: SteeringRequest) => api.steer(c.id, command),
+    onSettled: async () => {
+      await client.invalidateQueries();
+    },
+  });
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (attempt === undefined && request === null) return;
+    const command = request ?? {
+      idempotencyKey: crypto.randomUUID(),
+      assignmentId: attempt!.assignmentId,
+      expectedVersion: c.version,
+      expectedGeneration: c.specificationGeneration,
+      instruction,
+    };
+    setRequest(command);
+    mutation.mutate(command);
+  };
+  const eligible =
+    c.lifecycle === "active" &&
+    attempt !== undefined &&
+    c.budget.used.instructions < c.budget.limits.maxInstructions &&
+    c.budget.used.costMicros < c.budget.limits.maxCostMicros &&
+    c.budget.limits.deadlineAt > view.projectedAt;
+  return (
+    <section className="panel">
+      <h3>Assignment steering</h3>
+      <p className="notice">
+        One bounded implementation instruction; approved requirements and
+        acceptance remain unchanged. The controller waits for the bound Session
+        to be idle. No active tool is interrupted.
+      </p>
+      <form onSubmit={submit}>
+        <label className="field">
+          Assignment
+          <input
+            readOnly
+            value={
+              request?.assignmentId ??
+              attempt?.assignmentId ??
+              "No active Assignment"
+            }
+          />
+        </label>
+        <p className="muted">
+          Expected state version {request?.expectedVersion ?? c.version} ·
+          generation {request?.expectedGeneration ?? c.specificationGeneration}
+        </p>
+        <label className="field">
+          Implementation instruction
+          <textarea
+            required
+            maxLength={8000}
+            value={instruction}
+            disabled={request !== null}
+            onChange={(event) => setInstruction(event.target.value)}
+          />
+        </label>
+        {mutation.isError && (
+          <p role="alert">
+            {mutation.error.message} Retry preserves the original request key.
+            Inspect its journal status before starting a new request.
+          </p>
+        )}
+        {mutation.isSuccess && (
+          <p role="status">
+            Steering journaled · {mutation.data.operation.outcome.kind} ·{" "}
+            {mutation.data.operation.id}
+          </p>
+        )}
+        <div className="toolbar">
+          <Button
+            type="submit"
+            disabled={
+              mutation.isPending ||
+              mutation.isSuccess ||
+              !instruction.trim() ||
+              (request === null && !eligible)
+            }
+          >
+            {request === null ? "Queue steering" : "Retry identical steering"}
+          </Button>
+          {request !== null && (
+            <Button
+              type="button"
+              disabled={mutation.isPending}
+              onClick={() => {
+                setRequest(null);
+                mutation.reset();
+                void client.invalidateQueries();
+              }}
+            >
+              Start a new steering request
+            </Button>
+          )}
+        </div>
+        {request !== null && (
+          <small>Request key: {request.idempotencyKey}</small>
+        )}
+      </form>
+      <h4>Steering audit and status</h4>
+      {view.steeringCommands.length === 0 && (
+        <p className="muted">No steering intent recorded.</p>
+      )}
+      {view.steeringCommands.map((command) => (
+        <article className="evidence" key={command.operationId}>
+          <strong>
+            {command.disposition.kind} ·{" "}
+            {command.pending
+              ? "pending controller resolution"
+              : "provider outcome recorded"}
+          </strong>
+          <p>{command.request?.instruction}</p>
+          <small>
+            {command.request?.principalId} · {command.request?.assignmentId} ·{" "}
+            {command.target}
+            <br />
+            Requested {new Date(command.requestedAt).toISOString()} · key{" "}
+            {command.request?.idempotencyKey}
+          </small>
+          <Json value={command.disposition} />
+        </article>
+      ))}
     </section>
   );
 }

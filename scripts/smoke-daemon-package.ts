@@ -178,7 +178,7 @@ try {
   );
   const initialFacts = databaseFacts();
   assert(
-    initialFacts.migrationVersion === 5,
+    initialFacts.migrationVersion === 6,
     "SQLite schema migrations did not reach the current version",
   );
   assert(
