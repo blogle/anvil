@@ -107,6 +107,7 @@ async function stopServer(): Promise<void> {
 }
 
 async function waitForApi(adapter: OpenCodeAdapter) {
+  let lastFailure = "OpenCode server has not responded";
   for (let attempt = 0; attempt < 120; attempt += 1) {
     if (server.exitCode !== null) {
       await serverLogsRead;
@@ -116,11 +117,20 @@ async function waitForApi(adapter: OpenCodeAdapter) {
     }
     const result = await adapter.health();
     if (result.ok) return result.value;
-    if (result.error.kind === "rejected")
-      throw new Error("OpenCode server exposed an incompatible API version");
+    lastFailure = result.error.message;
+    if (
+      result.error.kind === "rejected" &&
+      result.error.message ===
+        "OpenCode API version is not a supported V2 contract"
+    )
+      throw new Error(
+        `OpenCode API rejected the health request: ${result.error.message}`,
+      );
     await Bun.sleep(100);
   }
-  throw new Error(`OpenCode v2 API did not become available: ${serverLogs}`);
+  throw new Error(
+    `OpenCode v2 API did not become available (${lastFailure}): ${serverLogs}`,
+  );
 }
 
 try {
