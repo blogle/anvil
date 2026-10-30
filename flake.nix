@@ -134,6 +134,7 @@
               pkgs.gitMinimal
               pkgs.gnugrep
               pkgs.gnused
+              pkgs.jq
               pkgs.nix
               pkgs.ripgrep
             ];
@@ -213,16 +214,45 @@
             export XDG_STATE_HOME="$HOME/.local/state"
             "${pkgs.coreutils}/bin/mkdir" -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
 
-            if ! "$nix_executable" --offline path-info --store "$store_uri" \
-              "''${required_paths[@]}" >/dev/null 2>&1; then
+            daemon_path_info="$("$nix_executable" --offline path-info --store "$store_uri" \
+              --json --json-format 1 "''${required_paths[@]}")" || {
               printf '%s\n' "BLOCKED: required worker closure paths are missing or unregistered" >&2
               exit 78
-            fi
+            }
             if ! "$nix_executable" --offline store verify --store "$store_uri" \
               --no-trust "''${required_paths[@]}" >/dev/null 2>&1; then
               printf '%s\n' "BLOCKED: shared Nix store failed content verification for the worker closure" >&2
               exit 78
             fi
+            for store_path in "''${required_paths[@]}"; do
+              mounted_path="$shared_store_root/''${store_path##*/}"
+              if [ ! -e "$mounted_path" ] && [ ! -L "$mounted_path" ]; then
+                printf 'BLOCKED: mounted shared store is missing %s\n' "''${store_path##*/}" >&2
+                exit 78
+              fi
+              mounted_paths+=("$mounted_path")
+            done
+            daemon_nar_hashes="$(printf '%s' "$daemon_path_info" | ${pkgs.jq}/bin/jq -er --rawfile manifest "$manifest" '. as $info | ($manifest | split("\n") | map(select(length > 0)))[] as $path | $info[$path].narHash // empty')" || {
+              printf '%s\n' "BLOCKED: Nix daemon did not provide the complete registered NAR hash list" >&2
+              exit 78
+            }
+            mapfile -t daemon_nar_hashes <<< "$daemon_nar_hashes"
+            mounted_nar_hashes="$("$nix_executable" --offline hash path --type sha256 "''${mounted_paths[@]}")" || {
+              printf '%s\n' "BLOCKED: mounted shared-store closure could not be NAR-hashed" >&2
+              exit 78
+            }
+            mapfile -t mounted_nar_hashes <<< "$mounted_nar_hashes"
+            if [ "''${#daemon_nar_hashes[@]}" -ne "''${#required_paths[@]}" ] || \
+              [ "''${#mounted_nar_hashes[@]}" -ne "''${#required_paths[@]}" ]; then
+              printf '%s\n' "BLOCKED: NAR hash count does not match the pinned runtime closure" >&2
+              exit 78
+            fi
+            for index in "''${!required_paths[@]}"; do
+              if [ "''${mounted_nar_hashes[$index]}" != "''${daemon_nar_hashes[$index]}" ]; then
+                printf 'BLOCKED: mounted bytes do not match daemon NAR hash for %s\n' "''${required_paths[$index]##*/}" >&2
+                exit 78
+              fi
+            done
             printf 'worker shared-store preflight passed (%s paths)\n' "''${#required_paths[@]}"
             EOF
             chmod 0555 "$out/bin/anvil-verify-worker-store-closure"

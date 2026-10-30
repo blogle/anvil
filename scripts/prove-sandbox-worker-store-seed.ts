@@ -1,14 +1,16 @@
 import {
   chmodSync,
+  cpSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
 const [
@@ -65,16 +67,16 @@ async function nix(arguments_: readonly string[], home: string) {
   });
 }
 
-async function runPreflight(
+async function preflight(
   storeUri: string,
+  mountedStoreRoot: string,
   manifest: string,
-  sharedStoreRoot: string,
   temporaryDirectory: string,
   home: string,
 ) {
   return run(
     workerPreflightExecutable,
-    [storeUri, manifest, sharedStoreRoot, nixExecutablePath],
+    [storeUri, manifest, mountedStoreRoot, nixExecutablePath],
     {
       HOME: home,
       PATH: dirname(nixExecutablePath),
@@ -95,6 +97,35 @@ function makeWritableForCleanup(path: string): void {
   } else {
     chmodSync(path, 0o600);
   }
+}
+
+function copyRuntimePaths(
+  sourceStoreRoot: string,
+  mountedStoreRoot: string,
+  runtimePaths: readonly string[],
+): void {
+  for (const storePath of runtimePaths)
+    cpSync(
+      join(sourceStoreRoot, basename(storePath)),
+      join(mountedStoreRoot, basename(storePath)),
+      { recursive: true, verbatimSymlinks: true, preserveTimestamps: true },
+    );
+}
+
+function corruptOpenCodePath(
+  mountedStoreRoot: string,
+  openCodeStorePath: string,
+): void {
+  const executable = join(
+    mountedStoreRoot,
+    basename(openCodeStorePath),
+    "bin",
+    "opencode",
+  );
+  const mode = statSync(executable).mode & 0o7777;
+  chmodSync(executable, mode | 0o200);
+  writeFileSync(executable, "split-brain corrupt OpenCode bytes");
+  chmodSync(executable, mode);
 }
 
 const runtimePaths = readFileSync(runtimeManifestPath, "utf8")
@@ -120,25 +151,81 @@ for (const required of [
     runtimePaths.some((path) => path.includes(required)),
     `worker runtime manifest is missing ${required}`,
   );
+const openCodePath = runtimePaths.find((path) =>
+  path.includes("opencode-2.0.32"),
+);
+if (openCodePath === undefined)
+  throw new Error("worker runtime manifest does not contain OpenCode");
 
 const isolatedRoot = mkdtempSync(join(tmpdir(), "anvil-worker-store-seed-"));
 const temporaryDirectory = join(isolatedRoot, "tmp");
 const temporaryHome = join(isolatedRoot, "home");
-const sharedStoreRoot = join(isolatedRoot, "nix", "store");
-const isolatedStore = `local?root=${isolatedRoot}`;
-for (const path of [temporaryDirectory, temporaryHome, sharedStoreRoot])
-  mkdirSync(path, { recursive: true });
+const daemonRoot = join(isolatedRoot, "daemon-store");
+const daemonStore = `local?root=${daemonRoot}`;
+const daemonStoreRoot = join(daemonRoot, "nix", "store");
+const emptyMountRoot = join(isolatedRoot, "mounted-empty");
+const wrongMountRoot = join(isolatedRoot, "mounted-wrong", "nix", "store");
+const correctMountRoot = join(isolatedRoot, "mounted-correct", "nix", "store");
+for (const directory of [
+  temporaryDirectory,
+  temporaryHome,
+  emptyMountRoot,
+  wrongMountRoot,
+  correctMountRoot,
+])
+  mkdirSync(directory, { recursive: true });
 
 try {
+  const unseededDaemonPreflight = await preflight(
+    daemonStore,
+    emptyMountRoot,
+    runtimeManifestPath,
+    temporaryDirectory,
+    temporaryHome,
+  );
+  assert(
+    unseededDaemonPreflight.exitCode !== 0 &&
+      unseededDaemonPreflight.stderr.includes("BLOCKED:"),
+    "preflight did not fail closed for an unseeded Nix daemon store",
+  );
+  console.log(
+    "PASS UNSEEDED-DAEMON NEGATIVE: preflight rejects store A before registration",
+  );
+
+  const seedDaemonStore = await nix(
+    ["copy", "--no-check-sigs", "--to", daemonStore, workerImagePath],
+    temporaryHome,
+  );
+  assert(
+    seedDaemonStore.exitCode === 0,
+    `seeding registered store A failed: ${seedDaemonStore.stderr}`,
+  );
+  const verifiedDaemonStore = await nix(
+    [
+      "store",
+      "verify",
+      "--store",
+      daemonStore,
+      "--no-trust",
+      "--recursive",
+      workerImagePath,
+    ],
+    temporaryHome,
+  );
+  assert(
+    verifiedDaemonStore.exitCode === 0,
+    `seeded store A failed Nix content verification: ${verifiedDaemonStore.stderr}`,
+  );
+
   const incompleteManifest = join(isolatedRoot, "incomplete-closure.paths");
   writeFileSync(
     incompleteManifest,
     `${runtimePaths.slice(0, -1).join("\n")}\n`,
   );
-  const wrongManifestPreflight = await runPreflight(
-    isolatedStore,
+  const wrongManifestPreflight = await preflight(
+    daemonStore,
+    emptyMountRoot,
     incompleteManifest,
-    sharedStoreRoot,
     temporaryDirectory,
     temporaryHome,
   );
@@ -147,89 +234,65 @@ try {
       wrongManifestPreflight.stderr.includes(
         "BLOCKED: worker closure manifest does not match the image-pinned digest",
       ),
-    "preflight accepted an incomplete or wrong-image closure manifest",
+    "preflight accepted an altered image-closure manifest",
   );
   console.log(
-    "PASS WRONG-MANIFEST NEGATIVE: preflight rejects a modified closure list",
+    "PASS WRONG-MANIFEST NEGATIVE: preflight rejects an incomplete closure list",
   );
 
-  const emptyStorePreflight = await runPreflight(
-    isolatedStore,
+  const emptyMountPreflight = await preflight(
+    daemonStore,
+    emptyMountRoot,
     runtimeManifestPath,
-    sharedStoreRoot,
     temporaryDirectory,
     temporaryHome,
   );
   assert(
-    emptyStorePreflight.exitCode !== 0 &&
-      emptyStorePreflight.stderr.includes(
-        "BLOCKED: required worker closure paths are missing or unregistered",
+    emptyMountPreflight.exitCode !== 0 &&
+      emptyMountPreflight.stderr.includes(
+        "BLOCKED: mounted shared store is missing",
       ),
-    "empty isolated store was not rejected by the actual Sandbox preflight",
+    "seeded/verified store A incorrectly greenlit empty mounted store B",
   );
   console.log(
-    "PASS EMPTY-STORE NEGATIVE: actual preflight rejects an unseeded store",
+    "PASS SPLIT-BRAIN EMPTY NEGATIVE: seeded store A rejects empty mount B",
   );
 
-  const copied = await nix(
-    ["copy", "--no-check-sigs", "--to", isolatedStore, workerImagePath],
-    temporaryHome,
-  );
-  assert(
-    copied.exitCode === 0,
-    `Nix closure copy into isolated local store failed: ${copied.stderr}`,
-  );
-
-  const registered = await nix(
-    ["path-info", "--store", isolatedStore, "--recursive", workerImagePath],
-    temporaryHome,
-  );
-  assert(
-    registered.exitCode === 0,
-    `isolated store did not register the seeded image closure: ${registered.stderr}`,
-  );
-  const actualPaths = new Set(
-    registered.stdout.split(/\r?\n/).filter((path) => path.length > 0),
-  );
-  const missingPaths = imageClosurePaths.filter(
-    (path) => !actualPaths.has(path),
-  );
-  assert(
-    missingPaths.length === 0 && actualPaths.size === imageClosurePaths.length,
-    `isolated store image closure mismatch: ${missingPaths.length} missing paths`,
-  );
-
-  const verifiedImage = await nix(
-    [
-      "store",
-      "verify",
-      "--store",
-      isolatedStore,
-      "--no-trust",
-      "--recursive",
-      workerImagePath,
-    ],
-    temporaryHome,
-  );
-  assert(
-    verifiedImage.exitCode === 0,
-    `isolated image closure failed Nix content verification: ${verifiedImage.stderr}`,
-  );
-
-  const seededPreflight = await runPreflight(
-    isolatedStore,
+  copyRuntimePaths(daemonStoreRoot, wrongMountRoot, runtimePaths);
+  copyRuntimePaths(daemonStoreRoot, correctMountRoot, runtimePaths);
+  corruptOpenCodePath(wrongMountRoot, openCodePath);
+  const wrongBytesPreflight = await preflight(
+    daemonStore,
+    wrongMountRoot,
     runtimeManifestPath,
-    sharedStoreRoot,
     temporaryDirectory,
     temporaryHome,
   );
   assert(
-    seededPreflight.exitCode === 0 &&
-      seededPreflight.stdout.includes("shared-store preflight passed"),
-    `actual Sandbox preflight rejected the seeded closure: ${seededPreflight.stderr}`,
+    wrongBytesPreflight.exitCode !== 0 &&
+      wrongBytesPreflight.stderr.includes(
+        `BLOCKED: mounted bytes do not match daemon NAR hash for ${basename(openCodePath)}`,
+      ),
+    "preflight accepted same-name mounted bytes that differ from registered store A",
   );
   console.log(
-    `PASS SEEDED-CLOSURE: actual preflight verified ${runtimePaths.length} runtime paths; all ${actualPaths.size} image paths are registered and content-verified in the isolated Nix store`,
+    "PASS SPLIT-BRAIN CORRUPTION NEGATIVE: daemon store A rejects tampered OpenCode bytes in mount B",
+  );
+
+  const correctMountPreflight = await preflight(
+    daemonStore,
+    correctMountRoot,
+    runtimeManifestPath,
+    temporaryDirectory,
+    temporaryHome,
+  );
+  assert(
+    correctMountPreflight.exitCode === 0 &&
+      correctMountPreflight.stdout.includes("shared-store preflight passed"),
+    `preflight rejected mount B with matching NAR bytes: ${correctMountPreflight.stderr}`,
+  );
+  console.log(
+    `PASS MATCHED-MOUNT POSITIVE: all ${runtimePaths.length} NAR-verified mounted runtime paths match registered store A`,
   );
 } finally {
   makeWritableForCleanup(isolatedRoot);

@@ -134,8 +134,11 @@ assert(
   preflightText.includes(runtimeManifestHash) &&
     preflightText.includes("path-info") &&
     preflightText.includes("store verify") &&
+    preflightText.includes("hash path --type sha256") &&
+    preflightText.includes("daemon_nar_hash") &&
+    preflightText.includes("mounted_nar_hash") &&
     preflightText.includes("manifest does not match"),
-  "preflight does not pin the image-specific closure manifest and verify registered content",
+  "preflight does not pin the image manifest and compare mounted NAR bytes against daemon registration/content",
 );
 const rootLayerPaths = imageLayers.flatMap((layerValue) =>
   array(record(layerValue)?.["paths"]).map(record),
@@ -158,7 +161,16 @@ assert(
     ),
   "image rootfs does not define the non-root Anvil worker identity",
 );
-for (const binary of ["bash", "git", "rg", "find", "grep", "sed"]) {
+for (const binary of [
+  "bash",
+  "git",
+  "rg",
+  "find",
+  "grep",
+  "sed",
+  "jq",
+  "nix",
+]) {
   assert(
     existsSync(join(workerToolsPath, "bin", binary)),
     `worker PATH is missing ${binary}`,
