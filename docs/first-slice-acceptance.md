@@ -211,6 +211,35 @@ with `git fetch origin` and `gh pr view 123`). The predecessor branch is preserv
 
 ## Remaining local work / stopping status
 
+### Exact published-source replay
+
+Draft successor [PR #124](https://github.com/blogle/anvil/pull/124) targets `v2` and
+preserves PR #123's head. Its implementation source is
+`d4a002341e91a7e094abdc4bd395a9b58697f8f4` (preceded by authority fix `5945dc5`).
+The evidence-only follow-up records this replay:
+
+```sh
+git clone --local --no-hardlinks --branch anvil/anvil-first-slice-completion-58824672 /home/anvil/workspace/anvil-first-slice-completion /tmp/opencode/anvil-successor-d4a0023
+# In that fresh clone at d4a002341e91a7e094abdc4bd395a9b58697f8f4:
+nix develop -c just check
+nix develop -c just ci-check
+nix develop -c just ci-verify
+nix run .#sdlc -- install --check
+nix build .#ui .#daemon .#checks.x86_64-linux.daemonSmoke --no-link -L
+git status --short
+```
+
+Results: `check` exit 0, **105 tests / 1251 assertions**; `ci-verify` exit 0;
+SDLC install check exit 0; Nix packages/process smoke exit 0; final Git status
+empty (generated lock unchanged). `ci-check` exit 1 at unchanged
+`sandboxImageGate`, with the exact closure-preseed `BLOCKED/INCOMPATIBLE` diagnostic
+above. Clean-clone built outputs:
+`/nix/store/dx6j3g907qnszc14kk4knl3473gxf2w7-anvil-ui-0.1.0` and
+`/nix/store/dni24aw8cbph2nz7jf6prqbb89s72apd-anvil-daemon-0.1.0`.
+The clone used a new working tree and dependency installation; Nix downloads and
+build cache were shared. No hermetic machine reset or independently executed
+review is inferred. GitHub PR checks are separate from these local outcomes.
+
 This session has not reached `LOCAL_SLICE_READY`. No complete FS-01–FS-14
 obligation is promoted to VERIFIED from these narrower checks. See
 [the successor handoff](first-slice-successor-handoff.md) for the exact remaining

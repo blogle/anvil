@@ -6,11 +6,13 @@
 This is a published implementation checkpoint, not `LOCAL_SLICE_READY`, independent
 acceptance, or a request to execute deployment. The approved FS contract is unchanged.
 
-The successor work branch is `anvil/anvil-first-slice-completion-58824672`, starting
+The successor work branch is `anvil/anvil-first-slice-completion-58824672`, published
+as draft [PR #124](https://github.com/blogle/anvil/pull/124) against `v2`, starting
 from PR #123's recorded and fetched head
 `f6723b79d5a938a86c6770660969a1298abde148`. First successor increment `5945dc5`
 revalidates Lease authority across provider I/O. The operational Ledger increment
-is the next commit containing this document; resolve its full SHA from Git/PR.
+is `d4a002341e91a7e094abdc4bd395a9b58697f8f4`. The later evidence-only commit records
+clean-clone replay and the PR link; it does not change implementation.
 The predecessor branch and PR remain preserved. Implementation PRs target `v2`.
 
 Read `first-slice-acceptance.md` for executed evidence and limitations, and run:
