@@ -1,0 +1,5 @@
+{
+  "type": "feat",
+  "semver": "minor",
+  "summary": "Build a pinned OpenCode worker OCI image and gate shared-store compatibility"
+}

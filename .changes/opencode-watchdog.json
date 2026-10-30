@@ -1,0 +1,5 @@
+{
+  "type": "feat",
+  "semver": "minor",
+  "summary": "Add bounded OpenCode watchdog observations, safe durable interruption, and hierarchical context recovery"
+}

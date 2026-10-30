@@ -1,0 +1,31 @@
+{
+  "name": "anvil-v2",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.2.5",
+  "exports": {
+    ".": "./src/application.ts"
+  },
+  "scripts": {
+    "postinstall": "bun2nix -o bun.nix",
+    "check": "bun run lock-check && bun run fmt:check && bun run typecheck && bun test",
+    "fmt": "prettier --write 'src/**/*.ts' 'test/**/*.ts' 'scripts/**/*.ts' package.json tsconfig.json",
+    "fmt:check": "prettier --check 'src/**/*.ts' 'test/**/*.ts' 'scripts/**/*.ts' package.json tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "lock-check": "bash scripts/check-bun-lock-drift.sh",
+    "start": "bun run src/main.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "hono": "^4.13.14",
+    "jose": "^6.2.13",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/bun": "1.2.5",
+    "fast-check": "3.23.2",
+    "prettier": "3.5.3",
+    "typescript": "5.8.3"
+  }
+}

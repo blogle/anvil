@@ -1,5 +1,11 @@
 # Anvil pre-1.0 rewrite
 
-Clean Rust development scaffold for the next Anvil design. The `v2` branch name is historical; this remains a pre-1.0, 0.x rewrite track rather than a SemVer 2.0 release.
+The `v2` branch name is historical; Anvil remains a pre-1.0, 0.x rewrite track rather than a SemVer 2.0 release.
 
-Use `nix develop -c just check` for the baseline validation. SDLC standardizes CI and release automation. Project intent and unresolved decisions live in [`spec.md`](spec.md). Fieldnotes documentation is available through `just docs` once the documentation content is integrated.
+The TypeScript slice includes a functional Commission reconciliation core, SQLite persistence, an authenticated Bun HTTP/MCP daemon, and local HTTP-contract clients for OpenCode V2, GitHub App/REST, Agent Sandbox, and Mergify. A provider-composition fixture drives a full local Sandbox→Session→Candidate/CI→PR/queue→merge path through the real ApplicationService and SQLite journal. The daemon defaults to an unavailable provider; a configured provider mode exists but is not deployment- or multi-controller-accepted. Local fixtures are not live integration. The operational UI and declarative image remain later checkpoints, and live acceptance has a separate authorized deployment gate. The incumbent `main` implementation remains the parity baseline until the rewrite exceeds its capabilities and reliability.
+
+Run `nix develop -c just check` for the pinned Bun-only fast path. `bun.lock` is the sole JavaScript lock authority; `bun.nix` is generated from it and checked by the Nix dependency derivation. `just ci-check` and `just ci-verify` run the higher-fidelity Nix/SDLC checks. Project intent and unresolved decisions live in [`docs/index.md`](docs/index.md). Fieldnotes documentation is available through `just docs`.
+
+See [`docs/local-daemon.md`](docs/local-daemon.md) for local HTTP/MCP startup and contract details.
+
+The separately authorized live-acceptance preparation (not execution approval) is documented in [`docs/first-slice-live-acceptance-runbook.md`](docs/first-slice-live-acceptance-runbook.md).

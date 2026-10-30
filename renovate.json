@@ -1,3 +1,6 @@
 {
-  "extends": ["github>blogle/sdlc#v1"]
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "github>blogle/sdlc#v1"
+  ]
 }
