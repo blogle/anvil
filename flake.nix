@@ -59,8 +59,14 @@
             ${bun}/bin/bun ${./scripts/smoke-daemon-package.ts} ${self.packages.${system}.daemon}/bin/anvil-daemon
             touch "$out"
           '';
+          opencodeSmoke = pkgs.runCommand "anvil-opencode-runtime-smoke" {
+            nativeBuildInputs = [ bun ];
+          } ''
+            ${bun}/bin/bun ${./.}/scripts/smoke-opencode-runtime.ts ${self.packages.${system}.opencodeRuntime}/bin/opencode ${pkgs.opencode.version}
+            touch "$out"
+          '';
         in {
-          inherit typescript daemonSmoke;
+          inherit typescript daemonSmoke opencodeSmoke;
           flake = pkgs.runCommand "anvil-flake-check" { } ''
             test -f ${./flake.nix}
             test -f ${./flake.lock}
@@ -101,8 +107,9 @@
               runHook postInstall
             '';
           };
+          opencodeRuntime = pkgs.opencode;
         in {
-          inherit daemon;
+          inherit daemon opencodeRuntime;
           sdlc = sdlc.packages.${system}.sdlc;
           nix-eval-jobs = sdlc.packages.${system}.nix-eval-jobs;
         });

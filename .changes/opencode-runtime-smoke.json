@@ -1,0 +1,5 @@
+{
+  "type": "feat",
+  "semver": "minor",
+  "summary": "Pin and smoke-test the OpenCode v2 server runtime through Nix"
+}
