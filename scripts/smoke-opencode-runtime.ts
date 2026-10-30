@@ -53,7 +53,7 @@ const server = Bun.spawn(
       XDG_DATA_HOME: dataHome,
       XDG_STATE_HOME: stateHome,
       TMPDIR: temporaryHome,
-      PATH: `${dirname(executable)}:${process.env["PATH"] ?? ""}`,
+      PATH: dirname(executable),
       OPENCODE_SERVER_PASSWORD: serverPassword,
       NO_COLOR: "1",
     },
