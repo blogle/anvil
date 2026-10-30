@@ -9,8 +9,8 @@
   "scripts": {
     "postinstall": "bun2nix -o bun.nix",
     "check": "bun run lock-check && bun run fmt:check && bun run typecheck && bun test",
-    "fmt": "prettier --write 'src/**/*.ts' 'test/**/*.ts' package.json tsconfig.json",
-    "fmt:check": "prettier --check 'src/**/*.ts' 'test/**/*.ts' package.json tsconfig.json",
+    "fmt": "prettier --write 'src/**/*.ts' 'test/**/*.ts' 'scripts/**/*.ts' package.json tsconfig.json",
+    "fmt:check": "prettier --check 'src/**/*.ts' 'test/**/*.ts' 'scripts/**/*.ts' package.json tsconfig.json",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "lock-check": "bash scripts/check-bun-lock-drift.sh",
