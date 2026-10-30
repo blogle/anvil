@@ -260,12 +260,26 @@
           nix-eval-jobs = sdlc.packages.${system}.nix-eval-jobs;
         });
 
-      apps = forAllSystems (system: {
-        docs = {
-          type = "app";
-          program = "${fieldnotes.packages.${system}.default}/bin/fieldnotes";
-        };
-      });
+      apps = forAllSystems (system:
+        let
+          pkgs = (sdlc.lib.importPackages { inherit system; }).latest;
+          bun = import ./nix/bun.nix { inherit pkgs; };
+          image = self.packages.${system}.sandboxWorkerImage;
+          imageClosure = pkgs.closureInfo { rootPaths = [ image ]; };
+          seedProof = pkgs.writeShellScriptBin "anvil-sandbox-worker-store-seed-proof" ''
+            exec ${bun}/bin/bun ${./.}/scripts/prove-sandbox-worker-store-seed.ts \
+              ${pkgs.nix}/bin/nix ${image} ${imageClosure}/store-paths
+          '';
+        in {
+          docs = {
+            type = "app";
+            program = "${fieldnotes.packages.${system}.default}/bin/fieldnotes";
+          };
+          sandboxWorkerStoreSeed = {
+            type = "app";
+            program = "${seedProof}/bin/anvil-sandbox-worker-store-seed-proof";
+          };
+        });
 
       publish = forAllSystems (system:
         let pkgs = (sdlc.lib.importPackages { inherit system; }).latest;
