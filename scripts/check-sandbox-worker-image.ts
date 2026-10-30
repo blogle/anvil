@@ -64,9 +64,12 @@ const closurePaths = readFileSync(closurePathsPath, "utf8")
 const workerIdentityPath = closurePaths.find((path) =>
   path.includes("anvil-sandbox-worker-identity"),
 );
+const workerToolsPath = closurePaths.find((path) =>
+  path.includes("anvil-sandbox-worker-tools"),
+);
 assert(
-  workerIdentityPath !== undefined,
-  "worker identity rootfs is absent from the image closure",
+  workerIdentityPath !== undefined && workerToolsPath !== undefined,
+  "worker identity or tools are absent from the image closure",
 );
 const identityLayerPath = imageLayers
   .flatMap((layerValue) => array(record(layerValue)?.["paths"]))
@@ -78,6 +81,35 @@ assert(
     record(identityLayerPath["options"])?.["rewrite"] !== undefined,
   "OCI image does not copy the non-root passwd/group identity into its root filesystem",
 );
+const writablePathsLayer = imageLayers
+  .flatMap((layerValue) => array(record(layerValue)?.["paths"]))
+  .map(record)
+  .find((layerPath) =>
+    layerPath?.["path"]
+      ?.toString()
+      .includes("anvil-sandbox-worker-writable-paths"),
+  );
+assert(
+  writablePathsLayer !== undefined &&
+    writablePathsLayer !== null &&
+    record(writablePathsLayer["options"])?.["rewrite"] !== undefined,
+  "OCI rootfs does not include the HOME/workspace/TMPDIR directory layer",
+);
+const writablePermissions = array(
+  record(writablePathsLayer["options"])?.["perms"],
+).map(record);
+assert(
+  writablePermissions.some(
+    (permission) =>
+      permission?.["regex"] === "^/home/anvil(/workspace)?$" &&
+      permission["mode"] === "0777",
+  ) &&
+    writablePermissions.some(
+      (permission) =>
+        permission?.["regex"] === "^/tmp$" && permission["mode"] === "1777",
+    ),
+  "OCI layer does not carry non-root writable HOME/workspace and sticky TMPDIR permissions",
+);
 assert(
   readFileSync(join(workerIdentityPath, "etc/passwd"), "utf8").includes(
     "anvil:x:1000:1000:",
@@ -87,10 +119,27 @@ assert(
     ),
   "image rootfs does not define the non-root Anvil worker identity",
 );
+for (const binary of ["bash", "git", "rg", "find", "grep", "sed"]) {
+  assert(
+    existsSync(join(workerToolsPath, "bin", binary)),
+    `worker PATH is missing ${binary}`,
+  );
+}
 const entrypointStorePath = entrypointPath.match(/^\/nix\/store\/[^/]+/)?.[0];
 assert(
   entrypointStorePath !== undefined,
   "OCI entrypoint is not in the Nix store",
+);
+const entrypointText = readFileSync(
+  join(entrypointStorePath, "bin/anvil-opencode-server"),
+  "utf8",
+);
+assert(
+  entrypointText.includes("OPENCODE_PORT") &&
+    entrypointText.includes("port_number") &&
+    entrypointText.includes("1024") &&
+    entrypointText.includes("65535"),
+  "worker entrypoint does not validate a configurable nonprivileged port",
 );
 for (const requiredPath of [
   openCodePath,

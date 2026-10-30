@@ -223,6 +223,18 @@
               workerOpenCodeLayer
               workerEntrypointLayer
             ];
+            perms = [
+              {
+                path = workerWritablePaths;
+                regex = "^/home/anvil(/workspace)?$";
+                mode = "0777";
+              }
+              {
+                path = workerWritablePaths;
+                regex = "^/tmp$";
+                mode = "1777";
+              }
+            ];
             config = {
               Entrypoint = [ "${workerEntrypoint}/bin/anvil-opencode-server" ];
               Env = [
