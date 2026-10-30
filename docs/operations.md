@@ -16,8 +16,9 @@ It defaults to the explicit unavailable provider. An opt-in configured mode
 composes Agent Sandbox, OpenCode V2, GitHub App/REST, and Mergify clients; exact
 settings and provider limits are documented in
 [`provider-contracts/runtime-configuration.md`](provider-contracts/runtime-configuration.md).
-The configured mode is fixture-tested but has not been deployed, validated for
-multi-controller operation, or accepted as a live provider integration.
+The configured mode includes namespaced Kubernetes Lease arbitration tested
+against loopback protocol fixtures. It has not been deployed or accepted for
+live multi-controller storage, Workspace exclusion or provider integration.
 
 ## Run
 
@@ -31,8 +32,9 @@ bun run start
 ```
 
 The database file is local application state and should not be committed. The
-default controller is single-process/local only; it is not a Kubernetes Lease
-implementation or HA/fencing contract. The operator identity defaults to
+default unavailable-provider controller is single-process/local only. Configured
+mode requires the explicit Kubernetes Lease settings below and never falls back
+to that local authority. The operator identity defaults to
 `local-operator`, and admission/amendment authorization is scoped to that
 configured identity and the bearer credential. The current unavailable provider
 means active work remains waiting/unavailable until an adapter is configured.
@@ -198,6 +200,81 @@ a single writer and a defined backup/recovery strategy. Package code is read-onl
 in the Nix store. A read-only-rootfs runtime needs writable state mounts. OpenCode
 needs writable HOME, XDG config/cache/data/state and TMPDIR, a configured HTTP
 credential, and a reachable configured port (worker default 4096).
+
+## Kubernetes Lease authority
+
+Configured mode uses `coordination.k8s.io/v1` Leases through the production-intended
+HTTP adapter. See [runtime configuration](provider-contracts/runtime-configuration.md)
+for exact variables, timing, namespace/name mapping, CA/token and epoch contract.
+Set an explicit controller label and Lease namespace, mount the Lease-specific
+projected service-account token only into the controller, and supply the API CA
+for HTTPS. Token content is reread for rotation and never logged or sent to a
+worker. The configured label is not the full holder identity: each process adds
+an incarnation UUID. Capabilities must use the actual durable Commission owner,
+not a guessed controller label or a previous process's identity.
+
+The proposed declarative permission boundary is one dedicated control namespace,
+one controller-only ServiceAccount, and a Role/RoleBinding granting only:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: anvil-commission-leases
+  namespace: APPROVED_CONTROL_NAMESPACE
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update]
+```
+
+An independently authorized deployment must declare the corresponding
+ServiceAccount and namespaced RoleBinding (subject that controller ServiceAccount,
+roleRef `Role/anvil-commission-leases`). Workers/verifiers receive no such token
+or RoleBinding. No list/watch/delete, ClusterRole, Secret read, Pod exec or
+cross-namespace access is needed by this adapter. Dynamic creation cannot be
+restricted by `resourceNames`; dedicate the namespace to this trust boundary.
+Holder strings and annotations are not cryptographic authorization against an
+actor already allowed to rewrite these Leases. RBAC/token custody and the API's
+CAS semantics are explicit trusted prerequisites. This YAML is a permission
+contract only, not an applied manifest or deployment authorization.
+
+Each authority check freshly reobserves and renews/acquires with resourceVersion
+CAS; prior cached success is not a fallback during 401/403/409/429/5xx, timeout,
+malformed/stale data or clock failure. After provider observation or model/status
+I/O, authority is checked again before a new effect. OpenCode model/prompt and
+interrupt/session writes, Sandbox create after lookup, and GitHub PR create after
+lookup/credential I/O receive the same application authority callback. This can
+stop a request before submission; it cannot fence an already accepted remote
+write. Credential-provider token issuance during read/authentication remains the
+existing broker contract, not a newly journaled Commission Operation.
+
+Shutdown stops reconciliation and HTTP service, then attempts bounded CAS release
+of known Leases before closing state. Release clears holder identity and retains
+epoch history; it does not delete resources or terminate workers. Failed release
+is reported and remaining contenders wait for conservatively observed expiry.
+A hard exit likewise leaves expiry/reobservation to a successor. Successors
+advance the epoch and inspect predecessor submitted/ambiguous Operations with
+their original immutable owner and message/PR identity; a new holder never turns
+unknown absence into retry permission.
+
+Retain the shared authoritative SQLite state and Lease resources across restart.
+A deleted Lease for a Commission with recorded ownership, regressed epoch,
+int32 epoch exhaustion, state rollback or namespace migration fails closed and
+requires explicit reviewed recovery. Clock synchronization must meet the
+configured skew bound; a detected wall/monotonic jump latches failure until
+restart. SQLite shared-storage topology and backup/restore remain separately
+unverified deployment contracts; a fresh database is not a recovery substitute.
+
+**Workspace isolation remains unverified.** A Lease arbitrates controller
+instruction admission, not already-running worker filesystem access or an
+independently credentialed OpenCode client. The local negative test deliberately
+demonstrates a remote write after transfer. Before claiming exclusive Workspace
+writers, establish termination/revocation or equivalent exclusion for the old
+writer and independently verify that no concurrent actor can write the volume.
+Independent verification must use a separate snapshot/checkout; no such live
+isolation proof is supplied by the Lease fixture. The active ExecPlan tracks
+campaign acceptance of this boundary.
 
 ## Deployment and recovery procedure
 

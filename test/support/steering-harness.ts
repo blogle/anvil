@@ -1,7 +1,11 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ApplicationService, type ProviderPort } from "../../src/application";
+import {
+  ApplicationService,
+  type ProviderPort,
+  type LeasePort,
+} from "../../src/application";
 import type { SteeringRequest } from "../../src/domain";
 import { CommissionStore } from "../../src/persistence/sqlite";
 import { AgentSandboxClient } from "../../src/providers/agent-sandbox";
@@ -26,6 +30,7 @@ export class SteeringHarness {
   interrupts = 0;
   beforeModel: (() => Promise<void>) | undefined;
   beforeObserve: (() => Promise<void>) | undefined;
+  afterPrompt: (() => Promise<void>) | undefined;
   sandbox: Record<string, unknown> | null = null;
   readonly fixture = Bun.serve({
     port: 0,
@@ -68,6 +73,7 @@ export class SteeringHarness {
           (await request.json()) as { id: string; text: string },
         );
         this.active = true;
+        await this.afterPrompt?.();
         if (this.loseAcknowledgement)
           return new Response(null, { status: 504 });
         return Response.json({ data: { id: this.prompts.at(-1)!.id } });
@@ -129,13 +135,16 @@ export class SteeringHarness {
     return composition;
   }
 
-  makeApplication(store = this.store): ApplicationService {
+  makeApplication(
+    store = this.store,
+    authority?: Readonly<{ lease: LeasePort; controllerId: string }>,
+  ): ApplicationService {
     return new ApplicationService(
       store,
-      this.world,
+      authority?.lease ?? this.world,
       this.composition(),
       this.world,
-      "controller-1",
+      authority?.controllerId ?? "controller-1",
       this.policy,
       () => this.now,
     );

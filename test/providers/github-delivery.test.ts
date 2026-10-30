@@ -15,6 +15,66 @@ afterEach(() => {
   server = undefined;
 });
 
+test("PR create reauthorizes after lookup and credential I/O; authority loss emits zero PR POSTs", async () => {
+  let tokenRequests = 0,
+    searches = 0,
+    creates = 0,
+    permitted = true;
+  server = Bun.serve({
+    port: 0,
+    fetch: async (request) => {
+      const path = new URL(request.url).pathname;
+      if (path.endsWith("/access_tokens")) {
+        tokenRequests += 1;
+        const body = (await request.json()) as {
+          permissions: Record<string, string>;
+        };
+        if (body.permissions["pull_requests"] === "write") permitted = false;
+        return Response.json(
+          {
+            token: "local-synthetic-token",
+            expires_at: new Date(epoch + 3600000).toISOString(),
+            permissions: body.permissions,
+          },
+          { status: 201 },
+        );
+      }
+      if (path.endsWith("/pulls") && request.method === "GET") {
+        searches += 1;
+        return Response.json([]);
+      }
+      if (path.endsWith("/pulls") && request.method === "POST") {
+        creates += 1;
+        return new Response(null, { status: 500 });
+      }
+      return new Response(null, { status: 404 });
+    },
+  });
+  const apiUrl = `http://127.0.0.1:${server.port}/api/`;
+  const broker = new GitHubAppBroker({
+    appId: "fixture",
+    installationId: 42,
+    privateKey,
+    apiUrl,
+    now: () => epoch,
+  });
+  const client = new GitHubDeliveryClient(broker, { apiUrl, now: () => epoch });
+  const result = await client.createOrFindPullRequest(
+    {
+      repositoryUrl: "https://github.com/acme/demo",
+      headRef: "anvil/work",
+      baseRef: "main",
+      title: "Bounded delivery",
+      body: "Local fixture",
+    },
+    async () => permitted,
+  );
+  expect(result).toMatchObject({ ok: false, error: { kind: "rejected" } });
+  expect(tokenRequests).toBe(2);
+  expect(searches).toBe(1);
+  expect(creates).toBe(0);
+});
+
 test("GitHub read adapter preserves PR, branch, check and truncation facts from local REST fixtures", async () => {
   const requests: { path: string; authorization: string | null }[] = [];
   let tokenRequests = 0;

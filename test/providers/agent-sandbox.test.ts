@@ -185,6 +185,21 @@ function client(apiUrl: string) {
   });
 }
 
+test("Sandbox create reauthorizes after remote lookup and emits no POST when authority is lost", async () => {
+  const fixture = createFixture();
+  const result = await client(fixture.apiUrl).create(intent, async () => {
+    expect(fixture.methods.some((method) => method.startsWith("GET"))).toBe(
+      true,
+    );
+    return false;
+  });
+  expect(result).toMatchObject({ ok: false, error: { kind: "rejected" } });
+  expect(fixture.createCount()).toBe(0);
+  expect(fixture.methods.some((method) => method.startsWith("POST"))).toBe(
+    false,
+  );
+});
+
 test("Sandbox resource contract creates a namespaced agent-sandbox with persistent Workspace and read-only shared Nix", () => {
   const manifest = buildSandboxResource(intent, "anvil-test");
   const metadata = manifest["metadata"] as Record<string, unknown>;

@@ -18,6 +18,7 @@ Maintain it under [repository-root PLANS.md](https://github.com/blogle/anvil/blo
 - [Prepared live acceptance sequence and evidence](#live-acceptance)
 - [Migration decisions, verification and outcome](#migration-checkpoint)
 - [Governed Assignment steering checkpoint](#governed-assignment-steering)
+- [Kubernetes Lease authority checkpoint](#kubernetes-lease-authority)
 
 No complete FS-01–FS-14 obligation is VERIFIED. **FS-15: BLOCKED_EXTERNAL**;
 **K8S_ACCEPTANCE_REQUEST: NOT_EXECUTABLE**. The `sandboxImageGate` still fails;
@@ -27,9 +28,10 @@ Historical checkpoint counts, findings and limitations below retain their origin
 scope and chronology; later evidence does not retroactively rewrite earlier results.
 In particular, the parity matrix contains stale rows (including Git/CI/provider
 handoff assessments); refreshing and independently comparing them remains work.
-Latest engineering progress is the [governed Assignment steering checkpoint](#governed-assignment-steering).
-Its local steering path supersedes the earlier missing-steering residual for this
-bounded interface; historical evidence and wider API/UI parity gaps remain.
+Latest engineering progress is the [Kubernetes Lease authority checkpoint](#kubernetes-lease-authority),
+following [governed Assignment steering](#governed-assignment-steering). These
+local paths supersede earlier missing-steering/adapter residuals for their bounded
+interfaces; historical evidence and wider isolation/API/UI parity gaps remain.
 
 <a id="evidence-ledger"></a>
 ## Evidence ledger
@@ -44,7 +46,7 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 | FS-02 | IMPLEMENTED_UNVERIFIED | Pure domain in `src/domain.ts`; frozen-input test and no-op decisions in `test/domain-core.test.ts`; SQL trigger test `test/lifecycle.test.ts` proves identical Wait, Hold, and Escalate polling execute zero Commission UPDATEs; forged transition denied in `test/store.test.ts`; roots `src/` and `test/`. Current suite: 94 tests. Remaining: exhaustive decision coverage and independent source review. |
 | FS-03 | IMPLEMENTED_UNVERIFIED | `src/domain.ts` compares approved amendments by semantic obligation ID/content/policy and treats identical (including reordered) amendments as no-ops. `test/domain-core.test.ts` “an identical amendment is a no-op and a stale generation is rejected”; `test/store.test.ts` “application authorization port rejects objective/criterion replacement…” and “application rejects a stale approved amendment…”; `test/lifecycle.test.ts` terminal amendment in “one unattended lifecycle converges…” remains rejected. Current `just check` passed 81 tests. Remaining: authority freshness beyond the exact generation-CAS and wrong-principal cases. |
 | FS-04 | IMPLEMENTED_UNVERIFIED | SQLite schema v3 adds criterion provenance and v4 adds durable `interrupt` Operations; SQL Operation journal persists `submitted` before provider dispatch in `src/application.ts`. `test/lifecycle.test.ts`: prepared/submitted/ambiguous/retry restart cases. `test/store.test.ts`: retry identity persistence. Watchdog interrupt lost-ack recovery is exercised in the configured daemon process. New delivery process case creates a PR remotely, returns HTTP 504 after effect, then reobserves by worker branch; it proves one PR create and a durable accepted integrate Operation across actual SQLite/daemon work. Remaining: process-kill failpoints between every SQLite/provider boundary and randomized crash matrix. |
-| FS-05 | IMPLEMENTED_UNVERIFIED | Owner/epoch checks and predecessor resolution in `src/domain.ts`; `test/store.test.ts` “a successor Lease holder resolves a predecessor Operation…”; `test/lifecycle.test.ts` “a successor ApplicationService observes a predecessor's accepted turn after lost acknowledgement” closes/reopens SQLite before B takes over and inspects, then proves stale A cannot reconcile or dispatch and the original dispatch count remains one. Competing SQLite connection CAS is tested by “two SQLite controller connections cannot both mutate one Commission version”. Remaining: Workspace single-writer/independent verifier snapshot and actual Kubernetes Lease adapter. |
+| FS-05 | IMPLEMENTED_UNVERIFIED | Owner/epoch checks and predecessor resolution in `src/domain.ts`; `test/store.test.ts` “a successor Lease holder resolves a predecessor Operation…”; `test/lifecycle.test.ts` “a successor ApplicationService observes a predecessor's accepted turn after lost acknowledgement” closes/reopens SQLite before B takes over and inspects, then proves stale A cannot reconcile or dispatch and the original dispatch count remains one. Competing SQLite connection CAS is tested by “two SQLite controller connections cannot both mutate one Commission version”. [Lease authority checkpoint](#kubernetes-lease-authority) adds `src/providers/kubernetes-lease.ts`, configured daemon wiring, real loopback Lease CAS/epoch and predecessor recovery tests in `test/providers/kubernetes-lease.test.ts` and `test/lease-authority.test.ts`. Remaining: actual Workspace single-writer enforcement/independent verifier snapshot (negative boundary demonstrated), live RBAC/TLS/API/clock validation and reviewed durable storage/recovery topology. |
 | FS-06 | IMPLEMENTED_UNVERIFIED | `test/domain-core.test.ts`: “maxAttempts one admits its first Attempt but blocks a second strategy Attempt”; “over-limit instructions, cost, and deadline hold without preparing effects”; “attempt and repair overlimits block only another strategy or repair”; “recording measured usage may cross the cost limit but blocks the next instruction”; “budget exhaustion blocks new work but not recording authoritative delivery”. `test/store.test.ts` “cost overrun is retained across SQLite reopen and blocks new provider work” proves measured overrun is durable and no new operation dispatches after restart. The configured daemon watchdog test also caps a stuck active Assignment at `maxAttempts=1` and holds rather than starting a second Attempt. Existing no-op lifecycle tests prove unchanged Wait/Hold polling does not increment version or execute SQL UPDATEs. Remaining: randomized bounded nonproductive-loop/restart traces and explicit deadline persistence combined with takeover. |
 | FS-07 | IMPLEMENTED_UNVERIFIED | `Evidence.criterionVersion` retains specification/Candidate/provenance binding. `ProviderComposition` accepts only completed assistant lines `ANVIL_EVIDENCE <obligation-id> <candidate-sha>: <claim>` whose SHA matches the observed Candidate, as submitted worker claims attributed to OpenCode Session; never independent acceptance. Required CI comes from target branch rules/classic protection and exact-SHA Check Runs/commit statuses; absent policy is unknown, missing contexts missing, and skipped/neutral/incomplete never passing. The configured-process trace supplies an old-SHA claim on the changed Candidate; the daemon continues instead of accepting the stale report. Required checks are adversarially tested in `test/providers/github-world.test.ts` and `test/domain-core.test.ts`. Independent evidence/freshness matrices and live ruleset validation remain. |
 | FS-08 | IN_PROGRESS | `src/providers/opencode.ts` extracts visible assistant text; `src/providers/composition.ts` accepts only explicit obligation claims that state the exact currently observed Candidate SHA. Continue/Repair directives specify that contract; worker claims remain non-independent. The configured daemon test autonomously drives Continue→failing required check→Repair→stale worker-claim rejection→Continue→stale-check Wait→pending-check Wait→Integrate→queue wait→Conclude across restart. Its delivery worker fixture now creates commits and publishes them through the real Git credential helper into a local bare HTTP receiver; the GitHub branch adapter reads that receiver ref with `git rev-parse`. Remaining: actual Sandbox helper/capability bootstrap, pinned deployed OpenCode compatibility, randomized SSE loss/order/restart and broader tool-boundary/context traces. |
@@ -877,3 +879,162 @@ residuals, then separately steer the remaining local core work. Broader Campaign
 Findings/review, provider bootstrap/Lease/Workspace, generalized command audit,
 governed invalidated-intent resolution and browser acceptance remain the gaps
 listed above; this checkpoint does not begin another implementation milestone.
+
+<a id="kubernetes-lease-authority"></a>
+## Kubernetes Lease authority checkpoint — 2026-10-30
+
+**Implemented locally; checkpoint for independent controller review.** Reconciled clean successor branch and
+draft PR #124 at `d6c6d29ae5ac142756c19750ca6390469b303269`; no concurrent work
+was present. Independent controller reviewed the steering checkpoint as
+substantive local evidence, not FS-05/11/12 or remote exactly-once acceptance.
+This checkpoint advances FS-05/04/08 with production-intended Lease REST wiring
+executed only against local protocol fixtures. All approved criteria/statuses
+remain unchanged; FS-15 is `BLOCKED_EXTERNAL` and K8S_ACCEPTANCE_REQUEST is
+`NOT_EXECUTABLE`. No cluster, dotfiles, dormant acceptance branch, deployment,
+merge, release or cutover action is authorized or performed.
+
+### Decisions, implementation and findings
+
+- `src/providers/kubernetes-lease.ts` implements namespaced per-Commission
+  acquisition/renewal, expiry reobservation and non-deleting CAS release. Every
+  grant needs a fresh API CAS, validated resource identity/UID/holder/epoch/spec,
+  request confirmation nonce and safe time window. Opaque resourceVersion is used
+  only for CAS, never as a provider fencing token or a numeric succession epoch.
+- Holder identity combines an explicit deployment label and a newly generated
+  process UUID. A receipt of attempted acquisition is required to renew one's
+  own holder string; choosing/copying a string is not sufficient. Positive
+  int32 `leaseTransitions` is the durable epoch, checked against the existing
+  Commission owner epoch. Acquisition increments, renewal preserves, and release
+  retains it in the resource. Missing history for an owned Commission and epoch
+  regression/exhaustion fail closed; there is no delete/reset fallback. Controllers
+  must share the same authoritative SQLite journal and Lease namespace/API.
+- Foreign expiry uses a full unchanged-duration observation plus twice the skew
+  bound on a monotonic clock, never a foreign timestamp to accelerate takeover.
+  API Date bounds, future timestamps, wall/monotonic jumps, delayed confirmations,
+  409 conflict and every transport/auth/body failure deny a grant. The server/API,
+  clock bound and controller-only RBAC are explicit trust assumptions; the adapter
+  does not authenticate a malicious actor already authorized to rewrite Leases.
+- `createControllerAuthority` wires configured daemon mode to that adapter, with
+  explicit namespace, separate rotating token file, CA and timing contract. There
+  is no configured-mode local fallback. Only unavailable/local development mode
+  retains the old deterministic authority. Shutdown attempts CAS release after
+  stopping scheduler and HTTP traffic. No second SQL ownership state machine,
+  Operation journal or new runtime dependency was introduced.
+- Real HTTP Lease replies arrive after asynchronous I/O: application authority
+  transitions now refresh wall time after Lease reads rather than evaluating a
+  fresh grant against an earlier poll timestamp. Worker credential authorization
+  also rejects concurrent state/version changes or deadline expiry during that
+  read. Provider callbacks now guard autonomous as well as steering model/prompt
+  requests, Sandbox POST after lookup, Session/interrupt POST and PR POST after
+  lookup/credential I/O. An already accepted remote effect remains unfenced.
+- Initial adapter tests failed because pinned Bun 1.2.5 adds its real Date header
+  to a supplied deterministic Date, both in `Bun.serve` and in `node:http` despite
+  `sendDate=false`. Both attempts failed closed (0/12 passing), not by bypassing
+  clock checks. The fixture now uses bounded real HTTP/1.1 framing over loopback
+  TCP with exactly one deterministic Date. Typecheck then exposed two fixture
+  Buffer/method optionality issues; corrected before the passing replay. A
+  per-request annotation nonce rejects stale successful bodies even when multiple
+  renewals occur at the same deterministic millisecond.
+- The explicit negative Workspace test transfers the Lease, denies stale A's
+  authority, then demonstrates that a separately credentialed fixture endpoint
+  still accepts a remote prompt and writes a local Workspace probe. This proves
+  the missing exclusion/fencing boundary, not isolation. FS-05 remains
+  `IMPLEMENTED_UNVERIFIED`; verifier snapshot/checkout isolation is not claimed.
+- Source review identified Kubernetes MicroTime's six-fractional-digit JSON
+  reserialization: a literal string comparison against millisecond input would
+  reject legitimate confirmations/renewals. Timestamp identity now compares the
+  instant including the final three microseconds; the HTTP fixture independently
+  emits six digits, and an altered microsecond in a successful reply is rejected.
+  This is local protocol-shape validation, not an executed API-server claim.
+
+### Executed local evidence
+
+- `nix develop -c just fmt` and `nix develop -c just typecheck` — exit 0.
+- `nix develop -c bun test test/providers/kubernetes-lease.test.ts test/lease-authority.test.ts test/authority-boundaries.test.ts test/steering.test.ts test/daemon-configured-process.test.ts`
+  — exit 0: **36 tests / 381 assertions**, before the final stale-GET/late-CAS
+  regression addition. Adapter tests exercise acquisition/renewal/release,
+  competing POST/RV conflicts, foreign expiry/takeover, stale holder rejection,
+  401/403/409/429/500/503, invalid JSON/identity/epoch/future data, stale successful
+  responses, lost renewal acknowledgement, copied holder string, timeout/network,
+  clock skew/jumps, invalid scope/TLS configuration and epoch regression.
+- `test/lease-authority.test.ts` uses real Lease HTTP with deterministic time,
+  production OpenCode/Sandbox composition and real SQLite. It asserts exact
+  Operation IDs/immutable owners, Lease epochs and prompt counts for successor
+  reopen/inspection after A's accepted effect; takeover during both steering and
+  Continue model I/O (zero prompts); loss during status I/O; concurrent steering
+  and autonomous observation; token rotation; and the negative Workspace boundary.
+- `test/daemon-configured-process.test.ts` now runs the actual configured Bun
+  child with Lease REST enabled, explicit fixture token/namespace/controller label,
+  actual owner identities for Git capabilities, clean shutdown/restart and higher
+  epochs. Existing one-PR lost-ack recovery and prompt dispatch counts still pass.
+- At the targeted-test checkpoint, full prescribed checks and relevant Nix builds
+  remained to run; final results are recorded below. Live API-server/etcd,
+  service-account/RBAC/TLS deployment, distributed SQLite storage, Workspace and
+  verifier isolation remain unverified; ambiguous prompt/PR absence still cannot
+  authorize replay. SandboxImageGate and untrusted Nix derivation-add/protocol
+  security findings remain failed/open. No FS obligation is promoted to VERIFIED.
+
+The first full `nix develop -c just check` replay exited 0 with **139 tests / 1489
+assertions** before the MicroTime refinement and the two resource-mutation guard
+regressions. Final staged implementation replay:
+
+| Exact command | Exit | Result / evidence boundary |
+|---|---|---|
+| `nix develop -c just check` | 0 | Locked install, generated lock match and deliberate drift-negative, formatting, strict TypeScript; **141 tests / 1499 assertions**, 23 files. |
+| `nix develop -c just ci-verify` | 0 | Pinned Nix TypeScript/test derivation `/nix/store/v87lh7abv8ypndk2namdvks3vsqa42kv-anvil-typescript-check-0.1.0.drv`. |
+| `nix run .#sdlc -- install --check` | 0 | `SDLC adapters match the locked contract`; `.changes/kubernetes-lease-authority.json` included. |
+| `nix develop -c just ci-check` | 1 | Existing `sandboxImageGate` failure; no gate disabled or weakened. |
+| `nix build .#ui .#daemon .#checks.x86_64-linux.daemonSmoke --no-link -L` | 0 | UI 155 modules; packaged non-root daemon built UI/assets, auth, health/readiness, SQLite schema v6, SIGTERM and reopen/restart smoke passed. |
+
+The known failing gate printed:
+
+```text
+PASS IMAGE-CONTENT: 5 OCI layers and closure include OpenCode 2.0.32, Git, and the configured non-root entrypoint
+BLOCKED/INCOMPATIBLE: the preflight rejects missing 9ysv2ynpka84idp745mcd8l0ayc2f102-opencode-2.0.32 paths, but no pre-provision contract guarantees the required closure is present; the main Sandbox mount overlays /nix/store and an empty-volume overlay hides the baked executable
+```
+
+Inspected output paths were
+`/nix/store/0clr3fw0ag8rblaxj5956d5z9zfdm2m2-anvil-ui-0.1.0` and
+`/nix/store/71las7dk0ji00mg0jvh6gjq8d46ab16h-anvil-daemon-0.1.0`; the proof source
+snapshot was `/nix/store/km4wsidg9aggbnn0552x6mzsxv8zj8mm-a62hy8bwhp5hkdkvg85hn6h6ikz09h64-source`.
+Later evidence-document updates can change input-addressed paths. Final additional
+regressions prove stale GET -> PUT 409 rejection and denial of a late successful
+CAS, exact MicroTime comparison, zero Sandbox POST after failed post-lookup
+authorization, and zero PR POST after authority loss during credential I/O.
+
+These results use loopback HTTP fixtures (including the actual configured child
+daemon), deterministic clocks in adapter/application authority tests, real SQLite
+and local Git/OpenCode fixture effects. The child-daemon trace uses its real
+process clock. They do not execute a Kubernetes API server, etcd, cluster, actual
+service-account/RBAC policy, TLS deployment, multi-node shared storage or a real
+Workspace/verifier isolation boundary. No browser/visual acceptance is added.
+
+### Per-obligation progress and residuals
+
+| FS | Local evidence added here | Remaining gap |
+|---|---|---|
+| FS-04 | A successor reopens the same SQLite journal and inspects A's accepted/submitted steering message by original ID, with one prompt and immutable original owner. Unknown absence stays unresolved. | Full process-kill/randomized crash matrix, governed invalidated-intent resolution and independently reviewed storage recovery. |
+| FS-05 | Production-intended Lease REST adapter, configured daemon factory, CAS conflicts/epochs, restart identity, stale-holder and clock/response failures; explicit remote-writer negative. | Workspace writer exclusion and verifier checkout/snapshot proof; live API/RBAC/TLS/storage topology acceptance. Status remains IMPLEMENTED_UNVERIFIED. |
+| FS-08 | In-flight status/model loss prevents new prompts; steering and autonomous observation serialize using the same SQL CAS; configured child daemon uses actual Lease fixture across restart. | Broader randomized event/authority/tool traces and real provider/sandbox bootstrap; no unattended live acceptance. |
+| FS-11 | Configured main process has explicit controller incarnation and Lease authority, and graceful release; existing local process/API/MCP suites remain applicable. | Broader command/graph/Findings/audit parity, operational hardening and live runtime acceptance. |
+| FS-13 | No image/shared-Nix contract or failing proof changed. | Existing closure preseed compatibility and untrusted derivation-add/protocol authorization failures remain open. |
+| FS-15 | No execution requested or attempted. | BLOCKED_EXTERNAL; K8S_ACCEPTANCE_REQUEST NOT_EXECUTABLE pending separate prerequisites, authorization and independent execution/review. |
+
+Final read-only Bun assertions against `git show d6c6d29:docs/plans/active/autonomous-first-slice.md`
+exited 0: all 15 approved FS criteria sections and status cells are byte-identical,
+and the external gate remains NOT_EXECUTABLE. Only progress/evidence is updated.
+`git diff --exit-code HEAD -- scripts/check-sandbox-worker-image.ts scripts/prove-sandbox-worker-store-signatures.ts`
+exited 0; neither failing proof changed. `git diff --check` and
+`git diff --cached --check` exited 0. Production adapter, callback, runtime and
+fixture diffs were reviewed before publication.
+
+### Outcome and handoff
+
+The requested bounded Lease authority implementation is ready for independent
+controller review, not `LOCAL_SLICE_READY` or full FS-05 acceptance. Configured
+runtime no longer invents local ownership; actual Namespace/RBAC/CA/storage and
+Workspace exclusion acceptance remain separate gaps. Ambiguous outcomes remain
+inspectable and never acquire retry permission merely from succession. Preserve
+FS-13's closure-preseed and Nix protocol failures, FS-15 BLOCKED_EXTERNAL, and
+K8S_ACCEPTANCE_REQUEST NOT_EXECUTABLE. Stop this checkpoint after publishing the
+single commit to PR #124; subsequent engineering requires the next controller turn.

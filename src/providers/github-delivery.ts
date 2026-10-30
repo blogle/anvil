@@ -196,6 +196,7 @@ export class GitHubDeliveryClient {
 
   async createOrFindPullRequest(
     input: GitHubPullRequestInput,
+    authorizeEffect?: () => Promise<boolean>,
   ): Promise<GitHubDeliveryResult<GitHubPullRequestFact>> {
     const repository = parseGitHubRepository(input.repositoryUrl);
     if (!repository.ok)
@@ -284,6 +285,7 @@ export class GitHubDeliveryClient {
         body: input.body,
         draft: input.draft ?? false,
       },
+      authorizeEffect,
     );
     if (created.ok) {
       const fact = parsePullRequestFact(
@@ -742,6 +744,7 @@ export class GitHubDeliveryClient {
     purpose: GitHubCredentialPurpose,
     method: "GET" | "POST",
     body?: unknown,
+    authorizeEffect?: () => Promise<boolean>,
   ): Promise<GitHubDeliveryResult<unknown>> {
     const repo = parseGitHubRepository(repositoryUrl);
     if (!repo.ok)
@@ -757,6 +760,14 @@ export class GitHubDeliveryClient {
       purpose,
     );
     if (!credential.ok) return credentialError(credential.error);
+    if (authorizeEffect !== undefined && !(await authorizeEffect()))
+      return {
+        ok: false,
+        error: {
+          kind: "rejected",
+          message: "Authority lost before GitHub mutation",
+        },
+      };
     const [owner, name] = repo.value.split("/") as [string, string];
     const url = new URL(
       `repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/${path}`,

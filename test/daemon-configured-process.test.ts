@@ -13,6 +13,7 @@ import { OpenCodeAdapter } from "../src/providers/opencode";
 import { WorkerGitCapabilitySigner } from "../src/providers/git-credentials";
 import { workBranchFor } from "../src/providers/runtime";
 import { proposalInput } from "./support/fixtures";
+import { LeaseApiFixture, leaseToken } from "./support/lease-api";
 
 type Child = Readonly<{
   kill: (signal?: number | NodeJS.Signals) => void;
@@ -27,6 +28,7 @@ let openCodeServer: ReturnType<typeof Bun.serve> | undefined;
 let githubServer: ReturnType<typeof Bun.serve> | undefined;
 let gitReceiverServer: ReturnType<typeof Bun.serve> | undefined;
 let mergifyServer: ReturnType<typeof Bun.serve> | undefined;
+let leaseApi: LeaseApiFixture | undefined;
 let provisionCount = 0;
 let sessionCreateCount = 0;
 let promptCount = 0;
@@ -51,6 +53,9 @@ afterEach(async () => {
   githubServer = undefined;
   gitReceiverServer = undefined;
   mergifyServer = undefined;
+  expect(leaseApi?.errors ?? []).toHaveLength(0);
+  leaseApi?.close();
+  leaseApi = undefined;
   if (directory !== undefined)
     rmSync(directory, { recursive: true, force: true });
   directory = undefined;
@@ -847,10 +852,18 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   writeFileSync(gitCapabilitySecretPath, gitCapabilitySecret);
   writeFileSync(mergifyTokenPath, "local-mergify-token");
   writeFileSync(kubernetesTokenPath, "local-kubernetes-token");
+  const leaseTokenPath = join(directory, "lease-token");
+  writeFileSync(leaseTokenPath, leaseToken, { mode: 0o600 });
+  leaseApi = new LeaseApiFixture(Date.now);
+  await leaseApi.ready;
   const runtimeEnvironment = {
     ANVIL_API_TOKEN: apiToken,
     ANVIL_DATABASE: join(directory, "configured.sqlite"),
     ANVIL_PROVIDER_MODE: "configured",
+    ANVIL_CONTROLLER_ID: "configured-process-fixture",
+    ANVIL_LEASE_NAMESPACE: "configured-leases",
+    ANVIL_LEASE_API_URL: leaseApi.url,
+    ANVIL_LEASE_TOKEN_FILE: leaseTokenPath,
     ANVIL_RECONCILE_INTERVAL_MS: "250",
     ANVIL_SANDBOX_NAMESPACE: "configured-test",
     ANVIL_SANDBOX_IMAGE_DIGEST: `ghcr.io/example/sandbox@sha256:${"b".repeat(64)}`,
@@ -1183,7 +1196,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
       workspaceId: workspaceOperation.outcome.externalIdentity,
       repository: "acme/demo",
       targetRef: deliveryTargetRef,
-      controllerId: "anvil-local-controller",
+      controllerId: deliveryCommission.owner!.controllerId,
       ownerEpoch: deliveryCommission.owner?.epoch ?? 1,
     },
     Date.now(),
@@ -1519,4 +1532,20 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
       { kind: "create_session", outcome: { kind: "ambiguous" } },
     ],
   });
+  expect(leaseApi.calls.filter((call) => call.method === "POST")).toHaveLength(
+    4,
+  );
+  expect(
+    leaseApi.calls.filter((call) => call.method === "PUT").length,
+  ).toBeGreaterThan(4);
+  expect(
+    leaseApi.get(ambiguousId, "configured-leases").spec.leaseTransitions,
+  ).toBeGreaterThan(1);
+  expect(
+    new Set(
+      leaseApi.calls.flatMap((call) =>
+        call.body?.spec.holderIdentity ? [call.body.spec.holderIdentity] : [],
+      ),
+    ).size,
+  ).toBeGreaterThan(1);
 }, 45_000);

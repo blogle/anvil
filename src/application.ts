@@ -331,6 +331,7 @@ export class ApplicationService {
     if (!current.ok) return current;
     const grant = await this.#currentLease(commissionId, now);
     if (!grant.ok) return grant;
+    now = this.#now?.() ?? now;
     const transition = evolve(current.value, {
       kind: "admit",
       actor: { kind: "approver", identity: principalId },
@@ -445,6 +446,7 @@ export class ApplicationService {
       if (!loaded.ok) return loaded;
       const lease = await this.#currentLease(commissionId, now);
       if (!lease.ok) return lease;
+      now = this.#now?.() ?? now;
       let current = loaded.value;
       if (!hasOwner(current, lease.value)) {
         const takeover = evolve(current, {
@@ -484,6 +486,7 @@ export class ApplicationService {
       now = this.#now?.() ?? now;
       const confirmedLease = await this.#currentLease(commissionId, now);
       if (!confirmedLease.ok) return confirmedLease;
+      now = this.#now?.() ?? now;
       if (!hasOwner(current, confirmedLease.value))
         return { ok: false, error: { kind: "ownership_unavailable" } };
       const result = evolve(current, {
@@ -627,6 +630,7 @@ export class ApplicationService {
         now = this.#now?.() ?? now;
         const resolutionLease = await this.#currentLease(commissionId, now);
         if (!resolutionLease.ok) return resolutionLease;
+        now = this.#now?.() ?? now;
         const resolution = evolveOperation(
           current,
           pending,
@@ -695,8 +699,11 @@ export class ApplicationService {
     reason: string,
     now: number,
   ): Promise<Result<Commission, ApplicationError>> {
-    return this.#authorizedTransition(commissionId, now, (commission, lease) =>
-      evolve(commission, { kind: "hold", lease, reason, now }),
+    return this.#authorizedTransition(
+      commissionId,
+      now,
+      (commission, lease, checkedAt) =>
+        evolve(commission, { kind: "hold", lease, reason, now: checkedAt }),
     );
   }
 
@@ -704,8 +711,11 @@ export class ApplicationService {
     commissionId: string,
     now: number,
   ): Promise<Result<Commission, ApplicationError>> {
-    return this.#authorizedTransition(commissionId, now, (commission, lease) =>
-      evolve(commission, { kind: "resume", lease, now }),
+    return this.#authorizedTransition(
+      commissionId,
+      now,
+      (commission, lease, checkedAt) =>
+        evolve(commission, { kind: "resume", lease, now: checkedAt }),
     );
   }
 
@@ -714,8 +724,16 @@ export class ApplicationService {
     costMicros: number,
     now: number,
   ): Promise<Result<Commission, ApplicationError>> {
-    return this.#authorizedTransition(commissionId, now, (commission, lease) =>
-      evolve(commission, { kind: "record_usage", lease, costMicros, now }),
+    return this.#authorizedTransition(
+      commissionId,
+      now,
+      (commission, lease, checkedAt) =>
+        evolve(commission, {
+          kind: "record_usage",
+          lease,
+          costMicros,
+          now: checkedAt,
+        }),
     );
   }
 
@@ -747,10 +765,13 @@ export class ApplicationService {
     )
       return false;
     const lease = await this.#currentLease(commission.id, now);
+    now = this.#now?.() ?? now;
     if (
       !lease.ok ||
       lease.value.validUntil <= now ||
       !hasOwner(commission, lease.value) ||
+      this.#store.get(commission.id)?.version !== commission.version ||
+      commission.budget.limits.deadlineAt <= now ||
       lease.value.owner.controllerId !== scope.controllerId ||
       lease.value.owner.epoch !== scope.ownerEpoch
     )
@@ -828,6 +849,7 @@ export class ApplicationService {
     now = this.#now?.() ?? now;
     const confirmedLease = await this.#currentLease(commission.id, now);
     if (!confirmedLease.ok) return confirmedLease;
+    now = this.#now?.() ?? now;
     if (!hasOwner(commission, confirmedLease.value))
       return { ok: false, error: { kind: "ownership_unavailable" } };
     lease = confirmedLease.value;
@@ -902,6 +924,7 @@ export class ApplicationService {
     now = this.#now?.() ?? now;
     const outcomeLease = await this.#currentLease(commission.id, now);
     if (!outcomeLease.ok) return outcomeLease;
+    now = this.#now?.() ?? now;
     const latest = this.#load(commission.id);
     if (!latest.ok) return latest;
     const persisted = this.#store
@@ -930,13 +953,14 @@ export class ApplicationService {
     make: (
       commission: Commission,
       lease: LeaseGrant,
+      checkedAt: number,
     ) => ReturnType<typeof evolve>,
   ): Promise<Result<Commission, ApplicationError>> {
     const current = this.#load(commissionId);
     if (!current.ok) return current;
     const lease = await this.#currentLease(commissionId, now);
     if (!lease.ok) return lease;
-    const transition = make(current.value, lease.value);
+    const transition = make(current.value, lease.value, this.#now?.() ?? now);
     if (!transition.ok)
       return { ok: false, error: { kind: "domain", error: transition.error } };
     return this.#commit(transition.value);

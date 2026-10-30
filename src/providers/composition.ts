@@ -239,6 +239,7 @@ export class ProviderComposition implements ProviderPort {
     if (operation.kind === "provision_sandbox") {
       const result = await this.#config.sandbox.create(
         this.#config.sandboxIntent(commission),
+        authorizeEffect,
       );
       if (!result.ok) return { ok: false, error: sandboxFailure(result.error) };
       return {
@@ -257,7 +258,10 @@ export class ProviderComposition implements ProviderPort {
       const sandboxResourceName = operation.target.slice("opencode:".length);
       if (sandboxResourceName.length === 0)
         return rejected("OpenCode Session Operation has no Sandbox identity");
-      const result = await this.#openCode(sandboxResourceName).createSession();
+      const result =
+        await this.#openCode(sandboxResourceName).createSession(
+          authorizeEffect,
+        );
       if (!result.ok) return result;
       this.#bindings.set(commission.id, {
         sandboxResourceName,
@@ -286,7 +290,7 @@ export class ProviderComposition implements ProviderPort {
         return rejected("Watchdog interrupt does not target the bound Session");
       const interrupted = await this.#openCode(
         binding.sandboxResourceName,
-      ).interruptSession(sessionId, this.#config.model, now);
+      ).interruptSession(sessionId, this.#config.model, now, authorizeEffect);
       if (!interrupted.ok) return interrupted;
       return {
         ok: true,
@@ -391,13 +395,16 @@ export class ProviderComposition implements ProviderPort {
         return rejected(
           "Worker branch no longer points at the authorized Candidate",
         );
-      const pullRequest = await this.#config.github.createOrFindPullRequest({
-        repositoryUrl: commission.repository,
-        headRef: this.#config.workBranch(commission),
-        baseRef: commission.integrationTarget,
-        title: commission.objective,
-        body: `Anvil Commission ${commission.id}\nCandidate ${operation.candidateRevision ?? "unknown"}`,
-      });
+      const pullRequest = await this.#config.github.createOrFindPullRequest(
+        {
+          repositoryUrl: commission.repository,
+          headRef: this.#config.workBranch(commission),
+          baseRef: commission.integrationTarget,
+          title: commission.objective,
+          body: `Anvil Commission ${commission.id}\nCandidate ${operation.candidateRevision ?? "unknown"}`,
+        },
+        authorizeEffect,
+      );
       if (!pullRequest.ok)
         return { ok: false, error: githubFailure(pullRequest.error) };
       if (

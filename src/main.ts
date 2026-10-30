@@ -1,6 +1,5 @@
 import { ApplicationService } from "./application";
 import { createDaemonApp, startReconciliationLoop } from "./daemon";
-import type { LeasePort } from "./application";
 import type { Policy } from "./domain";
 import { CommissionStore } from "./persistence/sqlite";
 import { readFileSync } from "node:fs";
@@ -9,12 +8,14 @@ import {
   WorkerGitCapabilitySigner,
   WorkerGitCredentialService,
 } from "./providers/git-credentials";
-import { createProviderPort, workBranchFor } from "./providers/runtime";
+import {
+  createControllerAuthority,
+  createProviderPort,
+  workBranchFor,
+} from "./providers/runtime";
 
 const bearerToken = process.env["ANVIL_API_TOKEN"];
 const databasePath = process.env["ANVIL_DATABASE"] ?? "./anvil.sqlite";
-const controllerId =
-  process.env["ANVIL_CONTROLLER_ID"] ?? "anvil-local-controller";
 const operatorId = process.env["ANVIL_OPERATOR_ID"] ?? "local-operator";
 const reconciliationIntervalMs = Number(
   process.env["ANVIL_RECONCILE_INTERVAL_MS"] ?? "5000",
@@ -38,30 +39,13 @@ const policy: Policy = {
   runtimeProvisioning: true,
 };
 
-const lease: LeasePort = {
-  async current(commissionId, requestedController, now) {
-    if (requestedController !== controllerId)
-      return {
-        ok: false,
-        error: { kind: "unavailable", message: "local controller mismatch" },
-      };
-    return {
-      ok: true,
-      value: {
-        owner: { controllerId, epoch: 1 },
-        resourceVersion: `local:${commissionId}:1`,
-        observedAt: now,
-        validUntil: now + 60_000,
-      },
-    };
-  },
-};
-
 let githubBroker: GitHubAppBroker | undefined;
 const provider = createProviderPort(process.env, (broker) => {
   githubBroker = broker;
 });
 const store = new CommissionStore(databasePath);
+const authority = createControllerAuthority(process.env, store);
+const { lease, controllerId } = authority;
 const application = new ApplicationService(
   store,
   lease,
@@ -132,6 +116,7 @@ console.log(JSON.stringify({ event: "daemon_started", port, databasePath }));
 const shutdown = async () => {
   await reconciler.stop();
   server.stop(true);
+  await authority.stop();
   store.close();
 };
 process.once("SIGINT", () => void shutdown());

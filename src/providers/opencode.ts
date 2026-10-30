@@ -109,7 +109,17 @@ export class OpenCodeAdapter {
         };
   }
 
-  async createSession(): Promise<ProviderResult<OpenCodeSession>> {
+  async createSession(
+    authorizeEffect?: () => Promise<boolean>,
+  ): Promise<ProviderResult<OpenCodeSession>> {
+    if (authorizeEffect !== undefined && !(await authorizeEffect()))
+      return {
+        ok: false,
+        error: {
+          kind: "rejected",
+          message: "Authority lost before OpenCode Session creation",
+        },
+      };
     const result = await this.#request("api/session", {
       method: "POST",
       body: "{}",
@@ -363,6 +373,7 @@ export class OpenCodeAdapter {
     sessionId: string,
     model: Readonly<{ providerId: string; modelId: string }>,
     now: number,
+    authorizeEffect?: () => Promise<boolean>,
   ): Promise<ProviderResult<boolean>> {
     const current = await this.#readExecution(sessionId, now, model);
     if (current.kind === "unknown" || current.kind === "unavailable")
@@ -388,6 +399,14 @@ export class OpenCodeAdapter {
         },
       };
     this.#executionSnapshots.delete(sessionId);
+    if (authorizeEffect !== undefined && !(await authorizeEffect()))
+      return {
+        ok: false,
+        error: {
+          kind: "rejected",
+          message: "Authority lost before OpenCode interruption",
+        },
+      };
     const result = await this.#request(
       `api/session/${encodeURIComponent(sessionId)}/interrupt?resume=false`,
       { method: "POST" },
@@ -502,34 +521,38 @@ export class OpenCodeAdapter {
     }
     const id = openCodeMessageId(operation.id);
     const sessionPath = `api/session/${encodeURIComponent(sessionId)}`;
-    const steeringPermission = async (): Promise<ProviderResult<true>> => {
-      if (operation.kind !== "steer") return { ok: true, value: true };
-      const active = await this.activeSessions();
-      if (!active.ok) return active;
+    const instructionPermission = async (): Promise<ProviderResult<true>> => {
+      if (operation.kind === "steer") {
+        const active = await this.activeSessions();
+        if (!active.ok) return active;
+        if (
+          operation.target !== `session:${sessionId}` ||
+          active.value.some(({ id }) => id === sessionId)
+        )
+          return {
+            ok: false,
+            error: {
+              kind: "rejected",
+              message:
+                "Steering boundary changed: bound OpenCode Session is not idle",
+            },
+          };
+      }
       if (
-        operation.target !== `session:${sessionId}` ||
-        active.value.some(({ id }) => id === sessionId)
+        (operation.kind === "steer" && authorizeEffect === undefined) ||
+        (authorizeEffect !== undefined && !(await authorizeEffect()))
       )
         return {
           ok: false,
           error: {
             kind: "rejected",
             message:
-              "Steering boundary changed: bound OpenCode Session is not idle",
-          },
-        };
-      if (authorizeEffect === undefined || !(await authorizeEffect()))
-        return {
-          ok: false,
-          error: {
-            kind: "rejected",
-            message:
-              "Steering authority or submission preconditions changed before OpenCode effect",
+              "Instruction authority or submission preconditions changed before OpenCode effect",
           },
         };
       return { ok: true, value: true };
     };
-    const permitted = await steeringPermission();
+    const permitted = await instructionPermission();
     if (!permitted.ok) return permitted;
     // An accepted prompt can start work before a new event arrives. Never reuse
     // a pre-dispatch idle cache entry to authorize another autonomous turn.
@@ -543,7 +566,7 @@ export class OpenCodeAdapter {
     });
     if (!selected.ok) return selected;
 
-    const stillPermitted = await steeringPermission();
+    const stillPermitted = await instructionPermission();
     if (!stillPermitted.ok) return stillPermitted;
 
     const prompt = await this.#request(`${sessionPath}/prompt`, {

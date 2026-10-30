@@ -1,0 +1,5 @@
+{
+  "type": "feat",
+  "semver": "minor",
+  "summary": "Wire configured daemon authority to namespaced Kubernetes Lease CAS with incarnation epochs, fail-closed provider guards and local succession proofs"
+}

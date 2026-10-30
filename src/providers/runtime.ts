@@ -9,10 +9,100 @@ import { OpenCodeAdapter } from "./opencode";
 import { ProviderComposition } from "./composition";
 import type {
   ProviderFailure,
+  LeasePort,
   ProviderPort,
   ProviderResult,
 } from "../application";
 import type { Commission, Operation, OperationOutcome } from "../domain";
+import type { CommissionStore } from "../persistence/sqlite";
+import { KubernetesLeaseClient } from "./kubernetes-lease";
+
+export function createControllerAuthority(
+  environment: NodeJS.ProcessEnv,
+  store: CommissionStore,
+  clock: Readonly<{ now: () => number; monotonicNow?: () => number }> = {
+    now: Date.now,
+  },
+): Readonly<{
+  controllerId: string;
+  lease: LeasePort;
+  stop: () => Promise<void>;
+}> {
+  const mode = environment["ANVIL_PROVIDER_MODE"] ?? "unavailable";
+  if (mode === "configured") {
+    const lease = new KubernetesLeaseClient({
+      apiServerUrl:
+        environment["ANVIL_LEASE_API_URL"] ??
+        required(environment, "ANVIL_KUBERNETES_API_URL"),
+      namespace: required(environment, "ANVIL_LEASE_NAMESPACE"),
+      controllerIdentity: required(environment, "ANVIL_CONTROLLER_ID"),
+      bearerToken: () => readSecretFile(environment, "ANVIL_LEASE_TOKEN_FILE"),
+      ...(environment["ANVIL_KUBERNETES_CA_FILE"] === undefined
+        ? {}
+        : {
+            caCertificate: readSecretFile(
+              environment,
+              "ANVIL_KUBERNETES_CA_FILE",
+            ),
+          }),
+      durationSeconds: positiveInteger(
+        environment["ANVIL_LEASE_DURATION_SECONDS"],
+        30,
+        "ANVIL_LEASE_DURATION_SECONDS",
+      ),
+      timeoutMs: positiveInteger(
+        environment["ANVIL_LEASE_TIMEOUT_MS"],
+        2000,
+        "ANVIL_LEASE_TIMEOUT_MS",
+      ),
+      maxClockSkewMs: positiveInteger(
+        environment["ANVIL_LEASE_MAX_CLOCK_SKEW_MS"],
+        2000,
+        "ANVIL_LEASE_MAX_CLOCK_SKEW_MS",
+      ),
+      epochFloor: (id) => store.get(id)?.owner?.epoch ?? 0,
+      ...clock,
+    });
+    // Validate explicit credential configuration at startup; reread for rotation.
+    readSecretFile(environment, "ANVIL_LEASE_TOKEN_FILE");
+    return {
+      controllerId: lease.controllerId,
+      lease,
+      stop: async () => {
+        for (const result of await lease.stop())
+          if (!result.ok)
+            console.error(
+              JSON.stringify({
+                event: "lease_release_failed",
+                error: result.error,
+              }),
+            );
+      },
+    };
+  }
+  if (mode !== "unavailable")
+    throw new Error("ANVIL_PROVIDER_MODE must be unavailable or configured");
+  const controllerId =
+    environment["ANVIL_CONTROLLER_ID"] ?? "anvil-local-controller";
+  return {
+    controllerId,
+    lease: {
+      current: async (commissionId, requested, now) =>
+        requested !== controllerId
+          ? { ok: false, error: unavailable("local controller mismatch") }
+          : {
+              ok: true,
+              value: {
+                owner: { controllerId, epoch: 1 },
+                resourceVersion: `local:${commissionId}:1`,
+                observedAt: now,
+                validUntil: now + 60000,
+              },
+            },
+    },
+    stop: async () => {},
+  };
+}
 
 export function createProviderPort(
   environment: NodeJS.ProcessEnv,

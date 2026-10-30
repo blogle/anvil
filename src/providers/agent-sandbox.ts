@@ -136,6 +136,7 @@ export class AgentSandboxClient {
 
   async create(
     intent: SandboxIntent,
+    authorizeEffect?: () => Promise<boolean>,
   ): Promise<SandboxAdapterResult<SandboxObservation>> {
     const desired = buildSandboxResource(intent, this.#namespace);
     const metadata = asRecord(desired["metadata"]);
@@ -151,6 +152,15 @@ export class AgentSandboxClient {
     const existing = await this.inspect(intent.commissionId);
     if (existing.ok) return verifySameIntent(existing.value, desired);
     if (existing.error.kind !== "not_found") return existing;
+
+    if (authorizeEffect !== undefined && !(await authorizeEffect()))
+      return {
+        ok: false,
+        error: {
+          kind: "rejected",
+          message: "Authority lost before Sandbox creation",
+        },
+      };
 
     const created = await this.#request(
       this.#collectionPath(),
