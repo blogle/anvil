@@ -40,6 +40,11 @@ function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
 
+type NixDaemonProcess = {
+  exited: Promise<number>;
+  kill: (signal?: number | NodeJS.Signals) => void;
+};
+
 async function run(
   executable: string,
   arguments_: readonly string[],
@@ -84,6 +89,254 @@ async function preflight(
       NIX_CONFIG: "",
       NIX_PATH: "",
     },
+  );
+}
+
+async function nixDaemonStoreInfo(
+  storeUri: string,
+  home: string,
+): Promise<string> {
+  const result = await nix(["store", "info", "--store", storeUri], home);
+  assert(
+    result.exitCode === 0,
+    `temporary Nix daemon store is not reachable at ${storeUri}: ${result.stderr}`,
+  );
+  return `${result.stdout}\n${result.stderr}`;
+}
+
+async function waitForSocket(
+  child: NixDaemonProcess,
+  socketPath: string,
+  stderr: Promise<string>,
+): Promise<void> {
+  let exitCode: number | undefined;
+  void child.exited.then((code) => (exitCode = code));
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      if (lstatSync(socketPath).isSocket()) return;
+    } catch {
+      // The listener may not have created its socket yet.
+    }
+    if (exitCode !== undefined) break;
+    await Bun.sleep(50);
+  }
+  await stopDaemon(child);
+  throw new Error(
+    `temporary unprivileged Nix daemon did not bind ${socketPath} (exit ${exitCode}; stderr: ${await stderr})`,
+  );
+}
+
+async function stopDaemon(child: NixDaemonProcess): Promise<void> {
+  let exited = false;
+  const exit = child.exited.then((code) => {
+    exited = true;
+    return code;
+  });
+  child.kill("SIGTERM");
+  await Promise.race([exit, Bun.sleep(3_000)]);
+  if (!exited) child.kill("SIGKILL");
+  await exit;
+}
+
+function makeReadOnly(path: string): void {
+  const details = lstatSync(path);
+  if (details.isSymbolicLink()) return;
+  if (details.isDirectory()) {
+    for (const child of readdirSync(path)) makeReadOnly(join(path, child));
+  }
+  chmodSync(path, details.mode & 0o7777 & ~0o222);
+}
+
+function assertNotWritable(path: string): void {
+  const writeProbe = join(path, ".anvil-preflight-write-probe");
+  try {
+    writeFileSync(writeProbe, "unexpected write access");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    assert(
+      code === "EACCES" || code === "EPERM",
+      `mounted store write failed for an unexpected reason: ${String(error)}`,
+    );
+    return;
+  }
+  rmSync(writeProbe, { force: true });
+  throw new Error("unprivileged client can write into the mounted store");
+}
+
+async function proveUnixSocketDaemon(
+  isolatedRoot: string,
+  temporaryDirectory: string,
+  temporaryHome: string,
+  openCodeStorePath: string,
+): Promise<void> {
+  assert(
+    process.getuid?.() === 1000,
+    `Unix-socket proof requires image UID 1000; actual UID is ${process.getuid?.() ?? "unavailable"}`,
+  );
+  const socketPath = join(isolatedRoot, "nix-daemon.sock");
+  const socketStoreUri = `unix://${socketPath}`;
+  const daemonBackendRoot = join(isolatedRoot, "daemon-backend");
+  const daemonBackendStoreRoot = join(daemonBackendRoot, "nix", "store");
+  const matchingMountRoot = join(isolatedRoot, "socket-mounted-matching");
+  const emptyMountRoot = join(isolatedRoot, "socket-mounted-empty");
+  const corruptMountRoot = join(isolatedRoot, "socket-mounted-corrupt");
+  for (const directory of [matchingMountRoot, emptyMountRoot, corruptMountRoot])
+    mkdirSync(directory, { recursive: true });
+
+  const daemon = Bun.spawn([nixExecutablePath, "daemon"], {
+    env: {
+      HOME: temporaryHome,
+      PATH: dirname(nixExecutablePath),
+      NIX_CONFIG: `store = local?root=${daemonBackendRoot}&require-sigs=false`,
+      NIX_DAEMON_SOCKET_PATH: socketPath,
+      NIX_PATH: "",
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const daemonStdout = new Response(daemon.stdout).text();
+  const daemonStderr = new Response(daemon.stderr).text();
+  try {
+    await waitForSocket(daemon, socketPath, daemonStderr);
+    const storeInfo = await nixDaemonStoreInfo(socketStoreUri, temporaryHome);
+    assert(
+      storeInfo.includes("Trusted: 0"),
+      `temporary daemon did not identify its UID-1000 client as untrusted (output: ${storeInfo})`,
+    );
+    console.log(
+      "PASS UNIX-DAEMON UNTRUSTED CLIENT: temporary Nix 2.34.9 daemon reports Trusted: 0 for UID 1000",
+    );
+
+    const seeded = await nix(
+      [
+        "copy",
+        "--no-check-sigs",
+        "--from",
+        "daemon",
+        "--to",
+        socketStoreUri,
+        workerImagePath,
+      ],
+      temporaryHome,
+    );
+    assert(
+      seeded.exitCode === 0,
+      `copying the image closure into the temporary daemon backend failed: ${seeded.stderr}`,
+    );
+
+    const exactMountedPaths = runtimePaths.filter((path) =>
+      imageClosurePaths.includes(path),
+    );
+    copyRuntimePaths(
+      daemonBackendStoreRoot,
+      matchingMountRoot,
+      exactMountedPaths,
+    );
+    copyRuntimePaths(
+      daemonBackendStoreRoot,
+      corruptMountRoot,
+      exactMountedPaths,
+    );
+    const emptyMountResult = await preflight(
+      socketStoreUri,
+      emptyMountRoot,
+      runtimeManifestPath,
+      temporaryDirectory,
+      temporaryHome,
+    );
+    assert(
+      emptyMountResult.exitCode !== 0 &&
+        emptyMountResult.stderr.includes(
+          "BLOCKED: mounted shared store is missing",
+        ),
+      "healthy seeded Unix daemon accepted an empty distinct mounted store",
+    );
+    console.log(
+      "PASS UNIX-DAEMON EMPTY-MOUNT NEGATIVE: healthy daemon rejects empty mounted store",
+    );
+
+    corruptOpenCodePath(corruptMountRoot, openCodeStorePath);
+    for (const path of [matchingMountRoot, corruptMountRoot])
+      makeReadOnly(path);
+    assertNotWritable(matchingMountRoot);
+    console.log(
+      "PASS READ-ONLY MOUNT: UID 1000 cannot create files in mounted closure",
+    );
+
+    const corruptMountResult = await preflight(
+      socketStoreUri,
+      corruptMountRoot,
+      runtimeManifestPath,
+      temporaryDirectory,
+      temporaryHome,
+    );
+    assert(
+      corruptMountResult.exitCode !== 0 &&
+        corruptMountResult.stderr.includes(
+          `BLOCKED: mounted bytes do not match daemon NAR hash for ${basename(openCodeStorePath)}`,
+        ),
+      "healthy Unix daemon accepted same-name tampered mounted OpenCode bytes",
+    );
+    console.log(
+      "PASS UNIX-DAEMON CORRUPTION NEGATIVE: healthy daemon rejects tampered distinct mount",
+    );
+
+    const matchedMountResult = await preflight(
+      socketStoreUri,
+      matchingMountRoot,
+      runtimeManifestPath,
+      temporaryDirectory,
+      temporaryHome,
+    );
+    assert(
+      matchedMountResult.exitCode === 0 &&
+        matchedMountResult.stdout.includes("shared-store preflight passed"),
+      `actual preflight rejected matching read-only mount via Unix daemon: ${matchedMountResult.stderr}`,
+    );
+    console.log(
+      `PASS UNIX-DAEMON MATCHED-MOUNT: actual packaged preflight NAR-verified ${runtimePaths.length} paths over ${socketStoreUri}`,
+    );
+
+    const missingSocketUri = `unix://${join(isolatedRoot, "missing-nix-daemon.sock")}`;
+    const missingSocketResult = await preflight(
+      missingSocketUri,
+      matchingMountRoot,
+      runtimeManifestPath,
+      temporaryDirectory,
+      temporaryHome,
+    );
+    assert(
+      missingSocketResult.exitCode !== 0 &&
+        missingSocketResult.stderr.includes(
+          "BLOCKED: required worker closure paths are missing or unregistered",
+        ),
+      "preflight did not fail closed when the Unix daemon socket path was missing",
+    );
+    console.log(
+      "PASS UNIX-DAEMON MISSING-SOCKET NEGATIVE: actual preflight fails closed",
+    );
+  } finally {
+    await stopDaemon(daemon);
+    await daemonStdout;
+    await daemonStderr;
+  }
+
+  const closedSocketResult = await preflight(
+    socketStoreUri,
+    matchingMountRoot,
+    runtimeManifestPath,
+    temporaryDirectory,
+    temporaryHome,
+  );
+  assert(
+    closedSocketResult.exitCode !== 0 &&
+      closedSocketResult.stderr.includes(
+        "BLOCKED: required worker closure paths are missing or unregistered",
+      ),
+    "preflight did not fail closed when the temporary daemon was stopped",
+  );
+  console.log(
+    "PASS UNIX-DAEMON CLOSED-SOCKET NEGATIVE: stopped daemon fails closed",
   );
 }
 
@@ -293,6 +546,12 @@ try {
   );
   console.log(
     `PASS MATCHED-MOUNT POSITIVE: all ${runtimePaths.length} NAR-verified mounted runtime paths match registered store A`,
+  );
+  await proveUnixSocketDaemon(
+    isolatedRoot,
+    temporaryDirectory,
+    temporaryHome,
+    openCodePath,
   );
 } finally {
   makeWritableForCleanup(isolatedRoot);
