@@ -45,4 +45,7 @@ unprotected ref until expiry; only existing branch rules protect configured
 branches. Verification observes CI but does not initiate a run. OpenCode Session-create lost acknowledgements stay
 unknown, and GitHub/Mergify/Sandbox credentials have not been validated against
 live services. Never enable this mode against a cluster without the separately
-authorized FS-15 workflow and independently reviewed isolation.
+authorized deployment workflow and independently reviewed isolation. The current
+campaign's [external acceptance gate](../plans/active/autonomous-first-slice.md#live-acceptance)
+records its FS-15 prerequisites and authorization status; stable procedures are in
+[operations](../operations.md).

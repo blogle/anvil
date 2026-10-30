@@ -6,6 +6,30 @@ Anvil implements the outer control loop around OpenCode execution. It observes d
 
 **Status:** Observed state and provenance · Selective model assessment · Operation recovery unresolved
 
+## Domain engine and effect boundary
+
+A single pure, cohesive functional core SHALL own Commission identity, lifecycle,
+decision authorization, state evolution, evidence policy and Operation transition
+constraints. It receives explicit immutable inputs and returns exhaustive typed
+results, without I/O, hidden time/randomness, mutation or provider calls. SQLite,
+HTTP, MCP and UI SHALL NOT redefine domain policy. Repeated identical Wait, Hold
+or Escalate decisions are no-ops: no new Operation, unnecessary state version or
+SQL write.
+
+One authoritative SQL Operation journal SHALL persist the approved transition and
+prepared Operation atomically before external mutation. Operation identity,
+target/preconditions and original owner remain stable across restart. A legitimate
+successor may inspect and record a predecessor's dispatched outcome without
+impersonation or replay; stale holders cannot authorize new writes. Provider-proven
+safe retry retains the original logical identity and bounded count, and
+`retry_authorized` remains unresolved until resolved. Ordered transactional
+migrations and SQLite reopen preserve state.
+
+Adapters SHALL preserve provider-owned IDs and distinguish failure from unknown
+or unavailable. Protocol-compatible local tests validate production-intended
+adapters without substituting fakes for real integrations. Local test results and
+live provider validation remain distinct.
+
 ## Outer reconciler
 
 Events, timers, and authorized interventions trigger reconciliation. Anvil reads its current specification and the relevant external authorities, derives typed observations and Findings, evaluates Commission policy, records any authorized Operation, and later observes its postcondition. Webhook delivery or OpenCode session idleness alone does not establish completion.
@@ -224,6 +248,13 @@ After replacement, reconcile OpenCode connection and Session binding, preview/se
 The initial daemon runtime is pinned Bun, with a prompt switch to Node.js upon material runtime friction. Bun standalone compilation is a packaging target: the executable embeds the Bun runtime, allowing a minimal OCI image without a separate Bun executable. Compilation SHALL NOT block early vertical slices. Runtime-specific integrations SHALL be isolated to preserve the fallback.
 
 The authenticated operations UI SHALL use React, Vite, TanStack Router and Query, Tailwind CSS, and shadcn/ui. Ledger visual tokens remain the default. Anvil already has an authoritative API/controller, so Next.js server-rendering and Server Actions are not required for v2. HTTP routing SHOULD use a thin Hono adapter. Shared runtime-validated contracts, strict discriminated unions, exhaustive reconciliation logic and existing SQLite migration/recovery contracts are retained.
+
+The daemon, UI and Sandbox runtime SHALL be packaged declaratively through Nix,
+using nix2container with explicit sensible layering where useful. Runtime contents,
+startup, migration, configuration/credential assumptions, probes and ports require
+local validation. Deployment interfaces identify immutable images/digests,
+namespaces, Secret references, health/readiness and compatible agent-sandbox/shared
+Nix contracts; deployment authority remains separate from artifact readiness.
 
 ## Observability and intervention API
 

@@ -32,9 +32,19 @@ Anvil remains pre-1.0. The historical `v2` branch names the rewrite track, not a
 
 - [Domain and requirements](spec.md#domain-terminology): definitions, authority boundaries, lifecycle, invariants, acceptance rules, and unresolved product decisions.
 - [Control mechanics](architecture.md#outer-reconciler): observation, the in-flight watchdog, continuation prompts, revision-bound evidence, command execution, and integration.
+- [Operations](operations.md): local daemon/UI, authenticated HTTP/MCP, packaging, deployment prerequisites and recovery procedures.
 - [Evidence and provenance](research.md): primary-source findings, applicability to Anvil, limitations, and claims awaiting empirical confirmation.
 - [Inbox, Campaign, Operations and Settings mockup](ui.html): responsive sample screens with shared Commission context.
 - [Technology decision — TypeScript stack](adr-001-typescript-stack.md).
+
+## Development plans
+
+Campaign-specific criteria, executed evidence, findings and handoff belong in
+continuously maintained ExecPlans, not permanent product documents. See
+[repository-root plan format and maintenance](https://github.com/blogle/anvil/blob/anvil/anvil-first-slice-completion-58824672/PLANS.md), [active plans](plans/active/) and
+[completed plans](plans/completed/). The current [autonomous development plan](plans/active/autonomous-first-slice.md)
+preserves FS-01–FS-15 and the separately authorized deployment gate. It is not
+live acceptance or deployment permission.
 
 ## Interpretation rules
 
