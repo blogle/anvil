@@ -69,6 +69,7 @@ const application = new ApplicationService(
   { approve: async ({ principalId }) => principalId === operatorId },
   controllerId,
   policy,
+  Date.now,
 );
 let gitCredentialService: WorkerGitCredentialService | undefined;
 if ((process.env["ANVIL_PROVIDER_MODE"] ?? "unavailable") === "configured") {

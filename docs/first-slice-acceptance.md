@@ -137,4 +137,33 @@ Contract synchronized from PR branch commit `7dea044425d94db3e694c8a6e1eca0a78a7
 
 ## Next checkpoint
 
+## Successor checkpoint — authority across asynchronous boundaries
+
+Successor branch `anvil/anvil-first-slice-completion-58824672` starts at the
+published PR #123 head `f6723b79d5a938a86c6770660969a1298abde148` (confirmed
+with `git fetch origin` and `gh pr view 123`). The predecessor branch is preserved.
+
+- `src/application.ts` now rechecks Lease authority after provider observation,
+  immediately before prepared/retry submission, after dispatch, and after remote
+  outcome inspection. The daemon supplies an explicit wall clock so Lease expiry
+  during I/O cannot be evaluated against the start-of-poll timestamp. Deterministic
+  callers can supply a controlled clock. Expired/future grants fail closed.
+- `test/authority-boundaries.test.ts` adds takeover, expiry, unavailable Lease,
+  loss just before submission, and loss after remote acceptance cases. They assert
+  persisted Operations and dispatch counts: no work prepared after observation
+  authority loss; prepared intent survives submission denial; a successor submits
+  the original prepared ID once; a remotely accepted/submitted Operation is
+  inspected by the successor without replay or rewriting its original owner.
+- `nix develop -c just check` passed: 100 tests, 1163 assertions, formatting,
+  strict TypeScript, locked install, generated lock match and negative drift probe.
+  An initial targeted run exposed an incorrect test expectation that a successor
+  could not submit prepared intent; the test now verifies legitimate successor
+  submission with immutable original owner and one dispatch. An initial full
+  check caught fixture forwarding arity errors, corrected before the passing run.
+- Scope: FS-04/05 asynchronous-boundary regressions only. The daemon's Lease
+  implementation is still local-only and does not coordinate multiple processes;
+  Kubernetes Lease and independent Workspace/reviewer isolation remain open.
+  Lease reads cannot fence already accepted remote writes. No FS status is
+  promoted and the image/shared-Nix failing gates are preserved.
+
 Next: bootstrap the helper and capability into the actual Sandbox contract without exposing the capability in prompt/environment/remote URLs. Decide whether repository branch protection suffices or a separate ref-restricting transport is needed. Build/inspect sandbox and daemon Nix artifacts locally afterward. FS-08/09 randomized/multiprocess traces, FS-11 projections, FS-12 UI and FS-14 parity remain. FS-15 stays BLOCKED_EXTERNAL. No current local subgate requires live K8s; do not request or perform deployment yet, and do not claim LOCAL_SLICE_READY.

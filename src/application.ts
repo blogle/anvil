@@ -261,6 +261,7 @@ export class ApplicationService {
   readonly #authorization: AuthorizationPort;
   readonly #controllerId: string;
   readonly #policy: Policy;
+  readonly #now: (() => number) | undefined;
 
   constructor(
     store: CommissionStore,
@@ -269,6 +270,7 @@ export class ApplicationService {
     authorization: AuthorizationPort,
     controllerId: string,
     policy: Policy,
+    now?: () => number,
   ) {
     this.#store = store;
     this.#lease = lease;
@@ -276,6 +278,7 @@ export class ApplicationService {
     this.#authorization = authorization;
     this.#controllerId = controllerId;
     this.#policy = policy;
+    this.#now = now;
   }
 
   subscribeExecutionEvents(
@@ -369,9 +372,16 @@ export class ApplicationService {
       const parsed = observationSchema.safeParse(rawObservation.value);
       if (!parsed.success)
         return { ok: false, error: { kind: "invalid_provider_observation" } };
+      // Observation may have waited on several remote providers. Its starting
+      // Lease is not authority to write after that I/O completes.
+      now = this.#now?.() ?? now;
+      const confirmedLease = await this.#currentLease(commissionId, now);
+      if (!confirmedLease.ok) return confirmedLease;
+      if (!hasOwner(current, confirmedLease.value))
+        return { ok: false, error: { kind: "ownership_unavailable" } };
       const result = evolve(current, {
         kind: "reconcile",
-        lease: lease.value,
+        lease: confirmedLease.value,
         observation: parsed.data,
         operations,
         policy: this.#policy,
@@ -489,10 +499,13 @@ export class ApplicationService {
             },
           };
         }
+        now = this.#now?.() ?? now;
+        const resolutionLease = await this.#currentLease(commissionId, now);
+        if (!resolutionLease.ok) return resolutionLease;
         const resolution = evolveOperation(
           current,
           pending,
-          lease.value,
+          resolutionLease.value,
           checkedOutcome.data,
           now,
         );
@@ -682,6 +695,16 @@ export class ApplicationService {
     lease: LeaseGrant,
     now: number,
   ): Promise<Result<Commission, ApplicationError>> {
+    // Recheck immediately before persisting submission, including recovered
+    // prepared Operations and provider-proven retries. CAS rejects a concurrent
+    // hold/amend/takeover while this Lease read was in flight. This does not
+    // fence an external request already accepted by a provider.
+    now = this.#now?.() ?? now;
+    const confirmedLease = await this.#currentLease(commission.id, now);
+    if (!confirmedLease.ok) return confirmedLease;
+    if (!hasOwner(commission, confirmedLease.value))
+      return { ok: false, error: { kind: "ownership_unavailable" } };
+    lease = confirmedLease.value;
     const submitted = evolveOperation(
       commission,
       operation,
@@ -725,10 +748,13 @@ export class ApplicationService {
         reason: dispatched.error.message,
       };
     }
+    now = this.#now?.() ?? now;
+    const outcomeLease = await this.#currentLease(commission.id, now);
+    if (!outcomeLease.ok) return outcomeLease;
     const transition = evolveOperation(
       submittedCommission,
       submittedOperation,
-      lease,
+      outcomeLease.value,
       outcome,
       now,
     );
@@ -777,9 +803,12 @@ export class ApplicationService {
     if (!result.ok)
       return { ok: false, error: { kind: "provider", error: result.error } };
     const parsed = ownerSchema.safeParse(result.value);
+    const checkedAt = this.#now?.() ?? now;
     if (
       parsed.success &&
-      parsed.data.owner.controllerId !== this.#controllerId
+      (parsed.data.owner.controllerId !== this.#controllerId ||
+        parsed.data.observedAt > checkedAt ||
+        parsed.data.validUntil <= checkedAt)
     ) {
       return { ok: false, error: { kind: "ownership_unavailable" } };
     }
