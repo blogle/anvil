@@ -75,6 +75,12 @@
             ${bun}/bin/bun ${self.packages.${system}.workerGitHelper}/lib/opencode-smoke.js ${self.packages.${system}.opencodeRuntime}/bin/opencode ${pkgs.opencode.version} ${self.packages.${system}.workerGitHelper}/bin/anvil-git-credential
             touch "$out"
           '';
+          workerAccessGate = pkgs.runCommand "anvil-worker-access-gate" {
+            nativeBuildInputs = [ bun pkgs.gitMinimal pkgs.coreutils pkgs.bash ];
+          } ''
+            ${bun}/bin/bun ${self.packages.${system}.workerGitHelper}/lib/opencode-smoke.js ${self.packages.${system}.opencodeRuntime}/bin/opencode ${pkgs.opencode.version} ${self.packages.${system}.workerGitHelper}/bin/anvil-git-credential --require-worker-isolation
+            touch "$out"
+          '';
           sandboxImageGate = pkgs.runCommand "anvil-sandbox-image-gate" {
             nativeBuildInputs = [ bun ];
           } ''
@@ -86,7 +92,7 @@
             touch "$out"
           '';
         in {
-          inherit typescript daemonSmoke opencodeSmoke workerBootstrapSmoke sandboxImageGate;
+          inherit typescript daemonSmoke opencodeSmoke workerBootstrapSmoke workerAccessGate sandboxImageGate;
           flake = pkgs.runCommand "anvil-flake-check" { } ''
             test -f ${./flake.nix}
             test -f ${./flake.lock}
@@ -311,6 +317,11 @@
           '';
           workerEntrypoint = pkgs.writeShellScriptBin "anvil-opencode-server" ''
             set -euo pipefail
+
+            if [ -z "''${OPENCODE_SERVER_PASSWORD:-}" ] || [ "''${#OPENCODE_SERVER_PASSWORD}" -lt 32 ]; then
+              printf '%s\n' "OpenCode requires a server password of at least 32 characters" >&2
+              exit 64
+            fi
 
             port="''${OPENCODE_PORT:-4096}"
             case "$port" in

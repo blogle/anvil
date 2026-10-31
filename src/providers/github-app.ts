@@ -215,6 +215,7 @@ export class GitHubAppBroker {
             permissions: permissionProfiles[purpose],
           }),
           signal: AbortSignal.timeout(this.#timeoutMs),
+          redirect: "error",
         },
       );
     } catch {
@@ -295,15 +296,32 @@ export class GitHubAppBroker {
         },
       };
     }
-    if (!permissionsWithin(actualPermissions, permissionProfiles[purpose])) {
+    if (
+      !permissionsWithin(actualPermissions, permissionProfiles[purpose]) ||
+      !Object.entries(permissionProfiles[purpose]).every(
+        ([name, permission]) => actualPermissions[name] === permission,
+      )
+    ) {
       return failure(
         "scope_mismatch",
         "github_token_scope_mismatch",
-        "GitHub returned permissions broader than the requested profile",
+        "GitHub returned permissions different from the requested profile",
         response.status,
         requestId,
       );
     }
+    // The request uses a short repository name within a configured installation.
+    // Verify the token's actual owner/name and cardinality rather than labelling
+    // it with the caller's requested owner (which may name another installation).
+    if (
+      purpose === "git" &&
+      !(await this.#workerRepositoryMatches(token, repository))
+    )
+      return failure(
+        "scope_mismatch",
+        "github_token_repository_mismatch",
+        "GitHub worker token repository selection could not be verified",
+      );
     return {
       ok: true,
       value: {
@@ -314,6 +332,46 @@ export class GitHubAppBroker {
         permissions: permissionProfiles[purpose],
       },
     };
+  }
+
+  async #workerRepositoryMatches(
+    token: string,
+    repository: string,
+  ): Promise<boolean> {
+    try {
+      const response = await fetch(
+        new URL("installation/repositories?per_page=2", this.#apiUrl),
+        {
+          headers: {
+            accept: "application/vnd.github+json",
+            authorization: `Bearer ${token}`,
+            "x-github-api-version": "2022-11-28",
+            "user-agent": "anvil-github-broker/0.1",
+          },
+          signal: AbortSignal.timeout(this.#timeoutMs),
+          redirect: "error",
+        },
+      );
+      if (!response.ok || response.headers.has("link")) {
+        await response.body?.cancel();
+        return false;
+      }
+      const body = asRecord(
+        JSON.parse(await readBounded(response, maxResponseBytes)),
+      );
+      const rows = body?.["repositories"];
+      const fullName =
+        Array.isArray(rows) && rows.length === 1
+          ? asRecord(rows[0])?.["full_name"]
+          : undefined;
+      return (
+        body?.["total_count"] === 1 &&
+        typeof fullName === "string" &&
+        fullName.toLowerCase() === repository.toLowerCase()
+      );
+    } catch {
+      return false;
+    }
   }
 }
 

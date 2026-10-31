@@ -20,16 +20,19 @@ Maintain it under [repository-root PLANS.md](https://github.com/blogle/anvil/blo
 - [Governed Assignment steering checkpoint](#governed-assignment-steering)
 - [Kubernetes Lease authority checkpoint](#kubernetes-lease-authority)
 - [Recovered worker bootstrap and adoption checkpoint](#worker-bootstrap-recovery)
+- [Gate A access and Git receiver checkpoint](#gate-a-access-ref-boundary)
 
 No complete FS-01–FS-14 obligation is VERIFIED. **FS-15: BLOCKED_EXTERNAL**;
 **K8S_ACCEPTANCE_REQUEST: NOT_EXECUTABLE**. The `sandboxImageGate` still fails;
+the actual-runtime `workerAccessGate` now also fails on worker API authority;
 the untrusted Nix `derivation add` and preflight protocol-authorization findings
 remain open. No deployment, dotfiles work, merge, release or cutover is authorized.
 Historical checkpoint counts, findings and limitations below retain their original
 scope and chronology; later evidence does not retroactively rewrite earlier results.
 In particular, the parity matrix contains stale rows (including Git/CI/provider
 handoff assessments); refreshing and independently comparing them remains work.
-Latest engineering progress is the [recovered worker bootstrap/adoption checkpoint](#worker-bootstrap-recovery),
+Latest engineering progress is the [Gate A access/ref-boundary checkpoint](#gate-a-access-ref-boundary),
+following the [recovered worker bootstrap/adoption checkpoint](#worker-bootstrap-recovery),
 following [Kubernetes Lease authority](#kubernetes-lease-authority) and
 [governed Assignment steering](#governed-assignment-steering). These
 local paths supersede earlier missing-steering/adapter residuals for their bounded
@@ -1215,3 +1218,189 @@ PR #124. Gate A's remaining access/ref-policy decisions precede B's retained
 shared-Nix blocker. No B/C/D implementation, live Kubernetes/provider mutation,
 dotfiles change, deployment, merge, release or acceptance self-authorization was
 performed in this attempt.
+
+<a id="gate-a-access-ref-boundary"></a>
+## Gate A access and Git receiver checkpoint — 2026-10-31
+
+**Disposition: BLOCKED; current same-UID OpenCode topology is not safely deployable
+under the required worker/control-API separation.** Stop after this one bounded
+checkpoint, with a reproducible failing gate rather than a compatibility claim.
+No FS obligation is promoted to VERIFIED. FS-15 remains BLOCKED_EXTERNAL;
+K8S_ACCEPTANCE_REQUEST remains NOT_EXECUTABLE. No B/C/D work is started.
+
+### Continuity and inspected contracts
+
+- Reconciled clean worktree/HEAD/origin and draft PR #124 against `v2` at
+  `5d2962abe7216f19a48d3f0b39253fe720bc3982`; same session and branch retained.
+  Predecessor PR #123 `f6723b79d5a938a86c6770660969a1298abde148` is untouched.
+  GitHub's checks for `5d2962a` had completed: evaluate, flake, check gate,
+  policy, check, pr-fast and Summary succeeded; verify/release jobs skipped;
+  Mergify protection/queue conclusions neutral. Those checks do not establish
+  success of local `nix flake check` or external deployment acceptance.
+- Read AGENTS.md, PLANS.md, authoritative specification/architecture, operations
+  and the active ExecPlan; applied the already-loaded software-craft guidance.
+  Inspected configured runtime, generated Sandbox, image entrypoint, pinned
+  OpenCode adapter/smoke, GitHub App broker, helper/capabilities and real-Git tests.
+- `docs/operations.md` now owns the permanent access/receiver permission contract
+  and replaces the obsolete suggestion to terminate a healthy worker on controller
+  succession. The runtime-configuration contract now marks authentication as
+  required and corrects the stale missing-bootstrap limitation. This section owns
+  checkpoint evidence and acceptance disposition.
+
+### Actual API authority finding and bounded enforcement
+
+- Actual flow: controller reads `ANVIL_OPENCODE_PASSWORD_FILE`; OpenCodeAdapter
+  sends Basic `opencode` authentication over HTTPS (HTTP only for loopback tests).
+  Sandbox receives the matching Secret reference as `OPENCODE_SERVER_PASSWORD`.
+  Image entrypoint serves on `0.0.0.0:4096` by default; Sandbox uses `service: true`
+  and declares the port. No ingress/NetworkPolicy is generated. Worker main UID
+  is 1000; OpenCode and its shell subprocess share that UID/environment. Automatic
+  service-account token mounting is disabled, but that is not control-API isolation.
+- Configured runtime no longer permits missing listener credentials or missing
+  Secret name/key; password minimum is 32 characters. Image entrypoint refuses a
+  missing/short password too. Matching authenticated protocol fixtures continue
+  to bootstrap/publish/restart; no unauthenticated configured fallback remains.
+- Actual OpenCode 2.0.32 smoke now sends missing and wrong-password POSTs to
+  session creation, shell, raw fs.write, prompt and interrupt routes. All ten
+  requests return HTTP 401 before authorized Session creation/bootstrap proceeds.
+- **Irreducible local finding:** a real shell subprocess recovers the password
+  from inherited environment (and can read server `/proc/<pid>/environ`), then uses
+  it directly against loopback to create another Session and write the Workspace.
+  This bypasses Anvil admission without a Lease or capability request. No model
+  provider credential or model instruction is used in the reproduction. Only
+  boolean diagnostics and non-secret marker content are written/logged; the
+  recovered ephemeral password remains in subprocess memory.
+- Added `checks.x86_64-linux.workerAccessGate` to ordinary flake checks, reusing
+  the actual-runtime smoke with `--require-worker-isolation`. It fails closed:
+
+  ```text
+  worker API authority probe: {"inherited":true,"processReadable":true,"created":true,"written":true} (no credential values)
+  BLOCKED/WORKER-API: same-UID worker recovers OpenCode authority and can create a Session/write Workspace; deployment isolation is required
+  ```
+
+  Positive bootstrap smoke can pass while reporting this negative; the separate
+  failing acceptance gate is required and is not skipped or converted to success.
+  Its execution proves a shell subprocess under the actual server's UID, not a
+  separately deployed model/tool isolation topology. No local code claims to fence
+  a client with equivalent OpenCode authority.
+- Existing current-Lease checks on Anvil Session/prompt/steer/interrupt paths,
+  stable Operations, takeover adoption and credential rotation are preserved.
+  Focused tests still demonstrate original lost-ack Operation recovery, one prompt,
+  one allocation, no succession-induced interrupt, successor access/rotation and
+  stale controller denial. A new password on every Lease epoch would not fix the
+  worker's ability to recover the replacement password and is not introduced.
+
+### Git repository, permission and receiver enforcement
+
+- Review found a concrete broker gap: requests select a repository by short name
+  within a configured installation but previously labelled the token using the
+  caller's owner/name without verifying actual selection. The broker also accepted
+  downgraded/missing permissions and returned the requested permission labels.
+- Production broker now requires every requested permission to be present at the
+  exact requested level and rejects extra privilege (implicit metadata read is
+  allowed). Git token requests remain repository-selected `contents:write` only;
+  no PR/workflow/admin write scope is added. Before caching/returning a Git token,
+  the broker uses that token to read `GET /installation/repositories?per_page=2`:
+  require `total_count: 1`, exactly one matching full owner/name, no pagination,
+  no redirects and a valid bounded response. Token mint requests also reject
+  redirects. Unknown/malformed/unavailable selection fails closed without exposing
+  token bytes to the worker. This is token repository validation, not ref mediation.
+- Protocol fixtures assert installation ID, short-name selection, contents-only
+  request, token-authenticated repository observation and cache/refresh behavior.
+  Adversaries reject same-name foreign owner, extra repositories, inconsistent
+  counts, empty/missing selection, redirect, downgraded/missing contents and extra
+  workflow permission. Diagnostics exclude the token. Existing worker credential
+  tests cover wrong Assignment/Attempt/Workspace/Session/repository/ref, hold,
+  expiry, stale authority, missing capability and redirects/lost acknowledgement.
+- Consulted GitHub's public REST documentation for
+  [installation repository listing](https://docs.github.com/en/rest/apps/installations#list-repositories-accessible-to-the-app-installation):
+  route, token-scoped list, `total_count`, `full_name` and pagination are documented.
+  This was documentation retrieval only, not a live provider experiment. Actual
+  installation/ruleset/App actor behavior remains unverified.
+- Strengthened real Git HTTP receiver tests to bypass the helper entirely with
+  an extracted fixture token. Receiver rejects main/foreign Commission/new branch,
+  tag and forbidden deletion; a mixed allowed/forbidden **actual update** with
+  `--atomic` is rejected and the allowed ref retains its exact prior SHA. Removing
+  the fixture's hook allows an unauthorized branch at the exact new commit SHA.
+  Restoring the hook denies deletion of that forbidden ref. This is deliberate
+  local negative evidence that signatures/helper checks are not receiver policy.
+- A held Commission denies fresh helper issuance, but the extracted provider
+  token still publishes a new commit to the receiver-approved branch. Bare-ref
+  observation proves the exact new SHA. Capability expiry (maximum 300 seconds)
+  is not GitHub token expiry; direct-token access lasts until provider expiration
+  or provider revocation. No claim of instant held-state/provider-token revocation.
+- Configured child-daemon trace now requires Basic auth at the OpenCode fixture
+  and verifies token repository selection before installed-helper publication.
+  Exact Candidate SHA observation, CI repair/delivery and restart still pass.
+  This is actual daemon/Git subprocess plus protocol fixtures; actual OpenCode
+  compatibility is measured by separate packaged-runtime smokes, not a combined
+  real-model/deployed Sandbox acceptance trace.
+
+### Exact executed checks
+
+Final implementation tree is based on `5d2962a`, committed with this entry.
+Full-check Nix source before plan/runtime-contract updates and a final diagnostic
+wording correction ("broader" → "different" for mismatched permissions):
+`/nix/store/m8vba1r2qz5bhpb2cnscprr55dh340lx-zy5nvmza555r10a3irayz8x6dnwr4sap-source`.
+
+| Command | Exit | Observed outcome |
+|---|---|---|
+| `nix develop -c just fmt` | 0 | Source/tests/scripts formatted. |
+| `nix develop -c just check` | 0 | Frozen dependencies, lock match/drift-negative, formatting, strict TypeScript; **149 tests / 1705 assertions**, 24 files. |
+| `nix develop -c bun test test/worker-bootstrap.test.ts test/providers/github-app.test.ts test/providers/git-credentials.test.ts test/providers/runtime.test.ts test/daemon-configured-process.test.ts test/lease-authority.test.ts test/authority-boundaries.test.ts` | 0 | **28 tests / 513 assertions**, seven files, including real Git direct-token/ref negatives and adoption. |
+| `nix develop -c just ci-verify` | 0 | Pinned sandboxed TypeScript/test derivation `/nix/store/2z3nq1774z8yqfif7myssrvmmswfji1h-anvil-typescript-check-0.1.0.drv`. |
+| `nix run .#sdlc -- install --check` | 0 | SDLC adapters match the locked contract. |
+| `nix build .#ui .#daemon .#sandboxWorkerImage .#checks.x86_64-linux.daemonSmoke .#checks.x86_64-linux.opencodeSmoke .#checks.x86_64-linux.workerBootstrapSmoke --no-link` | 0 | UI/daemon/helper-bearing worker image and daemon/OpenCode/bootstrap smokes built. Authenticated bootstrap compatibility is distinct from the failed worker-access gate. |
+| `nix build .#checks.x86_64-linux.workerAccessGate --no-link -L` | 1 | First concrete actual-runtime reproduction above. Initial derivation `/nix/store/fvc87drn4hh85hfgxs1lpjzmjzdxpi1l-anvil-worker-access-gate.drv`; final invocation through `ci-check` also fails. |
+| `nix develop -c just ci-check` | 1 | Final flake check stops at **workerAccessGate**, `/nix/store/92wv0g1j6y0h8yi7980dwhknpyx02xkk-anvil-worker-access-gate.drv`, with all four exposure booleans true. It is no longer accurate to describe this command as failing only at the image gate. |
+| `nix build .#checks.x86_64-linux.sandboxImageGate --no-link -L` | 1 | Separately executed because flake check stopped at the new gate. Preserved `PASS IMAGE-CONTENT: 5 OCI layers...` then `BLOCKED/INCOMPATIBLE`: empty shared-store overlay hides OpenCode and no pre-provision closure guarantee. Final derivation `/nix/store/zg9b1ny3zv60bxjk5apivnnz42qicaza-anvil-sandbox-image-gate.drv`. |
+| `nix develop -c bun test test/providers/github-app.test.ts` | 0 | After the diagnostic-only wording correction: **7 tests / 96 assertions**; no enforcement change after the full checks. |
+
+Intermediate broad/focused runs passed 149/1702 and 28/508 respectively before
+strengthening the mixed-update/deletion receiver assertions. Both prescribed
+Nix acceptance gates genuinely fail; there were no implementation test/typecheck
+failures in this checkpoint. The historical untrusted derivation-add/preflight
+authorization findings remain open, unchanged and not rerun in this attempt.
+
+### Exact remaining acceptance conditions and stop
+
+1. **Worker/control API separation is the next hard Gate A blocker.** The current
+   server/tool same-UID execution contract must be replaced or constrained through
+   a supported, tested execution boundary that prevents inherited credentials,
+   server environment/memory access and direct control-API use by untrusted tools.
+   No compatible topology was established here. Do not treat external ingress
+   authentication, a sidecar sharing Pod networking, or Kubernetes NetworkPolicy
+   as resolving local loopback and process access. `workerAccessGate` must pass
+   against the actual intended runtime boundary without disabling legitimate tools
+   or the negative probes; separate independent review remains necessary.
+2. **Deployment isolation checks**, detailed in operations: confidential
+   controller-only API transport, no worker/preview control route, no independent
+   equivalent credential, enforced default-deny ingress with only controller
+   sources, no worker/verifier Secret/exec/port-forward/proxy/volume-mount RBAC,
+   no privileged/host bypass. Probe from worker and unrelated Pod identities;
+   mere manifest declarations are not evidence. No live checks are authorized here.
+3. **Authoritative GitHub ref contract:** for this single Commission, active
+   branch/tag rulesets deny creation/update/deletion of all refs except the exact
+   approved worker branch; unauthorized tags are denied. Cover new refs, not only
+   main. Worker App has no direct/inherited bypass, including shared App actor
+   bypass; integration authority must not leak through the same identity. Under
+   separate provider authorization, test intended exact-SHA publication and direct
+   worker-token wrong-repository/main/foreign/new-branch/tag/deletion/multi-ref
+   denial, record effective policy/App IDs and expiry, and verify no forbidden ref
+   changes. Receiver fixture behavior is not live GitHub proof. An installation
+   policy that cannot express this contract remains blocked for a reviewed decision.
+4. **FS conservation:** all approved FS-01–FS-15 criteria and ledger statuses
+   remain unchanged. The complete per-ID residual matrix in the preceding recovery
+   checkpoint remains applicable. FS-05 now has a stronger actual-runtime failing
+   isolation reproduction; independent verifier checkout still unproved. FS-08/09
+   retain the split actual-daemon/protocol-fixture vs actual-runtime smoke boundary.
+   FS-10 gains exact repository/minimum-permission checks and direct-token receiver
+   negatives but remains IN_PROGRESS. FS-11 gains mandatory configured listener
+   auth, not full API parity. FS-13 retains both shared-store and Nix authorization
+   blockers. FS-01/02/03/04/06/07/12/14 wider review/utility/parity gaps are not waived.
+   FS-15 remains BLOCKED_EXTERNAL; no executable K8S acceptance request is issued.
+
+Commit/push this one coherent checkpoint to the existing draft PR #124, verify
+remote head/check state and a clean worktree, then stop. No deployment, live
+provider mutation, addrspace/cluster access, dotfiles/dormant-branch changes,
+production/legacy change, merge/release/cutover or acceptance self-authorization.

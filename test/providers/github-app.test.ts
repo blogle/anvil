@@ -59,6 +59,18 @@ test("GitHub App broker signs short-lived JWTs, requests repository-scoped least
   let requests = 0;
   const requestsSeen: { body: unknown; authorization: string | null }[] = [];
   const baseUrl = startFixture(async (request) => {
+    if (request.method === "GET") {
+      expect(new URL(request.url).pathname).toBe(
+        "/api/installation/repositories",
+      );
+      expect(request.headers.get("authorization")).toMatch(
+        /^Bearer ghs_fixture_/,
+      );
+      return Response.json({
+        total_count: 1,
+        repositories: [{ full_name: "acme/demo" }],
+      });
+    }
     requests += 1;
     const body = await request.json();
     requestsSeen.push({
@@ -139,6 +151,17 @@ test("Git-purpose App credential is repository-scoped contents-only and excludes
   }[] = [];
   let tokenNumber = 0;
   const baseUrl = startFixture(async (request) => {
+    if (request.method === "GET") {
+      const number = Number(
+        request.headers.get("authorization")!.split("_").at(-1),
+      );
+      return Response.json({
+        total_count: 1,
+        repositories: [
+          { full_name: `acme/${requestsSeen[number - 1]!.repositories[0]}` },
+        ],
+      });
+    }
     const body = (await request.json()) as {
       repositories: string[];
       permissions: Record<string, string>;
@@ -314,4 +337,88 @@ test("expired and unavailable GitHub installation credentials are never returned
     ok: false,
     error: { kind: "upstream", diagnostic: { upstreamStatus: 503 } },
   });
+});
+
+test("Git tokens must prove exact installation repository identity and cardinality, with no redirects or permission upgrades", async () => {
+  let selected: unknown = {
+    total_count: 1,
+    repositories: [{ full_name: "acme/demo" }],
+  };
+  let permissions: Record<string, string> = {
+    contents: "write",
+    metadata: "read",
+  };
+  let redirect = false;
+  let tokens = 0;
+  let lists = 0;
+  const baseUrl = startFixture(async (request) => {
+    const url = new URL(request.url);
+    if (request.method === "POST") {
+      expect(url.pathname).toBe("/api/app/installations/42/access_tokens");
+      expect(await request.json()).toEqual({
+        repositories: ["demo"],
+        permissions: { contents: "write" },
+      });
+      tokens += 1;
+      return Response.json(
+        {
+          token: "ghs_private_fixture",
+          expires_at: new Date(epoch + 3600000).toISOString(),
+          permissions,
+        },
+        { status: 201 },
+      );
+    }
+    expect(url.pathname).toBe("/api/installation/repositories");
+    expect(url.searchParams.get("per_page")).toBe("2");
+    expect(request.headers.get("authorization")).toBe(
+      "Bearer ghs_private_fixture",
+    );
+    lists += 1;
+    return redirect
+      ? Response.redirect(`${baseUrl}sink`, 307)
+      : Response.json(selected);
+  });
+  const mint = () =>
+    new GitHubAppBroker({
+      appId: "fixture",
+      installationId: 42,
+      privateKey,
+      apiUrl: baseUrl,
+      now: () => epoch,
+    }).credential("https://github.com/acme/demo", "git");
+  expect((await mint()).ok).toBe(true);
+  for (const invalid of [
+    { total_count: 1, repositories: [{ full_name: "foreign/demo" }] },
+    {
+      total_count: 2,
+      repositories: [{ full_name: "acme/demo" }, { full_name: "acme/other" }],
+    },
+    { total_count: 2, repositories: [{ full_name: "acme/demo" }] },
+    { total_count: 0, repositories: [] },
+    { repositories: [{ full_name: "acme/demo" }] },
+  ]) {
+    selected = invalid;
+    const result = await mint();
+    expect(result).toMatchObject({
+      ok: false,
+      error: { kind: "scope_mismatch" },
+    });
+    expect(JSON.stringify(result)).not.toContain("ghs_private_fixture");
+  }
+  redirect = true;
+  expect((await mint()).ok).toBe(false);
+  expect(lists).toBe(7); // the redirect sink was never contacted
+  redirect = false;
+  const before = lists;
+  for (const invalid of [
+    { contents: "read" },
+    { metadata: "read" },
+    { contents: "write", workflows: "write" },
+  ]) {
+    permissions = invalid;
+    expect((await mint()).ok).toBe(false);
+  }
+  expect(lists).toBe(before); // reject missing/downgraded/broadened permissions before exposing token
+  expect(tokens).toBe(10);
 });

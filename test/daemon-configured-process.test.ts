@@ -452,6 +452,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   });
 
   const imageHelper = join(directory, "image-git-helper");
+  const openCodePassword = "local-controller-opencode-password-only";
   writeFileSync(
     imageHelper,
     `#!/bin/sh\nexec '${process.execPath}' '${process.cwd()}/src/providers/git-helper.ts' "$@"\n`,
@@ -474,6 +475,11 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
     port: openCodePort,
     async fetch(request) {
       const url = new URL(request.url);
+      if (
+        request.headers.get("authorization") !==
+        `Basic ${Buffer.from(`opencode:${openCodePassword}`).toString("base64")}`
+      )
+        return new Response(null, { status: 401 });
       const workerResponse = await filesFor(url.pathname.split("/")[1]!).handle(
         request,
       );
@@ -702,6 +708,11 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
     port: githubPort,
     async fetch(request) {
       const url = new URL(request.url);
+      if (url.pathname === "/api/installation/repositories")
+        return Response.json({
+          total_count: 1,
+          repositories: [{ full_name: "acme/demo" }],
+        });
       if (url.pathname.endsWith("/app/installations/42/access_tokens")) {
         const body = (await request.json()) as {
           permissions: Record<string, string>;
@@ -871,6 +882,8 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   const gitCapabilitySecretPath = join(directory, "git-capability-secret");
   const mergifyTokenPath = join(directory, "mergify-token");
   const kubernetesTokenPath = join(directory, "kubernetes-token");
+  const openCodePasswordPath = join(directory, "opencode-password");
+  writeFileSync(openCodePasswordPath, openCodePassword, { mode: 0o600 });
   writeFileSync(
     privateKeyPath,
     privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
@@ -902,6 +915,9 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
     ANVIL_OPENCODE_URL_TEMPLATE: `http://127.0.0.1:${openCodePort}/{sandbox}/{namespace}/`,
     ANVIL_OPENCODE_MODEL_PROVIDER: "fixture-provider",
     ANVIL_OPENCODE_MODEL_ID: "fixture-model",
+    ANVIL_OPENCODE_PASSWORD_FILE: openCodePasswordPath,
+    ANVIL_OPENCODE_SECRET_NAME: "opencode-controller-auth",
+    ANVIL_OPENCODE_SECRET_KEY: "password",
     ANVIL_GITHUB_APP_ID: "fixture-app",
     ANVIL_GITHUB_INSTALLATION_ID: "42",
     ANVIL_GITHUB_PRIVATE_KEY_FILE: privateKeyPath,
@@ -950,6 +966,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   if (configuredSandbox === undefined)
     throw new Error("Configured Session Sandbox fixture missing");
   const watchdogAdapter = new OpenCodeAdapter({
+    password: openCodePassword,
     baseUrl: `http://127.0.0.1:${openCodePort}/${encodeURIComponent(configuredSandbox)}/configured-test/`,
   });
   expect(

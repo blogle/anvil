@@ -17,15 +17,15 @@ Required runtime settings:
 | `ANVIL_GIT_CAPABILITY_SECRET_FILE` | Controller-only HMAC key for short-lived Assignment/Session Git capabilities. Required in configured mode; never mounted into a worker. |
 | `ANVIL_MERGIFY_TOKEN_FILE` | Separately held Mergify API bearer token. |
 | `ANVIL_OPENCODE_URL_TEMPLATE` | HTTPS service URL template containing `{sandbox}` and `{namespace}` placeholders. |
+| `ANVIL_OPENCODE_PASSWORD_FILE`, `ANVIL_OPENCODE_SECRET_NAME`, `ANVIL_OPENCODE_SECRET_KEY` | Required listener password (at least 32 characters) and matching Sandbox Secret reference; authenticates clients but does not isolate same-UID tools. |
+| `ANVIL_GIT_CREDENTIAL_URL` | Stable HTTPS controller service URL ending in `/v1/git/credentials`, installed in the worker helper; loopback HTTP is permitted only for fixtures. |
 | `ANVIL_OPENCODE_MODEL_PROVIDER`, `ANVIL_OPENCODE_MODEL_ID` | Explicit model selection for session instructions. |
 | `ANVIL_CONTROLLER_ID` | Explicit deployment/process label (1–80 ASCII letters, digits, `_`, `.`, `:` or `-`). The daemon appends its own random incarnation UUID; read actual owner identity from Commission state. Reusing this label after restart does not impersonate the old holder. |
 | `ANVIL_LEASE_NAMESPACE`, `ANVIL_LEASE_TOKEN_FILE` | Explicit control-plane Lease namespace and separate controller-only projected service-account token file. File is validated at startup and reread on every Lease API request. |
 
 Optional values include `ANVIL_KUBERNETES_CA_FILE`, `ANVIL_GITHUB_API_URL`,
-`ANVIL_MERGIFY_API_URL`, `ANVIL_OPENCODE_PORT`, `ANVIL_OPENCODE_PASSWORD_FILE`,
-and `ANVIL_OPENCODE_SECRET_NAME`/`ANVIL_OPENCODE_SECRET_KEY` (required together
-with the password file so the Sandbox receives a Secret reference, not the
-value). OpenCode HTTP is restricted to loopback fixture hosts; configured
+`ANVIL_MERGIFY_API_URL` and `ANVIL_OPENCODE_PORT`.
+OpenCode HTTP is restricted to loopback fixture hosts; configured
 non-loopback OpenCode endpoints must use HTTPS.
 
 `ANVIL_LEASE_API_URL` optionally overrides the Lease endpoint; otherwise it uses
@@ -83,9 +83,12 @@ provider mode retains single-process local authority for development only.
 `/v1/git/credentials` and
 `src/providers/git-credentials.ts` authenticate bounded Assignment/Attempt,
 Session, Workspace, owner-epoch, repository, ref and Lease claims and mint only
-the existing `contents:write` profile. The actual Agent Sandbox does not yet
-receive a capability file or include the helper in its image; a real push is not
-wired. A leaked installation token is repository-wide and can push another
+the existing `contents:write` profile. Configured bootstrap installs the capability
+and image-bundled helper through pinned OpenCode shell/fs APIs; local real-Git
+publication is tested, while deployed Sandbox startup remains blocked. The actual
+same-UID worker can recover the OpenCode API password; `workerAccessGate` fails.
+See [access and receiver requirements](../operations.md#opencode-api-access-boundary).
+A leaked installation token is repository-wide and can push another
 unprotected ref until expiry; only existing branch rules protect configured
 branches. Verification observes CI but does not initiate a run. OpenCode Session-create lost acknowledgements stay
 unknown, and GitHub/Mergify/Sandbox credentials have not been validated against

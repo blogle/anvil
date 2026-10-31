@@ -316,6 +316,15 @@ test("Git helper pushes a protected local ref through Assignment authority and r
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
+      if (url.pathname === "/api/installation/repositories") {
+        expect(request.headers.get("authorization")).toMatch(
+          /^Bearer ghs_worker_/,
+        );
+        return Response.json({
+          total_count: 1,
+          repositories: [{ full_name: "acme/demo" }],
+        });
+      }
       if (url.pathname === "/api/app/installations/42/access_tokens") {
         const body = (await request.json()) as {
           repositories: string[];

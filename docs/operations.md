@@ -268,13 +268,90 @@ unverified deployment contracts; a fresh database is not a recovery substitute.
 
 **Workspace isolation remains unverified.** A Lease arbitrates controller
 instruction admission, not already-running worker filesystem access or an
-independently credentialed OpenCode client. The local negative test deliberately
-demonstrates a remote write after transfer. Before claiming exclusive Workspace
-writers, establish termination/revocation or equivalent exclusion for the old
-writer and independently verify that no concurrent actor can write the volume.
-Independent verification must use a separate snapshot/checkout; no such live
-isolation proof is supplied by the Lease fixture. The active ExecPlan tracks
-campaign acceptance of this boundary.
+independently credentialed OpenCode client. A successor adopts the healthy worker,
+Workspace, Session and in-flight Operation; do not terminate it or revoke its
+credentials merely because controller identity/epoch changed. Independently
+exclude competing writers and use a separate verifier snapshot/checkout. The
+active ExecPlan tracks campaign acceptance of this boundary.
+
+### OpenCode API access boundary
+
+Configured runtime requires `ANVIL_OPENCODE_PASSWORD_FILE` (at least 32 characters),
+`ANVIL_OPENCODE_SECRET_NAME` and `ANVIL_OPENCODE_SECRET_KEY`. The controller reads
+the file and sends Basic authentication as user `opencode`; the Sandbox references
+the matching Secret as `OPENCODE_SERVER_PASSWORD`. The worker image also refuses
+startup with a missing/short password. Password bytes are not in the Pod spec,
+Operation journal or prompts. Non-loopback adapter transport requires HTTPS;
+redirects are rejected. This protects against clients without the credential,
+not clients that possess equivalent OpenCode authority.
+
+The current image executes `opencode serve --hostname 0.0.0.0 --port 4096` by
+default (host/port configurable). The Sandbox requests `service: true`, declares
+that container port and disables automatic service-account token mounting. It
+does not declare an ingress or NetworkPolicy. OpenCode's server and shell/tool
+subprocesses run as the same non-root worker UID. **Pinned OpenCode 2.0.32 shell
+subprocesses inherit the HTTP password and can read the server environment through
+`/proc`; they can authenticate a second Session and raw Workspace write.** Basic
+authentication and Kubernetes NetworkPolicy do not separate processes inside this
+same container/Pod. A Secret reference does not hide environment values from tools.
+
+`nix build .#checks.x86_64-linux.workerAccessGate --no-link -L` is a fail-closed
+validation gate. It starts actual pinned OpenCode, checks missing/wrong-password
+mutation denial, bootstraps a worker, then uses a real shell subprocess to attempt
+credential recovery, Session creation and Workspace mutation. It currently fails
+`BLOCKED/WORKER-API`, reporting booleans only. Do not waive the failure or treat a
+passing bootstrap smoke as worker-authority isolation. Replacing this topology
+requires a validated execution boundary that denies tool credential/process-memory
+access and direct control-API access while retaining legitimate tool execution;
+no compatible implementation is claimed here.
+
+A separately authorized deployment must additionally prove controller-only TLS
+ingress/service access, default-deny Sandbox ingress with only approved controller
+sources permitted, no worker/preview route to control APIs, no shared credentials
+with an independent client, and no worker/verifier RBAC for Secrets, Pod exec,
+port-forward/proxy or Workspace volume mounting. Deny unreviewed privileged/host
+access and mounts that bypass the boundary. Network policy must be enforced by
+the actual CNI; it cannot fix the same-UID local failure above. Controller and
+successor need the same recoverable per-worker authority without worker restart
+or a Lease-epoch-triggered listener password rotation. Validate unauthorized
+session/prompt/interrupt/fs/shell denial from worker and unrelated Pod identities,
+not just from an external unauthenticated HTTP client, before deployment readiness.
+
+### Worker Git receiver authorization
+
+Worker capabilities are Assignment/Attempt/Session/Workspace/repository/ref scoped
+and expire within 300 seconds. The credential endpoint rechecks current authority
+before returning a GitHub installation token. The broker requests only the named
+repository and `contents:write`, rejects missing/downgraded/extra permissions
+(implicit `metadata:read` is allowed), and verifies the resulting token using
+`GET /installation/repositories?per_page=2`: exactly one matching owner/name,
+`total_count: 1`, no pagination or redirect. This proves local protocol handling;
+live GitHub response/installation behavior remains separately unverified.
+
+An extracted token is usable directly until its provider `expires_at`; capability
+expiry, hold or controller succession does not revoke an already extracted token.
+The helper cannot enforce its target ref on that direct use. Before a
+single-Commission deployment can be accepted, the authoritative GitHub receiver
+must deny creation, update and deletion of every branch except the exact approved
+worker ref, and deny unauthorized tags. Branch/organization rulesets must be active
+and cover existing **and newly created** refs; protecting only `main` is insufficient.
+The worker App must have no direct or inherited ruleset/bypass authority, including
+an App identity shared with a privileged controller. An integration actor's needed
+bypass cannot be shared with worker tokens. A shared App is acceptable only if
+this actual actor-policy interaction is independently demonstrated safe.
+
+The authorized receiver validation must use the real proposed worker token/profile:
+push the intended Candidate and compare the exact observed SHA; attempt a different
+repository, target/main ref, another Commission ref, new branch, tag, deletion and
+mixed allowed/forbidden multi-ref update. Require denial/no forbidden ref change,
+including direct-token use without the Anvil helper. Record ruleset IDs, active
+enforcement, ref patterns, App/installation IDs, effective bypass actors and token
+expiry without recording token values. Test allowed work-branch rewriting only
+according to the approved policy. Local `git-http-backend` pre-receive fixtures
+demonstrate receiver behavior, not GitHub ruleset compatibility. If the chosen
+GitHub installation/policy cannot express or enforce this boundary, deployment
+readiness remains blocked pending an explicit reviewed decision; instructions
+alone cannot satisfy it.
 
 ## Deployment and recovery procedure
 

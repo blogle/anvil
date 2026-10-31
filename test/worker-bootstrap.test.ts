@@ -4,6 +4,7 @@ import {
   chmodSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -67,6 +68,13 @@ async function setup() {
     hostname: "127.0.0.1",
     port: 0,
     fetch: async (request) => {
+      if (request.method === "GET") {
+        expect(request.headers.get("authorization")).toBe(`Bearer ${token}`);
+        return Response.json({
+          total_count: 1,
+          repositories: [{ full_name: "example/repository" }],
+        });
+      }
       issued += 1;
       const body = (await request.json()) as {
         permissions: Record<string, string>;
@@ -244,8 +252,98 @@ test("Session-bound provider bootstrap installs a private helper, recovers lost 
   ).toBe(revision);
   expect(issued()).toBe(1);
   expect(await publish("refs/heads/protected-other")).not.toBe(0); // receiver policy, not cryptographic ref confinement
+  // An extracted provider token bypasses the helper/capability completely.
+  // Only the authoritative receiver can reject these updates.
+  const rawPush = async (...refs: string[]) => {
+    const child = Bun.spawn(
+      [
+        "git",
+        "-c",
+        "credential.helper=",
+        "-c",
+        `http.extraHeader=Authorization: Basic ${Buffer.from("x-access-token:ghs_initial_fixture").toString("base64")}`,
+        "push",
+        "--atomic",
+        "origin",
+        ...refs,
+      ],
+      {
+        cwd: repo,
+        env: {
+          ...process.env,
+          HOME: files.home,
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_TERMINAL_PROMPT: "0",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    const [code] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    return code;
+  };
+  for (const ref of [
+    "refs/heads/main",
+    "refs/heads/another-commission",
+    "refs/tags/unauthorized",
+  ])
+    expect(await rawPush(`HEAD:${ref}`)).not.toBe(0);
+  expect(
+    git(
+      files.home,
+      ["commit", "--allow-empty", "-m", "Mixed-ref receiver adversary"],
+      repo,
+    ).code,
+  ).toBe(0);
+  const mixedRevision = git(files.home, ["rev-parse", "HEAD"], repo).out;
+  expect(
+    await rawPush(
+      "HEAD:refs/heads/anvil/worker",
+      "HEAD:refs/heads/another-commission",
+    ),
+  ).not.toBe(0);
+  expect(
+    git(files.home, ["--git-dir", bare, "rev-parse", "refs/heads/anvil/worker"])
+      .out,
+  ).toBe(revision);
+  expect(
+    git(files.home, ["--git-dir", bare, "rev-parse", "refs/heads/main"]).code,
+  ).not.toBe(0);
+  const hook = join(bare, "hooks/pre-receive");
+  renameSync(hook, `${hook}.disabled`);
+  try {
+    expect(await rawPush("HEAD:refs/heads/unprotected-negative-probe")).toBe(0);
+    expect(
+      git(files.home, [
+        "--git-dir",
+        bare,
+        "rev-parse",
+        "refs/heads/unprotected-negative-probe",
+      ]).out,
+    ).toBe(mixedRevision);
+  } finally {
+    renameSync(`${hook}.disabled`, hook);
+  }
+  expect(await rawPush(":refs/heads/unprotected-negative-probe")).not.toBe(0);
+  expect(
+    git(files.home, [
+      "--git-dir",
+      bare,
+      "rev-parse",
+      "refs/heads/unprotected-negative-probe",
+    ]).out,
+  ).toBe(mixedRevision);
   value(await worker.application.hold("commission-1", "review", worker.now));
   expect(await publish()).not.toBe(0);
+  expect(await rawPush("HEAD:refs/heads/anvil/worker")).toBe(0); // hold denies issuance, not an extracted provider token
+  expect(
+    git(files.home, ["--git-dir", bare, "rev-parse", "refs/heads/anvil/worker"])
+      .out,
+  ).toBe(mixedRevision);
   value(await worker.application.resume("commission-1", worker.now));
   files.sessionExists = false;
   expect(await publish()).not.toBe(0);

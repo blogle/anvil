@@ -150,21 +150,17 @@ export function createProviderPort(
     environment,
     "ANVIL_KUBERNETES_TOKEN_FILE",
   );
-  const openCodePasswordFile = environment["ANVIL_OPENCODE_PASSWORD_FILE"];
-  const openCodePassword =
-    openCodePasswordFile === undefined
-      ? undefined
-      : readSecretFile(environment, "ANVIL_OPENCODE_PASSWORD_FILE");
-  const openCodeSecretName = environment["ANVIL_OPENCODE_SECRET_NAME"];
-  const openCodeSecretKey = environment["ANVIL_OPENCODE_SECRET_KEY"];
-  if (
-    openCodePassword !== undefined &&
-    (openCodeSecretName === undefined || openCodeSecretKey === undefined)
-  ) {
-    throw new Error(
-      "OpenCode password requires ANVIL_OPENCODE_SECRET_NAME and ANVIL_OPENCODE_SECRET_KEY for the Sandbox reference",
-    );
-  }
+  const openCodePassword = readSecretFile(
+    environment,
+    "ANVIL_OPENCODE_PASSWORD_FILE",
+  );
+  if (openCodePassword.length < 32)
+    throw new Error("OpenCode password must contain at least 32 characters");
+  const openCodeSecretName = required(
+    environment,
+    "ANVIL_OPENCODE_SECRET_NAME",
+  );
+  const openCodeSecretKey = required(environment, "ANVIL_OPENCODE_SECRET_KEY");
 
   const sandbox = new AgentSandboxClient({
     apiServerUrl: required(environment, "ANVIL_KUBERNETES_API_URL"),
@@ -232,9 +228,7 @@ export function createProviderPort(
         .replaceAll("{namespace}", encodeURIComponent(namespace));
       return new OpenCodeAdapter({
         baseUrl: url,
-        ...(openCodePassword === undefined
-          ? {}
-          : { password: openCodePassword }),
+        password: openCodePassword,
       });
     },
     sandboxIntent: (commission) => ({
@@ -254,16 +248,13 @@ export function createProviderPort(
       environment: {
         OPENCODE_CONFIG_DIR: "/anvil/profile/config",
       },
-      secretReferences:
-        openCodeSecretName === undefined || openCodeSecretKey === undefined
-          ? []
-          : [
-              {
-                name: "OPENCODE_SERVER_PASSWORD",
-                secretName: openCodeSecretName,
-                secretKey: openCodeSecretKey,
-              },
-            ],
+      secretReferences: [
+        {
+          name: "OPENCODE_SERVER_PASSWORD",
+          secretName: openCodeSecretName,
+          secretKey: openCodeSecretKey,
+        },
+      ],
     }),
     github,
     workBranch: workBranchFor,

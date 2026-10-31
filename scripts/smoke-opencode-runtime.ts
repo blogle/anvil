@@ -161,6 +161,36 @@ try {
     "OpenCode API version did not match the pinned Nix package",
   );
 
+  // Validate real listener authentication, not just the controller client's
+  // happy path. No model execution is needed for these rejected mutations.
+  for (const authorization of [
+    undefined,
+    `Basic ${Buffer.from("opencode:wrong-password").toString("base64")}`,
+  ]) {
+    for (const path of [
+      "api/session",
+      "api/shell",
+      "api/experimental/fs/write?path=/tmp/unauthorized-anvil-probe",
+      "api/session/foreign/prompt",
+      "api/session/foreign/interrupt",
+    ]) {
+      const response = await fetch(new URL(path, baseUrl), {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(authorization === undefined ? {} : { authorization }),
+        },
+        body: "{}",
+        redirect: "error",
+      });
+      assert(
+        response.status === 401,
+        "OpenCode accepted an unauthenticated mutation",
+      );
+      await response.body?.cancel();
+    }
+  }
+
   const created = await adapter.createSession();
   assert(created.ok, "OpenCode session creation route was rejected");
   assert(created.value.id.length > 0, "OpenCode returned an empty Session ID");
@@ -264,6 +294,76 @@ try {
     console.log(
       "actual OpenCode shell/fs bootstrap passed: private capability, executable helper, Git config and receipt; no model instruction or provider credential",
     );
+
+    // Same-UID tool execution is not an authentication boundary. This probe
+    // records booleans only; the recovered ephemeral credential never leaves
+    // the subprocess or enters its arguments, output, or workspace files.
+    const marker = join(home, "worker-authority-probe.json");
+    const mutation = join(repo, "unauthorized-worker-api-write");
+    const probe = `const proc = await Bun.file(${JSON.stringify(`/proc/${server.pid}/environ`)}).text().catch(() => "");
+const inherited = process.env.OPENCODE_SERVER_PASSWORD;
+const recovered = inherited || proc.split("\\0").find(v => v.startsWith("OPENCODE_SERVER_PASSWORD="))?.slice("OPENCODE_SERVER_PASSWORD=".length);
+let created = false, written = false;
+if (recovered) {
+  const headers = { authorization: "Basic " + Buffer.from("opencode:" + recovered).toString("base64"), "content-type": "application/json" };
+  const result = await fetch(${JSON.stringify(`${baseUrl}api/session`)}, { method: "POST", headers, body: "{}", redirect: "error" });
+  created = result.ok && typeof (await result.json()).data?.id === "string";
+  const write = await fetch(${JSON.stringify(`${baseUrl}api/experimental/fs/write?path=${encodeURIComponent(mutation)}`)}, { method: "POST", headers: { ...headers, "content-type": "application/octet-stream" }, body: "unauthorized worker API write", redirect: "error" });
+  written = write.ok;
+}
+await Bun.write(${JSON.stringify(marker)}, JSON.stringify({ inherited: !!inherited, processReadable: !!proc, created, written }));`;
+    const q = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
+    const headers = {
+      authorization: `Basic ${Buffer.from(`opencode:${serverPassword}`).toString("base64")}`,
+      "content-type": "application/json",
+    };
+    const shell = await fetch(`${baseUrl}api/shell`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        command: `${q(process.execPath)} -e ${q(probe)}`,
+        cwd: repo,
+        timeout: 10000,
+      }),
+      redirect: "error",
+    });
+    assert(shell.ok, "Actual worker authority probe shell was rejected");
+    let shellInfo = (
+      (await shell.json()) as {
+        data: { id: string; status: string; exit?: number };
+      }
+    ).data;
+    for (
+      let poll = 0;
+      poll < 100 && shellInfo.status === "running";
+      poll += 1
+    ) {
+      await Bun.sleep(100);
+      const status = await fetch(`${baseUrl}api/shell/${shellInfo.id}`, {
+        headers,
+        redirect: "error",
+      });
+      assert(status.ok, "Actual worker authority probe could not be observed");
+      shellInfo = ((await status.json()) as { data: typeof shellInfo }).data;
+    }
+    assert(
+      shellInfo.status === "exited" && shellInfo.exit === 0,
+      "Actual worker authority probe failed to execute",
+    );
+    const exposure = JSON.parse(readFileSync(marker, "utf8")) as {
+      inherited: boolean;
+      processReadable: boolean;
+      created: boolean;
+      written: boolean;
+    };
+    console.log(
+      `worker API authority probe: ${JSON.stringify(exposure)} (no credential values)`,
+    );
+    if (process.argv[5] === "--require-worker-isolation")
+      assert(
+        !exposure.created && !exposure.written,
+        "BLOCKED/WORKER-API: same-UID worker recovers OpenCode authority and can create a Session/write Workspace; deployment isolation is required",
+      );
   }
 
   const exists = await adapter.sessionExists(created.value.id);
