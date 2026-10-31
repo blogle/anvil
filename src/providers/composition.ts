@@ -13,6 +13,7 @@ import type {
 import { AgentSandboxClient, type SandboxIntent } from "./agent-sandbox";
 import { GitHubDeliveryClient } from "./github-delivery";
 import { OpenCodeAdapter } from "./opencode";
+import type { WorkerBootstrap } from "./worker-bootstrap";
 
 export type WorldObservationPort = Readonly<{
   observe(
@@ -22,6 +23,7 @@ export type WorldObservationPort = Readonly<{
 }>;
 
 export type ProviderCompositionConfig = Readonly<{
+  workerBootstrap?: WorkerBootstrap;
   sandbox: AgentSandboxClient;
   world: WorldObservationPort;
   openCodeForSandbox: (sandboxResourceName: string) => OpenCodeAdapter;
@@ -49,6 +51,27 @@ export class ProviderComposition implements ProviderPort {
 
   constructor(config: ProviderCompositionConfig) {
     this.#config = config;
+  }
+
+  async validateWorkerBinding(
+    commission: Commission,
+    scope: import("../application").WorkerGitCapabilityScope,
+  ): Promise<boolean> {
+    const workspace = await this.#config.sandbox.inspectIntent(
+      this.#config.sandboxIntent(commission),
+    );
+    if (
+      !workspace.ok ||
+      workspace.value.name !== scope.workspaceId ||
+      workspace.value.environmentState !== "ready"
+    )
+      return false;
+    const session = await this.#openCode(scope.workspaceId).sessionExists(
+      scope.sessionId,
+    );
+    if (!session.ok || !session.value) return false;
+    const active = await this.#openCode(scope.workspaceId).activeSessions();
+    return active.ok && active.value.every(({ id }) => id === scope.sessionId);
   }
 
   subscribeExecutionEvents(
@@ -210,11 +233,25 @@ export class ProviderComposition implements ProviderPort {
     const messages =
       await this.#openCode(sandboxResourceName).messages(openCodeSessionId);
     if (!messages.ok) return messages;
+    const active = await this.#openCode(sandboxResourceName).activeSessions();
+    if (!active.ok) return active;
+    const foreign = active.value
+      .filter(({ id }) => id !== openCodeSessionId)
+      .map(({ id }) => id);
     return {
       ok: true,
       value: {
         ...world.value,
         execution,
+        ...(foreign.length === 0
+          ? {}
+          : {
+              workspaceConflict: {
+                workspaceId: sandboxResourceName,
+                sessionIds: foreign,
+                source: "opencode-active-sessions",
+              },
+            }),
         workerClaims: [
           ...world.value.workerClaims,
           ...workerClaimsFromMessages(
@@ -236,6 +273,42 @@ export class ProviderComposition implements ProviderPort {
     now: number,
     authorizeEffect?: () => Promise<boolean>,
   ): Promise<ProviderResult<Exclude<OperationOutcome, { kind: "prepared" }>>> {
+    if (operation.kind === "bootstrap_worker") {
+      const binding = this.#bindings.get(commission.id);
+      if (
+        !binding?.openCodeSessionId ||
+        this.#config.workerBootstrap === undefined
+      )
+        return rejected(
+          "Secure worker bootstrap transport/configuration is unavailable",
+        );
+      const result = await this.#openCode(
+        binding.sandboxResourceName,
+      ).bootstrapWorker(
+        this.#config.workerBootstrap,
+        commission,
+        operation,
+        binding.sandboxResourceName,
+        binding.openCodeSessionId,
+        now,
+        authorizeEffect,
+      );
+      return result.ok && result.value
+        ? {
+            ok: true,
+            value: {
+              kind: "observed",
+              observedAt: now,
+              source: "opencode-2.0.32-worker-bootstrap",
+              result: "applied",
+              retrySafe: false,
+              externalIdentity: this.#config.workerBootstrap.receipt(operation),
+            },
+          }
+        : result.ok
+          ? rejected("Worker bootstrap postcondition is not verified")
+          : result;
+    }
     if (operation.kind === "provision_sandbox") {
       const result = await this.#config.sandbox.create(
         this.#config.sandboxIntent(commission),
@@ -437,6 +510,42 @@ export class ProviderComposition implements ProviderPort {
     operation: Operation,
     now: number,
   ): Promise<ProviderResult<OperationOutcome | null>> {
+    if (operation.kind === "bootstrap_worker") {
+      const binding = this.#bindings.get(commission.id);
+      if (
+        !binding?.openCodeSessionId ||
+        this.#config.workerBootstrap === undefined
+      )
+        return { ok: true, value: null };
+      const result = await this.#openCode(
+        binding.sandboxResourceName,
+      ).bootstrapWorker(
+        this.#config.workerBootstrap,
+        commission,
+        operation,
+        binding.sandboxResourceName,
+        binding.openCodeSessionId,
+        now,
+        undefined,
+        true,
+      );
+      return result.ok
+        ? {
+            ok: true,
+            value: result.value
+              ? {
+                  kind: "observed",
+                  observedAt: now,
+                  source: "opencode-worker-bootstrap-inspection",
+                  result: "applied",
+                  retrySafe: false,
+                  externalIdentity:
+                    this.#config.workerBootstrap.receipt(operation),
+                }
+              : null,
+          }
+        : result;
+    }
     if (operation.kind === "provision_sandbox") {
       const result = await this.#config.sandbox.inspectIntent(
         this.#config.sandboxIntent(commission),

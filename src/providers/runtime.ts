@@ -16,6 +16,8 @@ import type {
 import type { Commission, Operation, OperationOutcome } from "../domain";
 import type { CommissionStore } from "../persistence/sqlite";
 import { KubernetesLeaseClient } from "./kubernetes-lease";
+import { WorkerGitCapabilitySigner } from "./git-credentials";
+import { WorkerBootstrap } from "./worker-bootstrap";
 
 export function createControllerAuthority(
   environment: NodeJS.ProcessEnv,
@@ -106,7 +108,10 @@ export function createControllerAuthority(
 
 export function createProviderPort(
   environment: NodeJS.ProcessEnv,
-  onGitHubBroker?: (broker: GitHubAppBroker) => void,
+  onGitHubBroker?: (
+    broker: GitHubAppBroker,
+    signer: WorkerGitCapabilitySigner,
+  ) => void,
 ): ProviderPort {
   const mode = environment["ANVIL_PROVIDER_MODE"] ?? "unavailable";
   if (mode === "unavailable") return new UnavailableProvider();
@@ -181,7 +186,10 @@ export function createProviderPort(
     privateKey,
     ...(githubApiUrl === undefined ? {} : { apiUrl: githubApiUrl }),
   });
-  onGitHubBroker?.(githubCredentials);
+  const signer = new WorkerGitCapabilitySigner(
+    readSecretFile(environment, "ANVIL_GIT_CAPABILITY_SECRET_FILE"),
+  );
+  onGitHubBroker?.(githubCredentials, signer);
   const github = new GitHubDeliveryClient(
     githubCredentials,
     githubApiUrl === undefined ? {} : { apiUrl: githubApiUrl },
@@ -203,6 +211,19 @@ export function createProviderPort(
     maxObservationAgeMs,
   });
   return new ProviderComposition({
+    workerBootstrap: new WorkerBootstrap({
+      signer,
+      credentialUrl: required(environment, "ANVIL_GIT_CREDENTIAL_URL"),
+      repositoryDirectory:
+        environment["ANVIL_WORKER_REPOSITORY_DIRECTORY"] ??
+        "/home/anvil/workspace",
+      privateDirectory:
+        environment["ANVIL_WORKER_PRIVATE_DIRECTORY"] ??
+        "/home/anvil/.anvil-worker",
+      imageHelper:
+        environment["ANVIL_WORKER_GIT_HELPER"] ?? "/bin/anvil-git-credential",
+      targetRef: (c) => `refs/heads/${workBranchFor(c)}`,
+    }),
     sandbox,
     world,
     openCodeForSandbox: (sandboxResourceName) => {

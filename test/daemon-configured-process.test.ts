@@ -6,11 +6,13 @@ import {
   mkdtempSync,
   rmSync,
   writeFileSync,
+  readFileSync,
+  renameSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OpenCodeAdapter } from "../src/providers/opencode";
-import { WorkerGitCapabilitySigner } from "../src/providers/git-credentials";
+import { WorkerFiles } from "./support/worker-files";
 import { workBranchFor } from "../src/providers/runtime";
 import { proposalInput } from "./support/fixtures";
 import { LeaseApiFixture, leaseToken } from "./support/lease-api";
@@ -449,10 +451,33 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
     },
   });
 
+  const imageHelper = join(directory, "image-git-helper");
+  writeFileSync(
+    imageHelper,
+    `#!/bin/sh\nexec '${process.execPath}' '${process.cwd()}/src/providers/git-helper.ts' "$@"\n`,
+    { mode: 0o555 },
+  );
+  const workerFiles = new Map<string, WorkerFiles>();
+  const filesFor = (sandbox: string) => {
+    let files = workerFiles.get(sandbox);
+    if (files === undefined) {
+      files = new WorkerFiles(
+        join(directory!, "workers", sandbox),
+        imageHelper,
+        "/home/anvil",
+      );
+      workerFiles.set(sandbox, files);
+    }
+    return files;
+  };
   openCodeServer = Bun.serve({
     port: openCodePort,
     async fetch(request) {
       const url = new URL(request.url);
+      const workerResponse = await filesFor(url.pathname.split("/")[1]!).handle(
+        request,
+      );
+      if (workerResponse !== undefined) return workerResponse;
       if (url.pathname.endsWith("/api/event")) {
         let subscriber: ReadableStreamDefaultController<Uint8Array> | undefined;
         const body = new ReadableStream<Uint8Array>({
@@ -477,8 +502,9 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
             watchdogMode || interruptInspectionBusy
               ? Object.fromEntries(
                   [...sessions]
-                    .filter(([sandboxName]) =>
-                      sandboxName.startsWith("anvil-configured-"),
+                    .filter(
+                      ([sandboxName]) =>
+                        sandboxName === url.pathname.split("/")[1],
                     )
                     .map(([, sessionId]) => [sessionId, { type: "running" }]),
                 )
@@ -860,6 +886,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
     ANVIL_API_TOKEN: apiToken,
     ANVIL_DATABASE: join(directory, "configured.sqlite"),
     ANVIL_PROVIDER_MODE: "configured",
+    ANVIL_GIT_CREDENTIAL_URL: `http://127.0.0.1:${serverPort}/v1/git/credentials`,
     ANVIL_CONTROLLER_ID: "configured-process-fixture",
     ANVIL_LEASE_NAMESPACE: "configured-leases",
     ANVIL_LEASE_API_URL: leaseApi.url,
@@ -1183,27 +1210,16 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   ).commission;
   deliveryBranchName = workBranchFor(deliveryCommission);
   const deliveryTargetRef = `refs/heads/${deliveryBranchName}`;
-  const capabilityFile = join(directory, "delivery-git-capability");
-  const deliveryCapability = new WorkerGitCapabilitySigner(
-    gitCapabilitySecret,
-    300,
-  ).mint(
-    {
-      commissionId: deliveryId,
-      assignmentId: sessionOperation.assignmentId,
-      attemptId: sessionOperation.attemptId,
-      sessionId: sessionOperation.outcome.externalIdentity,
-      workspaceId: workspaceOperation.outcome.externalIdentity,
-      repository: "acme/demo",
-      targetRef: deliveryTargetRef,
-      controllerId: deliveryCommission.owner!.controllerId,
-      ownerEpoch: deliveryCommission.owner?.epoch ?? 1,
-    },
-    Date.now(),
-    300,
+  await waitForOperationKind(
+    baseUrl,
+    deliveryId,
+    "bootstrap_worker",
+    "observed",
   );
-  writeFileSync(capabilityFile, deliveryCapability, { mode: 0o600 });
-  chmodSync(capabilityFile, 0o600);
+  const deliveryFiles = filesFor(workspaceOperation.outcome.externalIdentity);
+  const capabilityFile = join(deliveryFiles.home, ".anvil-worker/capability");
+  expect(deliveryFiles.writes).toBe(1);
+  expect(readFileSync(capabilityFile, "utf8").length).toBeGreaterThan(0);
   const projectRoot = join(directory, "delivery-github");
   deliveryBareRepository = join(projectRoot, "acme", "demo.git");
   mkdirSync(join(projectRoot, "acme"), { recursive: true });
@@ -1233,7 +1249,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
         expectedGitAuthorization,
       ),
   });
-  deliveryWorkerRepository = join(directory, "delivery-worker");
+  deliveryWorkerRepository = join(deliveryFiles.home, "workspace");
   const initWorker = git(["init", deliveryWorkerRepository]);
   if (initWorker.exitCode !== 0) throw new Error(initWorker.stderr);
   for (const args of [
@@ -1265,32 +1281,13 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   if (firstCommit.exitCode !== 0) throw new Error(firstCommit.stderr);
   const localRemote = `http://127.0.0.1:${gitReceiverServer.port}/git/acme/demo.git`;
   git(["-C", deliveryWorkerRepository, "remote", "add", "origin", localRemote]);
-  const helperPath = join(process.cwd(), "src/providers/git-credentials.ts");
-  git([
-    "-C",
-    deliveryWorkerRepository,
-    "config",
-    "credential.helper",
-    `!${process.execPath} run ${helperPath}`,
-  ]);
-  git([
-    "-C",
-    deliveryWorkerRepository,
-    "config",
-    "credential.useHttpPath",
-    "true",
-  ]);
   deliveryPushEnvironment = {
-    ANVIL_GIT_CREDENTIAL_URL: `${baseUrl}/v1/git/credentials`,
-    ANVIL_GIT_CAPABILITY_FILE: capabilityFile,
-    ANVIL_GIT_TARGET_REF: deliveryTargetRef,
+    HOME: deliveryFiles.home,
     ANVIL_GIT_FIXTURE_REPOSITORY_URL: "https://github.com/acme/demo",
     GIT_TERMINAL_PROMPT: "0",
     GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_GLOBAL: "/dev/null",
   };
-  const absentCapabilityFile = join(directory, "absent-capability");
-  deliveryPushEnvironment["ANVIL_GIT_CAPABILITY_FILE"] = absentCapabilityFile;
+  renameSync(capabilityFile, `${capabilityFile}.saved`);
   deliveryPushArguments = [
     "-C",
     deliveryWorkerRepository,
@@ -1304,7 +1301,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
   });
   expect(deniedPush.exitCode).not.toBe(0);
   expect(deniedPush.stderr).toContain("ENOENT");
-  expect(deniedPush.stderr).toContain(absentCapabilityFile);
+  expect(deniedPush.stderr).toContain(capabilityFile);
   const absentCandidate = git([
     "--git-dir",
     deliveryBareRepository,
@@ -1316,7 +1313,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
     `http://127.0.0.1:${githubPort}/api/repos/acme/demo/branches/${encodeURIComponent(deliveryBranchName)}`,
   );
   expect(absentBranchObservation.status).toBe(404);
-  deliveryPushEnvironment["ANVIL_GIT_CAPABILITY_FILE"] = capabilityFile;
+  renameSync(`${capabilityFile}.saved`, capabilityFile);
   deliveryCapabilityReady?.();
   await waitForBootstrapOperations(baseUrl, deliveryId);
   const afterRepair = await waitForOperationKind(baseUrl, deliveryId, "repair");
@@ -1364,7 +1361,7 @@ test("configured Bun daemon composes local HTTP providers and recovers bindings 
     decision: { kind: "wait", reason: "required CI check is pending" },
   });
 
-  // Reopen SQLite in a new daemon process while required CI remains pending.
+  // A replacement controller adopts the same Assignment/Workspace/Session.
   daemonProcess.kill("SIGTERM");
   await daemonProcess.exited;
   daemonProcess = undefined;

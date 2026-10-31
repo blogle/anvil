@@ -48,6 +48,10 @@ export function projectCommission(
   );
   return {
     commission,
+    workerBoundary: {
+      writer: commission.workspaceWriter,
+      bootstrap: operations.filter((o) => o.kind === "bootstrap_worker"),
+    },
     projectedAt: now,
     reconciliation,
     decisionApplicable:

@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import type { ProviderResult } from "../application";
 import type { ExecutionObservation, Operation } from "../domain";
+import type { Commission } from "../domain";
+import type { WorkerBootstrap } from "./worker-bootstrap";
 
 const maxResponseBytes = 2 * 1024 * 1024;
 const maxEventFrameBytes = 2 * 1024 * 1024;
@@ -522,19 +524,20 @@ export class OpenCodeAdapter {
     const id = openCodeMessageId(operation.id);
     const sessionPath = `api/session/${encodeURIComponent(sessionId)}`;
     const instructionPermission = async (): Promise<ProviderResult<true>> => {
-      if (operation.kind === "steer") {
+      if (operation.kind === "steer" || authorizeEffect !== undefined) {
         const active = await this.activeSessions();
         if (!active.ok) return active;
         if (
-          operation.target !== `session:${sessionId}` ||
-          active.value.some(({ id }) => id === sessionId)
+          (operation.kind === "steer" &&
+            operation.target !== `session:${sessionId}`) ||
+          active.value.length !== 0
         )
           return {
             ok: false,
             error: {
               kind: "rejected",
               message:
-                "Steering boundary changed: bound OpenCode Session is not idle",
+                "Worker boundary changed: OpenCode Workspace is not idle or has a competing Session",
             },
           };
       }
@@ -640,14 +643,80 @@ export class OpenCodeAdapter {
     return openCodeMessageId(operationId);
   }
 
+  async bootstrapWorker(
+    bootstrap: WorkerBootstrap,
+    commission: Commission,
+    operation: Operation,
+    workspace: string,
+    session: string,
+    now: number,
+    authorize?: () => Promise<boolean>,
+    inspect = false,
+  ): Promise<ProviderResult<boolean>> {
+    const health = await this.health();
+    if (!health.ok) return health;
+    if (health.value.version.split("+")[0] !== "2.0.32")
+      return {
+        ok: false,
+        error: {
+          kind: "rejected",
+          message:
+            "Worker bootstrap requires pinned OpenCode 2.0.32 shell/fs contract",
+        },
+      };
+    const http = (
+      path: string,
+      method: "GET" | "POST",
+      body?: string,
+      raw = false,
+    ) =>
+      this.#request(path, {
+        method,
+        ...(body === undefined ? {} : { body }),
+        raw,
+      });
+    if (inspect)
+      return bootstrap.inspect(http, commission, operation, workspace, session);
+    if (authorize === undefined)
+      return {
+        ok: false,
+        error: {
+          kind: "rejected",
+          message: "Worker bootstrap requires application authority",
+        },
+      };
+    const active = await this.activeSessions();
+    if (!active.ok) return active;
+    if (active.value.some(({ id }) => id !== session))
+      return {
+        ok: false,
+        error: {
+          kind: "rejected",
+          message: "Competing Workspace Session prevents credential bootstrap",
+        },
+      };
+    return bootstrap.install(
+      http,
+      commission,
+      operation,
+      workspace,
+      session,
+      authorize,
+      now,
+    );
+  }
+
   async #request(
     path: string,
-    options: Readonly<{ method: "GET" | "POST"; body?: string }>,
+    options: Readonly<{ method: "GET" | "POST"; body?: string; raw?: boolean }>,
   ): Promise<ProviderResult<unknown>> {
     const url = new URL(path, this.#base);
     const headers = new Headers({ accept: "application/json" });
     if (options.body !== undefined)
-      headers.set("content-type", "application/json");
+      headers.set(
+        "content-type",
+        options.raw ? "application/octet-stream" : "application/json",
+      );
     if (this.#password !== undefined) {
       const credentials = Buffer.from(`opencode:${this.#password}`).toString(
         "base64",
@@ -661,6 +730,7 @@ export class OpenCodeAdapter {
         headers,
         ...(options.body === undefined ? {} : { body: options.body }),
         signal: AbortSignal.timeout(this.#timeoutMs),
+        redirect: "error",
       });
     } catch {
       return {

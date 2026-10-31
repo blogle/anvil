@@ -74,8 +74,17 @@ const migrationList = [
       "utf8",
     ),
   },
+  {
+    version: 7,
+    sql: readFileSync(
+      fileURLToPath(
+        new URL("./migrations/0007_worker_boundary.sql", import.meta.url),
+      ),
+      "utf8",
+    ),
+  },
 ] as const;
-const latestSchemaVersion = 6;
+const latestSchemaVersion = 7;
 const commissionColumns = [
   "id",
   "campaign_id",
@@ -111,9 +120,11 @@ const commissionColumns = [
   "delivered_expires_at",
   "delivered_check_run_id",
   "delivered_specification_generation",
+  "workspace_writer",
 ] as const;
 
 const commissionRow = z.object({
+  workspace_writer: z.string().nullable(),
   id: z.string(),
   campaign_id: z.string(),
   objective: z.string(),
@@ -181,6 +192,7 @@ const operationRow = z.object({
   logical_key: z.string(),
   commission_id: z.string(),
   kind: z.enum([
+    "bootstrap_worker",
     "steer",
     "provision_sandbox",
     "create_session",
@@ -314,6 +326,10 @@ export class CommissionStore {
         ? null
         : { controllerId: row.owner_controller_id, epoch: row.owner_epoch };
     return {
+      workspaceWriter:
+        row.workspace_writer === null
+          ? null
+          : (JSON.parse(row.workspace_writer) as Commission["workspaceWriter"]),
       id: row.id,
       campaignId: row.campaign_id,
       objective: row.objective,
@@ -781,6 +797,9 @@ function commissionValues(commission: Commission): (string | number | null)[] {
     delivery?.expiresAt ?? null,
     delivery?.checkRunId ?? null,
     delivery?.specificationGeneration ?? null,
+    commission.workspaceWriter === null
+      ? null
+      : JSON.stringify(commission.workspaceWriter),
   ];
 }
 

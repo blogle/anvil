@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, lstatSync } from "node:fs";
 import { z } from "zod";
 import type { WorkerGitCapabilityScope } from "../application";
 import type { GitHubAppBroker } from "./github-app";
@@ -21,6 +21,7 @@ const signedClaimsSchema = z
     targetRef: z.string().min(1).max(255),
     controllerId: z.string().min(1).max(128),
     ownerEpoch: z.number().int().positive(),
+    specificationGeneration: z.number().int().positive(),
     issuedAt: z.number().int().nonnegative(),
     expiresAt: z.number().int().positive(),
   })
@@ -59,6 +60,7 @@ export class WorkerGitCapabilitySigner {
     const claims = signedClaimsSchema.safeParse({
       kind: capabilityKind,
       ...scope,
+      specificationGeneration: scope.specificationGeneration ?? 1,
       issuedAt: now,
       expiresAt: now + ttlSeconds * 1_000,
     });
@@ -201,13 +203,22 @@ export class WorkerGitCredentialService {
     );
     if (!credential.ok)
       return errorResponse(503, "github_credential_unavailable");
+    let confirmed: boolean;
+    try {
+      confirmed = await this.#authorize(claims, this.#now());
+    } catch {
+      return errorResponse(503, "authority_unavailable");
+    }
+    const confirmedNow = this.#now();
+    if (claims.expiresAt <= confirmedNow || !confirmed)
+      return errorResponse(403, "capability_revoked");
     if (
       credential.value.repository.toLowerCase() !==
         claims.repository.toLowerCase() ||
       credential.value.permissions["contents"] !== "write" ||
       credential.value.permissions["pull_requests"] === "write" ||
       credential.value.permissions["workflows"] === "write" ||
-      Date.parse(credential.value.expiresAt) <= now
+      Date.parse(credential.value.expiresAt) <= confirmedNow
     )
       return errorResponse(503, "github_credential_scope_invalid");
     return Response.json({
@@ -253,6 +264,21 @@ export async function runGitCredentialHelper(
   const repository = parseGitHubRepository(repositoryUrl);
   if (!repository.ok) throw new Error("GitHub repository URL is invalid");
   const endpoint = requiredEnvironment(environment, "ANVIL_GIT_CREDENTIAL_URL");
+  const endpointUrl = new URL(endpoint);
+  if (
+    (endpointUrl.protocol !== "https:" &&
+      !(
+        endpointUrl.protocol === "http:" && isLoopbackHost(endpointUrl.host)
+      )) ||
+    endpointUrl.username ||
+    endpointUrl.password ||
+    endpointUrl.search ||
+    endpointUrl.hash ||
+    endpointUrl.pathname !== "/v1/git/credentials"
+  )
+    throw new Error(
+      "Git credential endpoint must be HTTPS (HTTP only for loopback), with no credentials/query/fragment",
+    );
   const capabilityPath = requiredEnvironment(
     environment,
     "ANVIL_GIT_CAPABILITY_FILE",
@@ -260,7 +286,13 @@ export async function runGitCredentialHelper(
   const targetRef = requiredEnvironment(environment, "ANVIL_GIT_TARGET_REF");
   if (!validTargetRef(targetRef))
     throw new Error("authorized Git ref is invalid");
-  if ((statSync(capabilityPath).mode & 0o077) !== 0)
+  const info = lstatSync(capabilityPath);
+  if (
+    !info.isFile() ||
+    info.isSymbolicLink() ||
+    (info.mode & 0o077) !== 0 ||
+    info.uid !== process.getuid?.()
+  )
     throw new Error("Git capability file permissions must be 0600 or stricter");
   const capability = readFileSync(capabilityPath, "utf8").trim();
   if (capability.length === 0 || capability.length > maximumCapabilityBytes)
@@ -276,6 +308,7 @@ export async function runGitCredentialHelper(
       },
       body: JSON.stringify({ repositoryUrl, targetRef }),
       signal: AbortSignal.timeout(5_000),
+      redirect: "error",
     });
   } catch {
     throw new Error("Anvil Git credential service is unavailable");
@@ -395,18 +428,4 @@ async function readBounded(
 
 function errorResponse(status: number, error: string): Response {
   return Response.json({ error }, { status });
-}
-
-if (import.meta.main) {
-  const [action] = process.argv.slice(2);
-  try {
-    process.stdout.write(
-      await runGitCredentialHelper(action, await Bun.stdin.text(), process.env),
-    );
-  } catch (error) {
-    process.stderr.write(
-      `${error instanceof Error ? error.message : "Anvil Git helper failed"}\n`,
-    );
-    process.exitCode = 1;
-  }
 }

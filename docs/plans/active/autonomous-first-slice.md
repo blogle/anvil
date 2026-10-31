@@ -19,6 +19,7 @@ Maintain it under [repository-root PLANS.md](https://github.com/blogle/anvil/blo
 - [Migration decisions, verification and outcome](#migration-checkpoint)
 - [Governed Assignment steering checkpoint](#governed-assignment-steering)
 - [Kubernetes Lease authority checkpoint](#kubernetes-lease-authority)
+- [Recovered worker bootstrap and adoption checkpoint](#worker-bootstrap-recovery)
 
 No complete FS-01–FS-14 obligation is VERIFIED. **FS-15: BLOCKED_EXTERNAL**;
 **K8S_ACCEPTANCE_REQUEST: NOT_EXECUTABLE**. The `sandboxImageGate` still fails;
@@ -28,8 +29,9 @@ Historical checkpoint counts, findings and limitations below retain their origin
 scope and chronology; later evidence does not retroactively rewrite earlier results.
 In particular, the parity matrix contains stale rows (including Git/CI/provider
 handoff assessments); refreshing and independently comparing them remains work.
-Latest engineering progress is the [Kubernetes Lease authority checkpoint](#kubernetes-lease-authority),
-following [governed Assignment steering](#governed-assignment-steering). These
+Latest engineering progress is the [recovered worker bootstrap/adoption checkpoint](#worker-bootstrap-recovery),
+following [Kubernetes Lease authority](#kubernetes-lease-authority) and
+[governed Assignment steering](#governed-assignment-steering). These
 local paths supersede earlier missing-steering/adapter residuals for their bounded
 interfaces; historical evidence and wider isolation/API/UI parity gaps remain.
 
@@ -1038,3 +1040,178 @@ inspectable and never acquire retry permission merely from succession. Preserve
 FS-13's closure-preseed and Nix protocol failures, FS-15 BLOCKED_EXTERNAL, and
 K8S_ACCEPTANCE_REQUEST NOT_EXECUTABLE. Stop this checkpoint after publishing the
 single commit to PR #124; subsequent engineering requires the next controller turn.
+
+<a id="worker-bootstrap-recovery"></a>
+## Recovered worker bootstrap and adoption checkpoint — 2026-10-31
+
+### Recovery, authority and disposition
+
+- Inspected HEAD/status, tracked/untracked/ignored changes, origin, recent commits,
+  draft PR #124 and actual tests before editing. Local and published HEAD were
+  `8808a593cc5a2b8231000b95ab2837ec13fab205`, on the existing
+  `anvil/anvil-first-slice-completion-58824672` branch against `v2`.
+  PR #123 `f6723b79d5a938a86c6770660969a1298abde148` remains immutable.
+  All 19 modified tracked files and five untracked worker-bootstrap/migration/
+  fixture files were legitimate unpublished engineering and were preserved.
+  Ignored `dist/` and `node_modules/` remain outside the checkpoint.
+- Operator decision: a per-Commission Kubernetes Lease elects the **controller**;
+  it is not a worker lease. Successor adoption retains durable Assignment,
+  Workspace, Session and original Operations. Controller provenance on the writer
+  allocation is not worker revocation or fencing authority. No controller-held
+  Lease loss stops an already admitted tool call.
+- **Gate A: local bootstrap/publication/adoption paths pass; full gate remains
+  BLOCKED on independently credentialed writer exclusion and deployment credential
+  policy validation.** This checkpoint does not establish LOCAL_SLICE_READY,
+  complete FS acceptance or permission to begin B/C/D. No FS status is promoted;
+  FS-15 remains BLOCKED_EXTERNAL and K8S_ACCEPTANCE_REQUEST NOT_EXECUTABLE.
+
+### Concrete implementation and evidence boundaries
+
+- Migration `0007_worker_boundary.sql` journals `bootstrap_worker` in the existing
+  Operation table and persists one Assignment/Workspace/Session allocation. The
+  migration adopts an unambiguous existing allocation; multiple observed
+  Workspaces, Sessions or effect-bearing Assignments become `unresolved`.
+  `test/store.test.ts` exercises all four cases against the actual SQL migrations.
+- Configured runtime creates `WorkerBootstrap` through `createProviderPort`, using
+  the shared controller-only capability signer and GitHub App broker. Required
+  `ANVIL_GIT_CREDENTIAL_URL` is the stable controller-service endpoint ending in
+  `/v1/git/credentials`; production requires HTTPS. Optional worker path overrides
+  are `ANVIL_WORKER_REPOSITORY_DIRECTORY`, `ANVIL_WORKER_PRIVATE_DIRECTORY` and
+  `ANVIL_WORKER_GIT_HELPER`; defaults are `/home/anvil/workspace`,
+  `/home/anvil/.anvil-worker` and `/bin/anvil-git-credential`.
+- Bootstrap follows observed Sandbox/Session Operations before initial prompt
+  admission. The pinned OpenCode 2.0.32 shell/fs transport creates private worker
+  state, installs the image-bundled Git helper, writes a short-lived signed
+  capability via raw fs.write, configures Git, and publishes an Operation-bound
+  non-secret receipt. Capability bytes are not in shell commands, prompts,
+  receipts, SQLite, or Git remote URLs. Controller signing keys and privileged
+  credentials are never delivered. OpenCode and credential HTTP redirects fail
+  closed; a 307 exfiltration fixture observes zero requests at the redirect sink.
+- Rotation stages mode-0600 capability bytes and atomically renames the complete
+  file on the same filesystem. An existing helper must be byte-identical; helper
+  and Git config are not rewritten during routine rotation. A changed helper,
+  credential endpoint or ref contract fails closed pending an explicit safe-boundary
+  upgrade. Initial helper/config/capability/receipt installation is **not** one
+  filesystem transaction: partial or missing acknowledgement stays ambiguous,
+  blocks model dispatch, and is not blindly replayed. Receipt field mismatch is
+  also ambiguous. Receipt equality ignores JSON key ordering, not identity fields.
+- `test/worker-bootstrap.test.ts` now asserts the approved successor adoption,
+  replacing the unpublished contradictory `unresolved` expectation. Real local
+  Git commit/push works before and after takeover using the original capability;
+  predecessor authorization and dispatch fail. A successor rotates credentials
+  while the original Session remains active, old credentials still work during
+  staging, and lost finish acknowledgement resolves without a second write.
+  The original instruction's lost acknowledgement is independently recovered
+  after SQLite reopen/takeover with one prompt, unchanged writer identity and
+  immutable original Operation owner. Interrupt count remains zero.
+- Credential issuance revalidates current Lease/controller authority, active
+  Commission/Attempt, unchanged Assignment/Session/Workspace/repository/ref and
+  specification generation, including after broker I/O. Earlier issuer epoch is
+  allowed only with known durable provenance and unchanged worker identity. Hold,
+  expiry, wrong identity/repository/ref, missing Session, insecure file permissions,
+  unknown issuer and competing active Session deny issuance. Observation of a
+  foreign Session persists an unresolved allocation and prevents new dispatch.
+- `test/daemon-configured-process.test.ts` now obtains helper and capability via
+  the production-intended configured provider/bootstrap path, replacing manually
+  minted fixture bootstrap. It launches the actual Bun daemon with SQLite,
+  loopback Sandbox/OpenCode/Lease/GitHub/Mergify protocols and shell subprocesses.
+  Worker commits push through the installed authenticated helper into a real bare
+  Git HTTP receiver; the branch adapter reads its exact SHA, and the Commission
+  observes the matching Candidate through repair, restart and delivery. A missing
+  capability denies push and leaves the remote branch absent. Model execution,
+  Sandbox provisioning, CI, PR and Mergify remain fixtures, not live observations.
+- `workerGitHelper` packages the Bun helper into the worker OCI closure.
+  `workerBootstrapSmoke` starts the **actual** packaged OpenCode 2.0.32 and uses
+  the production adapter/bootstrap shell/fs path to verify private capability,
+  executable helper, Git configuration and receipt. It submits no model prompt
+  and requests no GitHub credential. This complements, rather than replaces, the
+  configured-daemon protocol/real-Git integration evidence.
+
+### Exact executed verification and failures
+
+Final code/migration/test tree is the recovered working tree based on `8808a59`,
+committed with this entry. The final Nix source snapshot before this plan-only
+update is `/nix/store/4c5f0pqmijshrgrrrsd61qbg8znn7dam-lqwm7k8x7b09rnzsqj96nis4k3pabi9g-source`.
+
+| Executed command | Exit | Observed result |
+|---|---|---|
+| `nix develop -c just fmt` | 0 | Final source/tests/scripts formatted. |
+| `nix develop -c just check` | 0 | Frozen dependencies, generated-lock match and drift-negative probe, formatting, strict TypeScript; **147 tests / 1619 assertions**, 24 files. |
+| `nix develop -c bun test test/worker-bootstrap.test.ts test/daemon-configured-process.test.ts test/providers/git-credentials.test.ts test/lease-authority.test.ts test/authority-boundaries.test.ts test/store.test.ts` | 0 | **33 tests / 486 assertions**, six files; positive and adversarial subprocess/HTTP/SQLite/Lease evidence described above. |
+| `nix develop -c just ci-verify` | 0 | Pinned Nix-sandboxed TypeScript/test derivation `/nix/store/fhvk2lrhl6nnikvr8qv3hwh5hp7fjlcz-anvil-typescript-check-0.1.0.drv`. |
+| `nix build .#ui .#daemon .#sandboxWorkerImage .#checks.x86_64-linux.daemonSmoke .#checks.x86_64-linux.opencodeSmoke .#checks.x86_64-linux.workerBootstrapSmoke --no-link -L` | 0 | UI, daemon, helper-bearing worker image and all three named smokes built. Daemon smoke confirms assets/auth/probes/SQLite/SIGTERM/restart; actual OpenCode bootstrap smoke passes. This is package/protocol evidence, not container/PVC startup acceptance. |
+| `nix run .#sdlc -- install --check` | 0 | SDLC adapters match locked contract. |
+| `nix develop -c just ci-check` | 1 | Preserved `sandboxImageGate`: `PASS IMAGE-CONTENT: 5 OCI layers and closure include OpenCode 2.0.32, Git, and the configured non-root entrypoint`, then `BLOCKED/INCOMPATIBLE`: no pre-provision closure guarantee; empty shared `/nix/store` overlay hides the executable. Final failing derivation `/nix/store/afx5a8bcq2j97vansar984x6nbbxqs10-anvil-sandbox-image-gate.drv`. |
+
+Failures retained with chronology:
+
+- Initial focused bootstrap/configured-daemon/credential run: exit 1, **3 pass /
+  1 fail / 272 assertions**. Implementation retained an owned allocation while
+  the unpublished test expected unresolved; the operator-approved test now checks
+  adoption and continued Git publication instead.
+- First new conflicting-receipt test run: exit 1, **14 pass / 1 fail /
+  166 assertions**. Reconciliation correctly returned a provider error; the test
+  incorrectly required success. It now checks failed reconciliation and preserved
+  ambiguous Operation with zero replay/prompt.
+- First broad check stopped at TypeScript (exit 2, `just` exit 2): optional Zod
+  conflict projection under `exactOptionalPropertyTypes` and `process.env.PATH`
+  index-signature access. Both corrected; final strict check passes.
+- A focused run concurrent with Nix builds timed out the existing many-process Git
+  credential test at Bun's 5002ms default: exit 1, **16 pass / 1 fail /
+  381 assertions**. Both long Git subprocess tests now have bounded 30-second
+  test deadlines; per-request timeouts and all assertions remain. Final focused,
+  broad and Nix verification pass. Parallel Nix evaluation also emitted an
+  ignored busy eval-cache warning; the sequential final checks completed.
+- Earlier intermediate `just check` passed **145 tests / 1614 assertions** before
+  redirect and migration adversaries were added. The earlier and final
+  `ci-check` both failed only at the retained image compatibility gate. No image
+  gate or signature/derivation-add proof was disabled or weakened.
+
+### Remaining risks, FS gaps and next blocking decision
+
+**Gate A must not be represented as fully accepted.** The existing
+`test/lease-authority.test.ts` case “negative Workspace boundary: ownership
+transfer does not fence an already-running or independently credentialed remote
+writer” still reproduces an independent remote client writing after transfer.
+Anvil now excludes conflicting allocations and refuses credentials/new prompts
+when a foreign active Session is visible; a list-then-act check does not lock
+OpenCode's APIs against an independently authorized client. The deployment
+credential/network/admission boundary excluding that client, and an independent
+verifier checkout/snapshot, remain unproved. The next Gate A action is to close
+and test that access boundary without interrupting the legitimate adopted worker.
+
+Git credential fill necessarily exposes an extractable contents-write,
+repository-wide installation token to the worker until provider expiry. The
+capability lifetime is at most 300 seconds; it is not the installation-token
+lifetime. Hold/expiry/conflict prevent **new issuance**, not use of an already
+extracted provider token. Wrong/multi-ref push denial is enforced by the local
+receiver's pre-receive rule, not by the helper or signature. Live ruleset/App actor
+and bypass behavior must be validated under separate authorization before treating
+the proposed deployment's branch policy as safe. Worker-UID file modes do not hide
+worker capabilities from that same worker; raw OpenCode fs transport also requires
+an authenticated, confidential service path. These are explicit limits, not
+instruction-enforced safety claims.
+
+| FS | Remaining complete-obligation gap (statuses unchanged) |
+|---|---|
+| FS-01 | External release-policy review and final deployment SDLC evidence. |
+| FS-02 | Exhaustive decision coverage and independent source review. |
+| FS-03 | Broader authority freshness/amendment matrices and independent acceptance. |
+| FS-04 | Full process-kill/randomized crash matrix, safe resolution of partial bootstrap/invalidated intent and reviewed storage recovery. |
+| FS-05 | Independently authorized writer exclusion, separate verifier isolation and live RBAC/TLS/clock/storage topology. Controller succession alone is not worker fencing. |
+| FS-06 | Randomized bounded-loop/restart traces and combined persistent deadline/takeover exhaustion. |
+| FS-07 | Independent evidence/freshness matrices and live required-rule validation. |
+| FS-08 | Actual model/tool/provider deployment trace, randomized event loss/order and safe-boundary runtime upgrade implementation; local bootstrap/adoption now exercised. |
+| FS-09 | Multiprocess failpoint/randomized recovery and independently executed live lifecycle; configured path remains loopback protocol fixtures plus real Git. |
+| FS-10 | Token extraction/ref-policy/App bypass review, independent writer access isolation and deployed Sandbox/helper/credential transport acceptance. |
+| FS-11 | Campaign graph/commands, Findings/command-audit/auth parity and deployment hardening. |
+| FS-12 | Campaign/Findings/review/diff/preview parity and full browser/accessibility/visual acceptance. Writer/bootstrap operation labels are projection support only. |
+| FS-13 | Shared-store availability/preseed ordering, Nix protocol/build authorization, complete immutable daemon/UI OCI and declarative deployment interface, safe runtime upgrades and isolated runtime acceptance. Existing untrusted derivation-add/preflight authorization failures remain open and were not rerun here. |
+| FS-14 | Refresh stale parity rows, execute comparative scenarios and independent cutover review. |
+| FS-15 | BLOCKED_EXTERNAL; separately authorized isolated deployment and independent review only after prerequisites. K8S_ACCEPTANCE_REQUEST NOT_EXECUTABLE. |
+
+Stop after this single reviewed recovery checkpoint is published to the same draft
+PR #124. Gate A's remaining access/ref-policy decisions precede B's retained
+shared-Nix blocker. No B/C/D implementation, live Kubernetes/provider mutation,
+dotfiles change, deployment, merge, release or acceptance self-authorization was
+performed in this attempt.

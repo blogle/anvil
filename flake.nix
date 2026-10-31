@@ -66,7 +66,13 @@
           opencodeSmoke = pkgs.runCommand "anvil-opencode-runtime-smoke" {
             nativeBuildInputs = [ bun ];
           } ''
-            ${bun}/bin/bun ${./.}/scripts/smoke-opencode-runtime.ts ${self.packages.${system}.opencodeRuntime}/bin/opencode ${pkgs.opencode.version}
+            ${bun}/bin/bun ${self.packages.${system}.workerGitHelper}/lib/opencode-smoke.js ${self.packages.${system}.opencodeRuntime}/bin/opencode ${pkgs.opencode.version}
+            touch "$out"
+          '';
+          workerBootstrapSmoke = pkgs.runCommand "anvil-worker-bootstrap-smoke" {
+            nativeBuildInputs = [ bun pkgs.gitMinimal pkgs.coreutils pkgs.bash ];
+          } ''
+            ${bun}/bin/bun ${self.packages.${system}.workerGitHelper}/lib/opencode-smoke.js ${self.packages.${system}.opencodeRuntime}/bin/opencode ${pkgs.opencode.version} ${self.packages.${system}.workerGitHelper}/bin/anvil-git-credential
             touch "$out"
           '';
           sandboxImageGate = pkgs.runCommand "anvil-sandbox-image-gate" {
@@ -80,7 +86,7 @@
             touch "$out"
           '';
         in {
-          inherit typescript daemonSmoke opencodeSmoke sandboxImageGate;
+          inherit typescript daemonSmoke opencodeSmoke workerBootstrapSmoke sandboxImageGate;
           flake = pkgs.runCommand "anvil-flake-check" { } ''
             test -f ${./flake.nix}
             test -f ${./flake.lock}
@@ -144,9 +150,24 @@
             '';
           };
           opencodeRuntime = pkgs.opencode;
+          workerGitHelper = daemon.overrideAttrs (_: {
+            pname = "anvil-worker-git-helper";
+            installPhase = ''
+              mkdir -p "$out/bin" "$out/lib"
+              ${bun}/bin/bun build src/providers/git-helper.ts --target=bun --outfile "$out/lib/git-credentials.js"
+              ${bun}/bin/bun build scripts/smoke-opencode-runtime.ts --target=bun --outfile "$out/lib/opencode-smoke.js"
+              cat > "$out/bin/anvil-git-credential" <<EOF
+              #!${pkgs.runtimeShell}
+              exec ${bun}/bin/bun "$out/lib/git-credentials.js" "\$@"
+              EOF
+              chmod 0555 "$out/bin/anvil-git-credential"
+            '';
+          });
           workerTools = pkgs.buildEnv {
             name = "anvil-sandbox-worker-tools";
             paths = [
+              workerGitHelper
+              bun
               pkgs.bashInteractive
               pkgs.coreutils
               pkgs.diffutils
@@ -414,6 +435,7 @@
             daemon
             ui
             opencodeRuntime
+            workerGitHelper
             sandboxWorkerImage
             sandboxWorkerStorePreflight
             sandboxWorkerClosureManifest

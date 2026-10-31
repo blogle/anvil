@@ -33,6 +33,7 @@ if (
   );
 
 const policy: Policy = {
+  workerBootstrap: true,
   maxObservationAgeMs: 60_000,
   repeatedToolFailureThreshold: 3,
   activeTurnStuckAfterMs: 5 * 60_000,
@@ -40,8 +41,10 @@ const policy: Policy = {
 };
 
 let githubBroker: GitHubAppBroker | undefined;
-const provider = createProviderPort(process.env, (broker) => {
+let gitSigner: WorkerGitCapabilitySigner | undefined;
+const provider = createProviderPort(process.env, (broker, signer) => {
   githubBroker = broker;
+  gitSigner = signer;
 });
 const store = new CommissionStore(databasePath);
 const authority = createControllerAuthority(process.env, store);
@@ -68,7 +71,8 @@ if ((process.env["ANVIL_PROVIDER_MODE"] ?? "unavailable") === "configured") {
   } catch {
     throw new Error("ANVIL_GIT_CAPABILITY_SECRET_FILE could not be read");
   }
-  const signer = new WorkerGitCapabilitySigner(capabilitySecret, 300);
+  const signer =
+    gitSigner ?? new WorkerGitCapabilitySigner(capabilitySecret, 300);
   gitCredentialService = new WorkerGitCredentialService({
     signer,
     github: githubBroker,

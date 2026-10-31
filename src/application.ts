@@ -37,6 +37,7 @@ export type WorkerGitCapabilityScope = Readonly<{
   targetRef: string;
   controllerId: string;
   ownerEpoch: number;
+  specificationGeneration?: number;
 }>;
 
 export interface LeasePort {
@@ -58,6 +59,10 @@ export interface AuthorizationPort {
 }
 
 export interface ProviderPort {
+  validateWorkerBinding?(
+    commission: Commission,
+    scope: WorkerGitCapabilityScope,
+  ): Promise<boolean>;
   subscribeExecutionEvents?(
     onCommission: (commissionId: string) => void,
   ): () => void;
@@ -161,6 +166,14 @@ const executionSchema = z.discriminatedUnion("kind", [
 ]);
 const observationSchema = z
   .object({
+    workspaceConflict: z
+      .object({
+        workspaceId: z.string().min(1),
+        sessionIds: z.array(z.string().min(1)).min(1),
+        source: z.string().min(1),
+      })
+      .strict()
+      .optional(),
     candidateRevision: z.string().nullable(),
     candidateObservedAt: z.number().int(),
     candidateExpiresAt: z.number().int(),
@@ -746,12 +759,16 @@ export class ApplicationService {
     if (
       commission === null ||
       commission.lifecycle !== "active" ||
+      commission.workspaceWriter?.kind === "unresolved" ||
+      commission.specificationGeneration !==
+        (scope.specificationGeneration ?? 1) ||
       githubRepositoryIdentity(commission.repository) !==
         scope.repository.toLowerCase() ||
       scope.targetRef !== expectedTargetRef ||
       commission.activeAttemptId !== scope.attemptId ||
-      commission.owner?.controllerId !== scope.controllerId ||
-      commission.owner.epoch !== scope.ownerEpoch ||
+      commission.owner === null ||
+      scope.ownerEpoch < 1 ||
+      scope.ownerEpoch > commission.owner.epoch ||
       commission.budget.limits.deadlineAt <= now
     )
       return false;
@@ -771,19 +788,31 @@ export class ApplicationService {
       lease.value.validUntil <= now ||
       !hasOwner(commission, lease.value) ||
       this.#store.get(commission.id)?.version !== commission.version ||
-      commission.budget.limits.deadlineAt <= now ||
-      lease.value.owner.controllerId !== scope.controllerId ||
-      lease.value.owner.epoch !== scope.ownerEpoch
+      commission.budget.limits.deadlineAt <= now
     )
       return false;
     const operations = this.#store.operations(commission.id);
+    const issuerKnown =
+      (scope.controllerId === commission.owner.controllerId &&
+        scope.ownerEpoch === commission.owner.epoch) ||
+      operations.some(
+        (o) =>
+          o.controllerId === scope.controllerId &&
+          o.ownerEpoch === scope.ownerEpoch &&
+          o.assignmentId === scope.assignmentId,
+      );
+    if (!issuerKnown) return false;
+    if (
+      commission.workspaceWriter !== null &&
+      (commission.workspaceWriter.assignmentId !== scope.assignmentId ||
+        commission.workspaceWriter.workspaceId !== scope.workspaceId ||
+        commission.workspaceWriter.sessionId !== scope.sessionId)
+    )
+      return false;
     const workspace = operations.find(
       (operation) =>
         operation.kind === "provision_sandbox" &&
-        operation.attemptId === scope.attemptId &&
         operation.assignmentId === scope.assignmentId &&
-        operation.specificationGeneration ===
-          commission.specificationGeneration &&
         operation.outcome.kind === "observed" &&
         operation.outcome.result === "applied" &&
         operation.outcome.externalIdentity === scope.workspaceId,
@@ -791,16 +820,33 @@ export class ApplicationService {
     const session = operations.find(
       (operation) =>
         operation.kind === "create_session" &&
-        operation.attemptId === scope.attemptId &&
         operation.assignmentId === scope.assignmentId &&
-        operation.specificationGeneration ===
-          commission.specificationGeneration &&
         operation.target === `opencode:${scope.workspaceId}` &&
         operation.outcome.kind === "observed" &&
         operation.outcome.result === "applied" &&
         operation.outcome.externalIdentity === scope.sessionId,
     );
-    return workspace !== undefined && session !== undefined;
+    if (workspace === undefined || session === undefined) return false;
+    if (
+      this.#policy.workerBootstrap &&
+      this.#provider.validateWorkerBinding === undefined
+    )
+      return false;
+    if (
+      this.#provider.validateWorkerBinding !== undefined &&
+      !(await this.#provider.validateWorkerBinding(commission, scope))
+    )
+      return false;
+    const confirmed = await this.#currentLease(
+      commission.id,
+      this.#now?.() ?? now,
+    );
+    return (
+      confirmed.ok &&
+      hasOwner(commission, confirmed.value) &&
+      this.#store.get(commission.id)?.version === commission.version &&
+      commission.budget.limits.deadlineAt > (this.#now?.() ?? now)
+    );
   }
 
   async amendSpecification(
@@ -859,9 +905,11 @@ export class ApplicationService {
       lease,
       { kind: "submitted", submittedAt: now },
       now,
-      observation === undefined
-        ? undefined
-        : { observation, policy: this.#policy },
+      {
+        ...(observation === undefined ? {} : { observation }),
+        policy: this.#policy,
+        operations: this.#store.operations(commission.id),
+      },
     );
     if (!submitted.ok)
       return { ok: false, error: { kind: "domain", error: submitted.error } };
@@ -896,9 +944,11 @@ export class ApplicationService {
           grant.value,
           { kind: "submitted", submittedAt: this.#now?.() ?? now },
           this.#now?.() ?? now,
-          observation === undefined
-            ? undefined
-            : { observation, policy: this.#policy },
+          {
+            ...(observation === undefined ? {} : { observation }),
+            policy: this.#policy,
+            operations: this.#store.operations(commission.id),
+          },
         ).ok;
       },
     );

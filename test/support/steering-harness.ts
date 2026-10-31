@@ -11,6 +11,7 @@ import { CommissionStore } from "../../src/persistence/sqlite";
 import { AgentSandboxClient } from "../../src/providers/agent-sandbox";
 import { ProviderComposition } from "../../src/providers/composition";
 import { OpenCodeAdapter } from "../../src/providers/opencode";
+import type { WorkerBootstrap } from "../../src/providers/worker-bootstrap";
 import { FakeWorld } from "./fake-world";
 import { epoch, observation, policy, proposalInput, value } from "./fixtures";
 
@@ -20,9 +21,18 @@ export class SteeringHarness {
   readonly path = join(this.directory, "state.sqlite");
   store = new CommissionStore(this.path);
   readonly world = new FakeWorld();
-  readonly policy = { ...policy, runtimeProvisioning: true };
+  readonly policy = {
+    ...policy,
+    runtimeProvisioning: true,
+    workerBootstrap: false,
+  };
+  bootstrap: WorkerBootstrap | undefined;
+  workerRequest:
+    | ((request: Request) => Promise<Response | undefined>)
+    | undefined;
   now = epoch + 10;
   active = false;
+  otherActiveSessions: string[] = [];
   loseAcknowledgement = false;
   hideMessages = false;
   readonly prompts: { id: string; text: string }[] = [];
@@ -35,6 +45,8 @@ export class SteeringHarness {
   readonly fixture = Bun.serve({
     port: 0,
     fetch: async (request) => {
+      const worker = await this.workerRequest?.(request);
+      if (worker !== undefined) return worker;
       const path = new URL(request.url).pathname;
       if (path.includes("/sandboxes")) {
         if (request.method === "POST") {
@@ -60,7 +72,12 @@ export class SteeringHarness {
         return Response.json({ data: { id: "session-1" } });
       if (path === "/api/session/active")
         return Response.json({
-          data: this.active ? { "session-1": { type: "busy" } } : {},
+          data: {
+            ...(this.active ? { "session-1": { type: "busy" } } : {}),
+            ...Object.fromEntries(
+              this.otherActiveSessions.map((id) => [id, { type: "busy" }]),
+            ),
+          },
         });
       if (path === "/api/model") return Response.json({ data: [] });
       if (path.endsWith("/model")) {
@@ -100,6 +117,9 @@ export class SteeringHarness {
 
   composition(): ProviderPort {
     const composition = new ProviderComposition({
+      ...(this.bootstrap === undefined
+        ? {}
+        : { workerBootstrap: this.bootstrap }),
       sandbox: new AgentSandboxClient({
         apiServerUrl: this.fixture.url.href,
         namespace: "test",

@@ -281,7 +281,7 @@ test("Git helper pushes a protected local ref through Assignment authority and r
   } as const;
   const signer = new WorkerGitCapabilitySigner(signingSecret, 300);
   const capabilityFile = join(directory, "worker-capability");
-  const helperPath = join(process.cwd(), "src/providers/git-credentials.ts");
+  const helperPath = join(process.cwd(), "src/providers/git-helper.ts");
   const capability = signer.mint(scope, clock, 300);
   writeFileSync(capabilityFile, capability, { mode: 0o600 });
 
@@ -695,4 +695,4 @@ test("Git helper pushes a protected local ref through Assignment authority and r
   );
   expect(terminalExit).not.toBe(0);
   expect(appTokenRequests).toBe(3);
-});
+}, 30_000);

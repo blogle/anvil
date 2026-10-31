@@ -1,8 +1,17 @@
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  statSync,
+  readFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { OpenCodeAdapter } from "../src/providers/opencode";
+import { WorkerBootstrap } from "../src/providers/worker-bootstrap";
+import { WorkerGitCapabilitySigner } from "../src/providers/git-credentials";
+import { proposeCommission, evolve, type Operation } from "../src/domain";
 
 const executable = process.argv[2];
 const expectedVersion = process.argv[3];
@@ -53,7 +62,10 @@ const server = Bun.spawn(
       XDG_DATA_HOME: dataHome,
       XDG_STATE_HOME: stateHome,
       TMPDIR: temporaryHome,
-      PATH: dirname(executable),
+      PATH:
+        process.argv[4] === undefined
+          ? dirname(executable)
+          : (process.env["PATH"] ?? dirname(executable)),
       OPENCODE_SERVER_PASSWORD: serverPassword,
       NO_COLOR: "1",
     },
@@ -152,6 +164,107 @@ try {
   const created = await adapter.createSession();
   assert(created.ok, "OpenCode session creation route was rejected");
   assert(created.value.id.length > 0, "OpenCode returned an empty Session ID");
+  const helper = process.argv[4];
+  if (helper !== undefined) {
+    const now = Date.now();
+    const repo = join(home, "workspace");
+    mkdirSync(repo);
+    const proposal = proposeCommission({
+      id: "bootstrap-smoke",
+      campaignId: "smoke",
+      objective: "Protocol compatibility probe",
+      repository: "https://github.com/example/repository",
+      integrationTarget: "main",
+      obligations: [
+        {
+          id: "probe",
+          description: "No model or GitHub work",
+          independentReviewRequired: false,
+        },
+      ],
+      independentReviewRequired: false,
+      budget: {
+        maxAttempts: 1,
+        maxInstructions: 1,
+        maxRepairs: 0,
+        maxCostMicros: 1,
+        deadlineAt: now + 60000,
+      },
+    });
+    assert(proposal.ok, "Probe proposal failed");
+    const admitted = evolve(proposal.value.commission, {
+      kind: "admit",
+      actor: { kind: "approver", identity: "smoke" },
+      lease: {
+        owner: { controllerId: "smoke", epoch: 1 },
+        resourceVersion: "local",
+        observedAt: now,
+        validUntil: now + 60000,
+      },
+      attemptId: "attempt",
+      assignmentId: "assignment",
+      now,
+    });
+    assert(admitted.ok, "Probe admission failed");
+    const operation: Operation = {
+      id: "bootstrap-protocol-smoke",
+      logicalKey: "bootstrap-protocol-smoke",
+      commissionId: "bootstrap-smoke",
+      kind: "bootstrap_worker",
+      target: `session:${created.value.id}`,
+      controllerId: "smoke",
+      ownerEpoch: 1,
+      specificationGeneration: 1,
+      assignmentId: "assignment",
+      attemptId: "attempt",
+      instructionSequence: 1,
+      retryCount: 0,
+      candidateRevision: null,
+      findingIds: [],
+      directive: "Non-model bootstrap probe",
+      createdAt: now,
+      outcome: { kind: "submitted", submittedAt: now },
+    };
+    const root = join(home, ".anvil-worker");
+    const bootstrap = new WorkerBootstrap({
+      signer: new WorkerGitCapabilitySigner(randomBytes(32).toString("hex")),
+      credentialUrl: "https://controller.example.invalid/v1/git/credentials",
+      privateDirectory: root,
+      repositoryDirectory: repo,
+      imageHelper: helper,
+      targetRef: () => "refs/heads/probe",
+    });
+    const result = await adapter.bootstrapWorker(
+      bootstrap,
+      admitted.value.commission,
+      operation,
+      "workspace",
+      created.value.id,
+      now,
+      async () => true,
+    );
+    assert(
+      result.ok && result.value,
+      `Actual OpenCode worker bootstrap failed: ${result.ok ? "unverified receipt" : result.error.message}`,
+    );
+    assert(
+      (statSync(join(root, "capability")).mode & 0o777) === 0o600,
+      "Capability mode was not 0600",
+    );
+    assert(
+      (statSync(join(root, "helper")).mode & 0o111) !== 0,
+      "Installed helper was not executable",
+    );
+    assert(
+      readFileSync(join(home, ".gitconfig"), "utf8").includes(
+        join(root, "helper"),
+      ),
+      "Worker Git helper was not configured",
+    );
+    console.log(
+      "actual OpenCode shell/fs bootstrap passed: private capability, executable helper, Git config and receipt; no model instruction or provider credential",
+    );
+  }
 
   const exists = await adapter.sessionExists(created.value.id);
   assert(exists.ok && exists.value, "OpenCode session observation failed");

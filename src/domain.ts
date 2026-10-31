@@ -68,6 +68,17 @@ export type Budget = Readonly<{
 }>;
 
 export type Commission = Readonly<{
+  // Durable Assignment/Workspace/Session allocation, not a worker Lease.
+  // Controller fields retain provenance, never remote execution fencing.
+  workspaceWriter: null | Readonly<{
+    kind: "owned" | "unresolved";
+    controllerId: string;
+    epoch: number;
+    operationId: string;
+    assignmentId: string;
+    workspaceId: string | null;
+    sessionId: string | null;
+  }>;
   id: string;
   campaignId: string;
   objective: string;
@@ -93,6 +104,7 @@ export type Commission = Readonly<{
 }>;
 
 export type OperationKind =
+  | "bootstrap_worker"
   | "steer"
   | "provision_sandbox"
   | "create_session"
@@ -232,6 +244,13 @@ export type IndependentReview = Readonly<{
 }>;
 
 export type Observation = Readonly<{
+  workspaceConflict?:
+    | Readonly<{
+        workspaceId: string;
+        sessionIds: readonly string[];
+        source: string;
+      }>
+    | undefined;
   candidateRevision: string | null;
   candidateObservedAt: number;
   candidateExpiresAt: number;
@@ -244,6 +263,7 @@ export type Observation = Readonly<{
 }>;
 
 export type Policy = Readonly<{
+  workerBootstrap?: boolean;
   maxObservationAgeMs: number;
   repeatedToolFailureThreshold: number;
   activeTurnStuckAfterMs: number;
@@ -258,6 +278,7 @@ export type WakeCondition =
   | Readonly<{ kind: "provider_refresh"; provider: string }>;
 
 export type Decision =
+  | Readonly<{ kind: "bootstrap_worker"; attemptId: string; sessionId: string }>
   | Readonly<{ kind: "provision_sandbox"; attemptId: string }>
   | Readonly<{ kind: "create_session"; attemptId: string; sandboxId: string }>
   | Readonly<{ kind: "wait"; reason: string; wake: WakeCondition }>
@@ -388,7 +409,45 @@ export type DomainError =
   | "stale_version"
   | "idempotency_conflict"
   | "invalid_assignment"
-  | "execution_not_idle";
+  | "execution_not_idle"
+  | "writer_unresolved"
+  | "worker_not_ready";
+
+export const workerBootstrapTtlMs = 300_000;
+function workerMaintenance(
+  c: Commission,
+  operations: readonly Operation[],
+): boolean {
+  return (
+    c.workspaceWriter?.kind === "owned" &&
+    operations.some(
+      (o) =>
+        o.kind === "bootstrap_worker" &&
+        o.assignmentId === c.workspaceWriter!.assignmentId &&
+        o.target === `session:${c.workspaceWriter!.sessionId}` &&
+        o.outcome.kind === "observed" &&
+        o.outcome.result === "applied",
+    )
+  );
+}
+export function workerReady(
+  c: Commission,
+  operations: readonly Operation[],
+  now: number,
+): boolean {
+  return operations.some(
+    (o) =>
+      o.kind === "bootstrap_worker" &&
+      o.attemptId === c.activeAttemptId &&
+      o.specificationGeneration === c.specificationGeneration &&
+      o.assignmentId === c.workspaceWriter?.assignmentId &&
+      o.target === `session:${c.workspaceWriter.sessionId}` &&
+      o.createdAt <= now &&
+      o.createdAt + workerBootstrapTtlMs > now + 10_000 &&
+      o.outcome.kind === "observed" &&
+      o.outcome.result === "applied",
+  );
+}
 
 export type Result<T, E> =
   | Readonly<{ ok: true; value: T }>
@@ -475,6 +534,7 @@ export function proposeCommission(
   return ok({
     [proposalBrand]: true,
     commission: {
+      workspaceWriter: null,
       id: input.id,
       campaignId: input.campaignId,
       objective: input.objective,
@@ -579,7 +639,21 @@ export function decide(
       wake: { kind: "operation", operationId: pendingOperation.id },
     };
   }
-  if (budgetExhausted(commission, now))
+  if (commission.workspaceWriter?.kind === "unresolved")
+    return {
+      kind: "escalate",
+      reason:
+        "Workspace allocation or competing Session requires old-writer exclusion proof",
+    };
+  if (
+    budgetExhausted(commission, now) &&
+    !(
+      policy.workerBootstrap &&
+      workerMaintenance(commission, operations) &&
+      !workerReady(commission, operations, now) &&
+      now < commission.budget.limits.deadlineAt
+    )
+  )
     return { kind: "hold", reason: "budget_exhausted" };
   const unapplied = operations.find(
     (operation) =>
@@ -671,8 +745,6 @@ export function decide(
       (operation) =>
         operation.commissionId === commission.id &&
         operation.kind === "provision_sandbox" &&
-        operation.specificationGeneration ===
-          commission.specificationGeneration &&
         operation.outcome.kind === "observed" &&
         operation.outcome.result === "applied" &&
         operation.outcome.externalIdentity !== null,
@@ -692,8 +764,6 @@ export function decide(
       (operation) =>
         operation.commissionId === commission.id &&
         operation.kind === "create_session" &&
-        operation.specificationGeneration ===
-          commission.specificationGeneration &&
         operation.target === `opencode:${sandboxId}` &&
         operation.outcome.kind === "observed" &&
         operation.outcome.result === "applied" &&
@@ -711,6 +781,25 @@ export function decide(
         attemptId: attempt.id,
         sandboxId,
       };
+    if (policy.workerBootstrap && !workerReady(commission, operations, now)) {
+      if (
+        observation.execution.kind !== "idle" &&
+        !workerMaintenance(commission, operations)
+      )
+        return {
+          kind: "wait",
+          reason: "Worker bootstrap requires idle bound Session",
+          wake: { kind: "provider_refresh", provider: "execution" },
+        };
+      return {
+        kind: "bootstrap_worker",
+        attemptId: attempt.id,
+        sessionId:
+          session.outcome.kind === "observed"
+            ? session.outcome.externalIdentity!
+            : "",
+      };
+    }
   }
   const priorInterrupt = operations
     .filter(
@@ -1198,6 +1287,8 @@ function prepareSteering(
     return err("stale_generation");
   if (request.expectedVersion !== current.version) return err("stale_version");
   if (current.lifecycle !== "active") return err("invalid_lifecycle");
+  if (current.workspaceWriter?.kind === "unresolved")
+    return err("writer_unresolved");
   const attempt = activeAttempt(current);
   if (
     attempt === null ||
@@ -1344,8 +1435,26 @@ export function evolve(
         return err("owner_mismatch");
       if (!observationValidFor(current, input.observation))
         return err("invalid_observation");
-      const observed = recordObservation(current, input.observation);
+      let observed = recordObservation(current, input.observation);
       if (observed === null) return err("invalid_observation");
+      if (
+        input.observation.workspaceConflict !== undefined &&
+        current.workspaceWriter !== null &&
+        input.observation.workspaceConflict.workspaceId !==
+          current.workspaceWriter.workspaceId
+      )
+        return err("invalid_observation");
+      const allocation = current.workspaceWriter;
+      if (
+        allocation?.kind === "owned" &&
+        (input.observation.workspaceConflict !== undefined ||
+          (activeAttempt(current) !== null &&
+            activeAttempt(current)!.assignmentId !== allocation.assignmentId))
+      )
+        observed = {
+          ...observed,
+          workspaceWriter: { ...allocation, kind: "unresolved" },
+        };
       const decision = decide(
         observed,
         input.observation,
@@ -1698,7 +1807,11 @@ export function evolveOperation(
   lease: LeaseGrant,
   outcome: OperationOutcome,
   now: number,
-  submission?: Readonly<{ observation: Observation; policy: Policy }>,
+  submission?: Readonly<{
+    observation?: Observation;
+    policy: Policy;
+    operations?: readonly Operation[];
+  }>,
 ): Result<Transition, DomainError> {
   if (!authorizedOwner(current, lease, now)) return err("owner_mismatch");
   if (operation.commissionId !== current.id || current.owner === null)
@@ -1713,9 +1826,38 @@ export function evolveOperation(
     return ok(transition(current.version, current));
   }
   if (outcome.kind === "submitted") {
+    if (current.workspaceWriter?.kind === "unresolved")
+      return err("writer_unresolved");
+    if (
+      current.workspaceWriter !== null &&
+      current.workspaceWriter.assignmentId !== operation.assignmentId
+    )
+      return err("writer_unresolved");
+    if (
+      operation.kind === "create_session" &&
+      current.workspaceWriter?.sessionId
+    )
+      return err("writer_unresolved");
+    if (
+      submission?.policy.workerBootstrap &&
+      [
+        "steer",
+        "continue",
+        "repair",
+        "refresh_context",
+        "change_strategy",
+      ].includes(operation.kind) &&
+      !workerReady(current, submission.operations ?? [], now)
+    )
+      return err("worker_not_ready");
+    if (
+      operation.kind === "bootstrap_worker" &&
+      operation.createdAt + workerBootstrapTtlMs <= now
+    )
+      return err("worker_not_ready");
     if (
       operation.kind === "steer" &&
-      (submission === undefined ||
+      (submission?.observation === undefined ||
         !steeringBoundaryIsIdle(
           operation,
           submission.observation,
@@ -1753,10 +1895,12 @@ export function evolveOperation(
     if (
       operation.kind !== "interrupt" &&
       (now >= current.budget.limits.deadlineAt ||
-        current.budget.used.costMicros >= current.budget.limits.maxCostMicros ||
-        current.budget.used.instructions >
-          current.budget.limits.maxInstructions ||
-        current.budget.used.repairs > current.budget.limits.maxRepairs)
+        (operation.kind !== "bootstrap_worker" &&
+          (current.budget.used.costMicros >=
+            current.budget.limits.maxCostMicros ||
+            current.budget.used.instructions >
+              current.budget.limits.maxInstructions ||
+            current.budget.used.repairs > current.budget.limits.maxRepairs)))
     )
       return err("budget_exhausted");
   }
@@ -1799,9 +1943,41 @@ export function evolveOperation(
           version: current.version + 1,
           registeredPullRequestId: outcome.externalIdentity,
         }
-      : { ...current, version: current.version + 1 };
+      : {
+          ...current,
+          version: current.version + 1,
+          workspaceWriter:
+            outcome.kind === "submitted" &&
+            !["verify", "integrate"].includes(operation.kind)
+              ? (current.workspaceWriter ?? {
+                  kind: "owned" as const,
+                  controllerId: lease.owner.controllerId,
+                  epoch: lease.owner.epoch,
+                  operationId: operation.id,
+                  assignmentId: operation.assignmentId,
+                  workspaceId: null,
+                  sessionId: null,
+                })
+              : current.workspaceWriter,
+        };
+  const allocated =
+    outcome.kind === "observed" &&
+    outcome.result === "applied" &&
+    commission.workspaceWriter !== null &&
+    (operation.kind === "provision_sandbox" ||
+      operation.kind === "create_session")
+      ? {
+          ...commission,
+          workspaceWriter: {
+            ...commission.workspaceWriter,
+            ...(operation.kind === "provision_sandbox"
+              ? { workspaceId: outcome.externalIdentity }
+              : { sessionId: outcome.externalIdentity }),
+          },
+        }
+      : commission;
   return ok(
-    transition(current.version, commission, [], [{ ...operation, outcome }]),
+    transition(current.version, allocated, [], [{ ...operation, outcome }]),
   );
 }
 
@@ -1914,6 +2090,11 @@ function operationFor(
     decision.kind === "interrupt" ? decision.directive : "",
     decision.kind === "change_strategy" ? decision.nextStrategy : "",
     decision.kind === "create_session" ? decision.sandboxId : "",
+    ...(decision.kind === "bootstrap_worker"
+      ? [
+          `${decision.sessionId}:${owner.controllerId}:${owner.epoch}:${Math.floor(now / 120000)}`,
+        ]
+      : []),
   ].join("|");
   const logicalKey = [
     commission.id,
@@ -1929,6 +2110,10 @@ function operationFor(
       break;
     case "create_session":
       directive = "Create an OpenCode Session in the provisioned Sandbox";
+      break;
+    case "bootstrap_worker":
+      directive =
+        "Install and verify Assignment-scoped worker Git bootstrap; never record capability contents";
       break;
     case "continue":
     case "repair":
@@ -1953,6 +2138,9 @@ function operationFor(
       target = `opencode:${decision.sandboxId}`;
       break;
     case "interrupt":
+      target = `session:${decision.sessionId}`;
+      break;
+    case "bootstrap_worker":
       target = `session:${decision.sessionId}`;
       break;
     case "verify":

@@ -296,6 +296,10 @@ export function Inspector({ id, api }: { id: string; api: AnvilApi }) {
                   <Json value={view.commission.budget} />
                 </section>
                 <Interventions api={api} view={view} />
+                <section className="panel">
+                  <h3>Worker readiness and writer boundary</h3>
+                  <Json value={view.workerBoundary} />
+                </section>
                 <AssignmentSteering api={api} view={view} />
               </>
             )}

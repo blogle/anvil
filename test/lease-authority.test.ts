@@ -222,6 +222,17 @@ test("negative Workspace boundary: ownership transfer does not fence an already-
   expect((await a.current("commission-1", a.controllerId, h.now)).ok).toBe(
     false,
   );
+  h.application = h.makeApplication(h.store, {
+    lease: b,
+    controllerId: b.controllerId,
+  });
+  expect(value(await h.reconcile()).decision).toMatchObject({ kind: "wait" });
+  expect(h.store.get("commission-1")!.workspaceWriter).toMatchObject({
+    kind: "owned",
+    controllerId: a.controllerId,
+    sessionId: "session-1",
+  });
+  expect(h.prompts).toHaveLength(1);
   const probe = join(h.directory, "workspace-writer-probe");
   h.afterPrompt = async () => {
     writeFileSync(probe, "stale remote writer was not fenced");

@@ -35,7 +35,7 @@ function openStore(): CommissionStore {
 
 test("runs versioned schema migrations once and reopens the normalized Commission projection", () => {
   const repository = openStore();
-  expect(repository.migrationVersion()).toBe(6);
+  expect(repository.migrationVersion()).toBe(7);
   expect(repository.propose(proposal())).toEqual({
     ok: true,
     value: undefined,
@@ -44,9 +44,79 @@ test("runs versioned schema migrations once and reopens the normalized Commissio
   store = undefined;
 
   const reopened = openStore();
-  expect(reopened.migrationVersion()).toBe(6);
+  expect(reopened.migrationVersion()).toBe(7);
   expect(reopened.get("commission-1")).toEqual(proposal().commission);
   expect(reopened.operations("commission-1")).toEqual([]);
+});
+
+test("worker-boundary migration adopts one durable writer but fails closed on multiple Workspaces, Sessions or Assignments", () => {
+  const db = new Database(":memory:");
+  try {
+    for (const file of [
+      "0001_core",
+      "0002_runtime_operations",
+      "0003_criterion_versions",
+      "0004_watchdog_interrupt",
+      "0005_operational_views",
+      "0006_assignment_steering",
+    ])
+      db.exec(
+        readFileSync(
+          new URL(`../src/persistence/migrations/${file}.sql`, import.meta.url),
+          "utf8",
+        ),
+      );
+    for (const id of ["single", "workspaces", "sessions", "assignments"]) {
+      db.query(
+        `INSERT INTO commissions(id,campaign_id,objective,repository,integration_target,specification_generation,independent_review_required,lifecycle,version,max_attempts,max_instructions,max_repairs,max_cost_micros,deadline_at,attempts_used,instructions_used,repairs_used,cost_used_micros) VALUES (?, 'campaign','objective','https://github.com/acme/repo','main',1,0,'active',1,1,1,0,1,9999999999999,1,0,0,0)`,
+      ).run(id);
+      const insert = (
+        kind: string,
+        identity: string,
+        assignment = "assignment",
+      ) =>
+        db
+          .query(
+            `INSERT INTO operations(id,logical_key,commission_id,kind,target,controller_id,owner_epoch,specification_generation,assignment_id,attempt_id,instruction_sequence,directive,created_at,outcome_kind,outcome_result,external_identity) VALUES (?, ?, ?, ?, 'target','controller',1,1,?,'attempt',1,'directive',1,'observed','applied',?)`,
+          )
+          .run(
+            `${id}:${kind}:${identity}`,
+            `${id}:${kind}:${identity}`,
+            id,
+            kind,
+            assignment,
+            identity,
+          );
+      insert("provision_sandbox", "workspace");
+      insert("create_session", "session");
+      if (id === "workspaces") insert("provision_sandbox", "foreign-workspace");
+      if (id === "sessions") insert("create_session", "foreign-session");
+      if (id === "assignments")
+        insert("continue", "message", "foreign-assignment");
+    }
+    db.exec(
+      readFileSync(
+        new URL(
+          "../src/persistence/migrations/0007_worker_boundary.sql",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    );
+    const rows = db
+      .query("SELECT id, workspace_writer FROM commissions ORDER BY id")
+      .all() as { id: string; workspace_writer: string }[];
+    for (const row of rows)
+      expect(JSON.parse(row.workspace_writer)).toMatchObject({
+        kind: row.id === "single" ? "owned" : "unresolved",
+        workspaceId: "workspace",
+        sessionId: "session",
+        controllerId: "controller",
+        epoch: 1,
+      });
+  } finally {
+    db.close();
+  }
 });
 
 test("versioned migrations preserve an existing version one Operation journal", () => {
@@ -157,7 +227,7 @@ test("versioned migrations preserve an existing version one Operation journal", 
   legacy.close();
 
   const upgraded = openStore();
-  expect(upgraded.migrationVersion()).toBe(6);
+  expect(upgraded.migrationVersion()).toBe(7);
   const probe = new Database(path);
   const migratedRows = probe
     .query("SELECT id, commission_id FROM operations")
