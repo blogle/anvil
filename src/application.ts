@@ -1,0 +1,1101 @@
+import { z } from "zod";
+import {
+  evolve,
+  evolveOperation,
+  steeringBoundaryIsIdle,
+  proposeCommission,
+  type Commission,
+  type CommissionProposalInput,
+  type Decision,
+  type LeaseGrant,
+  type Observation,
+  type Operation,
+  type OperationOutcome,
+  type Policy,
+  type Result,
+  type SteeringRequest,
+} from "./domain";
+import { CommissionStore, type StoreError } from "./persistence/sqlite";
+import type { ReconciliationRecord } from "./operational";
+
+export type ProviderFailure = Readonly<{
+  kind: "unavailable" | "acknowledgement_lost" | "rejected";
+  message: string;
+}>;
+
+export type ProviderResult<T> =
+  | Readonly<{ ok: true; value: T }>
+  | Readonly<{ ok: false; error: ProviderFailure }>;
+
+export type WorkerGitCapabilityScope = Readonly<{
+  commissionId: string;
+  assignmentId: string;
+  attemptId: string;
+  sessionId: string;
+  workspaceId: string;
+  repository: string;
+  targetRef: string;
+  controllerId: string;
+  ownerEpoch: number;
+  specificationGeneration?: number;
+}>;
+
+export interface LeasePort {
+  current(
+    commissionId: string,
+    controllerId: string,
+    now: number,
+  ): Promise<ProviderResult<LeaseGrant>>;
+}
+
+export interface AuthorizationPort {
+  approve(
+    request: Readonly<{
+      commissionId: string;
+      principalId: string;
+      action: "admit" | "amend_specification" | "steer";
+    }>,
+  ): Promise<boolean>;
+}
+
+export interface ProviderPort {
+  validateWorkerBinding?(
+    commission: Commission,
+    scope: WorkerGitCapabilityScope,
+  ): Promise<boolean>;
+  subscribeExecutionEvents?(
+    onCommission: (commissionId: string) => void,
+  ): () => void;
+  observe(
+    commission: Commission,
+    now: number,
+    operations: readonly Operation[],
+  ): Promise<ProviderResult<Observation>>;
+  dispatch(
+    commission: Commission,
+    operation: Operation,
+    now: number,
+    authorizeEffect?: () => Promise<boolean>,
+  ): Promise<ProviderResult<Exclude<OperationOutcome, { kind: "prepared" }>>>;
+  inspectOperation(
+    commission: Commission,
+    operation: Operation,
+    now: number,
+  ): Promise<ProviderResult<OperationOutcome | null>>;
+}
+
+export type ApplicationError =
+  | Readonly<{ kind: "not_found" }>
+  | Readonly<{ kind: "unauthorized" }>
+  | Readonly<{ kind: "domain"; error: string }>
+  | Readonly<{ kind: "store"; error: StoreError }>
+  | Readonly<{ kind: "provider"; error: ProviderFailure }>
+  | Readonly<{ kind: "invalid_provider_observation" }>
+  | Readonly<{ kind: "ownership_unavailable" }>;
+
+export type ReconcileResult = Readonly<{
+  commission: Commission;
+  decision: Decision | null;
+}>;
+
+export const steeringRequestSchema = z
+  .object({
+    idempotencyKey: z.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/),
+    assignmentId: z.string().min(1),
+    expectedVersion: z.number().int().nonnegative(),
+    expectedGeneration: z.number().int().positive(),
+    instruction: z.string().min(1).max(8000),
+  })
+  .strict() satisfies z.ZodType<SteeringRequest>;
+
+const ownerSchema = z
+  .object({
+    owner: z.object({
+      controllerId: z.string().min(1),
+      epoch: z.number().int().positive(),
+    }),
+    resourceVersion: z.string().min(1),
+    observedAt: z.number().int().nonnegative(),
+    validUntil: z.number().int().nonnegative(),
+  })
+  .strict();
+
+const executionSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("running"),
+      sessionId: z.string(),
+      contextPressure: z.boolean(),
+      contextTokens: z.number().int().nonnegative().nullable(),
+      contextLimitTokens: z.number().int().positive().nullable(),
+      repeatedToolFailures: z.array(z.string()),
+      lastProgressAt: z.number().int().nullable(),
+      safeBoundary: z.boolean(),
+      observedAt: z.number().int(),
+      expiresAt: z.number().int(),
+      source: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("idle"),
+      sessionId: z.string(),
+      observedAt: z.number().int(),
+      expiresAt: z.number().int(),
+      source: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("unavailable"),
+      reason: z.string(),
+      observedAt: z.number().int(),
+      expiresAt: z.number().int(),
+      source: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("unknown"),
+      reason: z.string(),
+      observedAt: z.number().int(),
+      expiresAt: z.number().int(),
+      source: z.string().min(1),
+    })
+    .strict(),
+]);
+const observationSchema = z
+  .object({
+    workspaceConflict: z
+      .object({
+        workspaceId: z.string().min(1),
+        sessionIds: z.array(z.string().min(1)).min(1),
+        source: z.string().min(1),
+      })
+      .strict()
+      .optional(),
+    candidateRevision: z.string().nullable(),
+    candidateObservedAt: z.number().int(),
+    candidateExpiresAt: z.number().int(),
+    candidateSource: z.string().min(1),
+    execution: executionSchema,
+    checks: z
+      .object({
+        runId: z.string().min(1),
+        revision: z.string().min(1),
+        state: z.enum(["missing", "pending", "failing", "passing", "unknown"]),
+        failureIds: z.array(z.string()),
+        observedAt: z.number().int(),
+        expiresAt: z.number().int(),
+        source: z.string().min(1),
+      })
+      .strict()
+      .nullable(),
+    integration: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("none") }).strict(),
+      z
+        .object({
+          kind: z.enum(["pr_open", "queued", "merged"]),
+          revision: z.string().min(1),
+          providerIdentity: z.string().min(1),
+          repository: z.string().min(1),
+          target: z.string().min(1),
+          observedAt: z.number().int(),
+          expiresAt: z.number().int(),
+          source: z.string().min(1),
+        })
+        .strict(),
+    ]),
+    workerClaims: z.array(
+      z
+        .object({
+          id: z.string().min(1),
+          obligationId: z.string().min(1),
+          claim: z.string(),
+          observedAt: z.number().int(),
+          expiresAt: z.number().int(),
+          sourceIdentity: z.string().min(1),
+        })
+        .strict(),
+    ),
+    independentReviews: z.array(
+      z
+        .object({
+          id: z.string().min(1),
+          obligationId: z.string().min(1),
+          candidateRevision: z.string().min(1),
+          specificationGeneration: z.number().int().positive(),
+          result: z.enum(["accepted", "challenged"]),
+          checkRunId: z.string().nullable(),
+          claim: z.string(),
+          observedAt: z.number().int(),
+          expiresAt: z.number().int(),
+          sourceIdentity: z.string().min(1),
+        })
+        .strict(),
+    ),
+  })
+  .strict();
+const operationOutcomeSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("prepared") }).strict(),
+  z
+    .object({ kind: z.literal("submitted"), submittedAt: z.number().int() })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("ambiguous"),
+      observedAt: z.number().int(),
+      reason: z.string(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("observed"),
+      observedAt: z.number().int(),
+      source: z.string().min(1),
+      result: z.enum(["accepted", "rejected", "applied", "not_applied"]),
+      retrySafe: z.boolean(),
+      externalIdentity: z.string().nullable(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("retry_authorized"),
+      authorizedAt: z.number().int(),
+      observation: z
+        .object({
+          observedAt: z.number().int(),
+          source: z.string().min(1),
+          result: z.literal("not_applied"),
+          retrySafe: z.literal(true),
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("rejected"),
+      observedAt: z.number().int(),
+      reason: z.string(),
+    })
+    .strict(),
+]);
+
+export class ApplicationService {
+  readonly #store: CommissionStore;
+  readonly #lease: LeasePort;
+  readonly #provider: ProviderPort;
+  readonly #authorization: AuthorizationPort;
+  readonly #controllerId: string;
+  readonly #policy: Policy;
+  readonly #now: (() => number) | undefined;
+
+  constructor(
+    store: CommissionStore,
+    lease: LeasePort,
+    provider: ProviderPort,
+    authorization: AuthorizationPort,
+    controllerId: string,
+    policy: Policy,
+    now?: () => number,
+  ) {
+    this.#store = store;
+    this.#lease = lease;
+    this.#provider = provider;
+    this.#authorization = authorization;
+    this.#controllerId = controllerId;
+    this.#policy = policy;
+    this.#now = now;
+  }
+
+  subscribeExecutionEvents(
+    onCommission: (commissionId: string) => void,
+  ): () => void {
+    return (
+      this.#provider.subscribeExecutionEvents?.(onCommission) ?? (() => {})
+    );
+  }
+
+  propose(input: CommissionProposalInput): Result<void, ApplicationError> {
+    const proposal = proposeCommission(input);
+    if (!proposal.ok)
+      return { ok: false, error: { kind: "domain", error: proposal.error } };
+    const result = this.#store.propose(proposal.value);
+    return result.ok
+      ? result
+      : { ok: false, error: { kind: "store", error: result.error } };
+  }
+
+  async admit(
+    commissionId: string,
+    principalId: string,
+    now: number,
+  ): Promise<Result<Commission, ApplicationError>> {
+    if (
+      !(await this.#authorization.approve({
+        commissionId,
+        principalId,
+        action: "admit",
+      }))
+    ) {
+      return { ok: false, error: { kind: "unauthorized" } };
+    }
+    const current = this.#load(commissionId);
+    if (!current.ok) return current;
+    const grant = await this.#currentLease(commissionId, now);
+    if (!grant.ok) return grant;
+    now = this.#now?.() ?? now;
+    const transition = evolve(current.value, {
+      kind: "admit",
+      actor: { kind: "approver", identity: principalId },
+      lease: grant.value,
+      attemptId: `${commissionId}:attempt-1`,
+      assignmentId: `${commissionId}:assignment-1`,
+      now,
+    });
+    if (!transition.ok)
+      return { ok: false, error: { kind: "domain", error: transition.error } };
+    return this.#commit(transition.value);
+  }
+
+  async steerAssignment(
+    commissionId: string,
+    principalId: string,
+    request: SteeringRequest,
+    now: number,
+  ): Promise<Result<Operation, ApplicationError>> {
+    if (
+      !(await this.#authorization.approve({
+        commissionId,
+        principalId,
+        action: "steer",
+      }))
+    )
+      return { ok: false, error: { kind: "unauthorized" } };
+    const parsed = steeringRequestSchema.safeParse(request);
+    if (!parsed.success)
+      return {
+        ok: false,
+        error: { kind: "domain", error: "invalid_steering" },
+      };
+    for (let conflict = 0; conflict < 2; conflict += 1) {
+      const current = this.#load(commissionId);
+      if (!current.ok) return current;
+      const lease = await this.#currentLease(
+        commissionId,
+        this.#now?.() ?? now,
+      );
+      if (!lease.ok) return lease;
+      now = this.#now?.() ?? now;
+      const result = evolve(current.value, {
+        kind: "steer",
+        actor: { kind: "approver", identity: principalId },
+        request: parsed.data,
+        operations: this.#store.operations(commissionId),
+        lease: lease.value,
+        now,
+      });
+      if (!result.ok)
+        return { ok: false, error: { kind: "domain", error: result.error } };
+      const committed = this.#commit(result.value);
+      if (
+        !committed.ok &&
+        committed.error.kind === "store" &&
+        committed.error.error === "conflict"
+      )
+        continue;
+      if (!committed.ok) return committed;
+      const operation = this.#store
+        .operations(commissionId)
+        .find(
+          (item) => item.steering?.idempotencyKey === request.idempotencyKey,
+        );
+      if (operation === undefined)
+        throw new Error("Committed steering has no Operation");
+      return { ok: true, value: operation };
+    }
+    return { ok: false, error: { kind: "store", error: "conflict" } };
+  }
+
+  async reconcile(
+    commissionId: string,
+    now: number,
+  ): Promise<Result<ReconcileResult, ApplicationError>> {
+    const before = this.#store.get(commissionId);
+    let observation: ReconciliationRecord["observation"] = null;
+    const result = await this.#reconcile(
+      commissionId,
+      now,
+      (commission, value) => {
+        observation = {
+          commissionVersion: commission.version,
+          specificationGeneration: commission.specificationGeneration,
+          value,
+        };
+      },
+    );
+    const version = result.ok
+      ? result.value.commission.version
+      : before?.version;
+    if (version !== undefined)
+      this.#store.recordReconciliation(commissionId, {
+        commissionVersion: version,
+        recordedAt: this.#now?.() ?? now,
+        observation,
+        result: result.ok
+          ? { kind: "decision", decision: result.value.decision }
+          : { kind: "error", error: result.error },
+      });
+    return result;
+  }
+
+  async #reconcile(
+    commissionId: string,
+    now: number,
+    onObservation: (commission: Commission, observation: Observation) => void,
+  ): Promise<Result<ReconcileResult, ApplicationError>> {
+    for (let conflict = 0; conflict < 3; conflict += 1) {
+      const loaded = this.#load(commissionId);
+      if (!loaded.ok) return loaded;
+      const lease = await this.#currentLease(commissionId, now);
+      if (!lease.ok) return lease;
+      now = this.#now?.() ?? now;
+      let current = loaded.value;
+      if (!hasOwner(current, lease.value)) {
+        const takeover = evolve(current, {
+          kind: "takeover",
+          lease: lease.value,
+          now,
+        });
+        if (!takeover.ok)
+          return {
+            ok: false,
+            error: { kind: "domain", error: takeover.error },
+          };
+        const result = this.#store.commitTransition(takeover.value);
+        if (!result.ok && result.error === "conflict") continue;
+        if (!result.ok)
+          return { ok: false, error: { kind: "store", error: result.error } };
+        continue;
+      }
+
+      let operations = this.#store.operations(commissionId);
+      const rawObservation = await this.#provider.observe(
+        current,
+        now,
+        operations,
+      );
+      if (!rawObservation.ok)
+        return {
+          ok: false,
+          error: { kind: "provider", error: rawObservation.error },
+        };
+      const parsed = observationSchema.safeParse(rawObservation.value);
+      if (!parsed.success)
+        return { ok: false, error: { kind: "invalid_provider_observation" } };
+      onObservation(current, parsed.data);
+      // Observation may have waited on several remote providers. Its starting
+      // Lease is not authority to write after that I/O completes.
+      now = this.#now?.() ?? now;
+      const confirmedLease = await this.#currentLease(commissionId, now);
+      if (!confirmedLease.ok) return confirmedLease;
+      now = this.#now?.() ?? now;
+      if (!hasOwner(current, confirmedLease.value))
+        return { ok: false, error: { kind: "ownership_unavailable" } };
+      const result = evolve(current, {
+        kind: "reconcile",
+        lease: confirmedLease.value,
+        observation: parsed.data,
+        operations,
+        policy: this.#policy,
+        now,
+      });
+      if (!result.ok)
+        return { ok: false, error: { kind: "domain", error: result.error } };
+      const transition = result.value;
+      if (transition.commission.version !== transition.beforeVersion) {
+        const saved = this.#store.commitTransition(transition);
+        if (!saved.ok && saved.error === "conflict") continue;
+        if (!saved.ok)
+          return { ok: false, error: { kind: "store", error: saved.error } };
+      }
+      current = transition.commission;
+      operations = this.#store.operations(commissionId);
+      const created = transition.newOperations[0];
+      if (created !== undefined) {
+        const dispatched = await this.#dispatchAndRecord(
+          current,
+          created,
+          lease.value,
+          now,
+        );
+        if (!dispatched.ok) return dispatched;
+        return {
+          ok: true,
+          value: {
+            commission: dispatched.value,
+            decision: transition.decision,
+          },
+        };
+      }
+      const pending = operations.find(isPending);
+      if (pending !== undefined) {
+        if (pending.outcome.kind === "prepared") {
+          if (
+            pending.kind === "steer" &&
+            !steeringBoundaryIsIdle(pending, parsed.data, this.#policy, now)
+          ) {
+            return {
+              ok: true,
+              value: {
+                commission: current,
+                decision: {
+                  kind: "wait",
+                  reason:
+                    "Steering deferred until the bound Session is freshly observed idle; no interruption authorized",
+                  wake: { kind: "operation", operationId: pending.id },
+                },
+              },
+            };
+          }
+          const dispatched = await this.#dispatchAndRecord(
+            current,
+            pending,
+            lease.value,
+            now,
+            parsed.data,
+          );
+          if (!dispatched.ok) return dispatched;
+          return {
+            ok: true,
+            value: {
+              commission: dispatched.value,
+              decision: {
+                kind: "wait",
+                reason: "prepared Operation was submitted",
+                wake: { kind: "operation", operationId: pending.id },
+              },
+            },
+          };
+        }
+        if (pending.outcome.kind === "retry_authorized") {
+          const retried = await this.#dispatchAndRecord(
+            current,
+            pending,
+            lease.value,
+            now,
+          );
+          if (!retried.ok) return retried;
+          return {
+            ok: true,
+            value: {
+              commission: retried.value,
+              decision: {
+                kind: "wait",
+                reason:
+                  "safe retry was submitted with the original Operation identity",
+                wake: { kind: "operation", operationId: pending.id },
+              },
+            },
+          };
+        }
+        const inspected = await this.#provider.inspectOperation(
+          current,
+          pending,
+          now,
+        );
+        if (!inspected.ok)
+          return {
+            ok: false,
+            error: { kind: "provider", error: inspected.error },
+          };
+        if (inspected.value === null) {
+          return {
+            ok: true,
+            value: {
+              commission: current,
+              decision: {
+                kind: "wait",
+                reason: "operation result unknown; no safe retry evidence",
+                wake: { kind: "operation", operationId: pending.id },
+              },
+            },
+          };
+        }
+        const checkedOutcome = operationOutcomeSchema.safeParse(
+          inspected.value,
+        );
+        if (!checkedOutcome.success)
+          return { ok: false, error: { kind: "invalid_provider_observation" } };
+        if (checkedOutcome.data.kind === "prepared") {
+          return {
+            ok: true,
+            value: {
+              commission: current,
+              decision: {
+                kind: "wait",
+                reason: "submitted status is not observable; no safe retry",
+                wake: { kind: "operation", operationId: pending.id },
+              },
+            },
+          };
+        }
+        now = this.#now?.() ?? now;
+        const resolutionLease = await this.#currentLease(commissionId, now);
+        if (!resolutionLease.ok) return resolutionLease;
+        now = this.#now?.() ?? now;
+        const resolution = evolveOperation(
+          current,
+          pending,
+          resolutionLease.value,
+          checkedOutcome.data,
+          now,
+        );
+        if (!resolution.ok)
+          return {
+            ok: false,
+            error: { kind: "domain", error: resolution.error },
+          };
+        if (
+          resolution.value.commission.version !== resolution.value.beforeVersion
+        ) {
+          const committed = this.#store.commitTransition(resolution.value);
+          if (!committed.ok && committed.error === "conflict") continue;
+          if (!committed.ok)
+            return {
+              ok: false,
+              error: { kind: "store", error: committed.error },
+            };
+        }
+        return {
+          ok: true,
+          value: {
+            commission: resolution.value.commission,
+            decision: {
+              kind: "wait",
+              reason: "operation outcome observed; reobserve providers",
+              wake: { kind: "provider_refresh", provider: "world" },
+            },
+          },
+        };
+      }
+
+      const retry = transition.updatedOperations.find(
+        ({ outcome }) => outcome.kind === "retry_authorized",
+      );
+      if (retry !== undefined) {
+        const executed = await this.#dispatchAndRecord(
+          transition.commission,
+          retry,
+          lease.value,
+          now,
+        );
+        if (!executed.ok) return executed;
+        return {
+          ok: true,
+          value: { commission: executed.value, decision: transition.decision },
+        };
+      }
+      return {
+        ok: true,
+        value: {
+          commission: transition.commission,
+          decision: transition.decision,
+        },
+      };
+    }
+    return { ok: false, error: { kind: "store", error: "conflict" } };
+  }
+
+  async hold(
+    commissionId: string,
+    reason: string,
+    now: number,
+  ): Promise<Result<Commission, ApplicationError>> {
+    return this.#authorizedTransition(
+      commissionId,
+      now,
+      (commission, lease, checkedAt) =>
+        evolve(commission, { kind: "hold", lease, reason, now: checkedAt }),
+    );
+  }
+
+  async resume(
+    commissionId: string,
+    now: number,
+  ): Promise<Result<Commission, ApplicationError>> {
+    return this.#authorizedTransition(
+      commissionId,
+      now,
+      (commission, lease, checkedAt) =>
+        evolve(commission, { kind: "resume", lease, now: checkedAt }),
+    );
+  }
+
+  async recordUsage(
+    commissionId: string,
+    costMicros: number,
+    now: number,
+  ): Promise<Result<Commission, ApplicationError>> {
+    return this.#authorizedTransition(
+      commissionId,
+      now,
+      (commission, lease, checkedAt) =>
+        evolve(commission, {
+          kind: "record_usage",
+          lease,
+          costMicros,
+          now: checkedAt,
+        }),
+    );
+  }
+
+  async authorizeWorkerGitCapability(
+    scope: WorkerGitCapabilityScope,
+    expectedTargetRef: string,
+    now: number,
+  ): Promise<boolean> {
+    const commission = this.#store.get(scope.commissionId);
+    if (
+      commission === null ||
+      commission.lifecycle !== "active" ||
+      commission.workspaceWriter?.kind === "unresolved" ||
+      commission.specificationGeneration !==
+        (scope.specificationGeneration ?? 1) ||
+      githubRepositoryIdentity(commission.repository) !==
+        scope.repository.toLowerCase() ||
+      scope.targetRef !== expectedTargetRef ||
+      commission.activeAttemptId !== scope.attemptId ||
+      commission.owner === null ||
+      scope.ownerEpoch < 1 ||
+      scope.ownerEpoch > commission.owner.epoch ||
+      commission.budget.limits.deadlineAt <= now
+    )
+      return false;
+    const attempt = commission.attempts.find(
+      ({ id }) => id === scope.attemptId,
+    );
+    if (
+      attempt === undefined ||
+      attempt.lifecycle !== "active" ||
+      attempt.assignmentId !== scope.assignmentId
+    )
+      return false;
+    const lease = await this.#currentLease(commission.id, now);
+    now = this.#now?.() ?? now;
+    if (
+      !lease.ok ||
+      lease.value.validUntil <= now ||
+      !hasOwner(commission, lease.value) ||
+      this.#store.get(commission.id)?.version !== commission.version ||
+      commission.budget.limits.deadlineAt <= now
+    )
+      return false;
+    const operations = this.#store.operations(commission.id);
+    const issuerKnown =
+      (scope.controllerId === commission.owner.controllerId &&
+        scope.ownerEpoch === commission.owner.epoch) ||
+      operations.some(
+        (o) =>
+          o.controllerId === scope.controllerId &&
+          o.ownerEpoch === scope.ownerEpoch &&
+          o.assignmentId === scope.assignmentId,
+      );
+    if (!issuerKnown) return false;
+    if (
+      commission.workspaceWriter !== null &&
+      (commission.workspaceWriter.assignmentId !== scope.assignmentId ||
+        commission.workspaceWriter.workspaceId !== scope.workspaceId ||
+        commission.workspaceWriter.sessionId !== scope.sessionId)
+    )
+      return false;
+    const workspace = operations.find(
+      (operation) =>
+        operation.kind === "provision_sandbox" &&
+        operation.assignmentId === scope.assignmentId &&
+        operation.outcome.kind === "observed" &&
+        operation.outcome.result === "applied" &&
+        operation.outcome.externalIdentity === scope.workspaceId,
+    );
+    const session = operations.find(
+      (operation) =>
+        operation.kind === "create_session" &&
+        operation.assignmentId === scope.assignmentId &&
+        operation.target === `opencode:${scope.workspaceId}` &&
+        operation.outcome.kind === "observed" &&
+        operation.outcome.result === "applied" &&
+        operation.outcome.externalIdentity === scope.sessionId,
+    );
+    if (workspace === undefined || session === undefined) return false;
+    if (
+      this.#policy.workerBootstrap &&
+      this.#provider.validateWorkerBinding === undefined
+    )
+      return false;
+    if (
+      this.#provider.validateWorkerBinding !== undefined &&
+      !(await this.#provider.validateWorkerBinding(commission, scope))
+    )
+      return false;
+    const confirmed = await this.#currentLease(
+      commission.id,
+      this.#now?.() ?? now,
+    );
+    return (
+      confirmed.ok &&
+      hasOwner(commission, confirmed.value) &&
+      this.#store.get(commission.id)?.version === commission.version &&
+      commission.budget.limits.deadlineAt > (this.#now?.() ?? now)
+    );
+  }
+
+  async amendSpecification(
+    commissionId: string,
+    principalId: string,
+    expectedGeneration: number,
+    amendment: Readonly<{
+      objective: string;
+      integrationTarget: string;
+      obligations: Commission["obligations"];
+      independentReviewRequired: boolean;
+    }>,
+    now: number,
+  ): Promise<Result<Commission, ApplicationError>> {
+    if (
+      !(await this.#authorization.approve({
+        commissionId,
+        principalId,
+        action: "amend_specification",
+      }))
+    ) {
+      return { ok: false, error: { kind: "unauthorized" } };
+    }
+    return this.#authorizedTransition(commissionId, now, (commission) =>
+      evolve(commission, {
+        kind: "amend_specification",
+        actor: { kind: "approver", identity: principalId },
+        expectedGeneration,
+        ...amendment,
+        now,
+      }),
+    );
+  }
+
+  async #dispatchAndRecord(
+    commission: Commission,
+    operation: Operation,
+    lease: LeaseGrant,
+    now: number,
+    observation?: Observation,
+  ): Promise<Result<Commission, ApplicationError>> {
+    // Recheck immediately before persisting submission, including recovered
+    // prepared Operations and provider-proven retries. CAS rejects a concurrent
+    // hold/amend/takeover while this Lease read was in flight. This does not
+    // fence an external request already accepted by a provider.
+    now = this.#now?.() ?? now;
+    const confirmedLease = await this.#currentLease(commission.id, now);
+    if (!confirmedLease.ok) return confirmedLease;
+    now = this.#now?.() ?? now;
+    if (!hasOwner(commission, confirmedLease.value))
+      return { ok: false, error: { kind: "ownership_unavailable" } };
+    lease = confirmedLease.value;
+    const submitted = evolveOperation(
+      commission,
+      operation,
+      lease,
+      { kind: "submitted", submittedAt: now },
+      now,
+      {
+        ...(observation === undefined ? {} : { observation }),
+        policy: this.#policy,
+        operations: this.#store.operations(commission.id),
+      },
+    );
+    if (!submitted.ok)
+      return { ok: false, error: { kind: "domain", error: submitted.error } };
+    const savedSubmission = this.#store.commitTransition(submitted.value);
+    if (!savedSubmission.ok)
+      return {
+        ok: false,
+        error: { kind: "store", error: savedSubmission.error },
+      };
+    const submittedCommission = submitted.value.commission;
+    const submittedOperation = submitted.value.updatedOperations[0];
+    if (submittedOperation === undefined)
+      throw new Error("Submitting an Operation did not update its journal row");
+    const dispatched = await this.#provider.dispatch(
+      submittedCommission,
+      submittedOperation,
+      now,
+      async () => {
+        // Providers with multi-request instructions must reauthorize immediately
+        // before the prompt, not reuse permission from before model/status I/O.
+        const grant = await this.#currentLease(
+          commission.id,
+          this.#now?.() ?? now,
+        );
+        if (!grant.ok) return false;
+        const latest = this.#store.get(commission.id);
+        if (latest === null || latest.version !== submittedCommission.version)
+          return false;
+        return evolveOperation(
+          latest,
+          operation,
+          grant.value,
+          { kind: "submitted", submittedAt: this.#now?.() ?? now },
+          this.#now?.() ?? now,
+          {
+            ...(observation === undefined ? {} : { observation }),
+            policy: this.#policy,
+            operations: this.#store.operations(commission.id),
+          },
+        ).ok;
+      },
+    );
+    let outcome: OperationOutcome;
+    if (dispatched.ok) {
+      const parsed = operationOutcomeSchema.safeParse(dispatched.value);
+      if (!parsed.success)
+        return { ok: false, error: { kind: "invalid_provider_observation" } };
+      outcome = parsed.data;
+    } else if (dispatched.error.kind === "rejected") {
+      outcome = {
+        kind: "rejected",
+        observedAt: now,
+        reason: dispatched.error.message,
+      };
+    } else {
+      outcome = {
+        kind: "ambiguous",
+        observedAt: now,
+        reason: dispatched.error.message,
+      };
+    }
+    now = this.#now?.() ?? now;
+    const outcomeLease = await this.#currentLease(commission.id, now);
+    if (!outcomeLease.ok) return outcomeLease;
+    now = this.#now?.() ?? now;
+    const latest = this.#load(commission.id);
+    if (!latest.ok) return latest;
+    const persisted = this.#store
+      .operations(commission.id)
+      .find(({ id }) => id === operation.id);
+    if (persisted === undefined)
+      return { ok: false, error: { kind: "not_found" } };
+    const transition = evolveOperation(
+      latest.value,
+      persisted,
+      outcomeLease.value,
+      outcome,
+      now,
+    );
+    if (!transition.ok)
+      return { ok: false, error: { kind: "domain", error: transition.error } };
+    const committed = this.#store.commitTransition(transition.value);
+    return committed.ok
+      ? { ok: true, value: transition.value.commission }
+      : { ok: false, error: { kind: "store", error: committed.error } };
+  }
+
+  async #authorizedTransition(
+    commissionId: string,
+    now: number,
+    make: (
+      commission: Commission,
+      lease: LeaseGrant,
+      checkedAt: number,
+    ) => ReturnType<typeof evolve>,
+  ): Promise<Result<Commission, ApplicationError>> {
+    const current = this.#load(commissionId);
+    if (!current.ok) return current;
+    const lease = await this.#currentLease(commissionId, now);
+    if (!lease.ok) return lease;
+    const transition = make(current.value, lease.value, this.#now?.() ?? now);
+    if (!transition.ok)
+      return { ok: false, error: { kind: "domain", error: transition.error } };
+    return this.#commit(transition.value);
+  }
+
+  #load(commissionId: string): Result<Commission, ApplicationError> {
+    const commission = this.#store.get(commissionId);
+    return commission === null
+      ? { ok: false, error: { kind: "not_found" } }
+      : { ok: true, value: commission };
+  }
+
+  async #currentLease(
+    commissionId: string,
+    now: number,
+  ): Promise<Result<LeaseGrant, ApplicationError>> {
+    const result = await this.#lease.current(
+      commissionId,
+      this.#controllerId,
+      now,
+    );
+    if (!result.ok)
+      return { ok: false, error: { kind: "provider", error: result.error } };
+    const parsed = ownerSchema.safeParse(result.value);
+    const checkedAt = this.#now?.() ?? now;
+    if (
+      parsed.success &&
+      (parsed.data.owner.controllerId !== this.#controllerId ||
+        parsed.data.observedAt > checkedAt ||
+        parsed.data.validUntil <= checkedAt)
+    ) {
+      return { ok: false, error: { kind: "ownership_unavailable" } };
+    }
+    return parsed.success
+      ? { ok: true, value: parsed.data }
+      : { ok: false, error: { kind: "ownership_unavailable" } };
+  }
+
+  #commit(
+    transition: import("./domain").Transition,
+  ): Result<Commission, ApplicationError> {
+    if (transition.commission.version === transition.beforeVersion) {
+      return { ok: true, value: transition.commission };
+    }
+    const result = this.#store.commitTransition(transition);
+    return result.ok
+      ? { ok: true, value: transition.commission }
+      : { ok: false, error: { kind: "store", error: result.error } };
+  }
+}
+
+function hasOwner(commission: Commission, lease: LeaseGrant): boolean {
+  return (
+    commission.owner?.controllerId === lease.owner.controllerId &&
+    commission.owner.epoch === lease.owner.epoch
+  );
+}
+
+function isPending(operation: Operation): boolean {
+  return (
+    operation.outcome.kind === "prepared" ||
+    operation.outcome.kind === "submitted" ||
+    operation.outcome.kind === "ambiguous" ||
+    operation.outcome.kind === "retry_authorized"
+  );
+}
+
+function githubRepositoryIdentity(repositoryUrl: string): string | null {
+  try {
+    const url = new URL(repositoryUrl);
+    if (
+      url.protocol !== "https:" ||
+      url.hostname.toLowerCase() !== "github.com" ||
+      url.username !== "" ||
+      url.password !== "" ||
+      url.port !== "" ||
+      url.search !== "" ||
+      url.hash !== ""
+    )
+      return null;
+    const parts = url.pathname.split("/").filter((part) => part.length > 0);
+    if (parts.length !== 2) return null;
+    const name = parts[1]!.replace(/\.git$/i, "");
+    return name.length === 0 ? null : `${parts[0]}/${name}`.toLowerCase();
+  } catch {
+    return null;
+  }
+}

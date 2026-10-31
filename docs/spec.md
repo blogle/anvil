@@ -68,6 +68,32 @@ Decision handling must be exhaustive. Unknown or stale observations are distinct
 8. Attempt limits and Commission budgets persist across context refreshes, agent restarts, and controller process restarts.
 9. Current status, observations, their freshness, pending actions, decision rationale, and permitted interventions are available through the application API and MCP.
 
+### Governed state, budgets and delivery
+
+Only typed, authorized commands may propose/admit, hold/resume or amend a
+Commission. Objective, repository/target, budget, obligations, acceptance policy
+and authority SHALL NOT be replaceable through generic snapshot updates, worker
+reports or forged JSON. Amendments require the expected specification generation;
+SQLite compare-and-swap rejects stale concurrent writes. Changed criteria invalidate
+affected evidence/approval; unchanged criteria may retain applicable evidence.
+Ordinary amendments SHALL NOT change a terminal conclusion; reopening requires a
+separate explicitly governed contract.
+
+`maxAttempts` limits creation of a new Attempt, not continuation of its already
+admitted first Attempt. Instruction, repair, cost and deadline limits constrain
+their corresponding effects. Usage SHALL persist monotonically across restarts,
+strategies and context refresh. Exhaustion prohibits new costly work but SHALL
+NOT prevent recording an already-valid authoritative delivery result, subject to
+authority and evidence. Repeated failure or unchanged evidence must cause bounded
+waiting, strategy change, hold or actionable escalation rather than an infinite loop.
+
+Criterion evidence SHALL bind specification generation/criterion, immutable
+Candidate, applicable dependency/check context, provenance, freshness and
+disposition. Conclude only when the registered PR in the approved repository and
+target integrated the correct Candidate with configured healthy checks and
+acceptance. A different PR with the same SHA SHALL NOT satisfy delivery. Pending
+checks or queued Mergify state are healthy waits, not reasons to repeat effects.
+
 ## Controller ownership and recovery
 
 **Design direction adopted · #4.** Anvil persists authoritative intent and external identities. Operational status is reconstructed from the systems that own execution and integration state. A second event history of OpenCode, Kubernetes, GitHub, or Mergify is not required.

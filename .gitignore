@@ -1,4 +1,6 @@
 /result
-/target
+/target/
 .direnv/
 .envrc
+node_modules/
+dist/

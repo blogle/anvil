@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "Revalidate controller authority across provider I/O and before external submission"
+}

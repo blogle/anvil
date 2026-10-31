@@ -1,0 +1,5 @@
+{
+  "type": "feat",
+  "semver": "minor",
+  "summary": "Add durable operational projections and an authenticated Ledger UI with governed interventions"
+}

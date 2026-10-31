@@ -1,0 +1,5 @@
+{
+  "type": "feat",
+  "semver": "minor",
+  "summary": "Add the first authenticated local daemon and shared HTTP/MCP application surface"
+}

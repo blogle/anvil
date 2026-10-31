@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "Require configured GitHub status contexts before accepting Candidate delivery"
+}

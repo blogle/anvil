@@ -1,0 +1,5 @@
+{
+  "type": "feat",
+  "semver": "minor",
+  "summary": "Add a locally tested OpenCode V2 adapter with conservative ambiguous-turn recovery"
+}

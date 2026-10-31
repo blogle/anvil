@@ -5,6 +5,8 @@
     { "label": "Overview", "href": "index.md" },
     { "label": "Specification", "href": "spec.md" },
     { "label": "Architecture", "href": "architecture.md" },
+    { "label": "Operations", "href": "operations.md" },
+    { "label": "Active plan", "href": "plans/active/autonomous-first-slice.md" },
     { "label": "UI mockup", "href": "ui.html" },
     { "label": "Research", "href": "research.md" }
   ]

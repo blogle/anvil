@@ -1,0 +1,5 @@
+{
+  "type": "feat",
+  "semver": "minor",
+  "summary": "Record Candidate-bound OpenCode obligation claims as submitted worker evidence"
+}
