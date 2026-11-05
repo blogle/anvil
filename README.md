@@ -1,47 +1,17 @@
-# anvil
+# Anvil
 
-OpenCode orchestration on Kubernetes Agent Sandbox.
+Anvil supervises OpenCode work on Kubernetes Agent Sandbox. The existing
+mainline implementation is the baseline for an incremental architecture update;
+this branch begins with documentation only.
 
-## Kubernetes assets
+## Start here
 
-The application manifests live under `k8s/`. `k8s/base` creates the `anvil`
-namespace, `anvild` service account and narrowly scoped Sandbox RBAC, runtime
-configuration, the persistent OpenCode profile PVC, the singleton
-`anvil-profile` OpenCode Deployment/Service, the `anvild`/MCP/router
-Deployments and Services. The base deliberately does not include an Ingress,
-Certificate, storage-class selection, or other platform-specific resources;
-those belong in an environment repository's overlay. `k8s/overlays/dev`
-renders the base with portable placeholder runtime values.
-The normal deployment pulls public images from `ghcr.io/blogle/anvil` and
-`ghcr.io/blogle/anvil-sandbox`. The pinned SDLC contract owns CI and rolling
-releases; Anvil exports fast/verify Nix checks and one image publication app.
-That app publishes version and merged-SHA tags plus `main`/`latest`, and refuses
-to replace an immutable tag with different image content.
+- [Project and current direction](docs/index.md)
+- [Controller spec status](docs/spec.md) — intentionally awaiting the vision
+  discussion; target spec is limited to one page.
+- [Incremental roadmap](docs/roadmap.md)
+- [Isolated deployment guardrails](docs/deployment.md)
 
-The pinned, unmodified Agent Sandbox v1.0.2 core release asset is vendored at
-`k8s/vendor/agent-sandbox/v1.0.2/sandbox.yaml`. It is not a Kustomize resource:
-Anvil does not install or change Agent Sandbox. Its provenance and checksum are
-in the adjacent README.
-
-Agent Sandbox and Sandbox Router are platform prerequisites and are not
-installed by these manifests. See [architecture](docs/architecture.md),
-[runtime/API contract](docs/api.md), [development](docs/development.md), and
-[future work](docs/future.md) for the deployment boundary and compatibility
-checks.
-
-## Operator client
-
-Build or install the `anvilctl` package, set `ANVIL_URL` (or pass `--server`),
-then authenticate Anvil once:
-
-```sh
-anvilctl providers list
-anvilctl providers login openai
-anvilctl providers login opencode-go --method api
-anvilctl sessions create --project dojo2 --repository https://github.com/blogle/dojo2.git --ref main --prompt "Inspect the repository."
-```
-
-Provider credentials and global OpenCode configuration are shared through the
-Anvil profile. Each sandbox retains its own checkout, home, session database,
-conversation, logs, and working tree. `just` is reserved for development and
-deployment workflows; `anvilctl` is the operator interface.
+The first deployment of any changed implementation must use a separately
+authorized, temporary Kubernetes namespace. Do not alter or interrupt the
+production deployment while this work is being evaluated.
