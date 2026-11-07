@@ -25,8 +25,10 @@ Fieldnotes and restored `PLANS.md` still uncommitted at plan creation. No PR is
 recorded for this work. Reconcile the actual working tree and remote PR before
 implementation; do not mistake the committed historical docs for the agreed spec.
 
-This request authorizes drafting the plan, not executing it. Implementation requires
-approval to proceed. Deployment, model spend and mutations to external repositories
+The original request authorized drafting; subsequent operator approval authorized
+local implementation, as recorded below. This revision persists the Campaign and
+five Commission contracts; it does not itself execute them or grant new external
+authority. Deployment, model spend and mutations to external repositories
 require an approved target and budget. Isolated deployment and production protection
 are governed in dotfiles; do not run the repository's generic deploy/cleanup recipes
 against an assumed environment. Production promotion is outside this campaign.
@@ -34,12 +36,12 @@ against an assumed environment. Production promotion is outside this campaign.
 ## Progress
 
 - [x] (2026-11-06) Drafted this plan from the agreed spec and inspected mainline entry points; no implementation evidence claimed.
-- [ ] M1: Preserve mainline behavior and deliver one local Commission-to-merge vertical slice. (in progress; reporting skill bootstrap committed, no Commission journey yet)
-- [ ] M2: Exercise reporting transport on pinned OpenCode and deploy the slice to an approved isolated environment.
-- [ ] M3: Complete deterministic convergence, restart recovery and watchdog behavior.
-- [ ] M4: Deliver interactive control, obligation amendments and evidence challenges.
-- [ ] M5: Deliver Campaign dependencies and coherent API/MCP/CLI/Ledger surfaces.
-- [ ] M6: Evaluate context policy and accept the complete runtime journey with exportable evidence.
+- [x] (2026-11-07) Recorded the Campaign and five sequential Commission contracts; preserved historical criteria and evidence without promoting acceptance.
+- [ ] EH-C1: Durable work and supervised execution. (partial implementation: reporting-skill bootstrap and turn/Attempt lifecycle correction; Commission journey unverified)
+- [ ] EH-C2: Obligation-driven progress and reporting.
+- [ ] EH-C3: Deterministic convergence and bounded recovery.
+- [ ] EH-C4: Human control and review workspace.
+- [ ] EH-C5: Authoritative delivery and end-to-end assurance.
 
 ## Surprises & Discoveries
 
@@ -58,6 +60,26 @@ must not run alongside another service using them. Its temporary fixture disable
 Git TLS verification; never carry that environment into a real deployment.
 
 ## Decision Log
+
+2026-11-07 — Operator-approved API scope amendment: delete the Task API rather
+than retain it as a compatibility product surface. Retain batch operations over
+Campaigns and Commissions, not Batch/Task as competing work identities. New APIs
+must support efficient set-oriented reads and commands, durable idempotency,
+cursors and concurrency preconditions. ChatGPT must be able to inspect an Inbox
+or Campaign aggregate without per-item fan-out, steer a set in one request and
+create/orchestrate a Campaign and its Commissions in one request. This adds EH-13
+and refines the Commission contracts below; it does not authorize external effects
+or bypass approval, budget, control-mode or dependency gates. Task API removal is
+required by EH-C4, after client migration, rather than an optional EH-C5 cleanup.
+
+2026-11-07 — Operator-requested planning revision: persist the spec-completion
+Campaign as five sequential Commissions in this existing ExecPlan, rather than
+creating a competing campaign document. The Commission contracts below replace the
+six-milestone execution sequence. Existing EH-01 through EH-12 normative criteria,
+external gates and historical evidence remain intact. Prior M1–M6 references are
+historical work-package references, not the current admission order. Research and
+optional extensions remain separately gated; any reduction of an existing acceptance
+criterion still requires an explicit approved amendment.
 
 2026-11-06 — User-approved design, recorded by the planning assistant: an Attempt
 is a bounded strategy; it begins with a fresh OpenCode Session. Session replacement
@@ -80,6 +102,11 @@ isolation before expanding breadth. Do not gate the first runnable slice on a fu
 Ledger redesign, generalized workflow engine or context-policy benchmark.
 
 ## Outcomes & Retrospective
+
+2026-11-07 planning revision: the current next action is EH-C1 against the reconciled
+working tree, followed by EH-C2 through EH-C5. No Commission is accepted or integrated
+by this planning change. Earlier statements below directing continuation of M1 or
+deployment before M3 describe the superseded sequence, not current instructions.
 
 Implementation is authorized by the operator's request. M1 has started with a
 small Workspace-bootstrap change: the Kubernetes Sandbox init container now installs
@@ -136,6 +163,221 @@ OpenCode at `9b4ec5714d481559990db0a816d5dec19541a814`; record the resolved runt
 version in experiments rather than assuming a different installed CLI matches it.
 
 ## Plan of Work
+
+### Campaign EH — Converge Anvil to the controller specification
+
+Purpose: deliver the operator journey described in Purpose / Big Picture and all
+mandatory behavior in `docs/spec.md`, while preserving the infrastructure contract
+and existing working mainline behavior. This file is the durable Campaign record
+until Anvil can represent it itself; the IDs below are planning identities, not
+claims that corresponding runtime records already exist. Do not create a parallel
+acceptance ledger when importing the contracts into Anvil: retain these IDs and
+link runtime identities and evidence back here.
+
+Shared contracts: reuse core validation and existing reconciliation/store authority;
+keep one writer; preserve budgets and historical evidence; distinguish worker claims
+from independently observed facts; never equate implementation with acceptance.
+Use Campaign/Commission vocabulary for the public work API. Batch is an operation
+shape, not a separate domain aggregate. The Task API must be deleted; temporary
+internal migration adapters and historical database readers are not justification
+for retaining public Task endpoints or MCP tools. The bulk interaction contract
+below applies from EH-C1 onward rather than being retrofitted in the last phase.
+Each Commission targets this repository and its operator-approved integration branch.
+The historical branch baseline above is not approval of a current target. Before
+starting each Commission, record its actual starting SHA, approved target, working
+branch, registered PR, budget and any ticket here. Those per-Commission execution
+bindings are currently unassigned; no PR or approved external budget is inferred.
+
+EH-C2 is start-blocked on EH-C1 integration; EH-C3 on EH-C2; EH-C4 on EH-C3; EH-C5
+on EH-C4. Each starts from the prior integrated baseline and ends only after its own
+registered PR authoritatively merges into the approved target. Local completion of
+an increment does not satisfy that gate. Surface missing approval rather than
+starting the next Commission. Each Commission adds a usable increment; later phases
+must preserve earlier behavior and evidence must be rechecked for applicability.
+
+The four obligation IDs per Commission below are stable grouping handles for its
+contract, not a replacement for EH-01–EH-12. Record their evidence and residual gaps
+in the existing acceptance ledger and Artifacts and Notes, citing both IDs. All
+Commission obligations are currently unverified. Evidence must identify the relevant
+obligation/version, Candidate, actual execution provenance, implementation references,
+verification artifacts and remaining limitations. Keep this record usable outside
+Anvil so an unfinished evidence implementation cannot certify itself by displaying
+green status.
+
+### EH-C1 — Durable work and supervised execution
+
+Objective: an operator can create work, run a worker and inspect durable execution
+state. Operator-directed continuation is acceptable in this phase.
+
+| Obligation | Acceptance contract | Existing criteria |
+| --- | --- | --- |
+| EH-C1-O1 | Persist Campaign → Commission → Attempt → Session identities, relationships and specified lifecycle/work-contract fields. A turn ending does not end the strategy Attempt. | EH-02 |
+| EH-C1-O2 | Admit only within capacity and explicit start gates; establish a persistent Workspace, branch and bound Session without regressing checkout, credentials, Nix or preview. | EH-01, EH-10 |
+| EH-C1-O3 | Supply the hierarchical work instruction and support worker implementation, tests, commits and PR publication; capture the first correlated execution trace. Provide idempotent Campaign-with-Commissions submission and aggregate reads with cursor foundations, without requiring per-Commission creation/query calls. | EH-03, EH-09, EH-11, EH-12, EH-13 |
+| EH-C1-O4 | Preserve work identity and aggregate usage across controller restart and Session recovery, without duplicate execution authority or simultaneous writers. | EH-02, EH-04, EH-05 |
+
+Demonstration: create a Commission, start its worker, produce a branch change,
+restart the controller and recover the same work without duplicate execution.
+Capture actual identities and durable state before/after. Provide a minimal usable
+operator entry point; full Ledger design and autonomous gap selection are not
+prerequisites. Distinguish local fixture results from live runtime observations.
+
+### EH-C2 — Obligation-driven progress and reporting
+
+Objective: operators can inspect a versioned acceptance contract and revision-bound
+claims, rather than relying on prose-only progress.
+
+| Obligation | Acceptance contract | Existing criteria |
+| --- | --- | --- |
+| EH-C2-O1 | Authorized obligation creation, amendment and removal preserve versions, invalidation semantics and audit history. | EH-07 |
+| EH-C2-O2 | Install and exercise the reporting skill; select a transport using the pinned-runtime comparison, with actual execution provenance, durable receipts and deduplication. | EH-03, EH-08 |
+| EH-C2-O3 | Expose missing, stale, inapplicable and challenged evidence as gaps; keep worker claims distinct from provider facts. Reports cannot amend obligations, approve work or conclude a Commission. | EH-07, EH-08, EH-09 |
+| EH-C2-O4 | Expose obligations, evidence, artifacts and gaps through a minimal Commission inspector and corresponding API/MCP capabilities. Set-oriented reads include useful progress/gap summaries and selective expansion without per-item evidence queries. | EH-11, EH-13 |
+
+Demonstration: receive and redeliver a claim without duplication, advance the
+Candidate, amend a requirement and challenge a claim. Observe the correct gaps
+without erasing history. Exercise malformed/foreign reports and lost receipts.
+Compare reporting transports before selection; implementing both permanently is
+not required. Repairs may still be directed by an operator until EH-C3.
+
+### EH-C3 — Deterministic convergence and bounded recovery
+
+Objective: the harness advances observed gaps autonomously without racing workers,
+replaying uncertain effects or consuming model turns for healthy waits.
+
+| Obligation | Acceptance contract | Existing criteria |
+| --- | --- | --- |
+| EH-C3-O1 | Reconcile execution, reports, branches/checks/PRs, Mergify and relevant health through events plus periodic observations that recover missed events. | EH-04, EH-09 |
+| EH-C3-O2 | Dispatch focused continuation or Candidate-bound repair; wait without model turns for active work and external prerequisites; surface required decisions. | EH-03, EH-04, EH-11 |
+| EH-C3-O3 | Serialize dispatch at safe boundaries, recheck facts, suppress repeated unchanged instructions and reobserve uncertain effects before replay. Persist multi-Commission orchestration intent once, execute through the same authority and expose per-command receipts/outcomes across retries and restart. Plugins may wake reconciliation but never own prompting. | EH-04, EH-08, EH-13 |
+| EH-C3-O4 | Use substantive progress signals and recorded configurable allowances for watchdog recovery, Session reconstruction, strategy replacement and escalation; stop new costly work on exhaustion or unknown outcomes without resetting budgets. | EH-02, EH-05, EH-12 |
+
+Demonstration: exercise missing reports, failed checks, unchanged failures, pending
+CI, dropped events, lost acknowledgements, Session loss and exhausted budget.
+Traces must explain each action/wait and show preserved budgets and one writer.
+A minimal actionable queue is sufficient here; full human control follows in EH-C4.
+
+### EH-C4 — Human control and review workspace
+
+Objective: humans can safely intervene, develop interactively and review the same
+work the controller manages.
+
+| Obligation | Acceptance contract | Existing criteria |
+| --- | --- | --- |
+| EH-C4-O1 | Serialize takeover and provide Session steering/live preview while retaining conversation continuity and binding obligations. | EH-01, EH-06 |
+| EH-C4-O2 | Defer routine autonomy, testing and integration during interactive control, permit explicit checks and resume only on explicit handback, preserving human changes and deferred work. Inactivity/watchdog alerts cannot hand back control. | EH-03, EH-06 |
+| EH-C4-O3 | Provide authorized, audited hold/resume, evidence challenges, obligation amendments and repair steering consistently through UI/API/MCP and existing CLI surfaces. Accept a set of explicitly targeted commands idempotently in one request, enforcing per-item versions and human-control gates. Migrate clients and delete public Task routes/tools rather than retaining aliases. | EH-06, EH-07, EH-11, EH-13 |
+| EH-C4-O4 | Complete Focused Inbox, Everything, Campaign gates and the Commission review packet, with exact working Session, PR, ticket and preview links. An Inbox query returns actionable state for a bounded set in one request and supplies the identities/preconditions needed for one subsequent bulk steering request. | EH-10, EH-11, EH-13 |
+
+Demonstration: take over active work, make a UX change, remain inactive through
+watchdog thresholds and explicitly hand back. Show retained changes, deferred checks
+and subsequent repair. Exercise navigation and commands against the daemon, not only
+component mocks. Repository approval remains a separate provider-observed fact.
+
+### EH-C5 — Authoritative delivery and end-to-end assurance
+
+Objective: complete the approved-work-to-integration journey and make its behavior
+auditable against the full specification.
+
+| Obligation | Acceptance contract | Existing criteria |
+| --- | --- | --- |
+| EH-C5-O1 | Distinguish work complete, review ready and integrated; conclude work only on authoritative merge of the registered PR into its approved target, never a worker assertion or unrelated/wrong-target merge. | EH-09 |
+| EH-C5-O2 | Enforce default parallel-start/integration dependencies and explicit start gates, reject invalid references/cycles, default PRs to integration:review and respect GitHub/Mergify approval policy. Record authoritative integration even while held. | EH-09, EH-10 |
+| EH-C5-O3 | Complete durable, correlated, exportable telemetry with required decision/context/outcome fields, credential redaction and measured/estimated/stale/unavailable distinctions. | EH-12 |
+| EH-C5-O4 | Validate the complete approved isolated runtime journey, preserve mainline/infrastructure behavior and reconcile every mandatory specification requirement and existing EH acceptance row with current evidence or an explicitly approved amendment. Demonstrate bounded-call Campaign orchestration and Inbox-to-bulk-steering, including retry/restart and cursor recovery, with no public Task surface. | EH-01–EH-13 |
+
+Demonstration: run dependent Commissions through implementation, challenge, repair,
+review and authoritative merge. Reject premature completion and wrong-target/unrelated
+merges, record a valid merge while held and export the correlated trace. Include
+restart and human handback with real OpenCode, preview and provider observations.
+Actual external work requires the separately recorded target, procedure and budget;
+fixtures cannot replace this live acceptance evidence.
+
+Telemetry begins in EH-C1 and grows throughout; EH-C5 validates rather than retrofits
+it. Deployment, optional reviewer workers, cross-worker messages, LLM classification
+and production promotion are not new mandatory deliverables. The previously required
+bounded context-policy comparison remains an explicitly gated acceptance activity
+under EH-12 unless amended by the operator; it cannot reset budgets or compromise
+interactive continuity. Stop at missing environment, cost or approval gates.
+
+### Bulk interaction contract — shared across EH-C1–EH-C5
+
+These are observable API/MCP capabilities, not prescriptions for route names or a
+new generic workflow language. HTTP, MCP and clients share application operations,
+authorization, validation and durable receipts. One MCP tool call must translate to
+one bulk application request, not require ChatGPT to discover or command every
+Commission separately. Internal provider observation and execution may be asynchronous.
+
+**Read sets and aggregates.** Query selected Campaigns/Commissions or a filtered
+Inbox in one request. Return actionable summaries including lifecycle/control mode,
+current Candidate, obligation gaps/challenges, checks/review, dependencies, decision
+or wait reason, observation freshness, and relevant versions/generations. Include
+counts, stable identities and optional bounded expansion for evidence and Attempts;
+do not require transcript retrieval or per-item calls to understand ordinary progress.
+An aggregate Campaign read includes its Commission graph and progress. A bounded
+Inbox response includes the context and preconditions needed to steer its items.
+
+**Cursors and bounded responses.** Support stable pagination and incremental changes
+for the same query scope, with explicit continuation/change cursors and observation
+or snapshot identity. Document ordering and consistency; concurrent updates must not
+silently skip work. Distinguish page cursors from change watermarks. Signal expired
+cursors/reset requirements and provide a full-snapshot recovery path. Report totals
+and truncation explicitly; large campaigns may require bounded pages, but ordinary
+set reads must not become one-call-per-item fan-out. Never silently advance a change
+watermark past unreturned changes. Scope cursor data to the authorized caller/query.
+
+**Bulk commands.** Accept explicitly identified Campaign/Commission commands in one
+request, including steering multiple Inbox items, hold/resume and governed amendments.
+Read-only filters may identify work, but a mutation must freeze its resolved target
+set in its durable acceptance record; retries must not act on newly matching items.
+Include per-command expected versions/specification generations as applicable, and
+preserve distinct command meanings: steering does not amend requirements or implicitly
+hand back human control. Recheck safe execution boundaries before dispatch. Stale
+items produce explicit conflicts rather than overwrite newer human or controller work.
+
+**Idempotency and outcomes.** A durable scoped request key plus canonical payload
+identify a logical request. Reusing a key with a different payload is a conflict.
+Each command has a stable identity and receipt so it can be inspected or safely
+retried individually or as part of the original envelope, without duplicate prompts,
+evidence, amendments or resource creation. Specify retention/replay limits and never
+silently treat an expired key as permission to repeat an uncertain external effect.
+Lost responses and controller restarts preserve accepted identities and outcomes.
+Return per-item accepted, deferred, conflicted or rejected dispositions and correlate
+them with later execution outcomes, including unknown effects. Acceptance is not
+execution or integration. Distinguish envelope validation failure from mixed item
+results; do not imply all-or-nothing external effects or roll back a dispatched prompt
+because another item failed. Unknown outcomes require observation, not blind replay.
+
+**Campaign orchestration.** One request can submit a Campaign with its Commission
+contracts, obligations, explicit dependency edges, execution targets and bounded
+approved orchestration intent. Validate and persist the graph and intent atomically
+before admission; invalid references/cycles or unauthorized configuration do not leave
+a partially created graph. Use request-local Commission references to avoid requiring
+server-ID round trips. Return the created identities, aggregate projection and durable
+receipt in the same response. Execute admitted work asynchronously under the normal
+controller, with dependencies, capacity, budgets, repository approval and explicit
+human handback still binding. One request authorizes only its declared scope, not
+arbitrary future actions or unbounded model spend. Subsequent orchestration updates
+use the same versioned/idempotent command boundary, not destructive resubmission.
+
+Required demonstrations: a single aggregate read for a multi-Commission Campaign;
+a single Inbox read followed by one bulk steering request for its actionable set;
+one Campaign submission containing multiple Commission contracts and dependencies;
+and replay after response loss/restart without duplicate effects. Exercise partial
+conflicts, authorization failures, changed-payload keys, concurrent human changes,
+pagination during updates, expired cursors, and frozen mutation targets. Record MCP
+call counts and request/response sizes alongside per-item outcomes. Fixtures establish
+deterministic transport/state behavior, not live OpenCode or provider completion.
+
+### Historical work packages — superseded M1–M6 sequence
+
+The following retained detail preserves implementation guidance, prior rationale and
+the meaning of historical evidence references. It is not a second executable plan:
+use EH-C1–EH-C5 above for admission order, scope and next actions. In particular, old
+M2 deployment timing and M1 Commission-to-merge breadth do not gate EH-C1. Reuse the
+applicable technical steps under the Commission that now owns them.
+Historical instructions to retain old clients mean a bounded migration period only;
+the approved EH-13 amendment requires public Task API/tool deletion by EH-C4.
 
 ### M1 — Make one Commission observable end to end locally
 
@@ -259,7 +501,7 @@ in its Nix development environment. First reconcile the baseline:
     just --list
 
 Record source revision plus relevant uncommitted diff, branch/PR and runtime version
-before each evidence run. Implement one milestone at a time, extending the existing
+before each evidence run. Implement one current Commission at a time, extending the existing
 tests with the scenario names and assertions from the acceptance table. Then run:
 
     just build
@@ -279,7 +521,7 @@ If build tools are missing, record the environment blocker rather than skipping 
 For artifact-affecting milestones also run `nix flake check` and `just image` and
 record output identities. `just docs` must serve the plan and specification links.
 
-Do not invent deployment commands here. Before M2, record the approved dotfiles
+Do not invent deployment commands here. Before any isolated deployment, record the approved dotfiles
 revision/procedure, isolated target, immutable images, cost limit and bounded live
 scenario in Artifacts and Notes. If any is missing, stop at that external gate.
 Before handoff rerun the relevant tests, fmt and workspace clippy and report results.
@@ -289,6 +531,10 @@ Before handoff rerun the relevant tests, fmt and workspace clippy and report res
 These stable criteria implement the agreed spec. All rows are **unverified** at
 plan creation. Record status, evidence references and residual gaps in this table
 without changing normative criteria to match implementation.
+
+The M1–M6 references in this historical ledger identify the original work packages,
+not current Commission gates. Use the EH-C1–EH-C5 mappings above for execution;
+partial Commission evidence does not establish the full cross-cutting EH criterion.
 
 | ID | Required behavior and negative case | Required evidence / milestone |
 | --- | --- | --- |
@@ -304,6 +550,7 @@ without changing normative criteria to match implementation.
 | EH-10 | Dependencies default to parallel start/integration gating; explicit start gates block admission; invalid references/cycles are rejected. | Multi-Commission scheduler and integration tests plus observable Campaign gates; M5. Unverified. |
 | EH-11 | HTTP, MCP, CLI and Ledger expose coherent work/actions; Focused/Everything, inspector/review packet, Campaign gates and exact external links work. | API/client tests and browser journey against real daemon, including unavailable/stale data; M5. Unverified. |
 | EH-12 | Durable redacted export correlates decisions/waits, source facts, instructions/effects, revisions, latency/retries/usage and context changes; context-policy experiment does not reset budgets or interactive continuity. | Restart-persistent export, secret-redaction test and bounded comparative results with limitations; M1–M6. Unverified. |
+| EH-13 | Campaign/Commission APIs and MCP support bounded set/aggregate reads, actionable Inbox reads, stable pagination/change cursors, single-request Campaign-with-Commissions orchestration and bulk steering/commands. Durable request/item idempotency, explicit concurrency preconditions and per-item outcomes prevent duplicate effects or stale overwrites after retries/restart. Delete public Task routes/tools; batch is an operation shape, not a competing work model. | EH-C1 submission/read foundations; EH-C2 evidence summaries; EH-C3 durable bulk execution; EH-C4 Inbox/bulk steering and Task API removal; EH-C5 end-to-end bounded-call demonstration. Exercise negative/recovery cases in Bulk interaction contract; record tool-call counts, payload sizes and remaining pagination. Unverified. |
 
 Local fixtures prove deterministic behavior, not live GitHub, sandbox or model
 behavior. Neither build success nor a worker completion claim accepts this campaign.
@@ -334,6 +581,19 @@ target only resources created for the approved isolated run and must not delete
 shared profile/Nix storage, production resources or unrelated user work.
 
 ## Artifacts and Notes
+
+2026-11-07 API-amendment validation: documentation-only changes to this plan on the
+same `637af464d3e86df9d11a0ef8222edbe894ce9b02` code baseline. From the repository
+root, `cargo fmt --check`, workspace clippy with all targets/features and `-D warnings`,
+and `git diff --check` exited 0. No runtime tests were run; EH-13 remains unverified.
+The pre-existing untracked `node_modules/` was not modified by this revision.
+
+2026-11-07 Commission-planning revision validation: baseline
+`637af464d3e86df9d11a0ef8222edbe894ce9b02`, with only this tracked plan modified
+and pre-existing untracked `node_modules/` left untouched. From the repository root,
+`cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+and `git diff --check` exited 0. No executable code changed; runtime/test suites were
+not run and no Commission acceptance, deployment or external mutation is claimed.
 
 Planning evidence: inspected `PLANS.md`, `docs/infra.md`, `justfile`, daemon/store
 entry points, frontend layout, local E2E startup and OpenCode pin on 2026-11-06.
@@ -386,6 +646,16 @@ failed observations and append corrections rather than replacing historical resu
 
 ## Interfaces and Dependencies
 
+Operator-approved interface direction (2026-11-07): expose Campaign/Commission
+bulk application operations with durable idempotency and receipts, aggregate queries,
+cursor pagination/change tracking and concurrency preconditions. Retire public Task
+routes and MCP tools by EH-C4; update CLI/UI/MCP consumers in the same Commission.
+Do not retain Batch/Task as a second public work hierarchy or implement bulk MCP as
+a requirement for client-side per-item loops. Existing transactional idempotency,
+change streams and cursor-reset behavior are useful implementation primitives to
+adapt rather than discard. Historical migration readers may remain without exposing
+Task commands. Exact new route/tool schemas are to be recorded here during EH-C1.
+
 Reuse core domain types, pure reconciliation snapshots/decisions, transactional
 SQLite store/effect ledger, existing HTTP authority, OpenCode adapter, GitHub observer
 and router interfaces. Extend them at the milestone that needs the behavior; do not
@@ -409,6 +679,21 @@ Nix and credential roles retain the infrastructure contracts already specified.
 
 Revision note — 2026-11-06: initial plan, requested after agreement on the controller
 spec; prioritizes an incremental deployed vertical slice over another rewrite.
+
+Revision note — 2026-11-07 API amendment: recorded the operator's explicit Task API
+deletion requirement and set-oriented Campaign/Commission interaction contract. Added
+EH-13, refined each Commission's existing obligations and set public Task retirement
+at EH-C4. Batch queries/commands, durable request/item idempotency, cursor recovery,
+concurrency checks and single-request Campaign orchestration are delivery requirements,
+not optional performance optimizations. No implementation acceptance is claimed.
+
+Revision note — 2026-11-07: at the operator's request, persisted Campaign EH and five
+sequential Commission contracts with stable grouped obligation IDs, demonstrations,
+integration start gates and evidence mappings. Replaced the active six-milestone
+sequence while retaining its technical detail as historical work packages. Preserved
+EH-01–EH-12 criteria, prior results, external authority constraints and the requirement
+for an explicit amendment before reducing existing acceptance scope. No implementation
+or runtime acceptance is claimed by this documentation revision.
 
 Implementation note — 2026-11-06: M1 began with the installed reporting skill in
 the existing Workspace bootstrap. No Commission data model or end-to-end journey is
