@@ -34,7 +34,7 @@ against an assumed environment. Production promotion is outside this campaign.
 ## Progress
 
 - [x] (2026-11-06) Drafted this plan from the agreed spec and inspected mainline entry points; no implementation evidence claimed.
-- [ ] M1: Preserve mainline behavior and deliver one local Commission-to-merge vertical slice. (in progress; reporting skill bootstrap only)
+- [ ] M1: Preserve mainline behavior and deliver one local Commission-to-merge vertical slice. (in progress; reporting skill bootstrap committed, no Commission journey yet)
 - [ ] M2: Exercise reporting transport on pinned OpenCode and deploy the slice to an approved isolated environment.
 - [ ] M3: Complete deterministic convergence, restart recovery and watchdog behavior.
 - [ ] M4: Deliver interactive control, obligation amendments and evidence challenges.
@@ -90,6 +90,14 @@ report ingestion and the Commission-to-merge journey are not implemented by this
 change. All acceptance rows remain unverified. No deployment, model spend, external
 repository mutation, or dotfiles change has been made. Continue M1 locally; stop
 before M2's isolated deployment gate until its target and budget are approved.
+
+2026-11-07 execution reconciliation: branch `anvil/incremental-roadmap`, HEAD
+`5eb2b4308e0ff6c5faf6e0f7d66a660f052592f6`, ahead 4 of `origin/main`; no local
+tracked modifications and no PR recorded. The only pre-existing untracked path is
+`node_modules/`, left untouched. This is the current implementation baseline; the
+reported bootstrap change and its verification are already committed. M1 remains
+incomplete and no claims are made about a Commission-to-merge journey. No external
+target, model budget, or deployment approval is recorded, so work remains local.
 
 ## Context and Orientation
 
@@ -389,3 +397,7 @@ Implementation note — 2026-11-06: M1 began with the installed reporting skill 
 the existing Workspace bootstrap. No Commission data model or end-to-end journey is
 claimed yet; preserve the baseline session navigation and execution authority while
 choosing those interfaces.
+
+Execution note — 2026-11-07: reconciled the checkout before continuing. The prior
+bootstrap implementation and verification commits are present at HEAD; `node_modules/`
+is pre-existing user data and must not be cleaned up. Continue M1 from this revision.
