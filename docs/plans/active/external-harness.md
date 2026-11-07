@@ -34,7 +34,7 @@ against an assumed environment. Production promotion is outside this campaign.
 ## Progress
 
 - [x] (2026-11-06) Drafted this plan from the agreed spec and inspected mainline entry points; no implementation evidence claimed.
-- [ ] M1: Preserve mainline behavior and deliver one local Commission-to-merge vertical slice.
+- [ ] M1: Preserve mainline behavior and deliver one local Commission-to-merge vertical slice. (in progress; reporting skill bootstrap only)
 - [ ] M2: Exercise reporting transport on pinned OpenCode and deploy the slice to an approved isolated environment.
 - [ ] M3: Complete deterministic convergence, restart recovery and watchdog behavior.
 - [ ] M4: Deliver interactive control, obligation amendments and evidence challenges.
@@ -81,11 +81,15 @@ Ledger redesign, generalized workflow engine or context-policy benchmark.
 
 ## Outcomes & Retrospective
 
-Plan drafted only. All runtime obligations below remain unverified. No application,
-registry, cluster, external repository or dotfiles changes have been made by this
-planning task. Next authorized action is review of this plan; implementation has
-not begun. Record actual results, residual gaps and the next authorized action here
-at every milestone stop.
+Implementation is authorized by the operator's request. M1 has started with a
+small Workspace-bootstrap change: the Kubernetes Sandbox init container now installs
+`.opencode/skills/anvil-reporting/SKILL.md` into the project Workspace. The skill
+defines progress, obligation-claim, artifact and blocker reporting and explicitly
+distinguishes claims from integration. This is guidance only; durable attributed
+report ingestion and the Commission-to-merge journey are not implemented by this
+change. All acceptance rows remain unverified. No deployment, model spend, external
+repository mutation, or dotfiles change has been made. Continue M1 locally; stop
+before M2's isolated deployment gate until its target and budget are approved.
 
 ## Context and Orientation
 
@@ -317,6 +321,32 @@ Planning evidence: inspected `PLANS.md`, `docs/infra.md`, `justfile`, daemon/sto
 entry points, frontend layout, local E2E startup and OpenCode pin on 2026-11-06.
 No build, runtime or acceptance results have been collected for this plan.
 
+2026-11-06 implementation baseline: branch `anvil/incremental-roadmap`, HEAD
+`3aa874442f96acc44e554657aa87509671264005`, ahead 2 of `origin/main`; no PR is
+recorded. `git status --short --branch` showed only pre-existing untracked
+`node_modules/`, left untouched. `cargo test -p anvil-core -p anvil-reconcile -p
+anvild --lib` compiled and reported 40 core and 42 reconcile tests passing; anvild
+was still running at timeout 120s, with `store::tests::retained_change_limit_resets_expired_cursors_across_restart`
+reported running over 60s. This is a timed-out run, not a passing suite.
+
+After the M1 skill-bootstrap change, `cargo test -p anvild --lib
+workspace_bootstrap_installs_anvil_reporting_skill` passed (1 test; 143 filtered)
+and `cargo fmt --check` exited 0. The change has not yet been checked in a full
+workspace build, clippy, full test suite, frontend checks, or E2E. Reporting transport
+and runtime skill discovery remain unverified.
+
+Follow-up on the same dirty revision: `cargo test -p anvil-core -p anvil-reconcile
+-p anvild --lib` exited 0 (40 + 42 + 144 = 226 tests passed; 0 failed, 91 seconds).
+The earlier 120-second timeout was only a timeout, not a test failure. Workspace
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` and
+`cargo fmt --check` exited 0. `just frontend-check` exited 0: 16 frontend unit tests
+passed and Vite production build succeeded. npm reported 2 high severity dependency
+vulnerabilities; no dependency changes were made. The frontend recipe ran `npm ci`
+against the already-untracked `node_modules/` directory; that directory remains
+untracked and was not cleaned up. `just security-check` and `git diff --check` exited
+0. Workspace build, full workspace tests and E2E remain to be run; the focused unit
+run does not establish any live OpenCode or GitHub behavior.
+
 For each executed run append here: UTC time, obligation IDs, revision/dirty baseline,
 exact command and working directory, exit status, test counts or trace IDs, actual
 versus expected behavior and residual gap. Store large redacted artifacts at a named
@@ -341,3 +371,8 @@ Nix and credential roles retain the infrastructure contracts already specified.
 
 Revision note — 2026-11-06: initial plan, requested after agreement on the controller
 spec; prioritizes an incremental deployed vertical slice over another rewrite.
+
+Implementation note — 2026-11-06: M1 began with the installed reporting skill in
+the existing Workspace bootstrap. No Commission data model or end-to-end journey is
+claimed yet; preserve the baseline session navigation and execution authority while
+choosing those interfaces.

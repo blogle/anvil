@@ -33,6 +33,33 @@ use regex::Regex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+const ANVIL_REPORTING_SKILL: &str = r#"---
+name: anvil-reporting
+description: Report progress, obligation evidence, artifacts, and blockers to Anvil.
+---
+
+# Anvil reporting
+
+When working on an Anvil-managed commission, report meaningful progress as you go
+and before ending a turn. Include the current Candidate commit SHA when available.
+
+For each obligation you address, report its obligation ID and version, your claim,
+the Candidate SHA, and concise artifact references (tests, files, or URLs). State
+blockers explicitly and identify any required decision. Do not invent an obligation,
+version, Candidate, test result, or artifact. If a fact is unavailable, say so.
+
+Reports are claims for human review, not approval or proof of integration. Do not
+claim that work is integrated: only Anvil's observation of the registered pull
+request merged into its approved target establishes integration.
+"#;
+
+fn workspace_init_script() -> String {
+    format!(
+        "set -euo pipefail\nmkdir -p /home/anvil/workspace/\"$ANVIL_PROJECT\"/.opencode/skills/anvil-reporting /home/anvil/.config /home/anvil/.cache /home/anvil/.local/share /home/anvil/.local/state/runtime\ncat > /home/anvil/workspace/\"$ANVIL_PROJECT\"/.opencode/skills/anvil-reporting/SKILL.md <<'ANVIL_SKILL'\n{}\nANVIL_SKILL\nchown -R 1000:1000 /home/anvil",
+        ANVIL_REPORTING_SKILL
+    )
+}
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -1529,9 +1556,7 @@ impl SandboxApi for KubeSandboxApi {
             "name": "fix-workspace-permissions",
             "image": self.config.image,
             "command": ["/bin/bash", "-c"],
-            "args": [
-                  "set -euo pipefail\nmkdir -p /home/anvil/workspace/\"$ANVIL_PROJECT\" /home/anvil/.config /home/anvil/.cache /home/anvil/.local/share /home/anvil/.local/state/runtime\nchown -R 1000:1000 /home/anvil"
-            ],
+            "args": [workspace_init_script()],
             "env": [{"name": "ANVIL_PROJECT", "value": r.project}],
             "securityContext": {"runAsUser": 0, "runAsGroup": 0},
             "volumeMounts": [{"name": "workspace", "mountPath": "/home/anvil"}]
@@ -11508,6 +11533,14 @@ mod tests {
         assert!(spec["volumes"][1]["persistentVolumeClaim"]
             .get("readOnly")
             .is_none());
+    }
+
+    #[test]
+    fn workspace_bootstrap_installs_anvil_reporting_skill() {
+        let script = workspace_init_script();
+        assert!(script.contains(".opencode/skills/anvil-reporting/SKILL.md"));
+        assert!(script.contains("obligation ID and version"));
+        assert!(script.contains("Do not\nclaim that work is integrated"));
     }
 
     #[test]
