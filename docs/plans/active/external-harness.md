@@ -335,6 +335,19 @@ and `cargo fmt --check` exited 0. The change has not yet been checked in a full
 workspace build, clippy, full test suite, frontend checks, or E2E. Reporting transport
 and runtime skill discovery remain unverified.
 
+2026-11-06 implementation follow-up, revision `9499fc7` (skill-bootstrap commit):
+`just build` exited 0, including frontend production build and `cargo build
+--workspace`. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+exited 0; `cargo fmt --check`, `git diff --check`, and `just frontend-check` exited
+0 (16 frontend unit tests; Vite production build passed). `cargo nextest run
+--workspace` first hit its 120-second command timeout after 251/252 tests had passed;
+the remaining slow retention/restart test was terminated. Re-running with a 360-second
+timeout exited 0: 252 tests passed, 0 failed, 1 slow (93.359 seconds). `just build`
+and frontend checks reported 2 high-severity npm audit findings; dependency files
+were not changed. These are regression/build checks only: no Commission journey,
+OpenCode skill discovery, reporting transport, GitHub merge, or E2E evidence has
+been collected. The untracked `node_modules/` remains untouched by cleanup.
+
 Follow-up on the same dirty revision: `cargo test -p anvil-core -p anvil-reconcile
 -p anvild --lib` exited 0 (40 + 42 + 144 = 226 tests passed; 0 failed, 91 seconds).
 The earlier 120-second timeout was only a timeout, not a test failure. Workspace
