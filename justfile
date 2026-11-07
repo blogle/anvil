@@ -1,6 +1,9 @@
 default:
     just --list
 
+docs:
+    nix run .#docs -- --root docs --project .
+
 fmt:
     cargo fmt --all
 
