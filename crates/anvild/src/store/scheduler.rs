@@ -273,6 +273,64 @@ impl ControllerStore {
         Ok(())
     }
 
+    /// Record a completed OpenCode turn without closing its strategy Attempt.
+    /// The Session and Attempt remain available for a later continuation.
+    pub fn set_attempt_turn_completed(&self, attempt_id: &str) -> Result<(), StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (version, raw_attempt): (i64, String) = tx
+            .query_row(
+                "SELECT version,payload_json FROM attempts WHERE attempt_id=?1",
+                [attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        let mut attempt: Value = serde_json::from_str(&raw_attempt)?;
+        let controller_mode: String = tx.query_row(
+            "SELECT controller_mode FROM task_durable_state WHERE task_id=?1",
+            [attempt["task_id"]
+                .as_str()
+                .ok_or_else(|| StoreError::InvalidState("Attempt has no Task identity".into()))?],
+            |row| row.get(0),
+        )?;
+        if controller_mode != "reconciler" {
+            return Err(StoreError::InvalidState(
+                "only the Reconciler may complete turns without ending the Attempt".into(),
+            ));
+        }
+        if attempt["lifecycle"] != "running" {
+            return Err(StoreError::InvalidState(
+                "only a running Attempt can complete a turn".into(),
+            ));
+        }
+        attempt["state"] = Value::String("completed".into());
+        attempt["turn_state"] = Value::String("completed".into());
+        attempt["lifecycle"] = Value::String("running".into());
+        attempt["exit_reason"] = Value::Null;
+        attempt["ended_at"] = Value::Null;
+        let next_version = version + 1;
+        attempt["version"] = serde_json::json!(next_version);
+        let encoded = serde_json::to_string(&attempt)?;
+        let updated = tx.execute(
+            "UPDATE attempts SET payload_json=?2,version=?3 WHERE attempt_id=?1 AND version=?4",
+            params![attempt_id, encoded, next_version, version],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::Conflict);
+        }
+        tx.execute(
+            "UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='attempt' AND resource_id=?1",
+            params![attempt_id, encoded, chrono::Utc::now().to_rfc3339()],
+        )?;
+        super::append_resource_change(&tx, "attempt", attempt_id, &attempt)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn compare_and_set_attempt_state(
         &self,
         attempt_id: &str,
@@ -486,8 +544,8 @@ pub(super) fn persist_attempt(
     )?;
     let next = current + 1;
     let mut attempt = attempt.clone();
-    let state = attempt["state"].as_str().unwrap_or_default();
-    let (lifecycle, exit_reason) = match state {
+    let state = attempt["state"].as_str().unwrap_or_default().to_owned();
+    let (lifecycle, exit_reason) = match state.as_str() {
         "queued" => ("queued", Value::Null),
         "provisioning" => ("provisioning", Value::Null),
         "running" => ("running", Value::Null),
@@ -502,6 +560,9 @@ pub(super) fn persist_attempt(
     };
     attempt["lifecycle"] = Value::String(lifecycle.into());
     attempt["exit_reason"] = exit_reason;
+    if state == "running" {
+        attempt["turn_state"] = Value::Null;
+    }
     let transition_time = chrono::Utc::now().to_rfc3339();
     if lifecycle == "running" && attempt["started_at"].is_null() {
         attempt["started_at"] = Value::String(transition_time.clone());

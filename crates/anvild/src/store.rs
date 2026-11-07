@@ -3752,6 +3752,58 @@ mod tests {
     }
 
     #[test]
+    fn completed_reconciler_turn_leaves_attempt_open_for_same_strategy_continuity() {
+        let (_directory, store) = store();
+        let task = serde_json::json!({"outcome":"implement feature"});
+        store
+            .accept_task("turn-task-key", "test", &task, "turn-task", &task)
+            .unwrap();
+        store
+            .set_task_control("turn-task", 1, false, "reconciler")
+            .unwrap();
+        store
+            .create_attempt("turn-task", "turn-attempt", "turn-attempt-key")
+            .unwrap();
+        store
+            .set_attempt_and_task_state("turn-attempt", "running", "running")
+            .unwrap();
+
+        store.set_attempt_turn_completed("turn-attempt").unwrap();
+
+        let attempt = store
+            .get_resource("attempt", "turn-attempt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt["state"], "completed");
+        assert_eq!(attempt["turn_state"], "completed");
+        assert_eq!(attempt["lifecycle"], "running");
+        assert!(attempt["ended_at"].is_null());
+        assert!(store.active_attempts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn completed_turn_cannot_end_an_attempt_that_never_started() {
+        let (_directory, store) = store();
+        let task = serde_json::json!({"outcome":"implement feature"});
+        store
+            .accept_task("turn-task-key", "test", &task, "turn-task", &task)
+            .unwrap();
+        store
+            .create_attempt("turn-task", "turn-attempt", "turn-attempt-key")
+            .unwrap();
+
+        assert!(matches!(
+            store.set_attempt_turn_completed("turn-attempt"),
+            Err(StoreError::InvalidState(_))
+        ));
+        let attempt = store
+            .get_resource("attempt", "turn-attempt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt["lifecycle"], "queued");
+    }
+
+    #[test]
     fn reconciler_create_attempt_admission_is_capacity_fenced_and_restart_idempotent() {
         let (directory, store) = store();
         let path = directory.path().join("controller.sqlite3");

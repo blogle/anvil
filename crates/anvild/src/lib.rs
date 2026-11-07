@@ -2954,9 +2954,20 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
         };
         if let Some(attempt_state) = disposition {
             if active.state != attempt_state {
-                store
-                    .set_attempt_state(&active.attempt_id, attempt_state)
-                    .map_err(|error| ServiceError::Store(error.to_string()))?;
+                if attempt_state == "completed"
+                    && store
+                        .task_control(&active.task_id)
+                        .map_err(|error| ServiceError::Store(error.to_string()))?
+                        .is_some_and(|control| control["controller_mode"] == "reconciler")
+                {
+                    store
+                        .set_attempt_turn_completed(&active.attempt_id)
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                } else {
+                    store
+                        .set_attempt_state(&active.attempt_id, attempt_state)
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                }
             }
             if attempt_state == "completed" {
                 let control = store

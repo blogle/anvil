@@ -99,6 +99,16 @@ reported bootstrap change and its verification are already committed. M1 remains
 incomplete and no claims are made about a Commission-to-merge journey. No external
 target, model budget, or deployment approval is recorded, so work remains local.
 
+2026-11-07 M1 increment: Reconciler-observed OpenCode turn completion now persists
+`state=completed`, `turn_state=completed`, `lifecycle=running`, no `exit_reason`, and
+no `ended_at`. It releases scheduler execution capacity while retaining the strategy
+Attempt and bound Session; legacy and shadow-owned turns retain their prior behavior.
+The store transition is transactional and rejects non-Reconciler ownership and
+non-running Attempts. This is an intermediate persistence correction, not a claim
+that continuation dispatch, Campaign/Commission records, reporting ingestion, or the
+Commission-to-merge journey are complete. EH-02 remains unverified pending the
+correlated end-to-end/restart evidence required by the acceptance table.
+
 ## Context and Orientation
 
 A Campaign supplies purpose and shared contracts. A Commission owns objective,
@@ -383,6 +393,13 @@ prescribe a new generalized event bus, orchestration DSL or replacement platform
 Record concrete new route/type/signature contracts here when implementation selects
 them, and reflect enduring component contracts in `docs/infra.md`.
 
+M1 execution-state adapter: `ControllerStore::set_attempt_turn_completed(attempt_id)`
+is the Reconciler-only durable transition for an ordinary completed OpenCode turn.
+It leaves the strategy Attempt lifecycle running and marks the turn completed; it
+does not complete the Task/Commission. The legacy scheduler continues to use
+`set_attempt_state(..., "completed")` and its existing compatibility completion
+bridge. Starting a subsequent turn clears the prior `turn_state`.
+
 The reporting boundary must resolve authenticated execution identity to instruction,
 Attempt and Commission, accept versioned Candidate-bound claims, and return a durable
 receipt or explicit error. All client commands share authorization/audit semantics.
@@ -401,3 +418,21 @@ choosing those interfaces.
 Execution note — 2026-11-07: reconciled the checkout before continuing. The prior
 bootstrap implementation and verification commits are present at HEAD; `node_modules/`
 is pre-existing user data and must not be cleaned up. Continue M1 from this revision.
+
+Execution evidence — 2026-11-07, implementation revision based on `a9062b9`
+(working tree changes to `crates/anvild/src/lib.rs`, `store.rs`, and
+`store/scheduler.rs`; pre-existing untracked `node_modules/` unchanged):
+
+- `cargo test -p anvild --lib completed` from the repository root exited 0: 5
+  matching tests passed, including the 2 new turn/Attempt lifecycle cases. The
+  subsequent full `cargo test -p anvild --lib` exited 0: 146 passed, 0 failed,
+  92.74 seconds. Expected state is confirmed in the durable attempt payload; no
+  end-to-end Commission journey or report provenance was exercised.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` exited 0.
+- `cargo fmt --check` and `git diff --check` exited 0 after formatting. The initial
+  targeted test command supplied two positional filters, which Cargo rejected; rerun
+  with the shared `completed` filter passed. The initial format check found only
+  rustfmt layout differences, corrected before final validation.
+- No frontend, workspace build, full workspace test, E2E, OpenCode runtime, provider,
+  deployment, or external repository test was run for this increment. No model spend
+  or external mutation occurred.
