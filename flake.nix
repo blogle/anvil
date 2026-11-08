@@ -30,6 +30,7 @@
         rust = import ./nix/rust.nix {
           inherit pkgs craneLib;
           inherit opencodePackage;
+          skillsPackage = sdlc.packages.${system}.skills;
           nix2containerPkgs = nix2container.packages.${system};
           repoRoot = ./.;
         };

@@ -44,6 +44,7 @@ against an assumed environment. Production promotion is outside this campaign.
 - [ ] (2026-11-08) EH-C1 deployment-readiness follow-up authorized: finish useful local delivery/recovery/idempotency and capacity/budget evidence, without expanding into EH-C2 or a speculative workflow engine; rerun validation and retain external gates.
 - [x] (2026-11-08) Local follow-up implementation: a scripted OpenCode worker committed/pushed to a disposable Git repo and published to a loopback PR fixture; start has durable key/receipt/restart replay; held submitted-run restart did not duplicate model request. Reviewed detached Task admission regression and added explicit held migration. Final validation and external gates remain open.
 - [x] (2026-11-08 04:21Z) EH-C1 local deployment-readiness checks completed after v16 safety migration: workspace build, fmt, all-feature Clippy, 276 workspace tests, frontend, security and fixture E2E passed. The fixture PR is local-only, and the unknown submitted run was not replayed. EH-C1 remains open for approved integration/live observations.
+- [ ] (2026-11-08) Prospective isolated addrspace validation preparation: inspect the dotfiles procedure and prepare render-only evidence for a new validation namespace beside the pinned incumbent; do not change production overlays/images/ingress/PVCs/secrets or promote anything. Live deployment remains blocked pending explicit approval and all gates below.
 - [ ] EH-C2: Obligation-driven progress and reporting.
 - [ ] EH-C3: Deterministic convergence and bounded recovery.
 - [ ] EH-C4: Human control and review workspace.
@@ -83,6 +84,19 @@ must not run alongside another service using them. Its temporary fixture disable
 Git TLS verification; never carry that environment into a real deployment.
 
 ## Decision Log
+
+2026-11-08 — Operator direction for prospective deployment preparation: use a
+separate addrspace validation namespace in dotfiles alongside the pinned incumbent.
+This is planning direction only, not approval to deploy or alter production. Until
+separately approved, preparation is render-only: no production overlay, image,
+ingress, PVC, or secret changes, and no promotion. Any live deployment requires
+explicit approval naming the target, immutable image digest, independent credentials,
+bounded cost, and bounded scenario. Stop if any item is missing. SDLC's dev lifecycle
+and changelog fragments are development workflow artifacts, not runtime reporting
+evidence. The repo-local, Nix-pinned skills CLI is distinct from the runtime reporting
+skill installed in a Workspace; neither substitutes for the other or proves runtime
+reporting behavior. This direction does not change acceptance criteria or claim a
+deployment/validation result.
 
 2026-11-07 22:44Z — EH-C1 implementation binding: use the existing SQLite store,
 Task-backed execution authority and Attempt/Session records as internal migration
@@ -597,9 +611,19 @@ If build tools are missing, record the environment blocker rather than skipping 
 For artifact-affecting milestones also run `nix flake check` and `just image` and
 record output identities. `just docs` must serve the plan and specification links.
 
-Do not invent deployment commands here. Before any isolated deployment, record the approved dotfiles
-revision/procedure, isolated target, immutable images, cost limit and bounded live
-scenario in Artifacts and Notes. If any is missing, stop at that external gate.
+Do not invent deployment commands here. Prospective preparation may inspect the
+dotfiles procedure and render proposed configuration only; render output must show
+the isolated addrspace validation namespace alongside the pinned incumbent, with no
+production overlay/image/ingress/PVC/secret mutation and no promotion. Record the
+dotfiles revision and render evidence here. Render-only output is not deployment or
+runtime validation. Before any live deployment, record explicit approval naming the
+target, reviewed dotfiles revision/procedure, immutable image digest, independently
+scoped credentials, bounded cost and bounded live scenario. Verify the rendered
+diff is confined to the approved isolated namespace and does not modify production
+overlays, images, ingress, PVCs or secrets. If any approval or verification is
+missing, stop before applying anything. After approval, deployment evidence must
+include the exact applied revision/image and runtime observations; do not claim it
+from render output alone.
 Before handoff rerun the relevant tests, fmt and workspace clippy and report results.
 
 ## Validation and Acceptance
