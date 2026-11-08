@@ -2133,10 +2133,13 @@ fn normalized_sandbox_value(record: &SandboxRecord) -> Value {
     json!({"session":session,"run_record":record.run_record,"binding_state":binding_state,"operating_mode":record.operating_mode,"created_at":record.created_at,"telemetry":record.telemetry})
 }
 pub fn router(state: AppState) -> Router {
-    let web_root = env::var_os("ANVIL_WEB_DIR")
+    router_with_web_root(state, web_root_from_env(env::var_os("ANVIL_WEB_DIR")))
+}
+
+fn web_root_from_env(configured: Option<std::ffi::OsString>) -> PathBuf {
+    configured
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("web/dist"));
-    router_with_web_root(state, web_root)
+        .unwrap_or_else(|| PathBuf::from("web/out"))
 }
 
 fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
@@ -2199,6 +2202,7 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
             post(github_credentials),
         )
         .route("/assets/*path", get(static_asset))
+        .route("/_next/static/*path", get(next_static_asset))
         .route("/", get(index))
         .route("/v1/providers", get(providers))
         .route("/v1/providers/:provider/login", post(begin_provider_login))
@@ -4693,12 +4697,24 @@ async fn health() -> Json<Value> {
 }
 
 async fn index(Extension(root): Extension<PathBuf>) -> Response {
-    static_file_at(&root, std::path::Path::new("index.html")).await
+    static_file_at(&root, std::path::Path::new("index.html"), false).await
 }
 
 async fn static_asset(Extension(root): Extension<PathBuf>, Path(path): Path<String>) -> Response {
     let relative = std::path::Path::new("assets").join(path);
-    static_file_at(&root, &relative).await
+    static_file_at(&root, &relative, true).await
+}
+
+async fn next_static_asset(
+    Extension(root): Extension<PathBuf>,
+    Path(path): Path<String>,
+) -> Response {
+    static_file_at(
+        &root,
+        &std::path::Path::new("_next/static").join(path),
+        true,
+    )
+    .await
 }
 
 async fn spa_fallback(Extension(root): Extension<PathBuf>, uri: axum::http::Uri) -> Response {
@@ -4709,17 +4725,35 @@ async fn spa_fallback_at(uri: axum::http::Uri, root: &std::path::Path) -> Respon
     if uri.path().starts_with("/v1/") || uri.path() == "/healthz" || uri.path() == "/readyz" {
         return StatusCode::NOT_FOUND.into_response();
     }
-    static_file_at(root, std::path::Path::new("index.html")).await
+    let relative = match uri.path() {
+        "/" => std::path::PathBuf::from("index.html"),
+        "/campaign" | "/campaign/" => std::path::PathBuf::from("campaign/index.html"),
+        "/commission" | "/commission/" => std::path::PathBuf::from("commission/index.html"),
+        "/sessions" | "/sessions/" => std::path::PathBuf::from("sessions/index.html"),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    static_file_at(root, &relative, false).await
 }
 
-async fn static_file_at(root: &std::path::Path, relative_path: &std::path::Path) -> Response {
+async fn static_file_at(
+    root: &std::path::Path,
+    relative_path: &std::path::Path,
+    immutable: bool,
+) -> Response {
     if relative_path
         .components()
         .any(|component| !matches!(component, std::path::Component::Normal(_)))
     {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let path = root.join(relative_path);
+    let root = match tokio::fs::canonicalize(root).await {
+        Ok(root) => root,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let path = match tokio::fs::canonicalize(root.join(relative_path)).await {
+        Ok(path) if path.starts_with(&root) => path,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
     let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -4727,14 +4761,28 @@ async fn static_file_at(root: &std::path::Path, relative_path: &std::path::Path)
     let content_type = match relative_path.extension().and_then(|value| value.to_str()) {
         Some("html") => "text/html; charset=utf-8",
         Some("js") => "text/javascript; charset=utf-8",
+        Some("mjs") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("svg") => "image/svg+xml",
         Some("json") => "application/json",
         Some("woff2") => "font/woff2",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("txt") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     };
+    let cache_control = if immutable {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
     (
-        [(axum::http::header::CONTENT_TYPE, content_type)],
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (axum::http::header::CACHE_CONTROL, cache_control),
+        ],
         axum::body::Body::from(bytes),
     )
         .into_response()
@@ -9074,6 +9122,15 @@ mod tests {
     }
 
     #[test]
+    fn default_web_root_is_next_static_export_directory() {
+        assert_eq!(web_root_from_env(None), PathBuf::from("web/out"));
+        assert_eq!(
+            web_root_from_env(Some("/tmp/custom-web".into())),
+            PathBuf::from("/tmp/custom-web")
+        );
+    }
+
+    #[test]
     fn campaign_work_instruction_uses_persisted_hierarchy_and_attempt() {
         let directory = tempfile::tempdir().unwrap();
         let db =
@@ -13255,57 +13312,134 @@ mod tests {
             "export const app = true"
         );
 
-        let session_route = static_app
+        let not_a_page = static_app
             .clone()
             .oneshot(Request::get("/session/demo").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(session_route.status(), StatusCode::OK);
-        assert_eq!(
-            session_route.headers()["content-type"],
-            "text/html; charset=utf-8"
-        );
-        let session_body = axum::body::to_bytes(session_route.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(std::str::from_utf8(&session_body)
-            .unwrap()
-            .contains("/assets/app-abc.js"));
+        assert_eq!(not_a_page.status(), StatusCode::NOT_FOUND);
         let missing_api = static_app
+            .clone()
             .oneshot(Request::get("/v1/missing").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(missing_api.status(), StatusCode::NOT_FOUND);
 
-        let built_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/dist");
-        if let Ok(built_index) = tokio::fs::read_to_string(built_root.join("index.html")).await {
+        for page in ["campaign", "commission", "sessions"] {
+            tokio::fs::create_dir_all(assets.path().join(page))
+                .await
+                .unwrap();
+            tokio::fs::write(
+                assets.path().join(page).join("index.html"),
+                format!("<!doctype html><main>{page}</main>"),
+            )
+            .await
+            .unwrap();
+        }
+        for (route, page) in [
+            ("/campaign?id=cmp_123", "campaign"),
+            ("/commission?id=cm_456", "commission"),
+            ("/sessions", "sessions"),
+        ] {
+            let response = static_app
+                .clone()
+                .oneshot(Request::get(route).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "page {route}");
+            assert_eq!(response.headers()["cache-control"], "no-cache");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(std::str::from_utf8(&body).unwrap().contains(page));
+        }
+
+        tokio::fs::create_dir_all(assets.path().join("_next/static/chunks"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            assets.path().join("_next/static/chunks/app.js"),
+            "export const next = true",
+        )
+        .await
+        .unwrap();
+        let next_asset = static_app
+            .clone()
+            .oneshot(
+                Request::get("/_next/static/chunks/app.js?v=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(next_asset.status(), StatusCode::OK);
+        assert_eq!(
+            next_asset.headers()["content-type"],
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            next_asset.headers()["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(outside.path(), "secret").await.unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                outside.path(),
+                assets.path().join("_next/static/chunks/leak.js"),
+            )
+            .unwrap();
+            let traversal = static_app
+                .oneshot(
+                    Request::get("/_next/static/chunks/leak.js")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(traversal.status(), StatusCode::NOT_FOUND);
+        }
+
+        let built_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/out");
+        if built_root.is_dir() {
+            let built_index = tokio::fs::read_to_string(built_root.join("index.html"))
+                .await
+                .expect("Next export should contain index.html");
             let built_app = router_with_web_root(app_state, built_root);
             let asset_urls = built_index
-                .split("/assets/")
+                .split("/_next/static/")
                 .skip(1)
                 .filter_map(|part| part.split(['\"', '\'']).next())
-                .filter(|path| !path.is_empty())
+                .filter(|path| path.ends_with(".js") || path.ends_with(".css"))
                 .collect::<Vec<_>>();
-            assert!(!asset_urls.is_empty(), "Vite index should reference assets");
+            assert!(
+                !asset_urls.is_empty(),
+                "Next index should reference script or CSS assets"
+            );
             for path in asset_urls {
                 let response = built_app
                     .clone()
                     .oneshot(
-                        Request::get(format!("/assets/{path}"))
+                        Request::get(format!("/_next/static/{path}"))
                             .body(Body::empty())
                             .unwrap(),
                     )
                     .await
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::OK, "asset {path}");
-                assert!(response.headers()["content-type"]
-                    .to_str()
-                    .unwrap()
-                    .starts_with(if path.ends_with(".css") {
-                        "text/css"
-                    } else {
-                        "text/javascript"
-                    }));
+                assert!(
+                    response.headers()["content-type"]
+                        .to_str()
+                        .unwrap()
+                        .starts_with(if path.ends_with(".css") {
+                            "text/css"
+                        } else {
+                            "text/javascript"
+                        }),
+                    "asset {path}"
+                );
             }
         }
     }

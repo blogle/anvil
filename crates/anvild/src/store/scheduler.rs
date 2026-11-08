@@ -972,18 +972,16 @@ mod tests {
         }
         let claimed = store.claim_runnable(1, 100, 5, 0).unwrap();
         let attempt_id = claimed[0].attempt["attempt_id"].as_str().unwrap();
-        assert!(
-            !store
-                .record_attempt_failure(
-                    attempt_id,
-                    FailureClass::Infrastructure,
-                    "temporary failure",
-                    100,
-                    5,
-                    10,
-                )
-                .unwrap()
-        );
+        assert!(!store
+            .record_attempt_failure(
+                attempt_id,
+                FailureClass::Infrastructure,
+                "temporary failure",
+                100,
+                5,
+                10,
+            )
+            .unwrap());
         drop(store);
 
         let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();

@@ -1,0 +1,5 @@
+{
+  "type": "feat",
+  "semver": "minor",
+  "summary": "Replace the operator frontend with a Next.js Campaign, Commission and Session workspace"
+}

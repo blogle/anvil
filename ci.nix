@@ -26,7 +26,7 @@ let
     pname = "anvil-web-test-dependencies";
     version = "0.1.0";
     src = ./web;
-    npmDepsHash = "sha256-jSbL4XIRQbOg6DGmouNpFpiVHE9MNKLJn3Wxzfn0yfk=";
+    npmDepsHash = "sha256-Ggps6Vi7SpFUDmOSH6nmQUHd62mNTE7fhPJVkp545/s=";
     dontNpmBuild = true;
     installPhase = ''
       mkdir -p "$out/node_modules"
@@ -44,7 +44,11 @@ let
     chmod u+w "$work"
     ln -s "$nodeModules/node_modules" "$work/node_modules"
     cd "$work"
-    node node_modules/tsx/dist/cli.mjs --test files-state.test.js state.test.js
+    npm test
+    test -f out/index.html
+    test -f out/campaign/index.html
+    test -f out/commission/index.html
+    test -f out/sessions/index.html
     mkdir -p "$out"
   '';
   staticSource = pkgs.lib.cleanSourceWith {

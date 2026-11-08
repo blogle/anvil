@@ -38,11 +38,11 @@
           pname = "anvil-web";
           version = "0.1.0";
           src = ./web;
-          npmDepsHash = "sha256-jSbL4XIRQbOg6DGmouNpFpiVHE9MNKLJn3Wxzfn0yfk=";
+          npmDepsHash = "sha256-Ggps6Vi7SpFUDmOSH6nmQUHd62mNTE7fhPJVkp545/s=";
           npmBuildScript = "build";
           installPhase = ''
             mkdir -p $out
-            cp -r dist/. $out/
+            cp -r out/. $out/
           '';
         };
         sandbox = import ./nix/sandbox.nix {

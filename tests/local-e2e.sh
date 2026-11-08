@@ -87,7 +87,7 @@ export ANVIL_PREVIEW_DOMAIN=localhost ANVIL_ANNOTATION_PREFIX=anvil.local
 export ANVIL_PROFILE_OPENCODE_URL=http://127.0.0.1:4097 ANVIL_CREDENTIAL_URL=http://127.0.0.1:8080
 export ANVIL_SESSION_SIGNING_SECRET=anvil-local-development-only-signing-secret
 export ANVIL_HISTORY_PATH="$tmp/history.jsonl"
-export ANVIL_WEB_DIR="${ANVIL_WEB_DIR:-$root/web/dist}"
+export ANVIL_WEB_DIR="${ANVIL_WEB_DIR:-$root/web/out}"
 unset ANVIL_STORE_PATH
 RUST_LOG="${RUST_LOG:-info}" "$anvild_bin" >"$tmp/anvild.log" 2>&1 & api_pid=$!
 
@@ -242,7 +242,10 @@ assert_http_smoke() {
   local index asset_paths asset_path=
   index="$(curl -fsS http://127.0.0.1:8080/)"
   grep -q '<html' <<<"$index"
-  asset_paths="$(grep -oE '/assets/[^"[:space:]]+' <<<"$index" || true)"
+  for route in campaign commission sessions; do
+    curl -fsS "http://127.0.0.1:8080/$route" >/dev/null
+  done
+  asset_paths="$(grep -oE '/_next/static/[^"[:space:]]+' <<<"$index" || true)"
   while IFS= read -r asset_path; do
     break
   done <<<"$asset_paths"
