@@ -2294,21 +2294,19 @@ struct StartCommissionRequest {
 async fn start_commission(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<StartCommissionRequest>,
 ) -> Result<Json<Value>, ServiceError> {
+    let key = headers
+        .get("Idempotency-Key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ServiceError::Invalid("Idempotency-Key header is required".into()))?;
     let store = state
         .store()
         .map_err(|error| ServiceError::Store(error.into()))?;
-    store
-        .start_commission(&id, request.expected_version)
-        .map(Json)
-        .map_err(|error| match error {
-            store::StoreError::NotFound => ServiceError::NotFound,
-            store::StoreError::Conflict => {
-                ServiceError::Conflict("commission version precondition failed".into())
-            }
-            other => ServiceError::Store(other.to_string()),
-        })
+    campaign::start_commission(store, &id, key, request.expected_version).map(Json)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -3035,6 +3033,9 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
                 .get_resource("attempt", &active.attempt_id)
                 .map_err(|error| ServiceError::Store(error.to_string()))?
                 .ok_or(ServiceError::NotFound)?;
+            store
+                .set_attempt_and_task_state(&active.attempt_id, "running", "running")
+                .map_err(|error| ServiceError::Store(error.to_string()))?;
             dispatch_commission_prompt(
                 state,
                 &session_id,
@@ -3185,6 +3186,9 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
                     // Run records are committed before prompt dispatch. Their
                     // absence therefore proves this provisioned sandbox has
                     // not yet submitted its initial turn.
+                    store
+                        .set_attempt_and_task_state(attempt_id, "running", "running")
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
                     let instruction = commission_instruction(store, &claim.task, &claim.attempt)?;
                     dispatch_commission_prompt(state, &session_id, instruction);
                     continue;
@@ -3267,6 +3271,9 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
                     .bind_attempt_session(attempt_id, &session.id)
                     .map_err(|error| ServiceError::Store(error.to_string()))?;
                 if is_commission {
+                    store
+                        .set_attempt_and_task_state(attempt_id, "running", "running")
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
                     dispatch_commission_prompt(
                         state,
                         &session.id,
@@ -4542,6 +4549,9 @@ async fn idempotency_middleware(
     if key.is_none()
         || path == "/v1/batches"
         || (path == "/v1/campaigns" && method == axum::http::Method::POST)
+        || (method == axum::http::Method::POST
+            && path.starts_with("/v1/commissions/")
+            && path.ends_with("/start"))
         || (method == axum::http::Method::POST
             && matches!(path.as_str(), "/v1/tasks" | "/v1/tasks/graph"))
         || (path.starts_with("/v1/tasks/") && path.ends_with("/attempts"))
@@ -9082,7 +9092,8 @@ mod tests {
         let commission_id = accepted.task["commissions"][0]["commission_id"]
             .as_str()
             .unwrap();
-        db.start_commission(commission_id, 1).unwrap();
+        db.start_commission("instruction-start", commission_id, 1)
+            .unwrap();
         let claim = db.claim_runnable(1, 0, 2, 0).unwrap().remove(0);
         let commission = db.get_commission(commission_id).unwrap().unwrap();
         let campaign = db
@@ -9117,7 +9128,8 @@ mod tests {
         let commission_id = accepted.task["commissions"][0]["commission_id"]
             .as_str()
             .unwrap();
-        db.start_commission(commission_id, 1).unwrap();
+        db.start_commission("detection-start", commission_id, 1)
+            .unwrap();
         let claim = db.claim_runnable(1, 0, 2, 0).unwrap().remove(0);
         db.bind_attempt_session(
             claim.attempt["attempt_id"].as_str().unwrap(),
@@ -9127,6 +9139,39 @@ mod tests {
 
         assert!(commission_attempt_for_session(&db, "commission-session").unwrap());
         assert!(!commission_attempt_for_session(&db, "other-session").unwrap());
+    }
+
+    #[test]
+    fn fast_commission_turn_can_complete_before_scheduler_observation() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = store::ControllerStore::open(directory.path().join("fast-turn.sqlite3")).unwrap();
+        let request = json!({"campaign":{"purpose":"test","shared_contracts":[]},"commissions":[
+            {"local_key":"work","objective":"Implement the feature","obligations":[{"id":"obligation","version":1,"requirement":"Deliver","acceptance_expectations":["test passes"]}],"execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},"budget":{"max_attempts":2,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},"start_after":[],"integration_after":[]}
+        ]});
+        let validated = anvil_core::validate_campaign_submission(
+            serde_json::from_value(request.clone()).unwrap(),
+        )
+        .unwrap();
+        let accepted = db
+            .accept_campaign("fast-turn-key", "test", &request, &validated)
+            .unwrap();
+        let commission_id = accepted.task["commissions"][0]["commission_id"]
+            .as_str()
+            .unwrap();
+        db.start_commission("fast-turn-start", commission_id, 1)
+            .unwrap();
+        let claim = db.claim_runnable(1, 0, 2, 0).unwrap().remove(0);
+        let attempt_id = claim.attempt["attempt_id"].as_str().unwrap();
+        db.bind_attempt_session(attempt_id, "fast-turn-session")
+            .unwrap();
+
+        // Dispatch follows this durable transition, so a turn completing
+        // before the next scheduler observation is valid state.
+        db.set_attempt_and_task_state(attempt_id, "running", "running")
+            .unwrap();
+        db.set_attempt_turn_completed(attempt_id).unwrap();
+        let attempt = db.get_resource("attempt", attempt_id).unwrap().unwrap();
+        assert_eq!(attempt["state"], "completed");
     }
 
     #[tokio::test]
@@ -9239,21 +9284,82 @@ mod tests {
         let commission_id = accepted["commissions"][0]["commission_id"]
             .as_str()
             .unwrap();
-        let start = |version| {
+        let start = |version, key: &str| {
             Request::builder()
                 .method("POST")
                 .uri(format!("/v1/commissions/{commission_id}/start"))
+                .header("Idempotency-Key", key)
                 .header("content-type", "application/json")
                 .body(Body::from(json!({"expected_version":version}).to_string()))
                 .unwrap()
         };
         assert_eq!(
-            restarted.clone().oneshot(start(99)).await.unwrap().status(),
+            restarted
+                .clone()
+                .oneshot(start(99, "bad-version"))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::CONFLICT
         );
+        let current = restarted
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/commissions/{commission_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let current: Value = serde_json::from_slice(
+            &axum::body::to_bytes(current.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let accepted_version = current["version"].as_u64().unwrap();
+        let started = restarted
+            .clone()
+            .oneshot(start(accepted_version, "http-start-key"))
+            .await
+            .unwrap();
+        let started_status = started.status();
+        let started: Value = serde_json::from_slice(
+            &axum::body::to_bytes(started.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(started_status, StatusCode::OK, "{started}");
+        assert_eq!(started["receipt"]["idempotency_key"], "http-start-key");
+        assert_eq!(started["receipt"]["commission_id"], commission_id);
+        assert_eq!(started["receipt"]["accepted_version"], accepted_version);
+        assert_eq!(started["commission"]["version"], accepted_version + 1);
+
+        // A retry after the durable transition uses the original precondition and
+        // returns the current projection alongside the stable acceptance receipt.
+        let replay = restarted
+            .clone()
+            .oneshot(start(accepted_version, "http-start-key"))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: Value = serde_json::from_slice(
+            &axum::body::to_bytes(replay.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay["receipt"], started["receipt"]);
+        assert_eq!(replay["commission"]["version"], accepted_version + 1);
         assert_eq!(
-            restarted.oneshot(start(1)).await.unwrap().status(),
-            StatusCode::OK
+            restarted
+                .oneshot(start(accepted_version, "another-start-key"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
         );
     }
 

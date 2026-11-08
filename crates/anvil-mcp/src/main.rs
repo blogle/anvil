@@ -113,6 +113,7 @@ struct CampaignPage {
 struct CommissionStart {
     id: String,
     expected_version: u64,
+    idempotency_key: String,
 }
 
 #[derive(Clone)]
@@ -360,17 +361,18 @@ impl AnvilMcp {
     }
 
     #[rmcp::tool(
-        description = "Explicitly authorize a queued Commission to start, guarded by its current version."
+        description = "Explicitly authorize a queued Commission to start, guarded by its current version and a required idempotency key."
     )]
     async fn anvil_start_commission(
         &self,
         Parameters(p): Parameters<CommissionStart>,
     ) -> Result<Json<Value>, ErrorData> {
         Ok(Json(
-            self.call(
+            self.call_with_key(
                 Method::POST,
                 &format!("v1/commissions/{}/start", p.id),
                 Some(json!({"expected_version":p.expected_version})),
+                Some(&p.idempotency_key),
             )
             .await?,
         ))
@@ -871,6 +873,7 @@ mod tests {
         let start = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/v1/commissions/cm1/start")
+                .header("idempotency-key", "start-cm1")
                 .json_body(json!({"expected_version":4}));
             then.status(200)
                 .json_body(json!({"version":5,"start_authorized":true}));
@@ -911,7 +914,8 @@ mod tests {
         assert_eq!(
             mcp.anvil_start_commission(Parameters(CommissionStart {
                 id: "cm1".into(),
-                expected_version: 4
+                expected_version: 4,
+                idempotency_key: "start-cm1".into()
             }))
             .await
             .unwrap()

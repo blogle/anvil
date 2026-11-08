@@ -51,6 +51,14 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
+# Refuse to share fixture/controller endpoints with an unrelated service/run.
+for port in 4097 4098 8080 8443; do
+  if ss -H -ltn "sport = :$port" | grep -q .; then
+    printf 'local E2E port %s is already in use; refusing to touch existing processes or sessions\n' "$port" >&2
+    exit 1
+  fi
+done
+
 if [ -n "${ANVIL_PREBUILT_BIN_DIR:-}" ]; then
   anvild_bin="$ANVIL_PREBUILT_BIN_DIR/anvild"
   model_bin="$ANVIL_PREBUILT_BIN_DIR/anvil-test-model"
@@ -169,6 +177,28 @@ worker_health() {
   poll "http://$(jq -r .service <<<"$session"):$(jq -r .opencode_port <<<"$session")/api/info"
 }
 
+model_request_count() {
+  node - "$tmp/model.log" "$1" <<'NODE'
+const fs = require("node:fs");
+const marker = process.argv[3];
+let count = 0;
+for (const line of fs.readFileSync(process.argv[2], "utf8").split(/\r?\n/)) {
+  const prefix = "deterministic responses request: ";
+  const start = line.indexOf(prefix);
+  if (start < 0) continue;
+  try {
+    const request = JSON.parse(line.slice(start + prefix.length));
+    const encoded = JSON.stringify(request);
+    if (encoded.includes("You are a title generator.")) continue;
+    if (!encoded.includes(marker)) continue;
+    if (!Array.isArray(request.tools) || request.tools.length === 0) continue;
+    count += 1;
+  } catch {}
+}
+process.stdout.write(String(count));
+NODE
+}
+
 poll http://127.0.0.1:4098/healthz
 poll http://127.0.0.1:4097/api/info
 poll http://127.0.0.1:8080/readyz
@@ -183,6 +213,9 @@ repository="file://$fixture"
 git_http_root="$tmp/git-http"
 mkdir -p "$git_http_root"
 git clone --bare "$fixture" "$git_http_root/repo.git" >/dev/null 2>&1
+# Enable receive-pack only for this disposable E2E repository. The global Git
+# HTTP receive-pack setting must remain untouched.
+git --git-dir="$git_http_root/repo.git" config http.receivepack true
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$tmp/git-http.key" -out "$tmp/git-http.crt" -days 1 -subj /CN=127.0.0.1 >/dev/null 2>&1
 task_repository="https://127.0.0.1:8443/repo.git"
 node "$root/tests/git-http-fixture.mjs" "$git_http_root" "$tmp/git-http.crt" "$tmp/git-http.key" 8443 >"$tmp/git-http.log" 2>&1 & git_http_pid=$!
@@ -366,7 +399,7 @@ printf 'concurrent workers, isolated endpoints/state/lifecycle: %ds\n' "$((SECON
 # recovery duplicates without treating an interrupted prompt as completed.
 scenario_start=$SECONDS
 curl -fsS -X POST http://127.0.0.1:4098/__test/hold >/dev/null
-campaign_request="$(jq -n --arg repository "$task_repository" '{campaign:{purpose:"local E2E campaign",shared_contracts:[]},commissions:[{local_key:"e2e-edit",objective:"ANVIL-E2E:edit-file ANVIL-E2E:wait-for-release change target.txt from before to after.",obligations:[{id:"target-after",version:1,requirement:"target.txt contains after",acceptance_expectations:["target.txt is after"]}],execution_target:{kind:"git_repository",project:"campaign-e2e",repository:$repository,base_ref:"main",delivery:"local_branch"},budget:{max_attempts:1,max_continuations_per_reason:1,max_verifier_cycles:0,max_ci_retries:0,max_execution_seconds:180,max_model_cost:"0"}}]}')"
+campaign_request="$(jq -n --arg repository "$task_repository" '{campaign:{purpose:"local E2E campaign",shared_contracts:[]},commissions:[{local_key:"e2e-edit",objective:"ANVIL-E2E:edit-file ANVIL-E2E:campaign-publish-local-fixture ANVIL-E2E:wait-for-release edit target.txt, commit, push, and publish locally.",obligations:[{id:"target-after",version:1,requirement:"target.txt contains after",acceptance_expectations:["target.txt is after"]}],execution_target:{kind:"git_repository",project:"campaign-e2e",repository:$repository,base_ref:"main",delivery:"local_branch"},budget:{max_attempts:1,max_continuations_per_reason:1,max_verifier_cycles:0,max_ci_retries:0,max_execution_seconds:180,max_model_cost:"0"}}]}')"
 campaign="$(curl --max-time 10 -fsS -H 'content-type: application/json' -H 'idempotency-key: local-e2e-campaign' -d "$campaign_request" http://127.0.0.1:8080/v1/campaigns)"
 campaign_again="$(curl --max-time 10 -fsS -H 'content-type: application/json' -H 'idempotency-key: local-e2e-campaign' -d "$campaign_request" http://127.0.0.1:8080/v1/campaigns)"
 campaign_id="$(jq -r .campaign_id <<<"$campaign")"
@@ -378,9 +411,10 @@ aggregate="$(curl -fsS "http://127.0.0.1:8080/v1/campaigns/$campaign_id?limit=1"
 jq -e --arg commission "$commission_id" 'any(.commissions[]; .commission_id == $commission)' <<<"$aggregate" >/dev/null
 commission="$(curl -fsS "http://127.0.0.1:8080/v1/commissions/$commission_id")"
 jq -e '.state == "queued"' <<<"$commission" >/dev/null
-curl -fsS -X POST -H 'content-type: application/json' -d "$(jq -n --argjson version "$(jq -r .version <<<"$commission")" '{expected_version:$version}')" "http://127.0.0.1:8080/v1/commissions/$commission_id/start" >/dev/null
-# Commission/task IDs share their stable identifier; the start response is the
-# updated Commission aggregate, not a task-acceptance response.
+start_request="$(jq -n --argjson version "$(jq -r .version <<<"$commission")" '{expected_version:$version}')"
+curl -fsS -X POST -H 'content-type: application/json' -H 'idempotency-key: local-e2e-commission-start' -d "$start_request" "http://127.0.0.1:8080/v1/commissions/$commission_id/start" >/dev/null
+# Commission/task IDs share their stable identifier; start returns a receipt
+# and the current Commission projection, not a terminal lifecycle claim.
 task_id="$commission_id"
 deadline=$((SECONDS + 90))
 session_id=""
@@ -406,15 +440,21 @@ deadline=$((SECONDS + 120))
 while (( SECONDS < deadline )); do
   if [ -f "$campaign_workspace/target.txt" ] && [ "$(cat "$campaign_workspace/target.txt")" = after ] \
     && [ "$(git -C "$campaign_workspace" branch --show-current 2>/dev/null || true)" != main ] \
-    && [ "$(git -C "$campaign_workspace" status --porcelain 2>/dev/null || true)" = " M target.txt" ]; then
+    && [ -z "$(git -C "$campaign_workspace" status --porcelain 2>/dev/null || true)" ] \
+    && [ "$(curl -ksS https://127.0.0.1:8443/__fixture/pr 2>/dev/null | jq '.pull_requests | length')" = 1 ]; then
     break
   fi
   sleep 0.3
 done
 test "$(<"$campaign_workspace/target.txt")" = after
-test "$(git -C "$campaign_workspace" status --porcelain)" = " M target.txt"
+test -z "$(git -C "$campaign_workspace" status --porcelain)"
 jq -e '.. | strings | select(contains("+after"))' <<<"$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$session_id/diff")" >/dev/null
-test "$(git -C "$campaign_workspace" branch --show-current)" != main
+campaign_branch="$(git -C "$campaign_workspace" branch --show-current)"
+campaign_sha="$(git -C "$campaign_workspace" rev-parse HEAD)"
+test "$campaign_branch" != main
+test "$(git --git-dir="$git_http_root/repo.git" rev-parse "refs/heads/$campaign_branch")" = "$campaign_sha"
+fixture_pr="$(curl -ksS https://127.0.0.1:8443/__fixture/pr)"
+jq -e --arg branch "$campaign_branch" --arg sha "$campaign_sha" '.pull_requests | length == 1 and .[0].id == "local-pr-1" and .[0].provider == "local-fixture-not-github" and .[0].repository == "campaign-e2e" and .[0].base_ref == "main" and .[0].branch == $branch and .[0].commit_sha == $sha' <<<"$fixture_pr" >/dev/null
 kill "$api_pid"
 wait "$api_pid" 2>/dev/null || true
 RUST_LOG="${RUST_LOG:-info}" "$anvild_bin" >"$tmp/anvild-campaign-restarted.log" 2>&1 & api_pid=$!
@@ -428,9 +468,103 @@ test "$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$session_id" | jq -r .openc
 test "$(jq '.attempts | length' <<<"$commission_after_restart")" = 1
 test "$(jq -r '.attempts[0].session_id' <<<"$commission_after_restart")" = "$session_id"
 test "$(<"$campaign_workspace/target.txt")" = after
-test "$(git -C "$campaign_workspace" status --porcelain)" = " M target.txt"
+test -z "$(git -C "$campaign_workspace" status --porcelain)"
 jq -e '.. | strings | select(contains("+after"))' <<<"$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$session_id/diff")" >/dev/null
-test "$(git -C "$campaign_workspace" branch --show-current)" != main
-printf 'Campaign idempotent submit/start, worker diff/branch and restart identity (campaign=%s commission=%s task=%s session=%s opencode=%s): %ds\n' "$campaign_id" "$commission_id" "$task_id" "$session_id" "$opencode_id" "$((SECONDS - scenario_start))"
+test "$(git -C "$campaign_workspace" branch --show-current)" = "$campaign_branch"
+test "$(git -C "$campaign_workspace" rev-parse HEAD)" = "$campaign_sha"
+test "$(git --git-dir="$git_http_root/repo.git" rev-parse "refs/heads/$campaign_branch")" = "$campaign_sha"
+fixture_pr_after="$(curl -ksS https://127.0.0.1:8443/__fixture/pr)"
+jq -e --arg branch "$campaign_branch" --arg sha "$campaign_sha" '.pull_requests | length == 1 and .[0].id == "local-pr-1" and .[0].provider == "local-fixture-not-github" and .[0].repository == "campaign-e2e" and .[0].base_ref == "main" and .[0].branch == $branch and .[0].commit_sha == $sha' <<<"$fixture_pr_after" >/dev/null
+messages_before_start_replay="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$session_id/messages")"
+replay_status="$(curl -sS -o "$tmp/start-replay.json" -w '%{http_code}' -X POST -H 'content-type: application/json' -H 'idempotency-key: local-e2e-commission-start' -d "$start_request" "http://127.0.0.1:8080/v1/commissions/$commission_id/start")"
+test "$replay_status" = 200
+jq -e --arg commission "$commission_id" '.receipt.commission_id == $commission and .receipt.disposition == "authorized" and .commission.commission_id == $commission and .commission.start_authorized == true' "$tmp/start-replay.json" >/dev/null
+conflict_request="$(jq -n --argjson version "$(($(jq -r .version <<<"$commission_after_restart") + 1))" '{expected_version:$version}')"
+conflict_status="$(curl -sS -o "$tmp/start-conflict.json" -w '%{http_code}' -X POST -H 'content-type: application/json' -H 'idempotency-key: local-e2e-commission-start' -d "$conflict_request" "http://127.0.0.1:8080/v1/commissions/$commission_id/start")"
+test "$conflict_status" = 409
+test "$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$session_id/messages")" = "$messages_before_start_replay"
+commission_after_replay="$(curl -fsS "http://127.0.0.1:8080/v1/commissions/$commission_id")"
+test "$(jq '.attempts | length' <<<"$commission_after_replay")" = "$commission_attempts"
+fixture_pr_final="$(curl -ksS https://127.0.0.1:8443/__fixture/pr)"
+jq -e --arg branch "$campaign_branch" --arg sha "$campaign_sha" '.pull_requests | length == 1 and .[0].id == "local-pr-1" and .[0].provider == "local-fixture-not-github" and .[0].repository == "campaign-e2e" and .[0].base_ref == "main" and .[0].branch == $branch and .[0].commit_sha == $sha' <<<"$fixture_pr_final" >/dev/null
+printf 'Campaign idempotent submit/start, worker Git push and local fixture PR (campaign=%s commission=%s task=%s session=%s opencode=%s branch=%s sha=%s pr=local-pr-1 provider=local-fixture-not-github): %ds\n' "$campaign_id" "$commission_id" "$task_id" "$session_id" "$opencode_id" "$campaign_branch" "$campaign_sha" "$((SECONDS - scenario_start))"
+
+# Bound the crash window to a separate, non-publishing Commission and the local
+# deterministic model. Keep the model request held across the controller
+# restart: a durable Submitted run is not evidence that the interrupted model
+# outcome is known, and must not be blindly replayed.
+scenario_start=$SECONDS
+crash_objective='ANVIL-E2E:crash-window ANVIL-E2E:edit-file ANVIL-E2E:wait-for-release inspect target.txt and change before to after; do not commit or publish.'
+crash_request="$(jq -n --arg repository "$task_repository" --arg objective "$crash_objective" '{campaign:{purpose:"local E2E bounded crash window",shared_contracts:[]},commissions:[{local_key:"e2e-crash-window",objective:$objective,obligations:[{id:"target-after",version:1,requirement:"target.txt contains after",acceptance_expectations:["target.txt is after"]}],execution_target:{kind:"git_repository",project:"crash-window-e2e",repository:$repository,base_ref:"main",delivery:"local_branch"},budget:{max_attempts:1,max_continuations_per_reason:1,max_verifier_cycles:0,max_ci_retries:0,max_execution_seconds:60,max_model_cost:"0"}}]}')"
+crash_campaign="$(curl --max-time 10 -fsS -H 'content-type: application/json' -H 'idempotency-key: local-e2e-crash-window-campaign' -d "$crash_request" http://127.0.0.1:8080/v1/campaigns)"
+crash_campaign_id="$(jq -r .campaign_id <<<"$crash_campaign")"
+crash_commission_id="$(jq -r '.commissions[0].commission_id' <<<"$crash_campaign")"
+test -n "$crash_campaign_id" && test "$crash_campaign_id" != null
+test -n "$crash_commission_id" && test "$crash_commission_id" != null
+curl -fsS -X POST http://127.0.0.1:4098/__test/hold >/dev/null
+crash_commission="$(curl -fsS "http://127.0.0.1:8080/v1/commissions/$crash_commission_id")"
+crash_start_request="$(jq -n --argjson version "$(jq -r .version <<<"$crash_commission")" '{expected_version:$version}')"
+curl --max-time 10 -fsS -X POST -H 'content-type: application/json' -H 'idempotency-key: local-e2e-crash-window-start' -d "$crash_start_request" "http://127.0.0.1:8080/v1/commissions/$crash_commission_id/start" >/dev/null
+deadline=$((SECONDS + 30))
+crash_session_id=""
+while (( SECONDS < deadline )); do
+  crash_commission="$(curl --max-time 3 -fsS "http://127.0.0.1:8080/v1/commissions/$crash_commission_id")"
+  crash_session_id="$(jq -r '.attempts[0].session_id // empty' <<<"$crash_commission")"
+  if [ -n "$crash_session_id" ]; then
+    crash_status="$(curl --max-time 3 -fsS "http://127.0.0.1:8080/v1/sessions/$crash_session_id/status")"
+    if jq -e '.current_run.state == "submitted"' <<<"$crash_status" >/dev/null 2>&1; then break; fi
+  fi
+  sleep 0.2
+done
+test -n "$crash_session_id"
+jq -e '.current_run.state == "submitted"' <<<"$crash_status" >/dev/null
+crash_session="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$crash_session_id")"
+crash_opencode_id="$(jq -r .opencode_session_id <<<"$crash_session")"
+test -n "$crash_opencode_id" && test "$crash_opencode_id" != null
+crash_attempt_count="$(jq '.attempts | length' <<<"$crash_commission")"
+test "$crash_attempt_count" = 1
+crash_run_id="$(jq -r .current_run.id <<<"$crash_status")"
+crash_user_message_id="$(jq -r .current_run.user_message_id <<<"$crash_status")"
+test -n "$crash_run_id" && test "$crash_run_id" != null
+test -n "$crash_user_message_id" && test "$crash_user_message_id" != null
+# Submitted is durable before OpenCode necessarily sends the request. Wait for
+# the unique objective to reach the gated model with tools, not an earlier
+# scenario's generic edit-file prompt or title-generation request.
+deadline=$((SECONDS + 30))
+crash_model_requests=0
+while (( SECONDS < deadline )); do
+  crash_model_requests="$(model_request_count ANVIL-E2E:crash-window)"
+  if [ "$crash_model_requests" -gt 0 ]; then break; fi
+  sleep 0.2
+done
+if [ "$crash_model_requests" -eq 0 ]; then
+  printf 'timed out waiting for a tool-bearing model request containing ANVIL-E2E:crash-window\n' >&2
+  grep -F 'deterministic responses request:' "$tmp/model.log" | tail -n 20 >&2 || true
+  exit 1
+fi
+kill "$api_pid"
+wait "$api_pid" 2>/dev/null || true
+RUST_LOG="${RUST_LOG:-info}" "$anvild_bin" >"$tmp/anvild-crash-window-restarted.log" 2>&1 & api_pid=$!
+poll http://127.0.0.1:8080/readyz
+crash_commission_after_restart="$(curl -fsS "http://127.0.0.1:8080/v1/commissions/$crash_commission_id")"
+test "$(jq '.attempts | length' <<<"$crash_commission_after_restart")" = "$crash_attempt_count"
+test "$(jq -r '.attempts[0].session_id' <<<"$crash_commission_after_restart")" = "$crash_session_id"
+test "$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$crash_session_id" | jq -r .opencode_session_id)" = "$crash_opencode_id"
+jq -e --arg run "$crash_run_id" --arg message "$crash_user_message_id" '(.current_run // .last_run).id == $run and (.current_run // .last_run).user_message_id == $message' \
+  <<<"$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$crash_session_id/status")" >/dev/null
+# Leave two full scheduler intervals for recovery to act; no extra model request
+# or prompt may be submitted while the original run's result remains unknown.
+sleep 3
+crash_commission_after_ticks="$(curl -fsS "http://127.0.0.1:8080/v1/commissions/$crash_commission_id")"
+crash_status_after_ticks="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$crash_session_id/status")"
+test "$(jq '.attempts | length' <<<"$crash_commission_after_ticks")" = "$crash_attempt_count"
+test "$(jq -r '.attempts[0].session_id' <<<"$crash_commission_after_ticks")" = "$crash_session_id"
+jq -e --arg run "$crash_run_id" --arg message "$crash_user_message_id" '(.current_run // .last_run).id == $run and (.current_run // .last_run).user_message_id == $message' <<<"$crash_status_after_ticks" >/dev/null
+crash_model_requests_after="$(model_request_count ANVIL-E2E:crash-window)"
+test "$crash_model_requests_after" = "$crash_model_requests"
+# Release only to avoid leaving the local fixture handler blocked. Its outcome
+# after the client/controller interruption is intentionally not asserted.
+curl -fsS -X POST http://127.0.0.1:4098/__test/release >/dev/null
+printf 'bounded Submitted crash window (campaign=%s commission=%s session=%s opencode=%s attempts=%s model_requests=%s->%s; outcome unknown, not replayed): %ds\n' "$crash_campaign_id" "$crash_commission_id" "$crash_session_id" "$crash_opencode_id" "$crash_attempt_count" "$crash_model_requests" "$crash_model_requests_after" "$((SECONDS - scenario_start))"
 
 printf 'frontend/API smoke: passed\ntotal: %ds\n' "$((SECONDS - start_time))"

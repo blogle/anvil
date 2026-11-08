@@ -45,3 +45,21 @@ pub fn commission(store: &store::ControllerStore, id: &str) -> Result<Value, Ser
         .map_err(|error| ServiceError::Store(error.to_string()))?
         .ok_or(ServiceError::NotFound)
 }
+
+pub fn start_commission(
+    store: &store::ControllerStore,
+    id: &str,
+    key: &str,
+    expected_version: u64,
+) -> Result<Value, ServiceError> {
+    store
+        .start_commission(key, id, expected_version)
+        .map_err(|error| match error {
+            store::StoreError::NotFound => ServiceError::NotFound,
+            store::StoreError::Conflict => ServiceError::Conflict(
+                "commission version or idempotency precondition failed".into(),
+            ),
+            store::StoreError::InvalidState(message) => ServiceError::Invalid(message),
+            other => ServiceError::Store(other.to_string()),
+        })
+}

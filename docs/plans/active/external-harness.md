@@ -41,6 +41,9 @@ against an assumed environment. Production promotion is outside this campaign.
 - [x] (2026-11-07 22:44Z) EH-C1 execution baseline reconciled: `anvil/incremental-roadmap` at `a4d36658a81001c572174906b96b6efe40f0eb92`, ahead seven of `origin/main`; no associated PR (`gh pr status`); only pre-existing untracked `node_modules/`, preserved. Local implementation authorized; integration target, registered PR, external model budget and ticket not assigned.
 - [x] (2026-11-08 00:03Z) EH-C1 local increment: Campaign graph validation, additive durable Campaign/Commission records backed by the existing Task/Attempt/Session authority, explicit start, aggregate HTTP/MCP reads, hierarchical instruction and local fixture branch-change/restart demonstration. EH-C1 remains open: integration, live Kubernetes/provider evidence and identified usage/recovery gaps remain.
 - [x] (2026-11-08) EH-C1 review/validation checkpoint: repaired the nullable Batch lookup, pre-submission dispatch stall, Kubernetes runtime-only nil-run panic and unsafe retry. Workspace build, format, all-feature workspace Clippy, 269 workspace tests and disposable local E2E passed. No PR or approved target; EH-C1 is not concluded.
+- [ ] (2026-11-08) EH-C1 deployment-readiness follow-up authorized: finish useful local delivery/recovery/idempotency and capacity/budget evidence, without expanding into EH-C2 or a speculative workflow engine; rerun validation and retain external gates.
+- [x] (2026-11-08) Local follow-up implementation: a scripted OpenCode worker committed/pushed to a disposable Git repo and published to a loopback PR fixture; start has durable key/receipt/restart replay; held submitted-run restart did not duplicate model request. Reviewed detached Task admission regression and added explicit held migration. Final validation and external gates remain open.
+- [x] (2026-11-08 04:21Z) EH-C1 local deployment-readiness checks completed after v16 safety migration: workspace build, fmt, all-feature Clippy, 276 workspace tests, frontend, security and fixture E2E passed. The fixture PR is local-only, and the unknown submitted run was not replayed. EH-C1 remains open for approved integration/live observations.
 - [ ] EH-C2: Obligation-driven progress and reporting.
 - [ ] EH-C3: Deterministic convergence and bounded recovery.
 - [ ] EH-C4: Human control and review workspace.
@@ -97,6 +100,27 @@ An ambiguous prompt submission stops with recovery required rather than blindly
 replaying. The local fixture demonstrates a branch edit then restart; neither
 this nor a worker's claim marks the Commission integrated. These are bounded
 EH-C1 decisions, not a redesign of provider execution or approval policy.
+
+2026-11-08 — Operator authorized closing local EH-C1 deployment-readiness
+gaps before seeking isolated deployment, favoring actual fixture evidence over
+speculative redesign, and explicitly authorized pruning `node_modules/`.
+At follow-up start HEAD `39f0efa5375842fe813dc751df27597ec70406f1`
+on `anvil/incremental-roadmap`, clean tracked tree, no associated PR; root
+`node_modules/` was already absent, and ignored `web/node_modules/` was removed
+with `rm -rf -- node_modules web/node_modules` (exit 0). Prescribed frontend
+validation may recreate the ignored directory; prune again after verification.
+No approved integration target, external model budget or deployment target was
+added by this authorization.
+
+2026-11-08 — To address review finding that a Task accepted without Batch or
+Commission could be silently claimed by the legacy worker with an empty prompt
+or remain queued without an executor, use an additive v16 migration and hold
+new/historical unattached Task intent as `awaiting_controller_mode`. A versioned
+transfer to the Reconciler clears the hold. This is an internal safety adapter
+for the bounded Task migration period, not expansion of the Task public API;
+EH-C4 deletion remains required. The old detached claim assertion had to be
+replaced with a hold/transfer regression test, rather than deleted without
+coverage. This change is relevant to EH-C1-O2/EH-01/EH-10 and EH-C1-O4/EH-04.
 
 2026-11-07 — Operator-approved API scope amendment: delete the Task API rather
 than retain it as a compatibility product surface. Retain batch operations over
@@ -694,6 +718,66 @@ restart, then stable identities and one Attempt afterward. `just frontend-check`
 (16 tests) and `just security-check` also exited 0 in the preceding full
 verification run; those were not repeated after the final Rust changes.
 These are deterministic local fixtures, not real provider/cluster integration.
+
+2026-11-08 EH-C1 local deployment-readiness follow-up (HEAD `39f0efa`, then
+dirty implementation), mapped evidence and limits:
+
+| Obligation / acceptance | New local evidence and remaining limit |
+| --- | --- |
+| EH-C1-O1 / EH-02 | Durable Commission start now records a stable keyed receipt, initial version and current projection; unchanged replay after restart returns the original receipt, changed payload or stale distinct command conflicts. `crates/anvild/src/store.rs`, `crates/anvild/src/campaign.rs`, HTTP and MCP tests. No integrated lifecycle claimed. |
+| EH-C1-O2 / EH-01, EH-10 | Three-Commission deterministic graph test exercises atomic acceptance, explicit start, integration-only parallel admission, start-after block, capacity-one scheduling and restart-stable pages. Unattached legacy Task admission is explicitly held and migrated additively in v16 rather than silently executing an empty prompt. Fixture Git/worker path does not establish Kubernetes, scoped broker, shared Nix or preview. |
+| EH-C1-O3 / EH-03, EH-09, EH-11–EH-13 | `tests/local-e2e.sh` and `crates/anvil-test-model` now exercise actual OpenCode edit, shell test, commit and push to a disposable HTTPS bare repository; the worker POSTs one PR record to loopback `tests/git-http-fixture.mjs`. Fixture PR provider is `local-fixture-not-github`, **not** a live GitHub PR or authoritative merge. Recorded successful local run in `/tmp/opencode/eh-c1-readiness-final.log`: branch `anvil/campaign-e2e-19a31206`, commit `54fde2e22b44f697335542144757c84767d4ce77`, PR `local-pr-1`; start replay 200 and changed-key payload conflict 409 after controller restart, with no second Attempt, Session or PR. |
+| EH-C1-O4 / EH-02, EH-04, EH-05 | Separate local crash-window Commission holds one actual model request across controller restart after durable Submitted; request count remains **1→1** across scheduler ticks and Attempt/Session/run identities stay stable. An unknown outcome is not equated with success or replayed. `attempt_elapsed_ms` is wall-clock, not model execution; `execution_ms`, tokens and cost remain explicitly unavailable and their budgets unenforced. |
+
+Preserved failed fixture diagnostics: `/tmp/opencode/anvil-local-e2e.lmYrEg`
+(pre-integration HTTP start mismatch), `/tmp/opencode/anvil-local-e2e.Yq58bs`
+(scripted model's wrong `bash` tool), `/tmp/opencode/anvil-local-e2e.5Bkfen`
+(incorrect assertion on nested receipt), `/tmp/opencode/eh-c1-delivery-green-attempt.log`
+(standalone Task raced legacy scheduler), `/tmp/opencode/eh-c1-crash-window-attempt.log`
+(restart before model request), and `/tmp/anvil-local-e2e.WGBKqS`
+(fast turn ended before Attempt entered running). These are failed runs, not
+acceptance; fixes and subsequent passing checks are described above. On the
+dirty pre-v16 revision `/tmp/opencode/eh-c1-readiness-final.log` records
+`just build`, fmt, full workspace Clippy, nextest **274 passed, 0 skipped**,
+frontend **16 passed**, security, syntax, diff and prebuilt E2E exiting 0.
+Npm reported two high-severity vulnerabilities; they were not silently
+remediated. After the v16 detached-Task safety fix, the full validation must
+be rerun and recorded separately. The prescribed build may recreate ignored
+`web/node_modules/`; prune it again at handoff under the operator's approval.
+
+2026-11-08 04:21Z post-v16 validation correction: the first workspace nextest
+run after the migration exited 100 with `169 passed, 1 failed, 102 not run`:
+`task_page_applies_lifecycle_runnable_and_external_filters_before_pagination`
+still expected a now-held detached Task to appear runnable (diagnostics
+`/tmp/opencode/eh-c1-readiness-migration.log`). The test now asserts the hold
+and versioned transfer before runnable projection. Subsequent checks from
+repository root on HEAD `39f0efa` plus uncommitted EH-C1 changes all exited 0:
+`just build`; `cargo fmt --check`;
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`;
+`cargo nextest run --workspace` (**276 passed, 0 skipped**);
+`just frontend-check` (**16 tests passed**); `just security-check`;
+`git diff --check`; `bash -n tests/local-e2e.sh`;
+`node --check tests/git-http-fixture.mjs`; and after a free-port check,
+`ANVIL_PREBUILT_BIN_DIR="$PWD/target/debug" ANVIL_E2E_TMPDIR=/tmp/opencode ANVIL_E2E_KEEP=1 just e2e`
+(31 seconds). Full log: `/tmp/opencode/eh-c1-readiness-v16-final.log`.
+Fixture worker branch `anvil/campaign-e2e-14994016`, commit
+`67aee37c21655a6b4fd2426951794ee5d763cd1a`, local PR `local-pr-1`;
+the separate held submitted-run fixture counted model requests **1→1**, one
+Attempt, and did not replay the unknown outcome. No real GitHub/Kubernetes,
+paid model or external repository was involved. `rm -rf -- node_modules
+web/node_modules` exited 0 after validation; neither directory exists at
+this checkpoint. Npm still reports two high-severity audit findings.
+
+Final read-only review found the detached-Task silent queue issue resolved by
+the held migration and confirmed start receipt/no-replay fixture boundaries.
+Its bounded residual observation: v16 directly updates the change projection
+and does not upsert a missing materialization row or prune migration-appended
+changes; representative old-state migration tests pass but the missing-row
+case was not exercised. This does not certify a live database migration;
+retain backup and matched binary/DB recovery rules before deployment. Safe
+completion/integration of a start-dependent upstream Commission and measured
+time/cost enforcement remain outside this local proof. No PR/approved target,
+external cost budget or isolated deployment procedure was granted.
 
 2026-11-08 commit binding: the validated local increment was committed as
 `8ef0a1829b130425839d8fa0e1239aebfa1dbce1` on

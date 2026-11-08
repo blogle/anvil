@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import https from "node:https";
 
 const [root, certificate, key, rawPort] = process.argv.slice(2);
+const pullRequests = [];
 const server = https.createServer(
   { cert: readFileSync(certificate), key: readFileSync(key) },
   (request, response) => {
@@ -10,6 +11,20 @@ const server = https.createServer(
     request.on("data", (chunk) => chunks.push(chunk));
     request.on("end", () => {
       const [path, query = ""] = request.url.split("?", 2);
+      if (path === "/__fixture/pr" && request.method === "POST") {
+        let pr;
+        try { pr = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+        catch { response.writeHead(400); response.end("invalid fixture PR JSON"); return; }
+        if (pr.repository !== "campaign-e2e" || !/^[A-Za-z0-9._/-]+$/.test(pr.branch ?? "") || pr.branch.includes("..") || !/^[0-9a-f]{40,64}$/.test(pr.commit_sha ?? "") || typeof pr.title !== "string") {
+          response.writeHead(400); response.end("invalid local fixture PR identity"); return;
+        }
+        const record = { id: `local-pr-${pullRequests.length + 1}`, ...pr, base_ref: "main", provider: "local-fixture-not-github" };
+        pullRequests.push(record);
+        response.writeHead(201, { "content-type": "application/json" }); response.end(JSON.stringify(record)); return;
+      }
+      if (path === "/__fixture/pr" && request.method === "GET") {
+        response.writeHead(200, { "content-type": "application/json" }); response.end(JSON.stringify({ pull_requests: pullRequests })); return;
+      }
       const backend = spawnSync("git", ["http-backend"], {
         input: Buffer.concat(chunks),
         env: {

@@ -104,8 +104,14 @@ impl ControllerStore {
             if operator_hold || controller_mode != "legacy" {
                 continue;
             }
-            let batch_id = batch_id.unwrap_or_default();
+            // Standalone Tasks are owned by the Reconciler, not the legacy
+            // scheduler. Legacy scheduling remains responsible for Batch work
+            // and explicitly-started Commissions.
             let task: Value = serde_json::from_str(&task_json)?;
+            if batch_id.is_none() && !task["commission_id"].is_string() {
+                continue;
+            }
+            let batch_id = batch_id.unwrap_or_default();
             if task["commission_id"].is_string() && task["start_authorized"] != true {
                 continue;
             }
@@ -735,10 +741,10 @@ fn count_runnable(
 ) -> Result<u32, StoreError> {
     let sql = match batch_id {
         Some(_) => {
-            "SELECT t.task_id,t.state,t.payload_json FROM tasks t JOIN task_durable_state d USING(task_id) WHERE t.batch_id=?1 AND t.state IN ('queued','retry_wait') AND d.operator_hold=0 AND d.controller_mode='legacy' ORDER BY t.rowid"
+            "SELECT t.task_id,t.batch_id,t.state,t.payload_json FROM tasks t JOIN task_durable_state d USING(task_id) WHERE t.batch_id=?1 AND t.state IN ('queued','retry_wait') AND d.operator_hold=0 AND d.controller_mode='legacy' ORDER BY t.rowid"
         }
         None => {
-            "SELECT t.task_id,t.state,t.payload_json FROM tasks t JOIN task_durable_state d USING(task_id) WHERE t.state IN ('queued','retry_wait') AND d.operator_hold=0 AND d.controller_mode='legacy' ORDER BY t.rowid"
+            "SELECT t.task_id,t.batch_id,t.state,t.payload_json FROM tasks t JOIN task_durable_state d USING(task_id) WHERE t.state IN ('queued','retry_wait') AND d.operator_hold=0 AND d.controller_mode='legacy' ORDER BY t.rowid"
         }
     };
     let mut statement = c.prepare(sql)?;
@@ -749,8 +755,12 @@ fn count_runnable(
     };
     while let Some(row) = rows.next()? {
         let task_id: String = row.get(0)?;
-        let task_state: String = row.get(1)?;
-        let task: Value = serde_json::from_str(&row.get::<_, String>(2)?)?;
+        let task_batch_id: Option<String> = row.get(1)?;
+        let task_state: String = row.get(2)?;
+        let task: Value = serde_json::from_str(&row.get::<_, String>(3)?)?;
+        if batch_id.is_none() && task_batch_id.is_none() && !task["commission_id"].is_string() {
+            continue;
+        }
         if task["commission_id"].is_string() && task["start_authorized"] != true {
             continue;
         }
@@ -1186,5 +1196,71 @@ mod tests {
         assert_eq!(capacity.provisioning, 1);
         assert_eq!(capacity.available_slots, 0);
         assert_eq!(capacity.queued_runnable, 2);
+    }
+
+    #[test]
+    fn detached_tasks_are_explicitly_held_while_batch_and_commission_work_run() {
+        let (_dir, store) = setup(&[(
+            "batch",
+            3,
+            vec![("batch-task", vec![]), ("commission", vec![])],
+        )]);
+        mark_as_commission(&store, "commission");
+        let standalone = serde_json::json!({
+            "outcome":"standalone reconciler task",
+            "execution_target":{
+                "kind":"git_repository",
+                "repository":"https://example.test/repo.git",
+                "base_ref":"main",
+                "delivery":"pull_request"
+            }
+        });
+        let accepted = store
+            .accept_task(
+                "standalone-key",
+                "demo",
+                &standalone,
+                "standalone",
+                &standalone,
+            )
+            .unwrap();
+        assert_eq!(accepted.task["state"], "open");
+        assert_eq!(accepted.task["operator_hold"], true);
+        assert_eq!(accepted.task["hold_reason"], "awaiting_controller_mode");
+        let projection = store.get_resource("task", "standalone").unwrap().unwrap();
+        assert_eq!(projection["hold_reason"], "awaiting_controller_mode");
+        let control = store.task_control("standalone").unwrap().unwrap();
+        assert_eq!(control["operator_hold"], true);
+        assert_eq!(control["hold_reason"], "awaiting_controller_mode");
+
+        let capacity = store.capacity(3, 0, 3, 0, 0).unwrap();
+        assert_eq!(capacity.queued_runnable, 2);
+        let claims = store.claim_runnable(3, 0, 3, 0).unwrap();
+        assert_eq!(
+            claims
+                .iter()
+                .map(|claim| claim.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["batch-task", "commission"]
+        );
+        assert!(store.attempts_for_task("standalone").unwrap().is_empty());
+
+        // A versioned controller ownership transition clears the admission hold;
+        // the legacy scheduler still cannot claim Reconciler-owned work.
+        assert_eq!(
+            store
+                .set_task_control("standalone", 1, false, "reconciler")
+                .unwrap(),
+            2
+        );
+        let transferred = store.get_resource("task", "standalone").unwrap().unwrap();
+        assert_eq!(transferred["operator_hold"], false);
+        assert!(transferred["hold_reason"].is_null());
+        assert!(store
+            .claim_runnable(3, 0, 3, 0)
+            .unwrap()
+            .iter()
+            .all(|claim| claim.task_id != "standalone"));
+        assert!(store.attempts_for_task("standalone").unwrap().is_empty());
     }
 }
