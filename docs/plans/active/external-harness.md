@@ -779,6 +779,13 @@ completion/integration of a start-dependent upstream Commission and measured
 time/cost enforcement remain outside this local proof. No PR/approved target,
 external cost budget or isolated deployment procedure was granted.
 
+2026-11-08 local follow-up commit binding: implementation and evidence above
+committed as `2341e3521fa4a17785b6b2689cd9df0aa191055d` on
+`anvil/incremental-roadmap`; `git status --short --branch` showed no tracked
+modifications and no untracked `node_modules/`. This final documentation-only
+binding records the source revision of the preceding successful dirty-tree
+verification; it is not a new runtime validation or integration claim.
+
 2026-11-08 commit binding: the validated local increment was committed as
 `8ef0a1829b130425839d8fa0e1239aebfa1dbce1` on
 `anvil/incremental-roadmap`; `git status --short --branch` afterward showed no
