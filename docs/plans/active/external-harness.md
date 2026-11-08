@@ -695,6 +695,18 @@ restart, then stable identities and one Attempt afterward. `just frontend-check`
 verification run; those were not repeated after the final Rust changes.
 These are deterministic local fixtures, not real provider/cluster integration.
 
+2026-11-08 commit binding: the validated local increment was committed as
+`8ef0a1829b130425839d8fa0e1239aebfa1dbce1` on
+`anvil/incremental-roadmap`; `git status --short --branch` afterward showed no
+tracked modifications. **Correction:** a subsequent explicit `test -d
+node_modules` found that the pre-existing untracked root `node_modules/` is
+absent (while ignored `web/node_modules/` exists). The exact removal point
+and prior directory contents were not captured. Do not claim it was preserved
+or recreate it destructively without confirming what was there; notify the
+operator. No tracked user changes were present at the start.
+There is still no registered PR or approved integration target. This record
+update is documentation-only and is not a new validation of runtime behavior.
+
 Read-only reviews identified and prompted fixes for capacity after turn-end,
 unknown submitted effects, branch mismatch, stale start preconditions and a
 Kubernetes runtime-only nil-run panic. Review also identifies residual risks:
