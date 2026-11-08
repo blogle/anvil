@@ -581,6 +581,241 @@ pub fn validate_task_spec(
     })
 }
 
+/// Campaign intent shared by all Commissions submitted in one atomic request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CampaignRequest {
+    pub purpose: String,
+    #[serde(default)]
+    pub shared_contracts: Vec<String>,
+}
+
+/// A stable, versioned obligation attached to one Commission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommissionObligationRequest {
+    pub id: String,
+    pub version: u64,
+    pub requirement: String,
+    #[serde(default)]
+    pub acceptance_expectations: Vec<String>,
+}
+
+/// One Commission's immutable submission contract. Dependency names refer to
+/// `local_key` values in the enclosing CampaignSubmissionRequest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommissionRequest {
+    pub local_key: String,
+    pub objective: String,
+    pub obligations: Vec<CommissionObligationRequest>,
+    pub execution_target: TaskExecutionTarget,
+    pub budget: TaskBudget,
+    #[serde(default)]
+    pub start_after: Vec<String>,
+    /// Integration dependencies gate integration only, never Commission start.
+    #[serde(default)]
+    pub integration_after: Vec<String>,
+}
+
+/// Atomic Campaign-with-Commissions create request; dependencies are request-local.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CampaignSubmissionRequest {
+    pub campaign: CampaignRequest,
+    pub commissions: Vec<CommissionRequest>,
+}
+
+/// Validated form suitable for service-layer persistence in one transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatedCampaignSubmission {
+    pub campaign: CampaignRequest,
+    pub commissions: Vec<CommissionRequest>,
+}
+
+/// Validate the complete graph before callers begin an atomic persistence operation.
+pub fn validate_campaign_submission(
+    request: CampaignSubmissionRequest,
+) -> Result<ValidatedCampaignSubmission, ValidationError> {
+    fn nonempty(value: &str, field: &'static str) -> Result<(), ValidationError> {
+        if value.trim().is_empty() {
+            Err(ValidationError::Empty { field })
+        } else {
+            Ok(())
+        }
+    }
+
+    nonempty(&request.campaign.purpose, "campaign.purpose")?;
+    if request.campaign.purpose.len() > 32_768
+        || request.campaign.shared_contracts.len() > 256
+        || request
+            .campaign
+            .shared_contracts
+            .iter()
+            .any(|value| value.trim().is_empty() || value.len() > 4096)
+    {
+        return Err(ValidationError::Invalid {
+            field: "campaign",
+            reason: "purpose and shared contracts must be non-empty and within supported bounds"
+                .into(),
+        });
+    }
+    if !(1..=256).contains(&request.commissions.len()) {
+        return Err(ValidationError::Invalid {
+            field: "commissions",
+            reason: "must contain between 1 and 256 Commissions".into(),
+        });
+    }
+
+    let mut keys = std::collections::BTreeSet::new();
+    for commission in &request.commissions {
+        nonempty(&commission.local_key, "commission.local_key")?;
+        nonempty(&commission.objective, "commission.objective")?;
+        if commission.local_key.len() > 128 || commission.objective.len() > 32_768 {
+            return Err(ValidationError::Invalid {
+                field: "commission",
+                reason: "local_key must be at most 128 bytes and objective at most 32768 bytes"
+                    .into(),
+            });
+        }
+        if !keys.insert(commission.local_key.as_str()) {
+            return Err(ValidationError::Invalid {
+                field: "commissions.local_key",
+                reason: format!("duplicate local key {:?}", commission.local_key),
+            });
+        }
+        if commission.obligations.is_empty() || commission.obligations.len() > 256 {
+            return Err(ValidationError::Invalid {
+                field: "commission.obligations",
+                reason: "must contain between 1 and 256 obligations".into(),
+            });
+        }
+        let mut obligation_ids = std::collections::BTreeSet::new();
+        for obligation in &commission.obligations {
+            nonempty(&obligation.id, "obligation.id")?;
+            nonempty(&obligation.requirement, "obligation.requirement")?;
+            if obligation.version == 0
+                || obligation.id.len() > 128
+                || obligation.requirement.len() > 32_768
+                || obligation.acceptance_expectations.is_empty()
+                || obligation.acceptance_expectations.len() > 256
+                || obligation
+                    .acceptance_expectations
+                    .iter()
+                    .any(|value| value.trim().is_empty() || value.len() > 4096)
+            {
+                return Err(ValidationError::Invalid {
+                    field: "commission.obligations",
+                    reason: "obligations require a positive version, non-empty acceptance expectations, and bounded fields".into(),
+                });
+            }
+            if !obligation_ids.insert(obligation.id.as_str()) {
+                return Err(ValidationError::Invalid {
+                    field: "obligation.id",
+                    reason: format!("duplicate obligation ID {:?}", obligation.id),
+                });
+            }
+        }
+        let budget = &commission.budget;
+        if budget.max_attempts == 0
+            || budget.max_attempts > 1_000
+            || budget.max_continuations_per_reason > 1_000
+            || budget.max_verifier_cycles > 100
+            || budget.max_ci_retries > 1_000
+            || budget.max_execution_seconds == 0
+            || budget.max_execution_seconds > 31_536_000
+            || budget.max_model_cost.as_deref().is_some_and(|cost| {
+                cost.len() > 64
+                    || cost
+                        .parse::<f64>()
+                        .map_or(true, |value| !value.is_finite() || value < 0.0)
+            })
+        {
+            return Err(ValidationError::Invalid {
+                field: "commission.budget",
+                reason: "allocation is outside supported positive bounds".into(),
+            });
+        }
+        match &commission.execution_target {
+            TaskExecutionTarget::GitRepository {
+                project,
+                repository,
+                base_ref,
+                ..
+            } => {
+                if let Some(project) = project {
+                    Project::new(project)?;
+                }
+                Repository::new(repository)?;
+                GitRef::new(base_ref)?;
+            }
+        }
+    }
+
+    let mut graph = std::collections::BTreeMap::<&str, Vec<&str>>::new();
+    for commission in &request.commissions {
+        let mut edges = std::collections::BTreeSet::new();
+        for dependency in commission
+            .start_after
+            .iter()
+            .chain(&commission.integration_after)
+        {
+            nonempty(dependency, "commission.dependency")?;
+            if dependency == &commission.local_key {
+                return Err(ValidationError::Invalid {
+                    field: "commission.dependency",
+                    reason: "self-dependency is not allowed".into(),
+                });
+            }
+            if !keys.contains(dependency.as_str()) {
+                return Err(ValidationError::Invalid {
+                    field: "commission.dependency",
+                    reason: format!("unknown local key {dependency:?}"),
+                });
+            }
+            if !edges.insert(dependency.as_str()) {
+                return Err(ValidationError::Invalid {
+                    field: "commission.dependency",
+                    reason: format!("duplicate dependency {dependency:?}"),
+                });
+            }
+        }
+        graph.insert(commission.local_key.as_str(), edges.into_iter().collect());
+    }
+    fn visit<'a>(
+        node: &'a str,
+        graph: &std::collections::BTreeMap<&'a str, Vec<&'a str>>,
+        visiting: &mut std::collections::BTreeSet<&'a str>,
+        visited: &mut std::collections::BTreeSet<&'a str>,
+    ) -> bool {
+        if visited.contains(node) {
+            return true;
+        }
+        if !visiting.insert(node) {
+            return false;
+        }
+        for next in &graph[node] {
+            if !visit(next, graph, visiting, visited) {
+                return false;
+            }
+        }
+        visiting.remove(node);
+        visited.insert(node);
+        true
+    }
+    let mut visiting = std::collections::BTreeSet::new();
+    let mut visited = std::collections::BTreeSet::new();
+    if graph
+        .keys()
+        .any(|node| !visit(node, &graph, &mut visiting, &mut visited))
+    {
+        return Err(ValidationError::Invalid {
+            field: "commissions.dependencies",
+            reason: "dependency graph contains a cycle".into(),
+        });
+    }
+    Ok(ValidatedCampaignSubmission {
+        campaign: request.campaign,
+        commissions: request.commissions,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckEvaluationKind {
@@ -1345,6 +1580,91 @@ pub fn parse_preview_hostname(hostname: &str, base_domain: &str) -> Option<(Sess
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn commission(key: &str) -> CommissionRequest {
+        CommissionRequest {
+            local_key: key.into(),
+            objective: format!("Implement {key}"),
+            obligations: vec![CommissionObligationRequest {
+                id: format!("{key}-deliverable"),
+                version: 1,
+                requirement: "Deliver the change".into(),
+                acceptance_expectations: vec!["Tests pass".into()],
+            }],
+            execution_target: TaskExecutionTarget::GitRepository {
+                project: None,
+                repository: "https://example.com/org/repo".into(),
+                base_ref: "main".into(),
+                delivery: DeliveryKind::PullRequest,
+            },
+            budget: TaskBudget::default(),
+            start_after: Vec::new(),
+            integration_after: Vec::new(),
+        }
+    }
+
+    fn submission(commissions: Vec<CommissionRequest>) -> CampaignSubmissionRequest {
+        CampaignSubmissionRequest {
+            campaign: CampaignRequest {
+                purpose: "Build the feature".into(),
+                shared_contracts: vec!["Use the existing API".into()],
+            },
+            commissions,
+        }
+    }
+
+    #[test]
+    fn campaign_submission_validates_graph_and_defaults_integration_to_nonblocking() {
+        let mut first = commission("first");
+        first.integration_after.push("second".into());
+        let valid =
+            validate_campaign_submission(submission(vec![first, commission("second")])).unwrap();
+        assert_eq!(valid.commissions.len(), 2);
+        assert!(valid.commissions[1].start_after.is_empty());
+        let encoded = serde_json::to_value(&valid).unwrap();
+        assert_eq!(encoded["commissions"][0]["integration_after"][0], "second");
+    }
+
+    #[test]
+    fn campaign_submission_rejects_duplicate_unknown_self_and_cyclic_edges() {
+        let mut duplicate_key = commission("same");
+        duplicate_key.local_key = "same".into();
+        assert!(
+            validate_campaign_submission(submission(vec![commission("same"), duplicate_key]))
+                .is_err()
+        );
+
+        let mut unknown = commission("a");
+        unknown.start_after.push("missing".into());
+        assert!(validate_campaign_submission(submission(vec![unknown])).is_err());
+
+        let mut duplicate_edge_a = commission("a");
+        let duplicate_edge_b = commission("b");
+        duplicate_edge_a.start_after.push("b".into());
+        duplicate_edge_a.integration_after.push("b".into());
+        assert!(
+            validate_campaign_submission(submission(vec![duplicate_edge_a, duplicate_edge_b]))
+                .is_err()
+        );
+
+        let mut self_edge = commission("a");
+        self_edge.start_after.push("a".into());
+        assert!(validate_campaign_submission(submission(vec![self_edge])).is_err());
+
+        let mut a = commission("a");
+        let mut b = commission("b");
+        a.start_after.push("b".into());
+        b.integration_after.push("a".into());
+        assert!(validate_campaign_submission(submission(vec![a, b])).is_err());
+    }
+
+    #[test]
+    fn campaign_submission_rejects_empty_required_fields_and_zero_commissions() {
+        assert!(validate_campaign_submission(submission(Vec::new())).is_err());
+        let mut invalid = commission("a");
+        invalid.obligations[0].acceptance_expectations.clear();
+        assert!(validate_campaign_submission(submission(vec![invalid])).is_err());
+    }
 
     #[test]
     fn aggregate_completion_requires_declared_children_and_all_completed() {

@@ -762,6 +762,7 @@ impl ControllerStore {
             "batch" => "SELECT payload_json FROM batches WHERE batch_id=?1",
             "task" => "SELECT payload_json FROM tasks WHERE task_id=?1",
             "attempt" => "SELECT payload_json FROM attempts WHERE attempt_id=?1",
+            "campaign" => "SELECT payload_json FROM campaigns WHERE campaign_id=?1",
             _ => return Ok(None),
         };
         connection
@@ -1027,6 +1028,258 @@ impl ControllerStore {
         })
     }
 
+    /// Atomically persist a Campaign and its Commissions. Each Commission is a
+    /// legacy Task internally so the existing scheduler remains the sole executor.
+    pub fn accept_campaign(
+        &self,
+        key: &str,
+        scope: &str,
+        request: &Value,
+        validated: &anvil_core::ValidatedCampaignSubmission,
+    ) -> Result<TaskAcceptance, StoreError> {
+        let hash = format!("{:x}", Sha256::digest(canonical_json(request).as_bytes()));
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = tx.query_row("SELECT operation_kind,scope,request_hash,canonicalization_version,result_json FROM idempotency_records WHERE idempotency_key=?1", [key], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?))).optional()?;
+        if let Some((kind, old_scope, old_hash, version, result)) = existing {
+            if kind != "submit_campaign"
+                || old_scope != scope
+                || old_hash != hash
+                || version != CANONICALIZATION_VERSION
+            {
+                return Err(StoreError::Conflict);
+            }
+            let task = serde_json::from_str(&result)?;
+            tx.commit()?;
+            return Ok(TaskAcceptance {
+                task,
+                created: false,
+            });
+        }
+        let campaign_id = uuid::Uuid::new_v4().to_string();
+        let mut ids = std::collections::HashMap::new();
+        for commission in &validated.commissions {
+            ids.insert(
+                commission.local_key.clone(),
+                uuid::Uuid::new_v4().to_string(),
+            );
+        }
+        let campaign = json!({"campaign_id":campaign_id,"purpose":validated.campaign.purpose,"shared_contracts":validated.campaign.shared_contracts,"scope":scope,"created_at":now});
+        tx.execute(
+            "INSERT INTO campaigns(campaign_id,scope,payload_json,created_at) VALUES(?1,?2,?3,?4)",
+            params![campaign_id, scope, serde_json::to_string(&campaign)?, now],
+        )?;
+        for commission in &validated.commissions {
+            let id = &ids[&commission.local_key];
+            let target = serde_json::to_value(&commission.execution_target)?;
+            let budget = serde_json::to_value(&commission.budget)?;
+            let criteria = json!([commission.objective]);
+            let policy = json!({"kind":"manual"});
+            let verification = json!({"holdout_scenarios":[]});
+            // The initial attempt's sandbox id determines its actual workspace branch
+            // (`branch_name(session_id)`); persist that exact branch rather than a
+            // Commission-id approximation.
+            let initial_attempt = format!("{id}-attempt-1");
+            let digest = Sha256::digest(initial_attempt.as_bytes());
+            let session_id = format!(
+                "{}-{:02x}{:02x}{:02x}{:02x}",
+                target["project"].as_str().unwrap_or("commission"),
+                digest[0],
+                digest[1],
+                digest[2],
+                digest[3]
+            );
+            let branch = format!("anvil/{session_id}");
+            let start_dependencies: Vec<_> = commission
+                .start_after
+                .iter()
+                .map(|key| ids[key].clone())
+                .collect();
+            let commission_value = json!({"commission_id":id,"campaign_id":campaign_id,"local_key":commission.local_key,"objective":commission.objective,"obligations":commission.obligations,"execution_target":target,"budget":budget,"usage":{"status":"unavailable","reason":"execution backend does not expose usage or enforce max_execution_seconds/max_model_cost; these budget limits are not enforced"},"start_after":commission.start_after,"integration_after":commission.integration_after,"state":"queued","version":1,"created_at":now});
+            let task = json!({"task_id":id,"commission_id":id,"campaign_id":campaign_id,"batch_id":null,"outcome":commission.objective,"project":target["project"],"repository":target["repository"],"requested_revision":target["base_ref"],"acceptance_criteria":criteria,"execution_target":target,"completion_policy":policy,"verification_spec":verification,"budget":budget,"work_branch":branch,"dependencies":start_dependencies,"state":"queued","version":1,"start_authorized":false});
+            tx.execute("INSERT INTO tasks(task_id,batch_id,client_task_id,project,repository,prompt,state,payload_json,created_at) VALUES(?1,NULL,?1,?2,?3,?4,'queued',?5,?6)",params![id,target["project"].as_str().unwrap_or_default(),target["repository"].as_str().unwrap_or_default(),commission.objective,serde_json::to_string(&task)?,now])?;
+            tx.execute("INSERT INTO task_durable_state(task_id,completion_policy_json,verification_spec_json,budget_json,execution_target_json,work_branch,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![id,policy.to_string(),verification.to_string(),budget.to_string(),target.to_string(),branch,now])?;
+            tx.execute("INSERT INTO orchestration_resources(resource_type,resource_id,batch_id,task_id,attempt_id,payload_json,created_at,updated_at) VALUES('task',?1,NULL,?1,NULL,?2,?3,?3)",params![id,task.to_string(),now])?;
+            append_resource_change(&tx, "task", id, &task)?;
+            tx.execute("INSERT INTO commissions(commission_id,campaign_id,local_key,payload_json,created_at) VALUES(?1,?2,?3,?4,?5)",params![id,campaign_id,commission.local_key,commission_value.to_string(),now])?;
+        }
+        for commission in &validated.commissions {
+            let to = &ids[&commission.local_key];
+            for predecessor in &commission.start_after {
+                tx.execute("INSERT INTO task_dependencies(predecessor_task_id,successor_task_id) VALUES(?1,?2)",params![ids[predecessor],to])?;
+            }
+            for predecessor in &commission.integration_after {
+                tx.execute("INSERT INTO commission_integration_dependencies(predecessor_commission_id,successor_commission_id) VALUES(?1,?2)",params![ids[predecessor],to])?;
+            }
+        }
+        let result = json!({"campaign_id":campaign_id,"commissions":validated.commissions.iter().map(|c|json!({"local_key":c.local_key,"commission_id":ids[&c.local_key]})).collect::<Vec<_>>(),"receipt":{"idempotency_key":key,"scope":scope,"accepted_at":now}});
+        tx.execute("INSERT INTO idempotency_records(idempotency_key,operation_kind,scope,request_hash,canonicalization_version,result_reference,result_json,state,created_at,updated_at) VALUES(?1,'submit_campaign',?2,?3,?4,?5,?6,'accepted',?7,?7)",params![key,scope,hash,CANONICALIZATION_VERSION,campaign_id,result.to_string(),now])?;
+        tx.commit()?;
+        Ok(TaskAcceptance {
+            task: result,
+            created: true,
+        })
+    }
+
+    /// Campaign page cursor is the last returned local_key (exclusive), stable
+    /// for an immutable membership set; it is not a change-stream watermark.
+    pub fn get_campaign(
+        &self,
+        id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Option<Value>, StoreError> {
+        let c = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let campaign: Option<String> = c
+            .query_row(
+                "SELECT payload_json FROM campaigns WHERE campaign_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(campaign) = campaign else {
+            return Ok(None);
+        };
+        let total: usize = c.query_row(
+            "SELECT COUNT(*) FROM commissions WHERE campaign_id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        let limit = limit.clamp(1, 256);
+        let mut stmt = c.prepare("SELECT local_key,payload_json FROM commissions WHERE campaign_id=?1 AND (?2 IS NULL OR local_key>?2) ORDER BY local_key LIMIT ?3")?;
+        let commissions = stmt
+            .query_map(params![id, after, (limit + 1) as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = commissions.len() > limit;
+        let page = &commissions[..commissions.len().min(limit)];
+        let items: Vec<Value> = page
+            .iter()
+            .map(|(key, v)| {
+                let mut commission: Value = serde_json::from_str(v)?;
+                commission["usage"] = Self::commission_usage(&c, commission["commission_id"].as_str().unwrap_or_default())?;
+                commission["task"] = c.query_row("SELECT payload_json FROM tasks WHERE task_id=(SELECT commission_id FROM commissions WHERE campaign_id=?1 AND local_key=?2)", params![id,key], |r| r.get::<_,String>(0)).optional()?.map(|s|serde_json::from_str(&s)).transpose()?.unwrap_or(Value::Null);
+                Ok::<_, StoreError>(commission)
+            })
+            .collect::<Result<_, _>>()?;
+        let next = if has_more {
+            page.last().map(|(k, _)| k.clone())
+        } else {
+            None
+        };
+        let mut result: Value = serde_json::from_str(&campaign)?;
+        result["commissions"] = json!(items);
+        result["total"] = json!(total);
+        result["next_page_cursor"] = json!(next);
+        Ok(Some(result))
+    }
+
+    pub fn get_commission(&self, id: &str) -> Result<Option<Value>, StoreError> {
+        let c = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let raw: Option<String> = c
+            .query_row(
+                "SELECT payload_json FROM commissions WHERE commission_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(raw) = raw else { return Ok(None) };
+        let mut value: Value = serde_json::from_str(&raw)?;
+        value["usage"] = Self::commission_usage(&c, id)?;
+        value["task"] = c
+            .query_row(
+                "SELECT payload_json FROM tasks WHERE task_id=?1",
+                [id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?
+            .unwrap_or(Value::Null);
+        let mut stmt = c.prepare(
+            "SELECT payload_json,session_id FROM attempts WHERE task_id=?1 ORDER BY ordinal",
+        )?;
+        value["attempts"] = json!(stmt
+            .query_map([id], |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?
+            )))?
+            .map(|r| {
+                let (p, s) = r?;
+                let mut a: Value = serde_json::from_str(&p)?;
+                a["session_id"] = json!(s);
+                Ok::<_, StoreError>(a)
+            })
+            .collect::<Result<Vec<_>, _>>()?);
+        Ok(Some(value))
+    }
+
+    /// Persist the explicit operator dispatch gate with an optimistic version check.
+    pub fn start_commission(&self, id: &str, expected_version: u64) -> Result<Value, StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let raw: String = tx
+            .query_row(
+                "SELECT payload_json FROM commissions WHERE commission_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        let mut commission: Value = serde_json::from_str(&raw)?;
+        let version = commission["version"].as_u64().unwrap_or(1);
+        if commission["start_authorized"] == true {
+            if expected_version != version {
+                return Err(StoreError::Conflict);
+            }
+            tx.commit()?;
+            return Ok(commission);
+        }
+        if version != expected_version {
+            return Err(StoreError::Conflict);
+        }
+        if commission["state"] != "queued" && commission["state"] != "running" {
+            return Err(StoreError::InvalidState(
+                "commission cannot be started in its current state".into(),
+            ));
+        }
+        commission["start_authorized"] = Value::Bool(true);
+        commission["version"] = serde_json::json!(version + 1);
+        tx.execute(
+            "UPDATE commissions SET payload_json=?2 WHERE commission_id=?1",
+            params![id, commission.to_string()],
+        )?;
+        let task_json: String = tx.query_row(
+            "SELECT payload_json FROM tasks WHERE task_id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        let mut task: Value = serde_json::from_str(&task_json)?;
+        task["start_authorized"] = Value::Bool(true);
+        tx.execute(
+            "UPDATE tasks SET payload_json=?2 WHERE task_id=?1",
+            params![id, task.to_string()],
+        )?;
+        tx.execute("UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='task' AND resource_id=?1", params![id, task.to_string(), chrono::Utc::now().to_rfc3339()])?;
+        append_resource_change(&tx, "task", id, &task)?;
+        tx.commit()?;
+        Ok(commission)
+    }
+
     /// Read the durable controller ownership/version tuple. The scheduler remains
     /// the capacity authority; this row fences future controller ownership changes.
     pub fn task_control(&self, task_id: &str) -> Result<Option<Value>, StoreError> {
@@ -1105,6 +1358,47 @@ impl ControllerStore {
             values.push(serde_json::from_str(&json)?);
         }
         Ok((values, cursor))
+    }
+
+    /// Derive Commission usage directly from durable Attempt rows. No second ledger is
+    /// maintained, so repeated reads and Session replacement cannot inflate totals.
+    fn commission_usage(connection: &Connection, commission_id: &str) -> Result<Value, StoreError> {
+        let mut statement = connection
+            .prepare("SELECT payload_json FROM attempts WHERE task_id=?1 ORDER BY ordinal")?;
+        let attempts = statement
+            .query_map([commission_id], |row| row.get::<_, String>(0))?
+            .map(|row| {
+                let payload = row?;
+                Ok::<_, StoreError>(serde_json::from_str::<Value>(&payload)?)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let attempt_count = attempts.len();
+        let durations = attempts
+            .iter()
+            .map(|attempt| {
+                let start = attempt["started_at"]
+                    .as_str()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+                let end = attempt["ended_at"]
+                    .as_str()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+                start.zip(end).and_then(|(start, end)| {
+                    (end >= start).then(|| (end - start).num_milliseconds() as u64)
+                })
+            })
+            .collect::<Vec<_>>();
+        let execution_ms = if attempt_count > 0 && durations.iter().all(Option::is_some) {
+            let total = durations.iter().flatten().copied().sum::<u64>();
+            json!({"value":total,"status":"measured"})
+        } else {
+            json!({"value":null,"status":"unavailable"})
+        };
+        Ok(json!({
+            "attempt_count":{"value":attempt_count,"status":"measured"},
+            "execution_ms":execution_ms,
+            "tokens":{"value":null,"status":"unavailable"},
+            "cost":{"value":null,"status":"unavailable"}
+        }))
     }
 
     /// Reserve a durable per-Task/key sequence before a provider request starts.
@@ -2791,7 +3085,10 @@ impl ControllerStore {
         Ok(rows)
     }
 
-    pub fn tasks_for_session(&self, session_id: &str) -> Result<Vec<(String, String)>, StoreError> {
+    pub fn tasks_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, Option<String>)>, StoreError> {
         let connection = self
             .connection
             .lock()
@@ -2802,7 +3099,7 @@ impl ControllerStore {
              WHERE a.resource_type='attempt' AND json_extract(a.payload_json,'$.session_id')=?1",
         )?;
         let rows = statement.query_map([session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
@@ -3669,6 +3966,19 @@ fn migrate_until(connection: &Connection, target_version: i64) -> Result<(), rus
             [chrono::Utc::now().to_rfc3339()],
         )?;
     }
+    let latest: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if latest < 15 && target_version >= 15 {
+        tx.execute_batch("CREATE TABLE campaigns(campaign_id TEXT PRIMARY KEY,scope TEXT NOT NULL,payload_json TEXT NOT NULL,created_at TEXT NOT NULL);
+            CREATE INDEX campaigns_by_scope ON campaigns(scope,created_at);
+            CREATE TABLE commissions(commission_id TEXT PRIMARY KEY,campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),local_key TEXT NOT NULL,payload_json TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(campaign_id,local_key));
+            CREATE INDEX commissions_by_campaign_key ON commissions(campaign_id,local_key);
+            CREATE TABLE commission_integration_dependencies(predecessor_commission_id TEXT NOT NULL REFERENCES commissions(commission_id),successor_commission_id TEXT NOT NULL REFERENCES commissions(commission_id),PRIMARY KEY(predecessor_commission_id,successor_commission_id));
+            INSERT INTO schema_migrations(version,applied_at) VALUES(15,datetime('now'));")?;
+    }
     tx.commit()?;
     connection.execute_batch("PRAGMA foreign_keys=ON;")?;
     let mut check = connection.prepare("PRAGMA foreign_key_check")?;
@@ -3749,6 +4059,128 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn campaign_acceptance_replays_atomically_paginates_and_gates_start_edges() {
+        let request = json!({"campaign":{"purpose":"demo","shared_contracts":[]},"commissions":[
+            {"local_key":"a","objective":"first","obligations":[{"id":"o1","version":1,"requirement":"done","acceptance_expectations":["test"]}],"execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},"budget":{"max_attempts":2,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},"start_after":[],"integration_after":[]},
+            {"local_key":"b","objective":"second","obligations":[{"id":"o2","version":1,"requirement":"done","acceptance_expectations":["test"]}],"execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},"budget":{"max_attempts":2,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},"start_after":["a"],"integration_after":[]}
+        ]});
+        let validated = anvil_core::validate_campaign_submission(
+            serde_json::from_value(request.clone()).unwrap(),
+        )
+        .unwrap();
+        let (dir, db) = store();
+        let first = db
+            .accept_campaign("campaign-key", "tenant", &request, &validated)
+            .unwrap();
+        assert!(first.created);
+        let ids = first.task["commissions"].as_array().unwrap();
+        let campaign_id = first.task["campaign_id"].as_str().unwrap().to_owned();
+        assert!(db.claim_runnable(10, 0, 3, 0).unwrap().is_empty());
+        assert!(matches!(
+            db.start_commission(ids[0]["commission_id"].as_str().unwrap(), 2),
+            Err(StoreError::Conflict)
+        ));
+        db.start_commission(ids[0]["commission_id"].as_str().unwrap(), 1)
+            .unwrap();
+        assert!(matches!(
+            db.start_commission(ids[0]["commission_id"].as_str().unwrap(), 1),
+            Err(StoreError::Conflict)
+        ));
+        db.start_commission(ids[0]["commission_id"].as_str().unwrap(), 2)
+            .unwrap();
+        assert_eq!(db.claim_runnable(10, 0, 3, 0).unwrap().len(), 1);
+        let page = db.get_campaign(&campaign_id, None, 1).unwrap().unwrap();
+        assert_eq!(page["total"], 2);
+        let cursor = page["next_page_cursor"].as_str().unwrap();
+        assert_eq!(
+            db.get_campaign(&campaign_id, Some(cursor), 1)
+                .unwrap()
+                .unwrap()["commissions"][0]["local_key"],
+            "b"
+        );
+        assert_eq!(
+            db.get_commission(ids[0]["commission_id"].as_str().unwrap())
+                .unwrap()
+                .unwrap()["campaign_id"],
+            campaign_id
+        );
+        drop(db);
+        let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
+        assert!(
+            !reopened
+                .accept_campaign("campaign-key", "tenant", &request, &validated)
+                .unwrap()
+                .created
+        );
+        assert!(matches!(
+            reopened.accept_campaign("campaign-key", "other", &request, &validated),
+            Err(StoreError::Conflict)
+        ));
+        assert_eq!(
+            reopened
+                .get_campaign(&campaign_id, Some(cursor), 1)
+                .unwrap()
+                .unwrap()["commissions"][0]["local_key"],
+            "b"
+        );
+        let mut cyclic = request;
+        cyclic["commissions"][0]["start_after"] = json!(["b"]);
+        assert!(
+            anvil_core::validate_campaign_submission(serde_json::from_value(cyclic).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn commission_usage_is_derived_once_from_attempts_across_reopen_and_session_replacement() {
+        let request = json!({"campaign":{"purpose":"usage","shared_contracts":[]},"commissions":[
+            {"local_key":"only","objective":"measure","obligations":[{"id":"o1","version":1,"requirement":"done","acceptance_expectations":["test"]}],"execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},"budget":{"max_attempts":2,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},"start_after":[],"integration_after":[]}
+        ]});
+        let validated = anvil_core::validate_campaign_submission(
+            serde_json::from_value(request.clone()).unwrap(),
+        )
+        .unwrap();
+        let (dir, db) = store();
+        let accepted = db
+            .accept_campaign("usage-key", "tenant", &request, &validated)
+            .unwrap();
+        let id = accepted.task["commissions"][0]["commission_id"]
+            .as_str()
+            .unwrap();
+        db.create_attempt(id, "usage-attempt", "usage-attempt-key")
+            .unwrap();
+        {
+            let connection = db.connection.lock().unwrap();
+            connection.execute(
+                "UPDATE attempts SET payload_json=json_set(payload_json,'$.started_at','2026-01-01T10:00:00Z','$.ended_at','2026-01-01T10:00:02Z'),session_id='session-old' WHERE attempt_id='usage-attempt'",
+                [],
+            ).unwrap();
+        }
+        let expected = json!({
+            "attempt_count":{"value":1,"status":"measured"},
+            "execution_ms":{"value":2000,"status":"measured"},
+            "tokens":{"value":null,"status":"unavailable"},
+            "cost":{"value":null,"status":"unavailable"}
+        });
+        assert_eq!(db.get_commission(id).unwrap().unwrap()["usage"], expected);
+        assert_eq!(db.get_commission(id).unwrap().unwrap()["usage"], expected);
+        {
+            let connection = db.connection.lock().unwrap();
+            connection.execute(
+                "UPDATE attempts SET session_id='session-replacement' WHERE attempt_id='usage-attempt'",
+                [],
+            ).unwrap();
+        }
+        assert_eq!(db.get_commission(id).unwrap().unwrap()["usage"], expected);
+        drop(db);
+        let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
+        assert_eq!(
+            reopened.get_commission(id).unwrap().unwrap()["usage"],
+            expected
+        );
     }
 
     #[test]
@@ -4281,7 +4713,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
     }
 
     #[test]
@@ -4423,7 +4855,7 @@ mod tests {
 
     #[test]
     fn every_historical_schema_migration_target_can_restart_and_continue() {
-        for target in 1..=14 {
+        for target in 1..=15 {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("historical.sqlite3");
             let connection = Connection::open(&path).unwrap();
@@ -4445,7 +4877,7 @@ mod tests {
                     row.get(0)
                 })
                 .unwrap();
-            assert_eq!(latest, 14, "restored schema version {target}");
+            assert_eq!(latest, 15, "restored schema version {target}");
         }
     }
 
@@ -4977,7 +5409,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(latest, 14);
+        assert_eq!(latest, 15);
         let index: i64=connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='orchestration_by_attempt'",[],|row|row.get(0)).unwrap();
         assert_eq!(index, 1);
         let state_mappings: i64 = connection

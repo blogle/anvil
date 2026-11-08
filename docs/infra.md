@@ -15,6 +15,21 @@ storage, provider and operator interfaces.
 | GitHub credential broker | Daemon-held App identity issues scoped, short-lived credentials through worker helpers and signed capabilities. App keys/signing secrets stay controller-side; provider tokens remain subject to their actual provider scope and expiry. |
 | GitHub and Mergify | Authoritative repository/PR, checks, approval, queue and merge observations. Repository labels/rules govern review versus automatic integration; Anvil does not implement reviewer identity policy. |
 
+## Incremental Campaign execution boundary
+
+Campaign submission validates the entire Commission contract and dependency graph
+in `anvil-core`, then commits Campaign/Commission identities and a scoped
+idempotency receipt in one daemon SQLite transaction. Each Commission currently
+uses its existing Task ID as an internal execution adapter: the legacy scheduler
+is the sole admission/execution writer, and an explicit version-checked start
+gate precedes admission. An ordinary worker turn does not terminate its strategy
+Attempt. HTTP and MCP share the daemon's application operations; immutable
+Campaign membership uses a bounded keyset page cursor, separate from the
+controller's change stream. Historical Task readers and execution paths remain
+until client migration and safe retirement; they are not a second public work
+model to expand. A submitted but unobserved worker prompt is recovery-required,
+not automatically replayed.
+
 ## Worker context and reporting interface
 
 The worker environment installs the Anvil reporting skill where OpenCode discovers

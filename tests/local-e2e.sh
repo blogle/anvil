@@ -81,7 +81,7 @@ export ANVIL_SESSION_SIGNING_SECRET=anvil-local-development-only-signing-secret
 export ANVIL_HISTORY_PATH="$tmp/history.jsonl"
 export ANVIL_WEB_DIR="${ANVIL_WEB_DIR:-$root/web/dist}"
 unset ANVIL_STORE_PATH
-"$anvild_bin" >"$tmp/anvild.log" 2>&1 & api_pid=$!
+RUST_LOG="${RUST_LOG:-info}" "$anvild_bin" >"$tmp/anvild.log" 2>&1 & api_pid=$!
 
 poll() {
   local url="$1" deadline=$((SECONDS + 90))
@@ -314,7 +314,7 @@ printf 'suspend/resume workspace, OpenCode binding, watcher reconciliation: %ds\
 scenario_start=$SECONDS
 kill "$api_pid"
 wait "$api_pid" 2>/dev/null || true
-"$anvild_bin" >"$tmp/anvild-restarted.log" 2>&1 & api_pid=$!
+RUST_LOG="${RUST_LOG:-info}" "$anvild_bin" >"$tmp/anvild-restarted.log" 2>&1 & api_pid=$!
 poll http://127.0.0.1:8080/readyz
 wait_for_state "$id" completed_run
 curl -fsS "http://127.0.0.1:8080/v1/sessions/$id/activity" | jq -e '.telemetry.schema_version == 1 and any(.telemetry.requests[]; .prompt | contains("ANVIL-E2E:edit-file"))' >/dev/null
@@ -360,5 +360,77 @@ jq -e '.. | strings | select(contains("+after"))' <<<"$second_diff" >/dev/null
 for session_id in "$first_id" "$second_id"; do curl -fsS -X DELETE "http://127.0.0.1:8080/v1/sessions/$session_id" >/dev/null; done
 test ! -e "$first_dir" && test ! -e "$second_dir"
 printf 'concurrent workers, isolated endpoints/state/lifecycle: %ds\n' "$((SECONDS - scenario_start))"
+
+# Exercise Campaign/Commission with the disposable Git fixture and deterministic
+# local model. Confirm its branch effects before an anvild restart to expose
+# recovery duplicates without treating an interrupted prompt as completed.
+scenario_start=$SECONDS
+curl -fsS -X POST http://127.0.0.1:4098/__test/hold >/dev/null
+campaign_request="$(jq -n --arg repository "$task_repository" '{campaign:{purpose:"local E2E campaign",shared_contracts:[]},commissions:[{local_key:"e2e-edit",objective:"ANVIL-E2E:edit-file ANVIL-E2E:wait-for-release change target.txt from before to after.",obligations:[{id:"target-after",version:1,requirement:"target.txt contains after",acceptance_expectations:["target.txt is after"]}],execution_target:{kind:"git_repository",project:"campaign-e2e",repository:$repository,base_ref:"main",delivery:"local_branch"},budget:{max_attempts:1,max_continuations_per_reason:1,max_verifier_cycles:0,max_ci_retries:0,max_execution_seconds:180,max_model_cost:"0"}}]}')"
+campaign="$(curl --max-time 10 -fsS -H 'content-type: application/json' -H 'idempotency-key: local-e2e-campaign' -d "$campaign_request" http://127.0.0.1:8080/v1/campaigns)"
+campaign_again="$(curl --max-time 10 -fsS -H 'content-type: application/json' -H 'idempotency-key: local-e2e-campaign' -d "$campaign_request" http://127.0.0.1:8080/v1/campaigns)"
+campaign_id="$(jq -r .campaign_id <<<"$campaign")"
+commission_id="$(jq -r '.commissions[0].commission_id' <<<"$campaign")"
+test -n "$campaign_id" && test "$campaign_id" != null
+test -n "$commission_id" && test "$commission_id" != null
+jq -e --arg campaign "$campaign_id" --arg commission "$commission_id" '.campaign_id == $campaign and .commissions[0].commission_id == $commission' <<<"$campaign_again" >/dev/null
+aggregate="$(curl -fsS "http://127.0.0.1:8080/v1/campaigns/$campaign_id?limit=1")"
+jq -e --arg commission "$commission_id" 'any(.commissions[]; .commission_id == $commission)' <<<"$aggregate" >/dev/null
+commission="$(curl -fsS "http://127.0.0.1:8080/v1/commissions/$commission_id")"
+jq -e '.state == "queued"' <<<"$commission" >/dev/null
+curl -fsS -X POST -H 'content-type: application/json' -d "$(jq -n --argjson version "$(jq -r .version <<<"$commission")" '{expected_version:$version}')" "http://127.0.0.1:8080/v1/commissions/$commission_id/start" >/dev/null
+# Commission/task IDs share their stable identifier; the start response is the
+# updated Commission aggregate, not a task-acceptance response.
+task_id="$commission_id"
+deadline=$((SECONDS + 90))
+session_id=""
+while (( SECONDS < deadline )); do
+  commission="$(curl --max-time 3 -fsS "http://127.0.0.1:8080/v1/commissions/$commission_id")"
+  session_id="$(jq -r '.attempts[0].session_id // empty' <<<"$commission")"
+  [ -n "$session_id" ] && break
+  sleep 0.2
+done
+test -n "$session_id"
+commission_session="$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$session_id")"
+opencode_id="$(jq -r .opencode_session_id <<<"$commission_session")"
+test -n "$opencode_id" && test "$opencode_id" != null
+commission_attempts="$(jq '.attempts | length' <<<"$commission")"
+test "$commission_attempts" = 1
+# The test model's hold gate is before it receives the prompt, so keeping it
+# held through the restart would interrupt the request before any edit occurs.
+# Release it only after the stable Session binding has been recorded, then
+# wait for observable branch effects before exercising recovery.
+curl -fsS -X POST http://127.0.0.1:4098/__test/release >/dev/null
+campaign_workspace="$runtime/$session_id/home/workspace/campaign-e2e"
+deadline=$((SECONDS + 120))
+while (( SECONDS < deadline )); do
+  if [ -f "$campaign_workspace/target.txt" ] && [ "$(cat "$campaign_workspace/target.txt")" = after ] \
+    && [ "$(git -C "$campaign_workspace" branch --show-current 2>/dev/null || true)" != main ] \
+    && [ "$(git -C "$campaign_workspace" status --porcelain 2>/dev/null || true)" = " M target.txt" ]; then
+    break
+  fi
+  sleep 0.3
+done
+test "$(<"$campaign_workspace/target.txt")" = after
+test "$(git -C "$campaign_workspace" status --porcelain)" = " M target.txt"
+jq -e '.. | strings | select(contains("+after"))' <<<"$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$session_id/diff")" >/dev/null
+test "$(git -C "$campaign_workspace" branch --show-current)" != main
+kill "$api_pid"
+wait "$api_pid" 2>/dev/null || true
+RUST_LOG="${RUST_LOG:-info}" "$anvild_bin" >"$tmp/anvild-campaign-restarted.log" 2>&1 & api_pid=$!
+poll http://127.0.0.1:8080/readyz
+commission_after_restart="$(curl -fsS "http://127.0.0.1:8080/v1/commissions/$commission_id")"
+jq -e --arg commission "$commission_id" 'any(.commissions[]; .commission_id == $commission)' \
+  <<<"$(curl -fsS "http://127.0.0.1:8080/v1/campaigns/$campaign_id?limit=1")" >/dev/null
+test "$(jq -r '.attempts | length' <<<"$commission_after_restart")" = "$commission_attempts"
+test "$(jq -r '.attempts[0].session_id' <<<"$commission_after_restart")" = "$session_id"
+test "$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$session_id" | jq -r .opencode_session_id)" = "$opencode_id"
+test "$(jq '.attempts | length' <<<"$commission_after_restart")" = 1
+test "$(jq -r '.attempts[0].session_id' <<<"$commission_after_restart")" = "$session_id"
+test "$(<"$campaign_workspace/target.txt")" = after
+test "$(git -C "$campaign_workspace" status --porcelain)" = " M target.txt"
+jq -e '.. | strings | select(contains("+after"))' <<<"$(curl -fsS "http://127.0.0.1:8080/v1/sessions/$session_id/diff")" >/dev/null
+test "$(git -C "$campaign_workspace" branch --show-current)" != main
+printf 'Campaign idempotent submit/start, worker diff/branch and restart identity (campaign=%s commission=%s task=%s session=%s opencode=%s): %ds\n' "$campaign_id" "$commission_id" "$task_id" "$session_id" "$opencode_id" "$((SECONDS - scenario_start))"
 
 printf 'frontend/API smoke: passed\ntotal: %ds\n' "$((SECONDS - start_time))"

@@ -38,12 +38,32 @@ against an assumed environment. Production promotion is outside this campaign.
 - [x] (2026-11-06) Drafted this plan from the agreed spec and inspected mainline entry points; no implementation evidence claimed.
 - [x] (2026-11-07) Recorded the Campaign and five sequential Commission contracts; preserved historical criteria and evidence without promoting acceptance.
 - [ ] EH-C1: Durable work and supervised execution. (partial implementation: reporting-skill bootstrap and turn/Attempt lifecycle correction; Commission journey unverified)
+- [x] (2026-11-07 22:44Z) EH-C1 execution baseline reconciled: `anvil/incremental-roadmap` at `a4d36658a81001c572174906b96b6efe40f0eb92`, ahead seven of `origin/main`; no associated PR (`gh pr status`); only pre-existing untracked `node_modules/`, preserved. Local implementation authorized; integration target, registered PR, external model budget and ticket not assigned.
+- [x] (2026-11-08 00:03Z) EH-C1 local increment: Campaign graph validation, additive durable Campaign/Commission records backed by the existing Task/Attempt/Session authority, explicit start, aggregate HTTP/MCP reads, hierarchical instruction and local fixture branch-change/restart demonstration. EH-C1 remains open: integration, live Kubernetes/provider evidence and identified usage/recovery gaps remain.
+- [x] (2026-11-08) EH-C1 review/validation checkpoint: repaired the nullable Batch lookup, pre-submission dispatch stall, Kubernetes runtime-only nil-run panic and unsafe retry. Workspace build, format, all-feature workspace Clippy, 269 workspace tests and disposable local E2E passed. No PR or approved target; EH-C1 is not concluded.
 - [ ] EH-C2: Obligation-driven progress and reporting.
 - [ ] EH-C3: Deterministic convergence and bounded recovery.
 - [ ] EH-C4: Human control and review workspace.
 - [ ] EH-C5: Authoritative delivery and end-to-end assurance.
 
 ## Surprises & Discoveries
+
+EH-C1 source reconnaissance at `a4d3665`: the legacy batch scheduler can dispatch
+worker turns, while the Reconciler executor currently dispatches CreateAttempt only;
+SendTurn is disabled pending uncertain-outcome recovery. Task graph submission has
+atomic durable idempotency but no Campaign identity. An internal Task-to-Commission
+adapter must not become a second execution writer; existing Task public routes are
+retirement candidates for EH-C4, not a new product contract. These are inspected
+source facts, not runtime acceptance.
+
+EH-C1 deterministic fixture revealed two execution races: legacy `create` waits
+for a held worker turn before the Attempt can bind its Session, and pinned v2
+OpenCode's `POST /api/session/{id}/prompt` is synchronous (not an asynchronous
+acknowledgement). The first run edited a file while the Attempt remained
+provisioning/unbound; a second run restarted before the model received input and
+left a submitted run with no edit. The corrected fixture releases its gate and
+observes the edit before restarting. These failures are retained, not promoted
+to successful unknown-effect recovery evidence. See Artifacts and Notes.
 
 Mainline already contains durable tasks, Attempts, scheduler capacity, reconciliation
 and effect execution. `crates/anvild/src/lib.rs` has `run_task_reconciliation_tick`,
@@ -60,6 +80,23 @@ must not run alongside another service using them. Its temporary fixture disable
 Git TLS verification; never carry that environment into a real deployment.
 
 ## Decision Log
+
+2026-11-07 22:44Z — EH-C1 implementation binding: use the existing SQLite store,
+Task-backed execution authority and Attempt/Session records as internal migration
+adapters; introduce Campaign/Commission public vocabulary and additive membership,
+not a second scheduler. Preserve old Task endpoints during the bounded EH-C1 to
+EH-C4 client migration and record their removal as EH-C4 work. The actual working
+branch is `anvil/incremental-roadmap`; no target approval or PR exists, so no merge
+or external execution is authorized by this checkpoint. Source baseline `a4d3665`.
+
+2026-11-08 00:03Z — Submission alone never dispatches work: the versioned
+`POST /v1/commissions/:id/start` gate authorizes the existing scheduler.
+Commissions use their Task ID internally and preserve a running strategy Attempt
+after turn completion; `start_after` cannot treat a mere turn as completion.
+An ambiguous prompt submission stops with recovery required rather than blindly
+replaying. The local fixture demonstrates a branch edit then restart; neither
+this nor a worker's claim marks the Commission integrated. These are bounded
+EH-C1 decisions, not a redesign of provider execution or approval policy.
 
 2026-11-07 — Operator-approved API scope amendment: delete the Task API rather
 than retain it as a compatibility product surface. Retain batch operations over
@@ -102,6 +139,21 @@ isolation before expanding breadth. Do not gate the first runnable slice on a fu
 Ledger redesign, generalized workflow engine or context-policy benchmark.
 
 ## Outcomes & Retrospective
+
+2026-11-07 22:44Z EH-C1 resumed from committed planning revision `a4d3665`, not
+the historical baseline at line 21. No EH-C1 obligation is accepted by this
+reconciliation; external integration and live model/provider observations remain
+blocked on approved target/budget. The minimum safe next step is local implementation
+and deterministic evidence, then request target/PR integration authority.
+
+2026-11-08 00:03Z: local Campaign submission and worker branch-edit/restart
+identity are observable in a disposable fixture. There is no accepted live
+provider/Kubernetes or registered-PR evidence, no demonstrated commit/push/PR
+publication, no safe same-branch strategy retry and no complete model cost/time
+budget. EH-C1-O1–O4 remain partial; no Commission or EH acceptance row is marked
+verified. EH-C2 remains start-blocked. Retire the Task public routes/tools and
+legacy Task-centric completion bridge during the governed EH-C4 migration only
+after their safety replacement is established.
 
 2026-11-07 planning revision: the current next action is EH-C1 against the reconciled
 working tree, followed by EH-C2 through EH-C5. No Commission is accepted or integrated
@@ -582,6 +634,76 @@ shared profile/Nix storage, production resources or unrelated user work.
 
 ## Artifacts and Notes
 
+2026-11-08 00:03Z EH-C1 checkpoint, source HEAD `a4d36658a81001c572174906b96b6efe40f0eb92`
+plus uncommitted core/daemon/store/MCP/test/plan changes; `node_modules/` was
+pre-existing and remains untracked. All commands below ran from repository root.
+The initial `just build` exited 0; `cargo fmt --check`,
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+`cargo nextest run --workspace` (262 passed, 0 failed, 1 slow),
+`just frontend-check` (16 passed), `just security-check`, and
+`git diff --check` exited 0 at that dirty checkpoint. Full validation logs:
+`/tmp/opencode/anvil-verification-*.log`. Npm reported two high-severity
+dependency findings, without a failing command; no dependency remediation
+was attempted. Subsequent source edits require a final rerun before handoff.
+
+| Obligation / mapped acceptance | Local evidence and present gap |
+| --- | --- |
+| EH-C1-O1 / EH-02 | `crates/anvil-core/src/lib.rs` validates Campaign/Commission/obligation graph; migration v15 and atomic store adapter in `crates/anvild/src/store.rs` preserve old records; `store/scheduler.rs` retains strategy Attempt after a turn. Store/restart and API tests are deterministic only. No authoritative integrated lifecycle demonstrated. |
+| EH-C1-O2 / EH-01, EH-10 | Explicit versioned start and capacity/start gates reuse the existing scheduler; `tests/local-e2e.sh` uses local Workspace, branch, bound Session and scripted worker. Existing security and E2E fixtures cover regressions, **not** live Kubernetes, broker, shared Nix or preview observations; start-dependent completion remains unresolved. |
+| EH-C1-O3 / EH-03, EH-09, EH-11, EH-12, EH-13 | One-request idempotent Campaign graph, HTTP/MCP aggregate page and instruction envelope are implemented; local scripted worker edited `target.txt` on an Anvil branch. No worker commit/push/PR, real model skill discovery, correlated full trace export, or live GitHub evidence. Page cursor covers immutable membership only; public change watermark is separate. |
+| EH-C1-O4 / EH-02, EH-04, EH-05 | Store-derived measured Attempt count persists across reopen; elapsed execution and model cost remain unavailable unless recorded. Fixture after branch edit restarts controller, retaining one Attempt/Session and diff. Unknown prompt outcome is not replayed. This does not prove recovery of a submitted-but-unobserved prompt, safe multi-Attempt branch continuity or all budget limits. |
+
+Two useful failed local runs are preserved: `/tmp/opencode/anvil-local-e2e-campaign-20261107-152527.log`
+(worker edit while Session unbound), `/tmp/opencode/eh-c1-e2e-rerun.log`
+(v2 synchronous prompt and early restart), and
+`/tmp/opencode/eh-c1-e2e-async.log` (restart before fixture model input).
+Each `just e2e` exited 1. After changing fixture ordering, the same command
+`ANVIL_PREBUILT_BIN_DIR="$PWD/target/debug" ANVIL_E2E_TMPDIR=/tmp/opencode ANVIL_E2E_KEEP=1 just e2e`
+exited 0 (delegate report); it observes the branch edit before restart and
+preserves identity with one Attempt, not a completed PR or unknown-effect replay.
+No paid model, external repository mutation or deployment was used.
+
+2026-11-08 subsequent review/verification correction: review against the
+post-fix source exposed a nullable `batch_id` lookup in `tasks_for_session` that
+made the initial Commission prompt fail before submitting a run. An E2E run
+after the prior green unit suite exited 1 and left a ready idle Session and
+provisioning Attempt, with no model request. Diagnostic artifact:
+`/tmp/opencode/eh-c1-final-validation.log`, fixture
+`/tmp/opencode/anvil-local-e2e.6t0kCN`. The Session-to-Commission classifier
+now uses bound Attempts; the historical session-to-Batch reader accepts null
+membership. Pre-submission failures persist an explicit failure only when
+the durable run record proves no submission; submitted/unknown outcomes still
+require observation. The later read-only reviewer attempt reached its step
+limit; its apparent sibling-instruction and double-dispatch concerns were
+checked against `campaign_work_instruction` (uses Campaign purpose/contracts,
+not sibling page) and the serialized prompt-worker guard. It did identify a
+legacy recovered-sandbox state regression, repaired in the small integration
+edit. The reviewer API key had first expired; a subsequent invocation did run.
+
+Latest validation on HEAD `a4d3665` plus dirty EH-C1 changes from repository
+root: `just build`, `cargo fmt --check`,
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+`cargo nextest run --workspace` (**269 passed, 0 skipped**),
+`git diff --check`, `bash -n tests/local-e2e.sh`, and
+`ANVIL_PREBUILT_BIN_DIR="$PWD/target/debug" ANVIL_E2E_TMPDIR=/tmp/opencode ANVIL_E2E_KEEP=1 just e2e`
+all exited 0. Full logs: `/tmp/opencode/eh-c1-gates-latest.log`. The
+scripted-model fixture used Campaign `f4bcb5bc-a5cb-44ec-8486-04e0837241d7`,
+Commission/Task `024bbf17-c1b8-4463-924b-5e71a2e25779`, and Session
+`campaign-e2e-5c641f39`; it observed the edit/diff on the branch before
+restart, then stable identities and one Attempt afterward. `just frontend-check`
+(16 tests) and `just security-check` also exited 0 in the preceding full
+verification run; those were not repeated after the final Rust changes.
+These are deterministic local fixtures, not real provider/cluster integration.
+
+Read-only reviews identified and prompted fixes for capacity after turn-end,
+unknown submitted effects, branch mismatch, stale start preconditions and a
+Kubernetes runtime-only nil-run panic. Review also identifies residual risks:
+Commission retry currently uses a fresh Session-derived branch rather than
+reusing the existing Workspace branch; start dependencies need an explicit
+upstream milestone beyond a mere turn end; time/cost budgets are not enforced
+and live Kubernetes runtime-only behavior remains unobserved. Do not admit
+unapproved external work on this partial evidence.
+
 2026-11-07 API-amendment validation: documentation-only changes to this plan on the
 same `637af464d3e86df9d11a0ef8222edbe894ce9b02` code baseline. From the repository
 root, `cargo fmt --check`, workspace clippy with all targets/features and `-D warnings`,
@@ -645,6 +767,22 @@ durable location and link them here; do not create a second acceptance ledger. K
 failed observations and append corrections rather than replacing historical results.
 
 ## Interfaces and Dependencies
+
+EH-C1 provisional public interface (2026-11-08): `POST /v1/campaigns` requires
+`Idempotency-Key` and accepts `{campaign:{purpose,shared_contracts},
+commissions:[{local_key,objective,obligations,execution_target,budget,
+start_after,integration_after}]}`; returns `{campaign_id,commissions:[{local_key,
+commission_id}],receipt}` with 201 created, 200 replay or 409 changed-key
+conflict. `GET /v1/campaigns/:id?after=<local_key>&limit=1..256` returns an
+immutable-membership keyset page, `total` and `next_page_cursor` (null when
+exhausted); `GET /v1/commissions/:id` projects Task-backed lifecycle, bound
+Attempts and measured/unavailable usage. `POST /v1/commissions/:id/start` takes
+`{expected_version}`; stale versions conflict. MCP tools
+`anvil_submit_campaign`, `anvil_get_campaign`, `anvil_get_commission`, and
+`anvil_start_commission` each forward one corresponding application request.
+The page cursor is not a change watermark; full query-scoped change recovery,
+bounded set steering and per-item receipts remain EH-C3/EH-C4 work. There is
+currently no committed PR or approved integration target for this interface.
 
 Operator-approved interface direction (2026-11-07): expose Campaign/Commission
 bulk application operations with durable idempotency and receipts, aggregate queries,

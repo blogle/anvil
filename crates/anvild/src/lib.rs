@@ -1,5 +1,6 @@
 //! HTTP control plane for Anvil Kubernetes sandboxes.
 
+mod campaign;
 mod github;
 mod local;
 pub mod store;
@@ -1472,9 +1473,7 @@ impl SandboxApi for KubeSandboxApi {
         let ns = &self.config.namespace;
         let name = format!("anvil-{id}");
         let now = chrono_like_now();
-        let run_id = initial_run
-            .run_id()
-            .expect("initial run record must contain its submitted run");
+        let run_id = initial_run.run_id();
         let l = labels();
         let work_branch = branch_name(&SessionId::parse(id).unwrap());
         let mut annotations = serde_json::Map::new();
@@ -1530,7 +1529,6 @@ impl SandboxApi for KubeSandboxApi {
             json!({"name":"ANVIL_REPOSITORY","value":r.repository}),
             json!({"name":"ANVIL_REF","value":r.base_ref}),
             json!({"name":"ANVIL_WORK_BRANCH","value":work_branch}),
-            json!({"name":"ANVIL_RUN_ID","value":run_id}),
             json!({"name":"OPENCODE_CONFIG","value":"/anvil/profile/config/opencode.jsonc"}),
             json!({"name":"OPENCODE_CONFIG_DIR","value":"/anvil/profile/config"}),
             json!({"name":"OPENCODE_DISABLE_CHANNEL_DB","value":"1"}),
@@ -1542,6 +1540,9 @@ impl SandboxApi for KubeSandboxApi {
             json!({"name":"XDG_RUNTIME_DIR","value":"/home/anvil/.local/state/runtime"}),
             json!({"name":"DISPLAY","value":":99"}),
         ];
+        if let Some(run_id) = run_id {
+            env.push(json!({"name":"ANVIL_RUN_ID","value":run_id}));
+        }
         env.extend(
             git_committer_environment(&self.config)
                 .into_iter()
@@ -1912,6 +1913,7 @@ pub struct AppState {
     materializations_reconciled: Arc<AtomicBool>,
     materialization_reconcile_lock: Arc<AsyncMutex<()>>,
     admission_lock: Arc<AsyncMutex<()>>,
+    commission_prompt_workers: Arc<Mutex<HashMap<String, Instant>>>,
     capability_signer: Option<github::CapabilitySigner>,
     github: Option<github::GithubBroker>,
     #[allow(dead_code)]
@@ -1967,6 +1969,7 @@ impl AppState {
             materializations_reconciled: Arc::new(AtomicBool::new(false)),
             materialization_reconcile_lock: Arc::new(AsyncMutex::new(())),
             admission_lock: Arc::new(AsyncMutex::new(())),
+            commission_prompt_workers: Arc::new(Mutex::new(HashMap::new())),
             capability_signer,
             github,
             git_pr_checks: Arc::new(Mutex::new(HashMap::new())),
@@ -2144,6 +2147,10 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
         .route("/v1/batches", post(submit_batch))
         .route("/v1/batches/:id", get(get_batch))
         .route("/v1/batches/:id/digest", get(get_batch_digest))
+        .route("/v1/campaigns", post(submit_campaign))
+        .route("/v1/campaigns/:id", get(get_campaign))
+        .route("/v1/commissions/:id", get(get_commission))
+        .route("/v1/commissions/:id/start", post(start_commission))
         .route("/v1/capacity", get(get_capacity))
         .route("/v1/tasks", post(create_task).get(list_tasks))
         .route("/v1/tasks/graph", post(create_task_graph))
@@ -2207,6 +2214,101 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
         .fallback(get(spa_fallback))
         .layer(Extension(web_root))
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+struct CampaignPageQuery {
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn submit_campaign(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Result<(StatusCode, Json<Value>), ServiceError> {
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ServiceError::Invalid("Idempotency-Key header is required".into()))?;
+    let acceptance = campaign::submit(
+        state
+            .store()
+            .map_err(|error| ServiceError::Store(error.into()))?,
+        key,
+        &request,
+    )?;
+    Ok((
+        if acceptance.created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(acceptance.task),
+    ))
+}
+
+async fn get_campaign(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<CampaignPageQuery>,
+) -> Result<Json<Value>, ServiceError> {
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=campaign::MAX_PAGE_SIZE).contains(&limit) {
+        return Err(ServiceError::Invalid(format!(
+            "limit must be between 1 and {}",
+            campaign::MAX_PAGE_SIZE
+        )));
+    }
+    campaign::aggregate(
+        state
+            .store()
+            .map_err(|error| ServiceError::Store(error.into()))?,
+        &id,
+        query.after.as_deref(),
+        limit,
+    )
+    .map(Json)
+}
+
+async fn get_commission(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ServiceError> {
+    campaign::commission(
+        state
+            .store()
+            .map_err(|error| ServiceError::Store(error.into()))?,
+        &id,
+    )
+    .map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+struct StartCommissionRequest {
+    expected_version: u64,
+}
+
+async fn start_commission(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<StartCommissionRequest>,
+) -> Result<Json<Value>, ServiceError> {
+    let store = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?;
+    store
+        .start_commission(&id, request.expected_version)
+        .map(Json)
+        .map_err(|error| match error {
+            store::StoreError::NotFound => ServiceError::NotFound,
+            store::StoreError::Conflict => {
+                ServiceError::Conflict("commission version precondition failed".into())
+            }
+            other => ServiceError::Store(other.to_string()),
+        })
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2618,7 +2720,7 @@ fn scan_batch_changes(
                             .tasks_for_session(session_id)
                             .map_err(|error| ServiceError::Store(error.to_string()))?;
                         changed.extend(tasks.into_iter().filter_map(|(task_id, owner_batch)| {
-                            (owner_batch == batch_id).then_some(task_id)
+                            (owner_batch.as_deref() == Some(batch_id)).then_some(task_id)
                         }));
                     }
                 }
@@ -2912,6 +3014,34 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
             }
             Err(error) => return Err(error),
         };
+        let is_commission = store
+            .get_commission(&active.task_id)
+            .map_err(|error| ServiceError::Store(error.to_string()))?
+            .is_some();
+        if record.session.environment_state == "ready"
+            && record.run_record.current.is_none()
+            && record.run_record.last.is_none()
+            && is_commission
+        {
+            // A ready sandbox with no run record is durable evidence that
+            // begin_run never marked a submission. Dispatch once; prompt()
+            // persists Submitted before the external request, so later
+            // observations never blindly replay an uncertain submission.
+            let task = store
+                .get_resource("task", &active.task_id)
+                .map_err(|error| ServiceError::Store(error.to_string()))?
+                .ok_or(ServiceError::NotFound)?;
+            let attempt = store
+                .get_resource("attempt", &active.attempt_id)
+                .map_err(|error| ServiceError::Store(error.to_string()))?
+                .ok_or(ServiceError::NotFound)?;
+            dispatch_commission_prompt(
+                state,
+                &session_id,
+                commission_instruction(store, &task, &attempt)?,
+            );
+            continue;
+        }
         let disposition = if record.session.environment_state == "suspended" {
             Some("suspended")
         } else if record.session.environment_state == "failed" {
@@ -2934,7 +3064,21 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
             Some("provisioning")
         } else {
             match (&record.run_record.current, &record.run_record.last) {
-                (Some(_), _) => Some("running"),
+                (Some(ActiveRunState::Running { .. }), _) => Some("running"),
+                (Some(ActiveRunState::Submitted { .. }), _) => {
+                    if state
+                        .commission_prompt_workers
+                        .lock()
+                        .expect("commission worker map poisoned")
+                        .contains_key(&session_id)
+                    {
+                        continue;
+                    }
+                    // The durable Submitted marker means the external prompt
+                    // may have been accepted. Never replay it automatically,
+                    // but do not stop scheduling unrelated work.
+                    continue;
+                }
                 (None, Some(FinishedRun::Completed(_))) => Some("completed"),
                 (None, Some(FinishedRun::Failed(run))) => {
                     store
@@ -2954,11 +3098,16 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
         };
         if let Some(attempt_state) = disposition {
             if active.state != attempt_state {
+                let campaign_turn = store
+                    .get_commission(&active.task_id)
+                    .map_err(|error| ServiceError::Store(error.to_string()))?
+                    .is_some();
                 if attempt_state == "completed"
-                    && store
-                        .task_control(&active.task_id)
-                        .map_err(|error| ServiceError::Store(error.to_string()))?
-                        .is_some_and(|control| control["controller_mode"] == "reconciler")
+                    && (campaign_turn
+                        || store
+                            .task_control(&active.task_id)
+                            .map_err(|error| ServiceError::Store(error.to_string()))?
+                            .is_some_and(|control| control["controller_mode"] == "reconciler"))
                 {
                     store
                         .set_attempt_turn_completed(&active.attempt_id)
@@ -2974,7 +3123,12 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
                     .task_control(&active.task_id)
                     .map_err(|error| ServiceError::Store(error.to_string()))?
                     .ok_or(ServiceError::NotFound)?;
-                if control["controller_mode"] == "legacy" {
+                if control["controller_mode"] == "legacy"
+                    && store
+                        .get_commission(&active.task_id)
+                        .map_err(|error| ServiceError::Store(error.to_string()))?
+                        .is_none()
+                {
                     store
                         .complete_legacy_scheduler_attempt(
                             &active.task_id,
@@ -3001,41 +3155,102 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
         )
         .map_err(|error| ServiceError::Store(error.to_string()))?;
     for claim in claims {
-        let project = claim.task["project"].as_str().unwrap_or("batch");
+        let target = &claim.task["execution_target"];
+        let project = claim.task["project"]
+            .as_str()
+            .or(target["project"].as_str())
+            .unwrap_or("commission");
         let attempt_id = claim.attempt["attempt_id"].as_str().unwrap_or_default();
         let session_id = deterministic_attempt_session_id(project, attempt_id);
         match state.kube.get(&session_id).await {
             Ok(_) => {
+                let record = state.kube.get(&session_id).await?;
                 store
-                    .bind_attempt_session(
-                        claim.attempt["attempt_id"].as_str().unwrap_or_default(),
-                        &session_id,
-                    )
-                    .and_then(|_| {
-                        store.set_attempt_and_task_state(
-                            claim.attempt["attempt_id"].as_str().unwrap_or_default(),
-                            "running",
-                            "running",
-                        )
-                    })
+                    .bind_attempt_session(attempt_id, &session_id)
                     .map_err(|error| ServiceError::Store(error.to_string()))?;
+                if claim.task["commission_id"].is_null() {
+                    // Preserve the legacy scheduler's existing-sandbox recovery path.
+                    store
+                        .set_attempt_and_task_state(attempt_id, "running", "running")
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                    continue;
+                }
+                if claim.task["commission_id"].is_string()
+                    && record.run_record.current.is_none()
+                    && record.run_record.last.is_none()
+                {
+                    if record.session.environment_state != "ready" {
+                        continue;
+                    }
+                    // Run records are committed before prompt dispatch. Their
+                    // absence therefore proves this provisioned sandbox has
+                    // not yet submitted its initial turn.
+                    let instruction = commission_instruction(store, &claim.task, &claim.attempt)?;
+                    dispatch_commission_prompt(state, &session_id, instruction);
+                    continue;
+                }
+                if matches!(
+                    record.run_record.current,
+                    Some(ActiveRunState::Running { .. })
+                ) {
+                    store
+                        .set_attempt_and_task_state(attempt_id, "running", "running")
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                } else if matches!(
+                    record.run_record.current,
+                    Some(ActiveRunState::Submitted { .. })
+                ) {
+                    if state
+                        .commission_prompt_workers
+                        .lock()
+                        .expect("commission worker map poisoned")
+                        .contains_key(&session_id)
+                    {
+                        continue;
+                    }
+                    // Submitted is durable evidence of an attempted dispatch;
+                    // preserve the attempt for recovery without replaying it.
+                    continue;
+                } else if matches!(record.run_record.last, Some(FinishedRun::Completed(_))) {
+                    store
+                        .set_attempt_turn_completed(attempt_id)
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                } else if let Some(FinishedRun::Failed(run)) = record.run_record.last {
+                    store
+                        .record_attempt_failure(
+                            attempt_id,
+                            store::scheduler::FailureClass::Execution,
+                            &run.error,
+                            chrono::Utc::now().timestamp_millis(),
+                            state.config.provisioning_max_attempts,
+                            state.config.provisioning_retry_base.as_millis() as u64,
+                        )
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                }
                 continue;
             }
             Err(ServiceError::NotFound) => {}
             Err(error) => return Err(error),
         }
+        let is_commission = claim.task["commission_id"].is_string();
         let request = CreateRequest {
             project: project.to_owned(),
             repository: claim.task["repository"]
                 .as_str()
+                .or(target["repository"].as_str())
                 .unwrap_or_default()
                 .to_owned(),
             base_ref: claim.task["base_commit"]
                 .as_str()
                 .or_else(|| claim.task["requested_revision"].as_str())
+                .or_else(|| target["base_ref"].as_str())
                 .unwrap_or("main")
                 .to_owned(),
-            prompt: claim.task["prompt"].as_str().unwrap_or_default().to_owned(),
+            prompt: if is_commission {
+                commission_instruction(store, &claim.task, &claim.attempt)?
+            } else {
+                claim.task["prompt"].as_str().unwrap_or_default().to_owned()
+            },
             model: claim.task["model"]
                 .as_str()
                 .or_else(|| claim.task["policy"]["model"].as_str())
@@ -3043,14 +3258,25 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
             author_name: None,
             author_email: None,
             session_id_override: Some(session_id.clone()),
-            runtime_only: false,
+            runtime_only: is_commission,
         };
+        let initial_instruction = is_commission.then(|| request.prompt.clone());
         match create(State(state.clone()), None, Json(request)).await {
             Ok((_, Json(session))) => {
                 store
                     .bind_attempt_session(attempt_id, &session.id)
-                    .and_then(|_| store.set_attempt_state(attempt_id, "running"))
                     .map_err(|error| ServiceError::Store(error.to_string()))?;
+                if is_commission {
+                    dispatch_commission_prompt(
+                        state,
+                        &session.id,
+                        initial_instruction.expect("commission instruction exists"),
+                    );
+                } else {
+                    store
+                        .set_attempt_state(attempt_id, "running")
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                }
             }
             Err(error) => {
                 let class = if matches!(
@@ -3061,6 +3287,15 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
                 } else {
                     store::scheduler::FailureClass::NonRetryable
                 };
+                if is_commission && class == store::scheduler::FailureClass::Infrastructure {
+                    // The backend create may have persisted the deterministic
+                    // Sandbox before returning an error. Without a transactional
+                    // backend existence check, fence retries rather than risk
+                    // creating a second Workspace.
+                    store
+                        .mark_workspace_creation_ambiguous(attempt_id)
+                        .map_err(|store_error| ServiceError::Store(store_error.to_string()))?;
+                }
                 store
                     .record_attempt_failure(
                         attempt_id,
@@ -3083,6 +3318,135 @@ fn deterministic_attempt_session_id(project: &str, attempt_id: &str) -> String {
         "{project}-{:02x}{:02x}{:02x}{:02x}",
         digest[0], digest[1], digest[2], digest[3]
     )
+}
+
+fn commission_instruction(
+    store: &store::ControllerStore,
+    task: &Value,
+    attempt: &Value,
+) -> Result<String, ServiceError> {
+    let commission = store
+        .get_commission(task["commission_id"].as_str().unwrap_or_default())
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+        .unwrap_or(Value::Null);
+    let campaign = store
+        .get_campaign(
+            commission["campaign_id"].as_str().unwrap_or_default(),
+            None,
+            1,
+        )
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+        .unwrap_or(Value::Null);
+    Ok(campaign_work_instruction(
+        &campaign,
+        &commission,
+        task,
+        attempt,
+    ))
+}
+
+fn dispatch_commission_prompt(state: &AppState, session_id: &str, instruction: String) {
+    {
+        let mut workers = state
+            .commission_prompt_workers
+            .lock()
+            .expect("commission worker map poisoned");
+        if workers.contains_key(session_id) {
+            return;
+        }
+        workers.insert(session_id.to_owned(), Instant::now());
+    }
+    let state = state.clone();
+    let session_id = session_id.to_owned();
+    tokio::spawn(async move {
+        info!(session_id, "Commission OpenCode prompt worker started");
+        let result = prompt(
+            Path(session_id.clone()),
+            State(state.clone()),
+            Json(PromptRequest {
+                prompt: instruction,
+            }),
+        )
+        .await;
+        match result {
+            Ok(_) => info!(session_id, "Commission OpenCode prompt worker returned"),
+            Err(error) => {
+                warn!(session_id, %error, "Commission OpenCode prompt worker ended without confirmation");
+                match fail_unsubmitted_commission_attempt(&state, &session_id, &error.to_string())
+                    .await
+                {
+                    Ok(true) => warn!(
+                        session_id,
+                        "Commission prompt failed before submission; bounded attempt failure recorded"
+                    ),
+                    Ok(false) => {}
+                    Err(failure) => warn!(
+                        session_id,
+                        %failure,
+                        "Could not record Commission pre-submission failure"
+                    ),
+                }
+            }
+        }
+        state
+            .commission_prompt_workers
+            .lock()
+            .expect("commission worker map poisoned")
+            .remove(&session_id);
+    });
+}
+
+async fn fail_unsubmitted_commission_attempt(
+    state: &AppState,
+    session_id: &str,
+    error: &str,
+) -> Result<bool, String> {
+    let record = match state.kube.get(session_id).await {
+        Ok(record) => record,
+        Err(ServiceError::NotFound) => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    // begin_run durably writes Submitted before contacting OpenCode. Only the
+    // absence of both active and finished run records proves no turn was sent.
+    if record.run_record.current.is_some() || record.run_record.last.is_some() {
+        return Ok(false);
+    }
+    let store = state.store().map_err(str::to_owned)?;
+    let Some(attempt) = store
+        .active_attempts()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|attempt| attempt.session_id.as_deref() == Some(session_id))
+    else {
+        return Ok(false);
+    };
+    if store
+        .get_commission(&attempt.task_id)
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    store
+        .record_attempt_failure(
+            &attempt.attempt_id,
+            store::scheduler::FailureClass::Infrastructure,
+            error,
+            Utc::now().timestamp_millis(),
+            state.config.provisioning_max_attempts,
+            state.config.provisioning_retry_base.as_millis() as u64,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+fn campaign_work_instruction(
+    campaign: &Value,
+    commission: &Value,
+    task: &Value,
+    attempt: &Value,
+) -> String {
+    format!("Campaign: {}\nShared contracts: {}\nCommission: {}\nObligations: {}\nTarget: {}\nAttempt: {}\nCurrent facts: session new; candidate SHA unavailable.\nNext action: implement.\nReport progress with the installed Anvil reporting skill.", campaign["purpose"], campaign["shared_contracts"], commission["objective"], commission["obligations"], task["execution_target"], attempt)
 }
 
 async fn get_task(
@@ -4177,6 +4541,7 @@ async fn idempotency_middleware(
         || method == axum::http::Method::DELETE;
     if key.is_none()
         || path == "/v1/batches"
+        || (path == "/v1/campaigns" && method == axum::http::Method::POST)
         || (method == axum::http::Method::POST
             && matches!(path.as_str(), "/v1/tasks" | "/v1/tasks/graph"))
         || (path.starts_with("/v1/tasks/") && path.ends_with("/attempts"))
@@ -5376,6 +5741,10 @@ async fn prompt(
         ));
     }
     let oc = OpenCode::new(service_url(&x, &s.config), s.config.request_timeout);
+    let prompt_store = s
+        .store()
+        .map_err(|error| ServiceError::Store(error.to_owned()))?;
+    let commission_run = commission_attempt_for_session(prompt_store, &id)?;
     let model = match x.model.as_deref() {
         Some(requested) => Some(oc.resolve_model(requested).await?),
         None => None,
@@ -5416,6 +5785,21 @@ async fn prompt(
             Ok(Json(response))
         }
         Err(error) => {
+            if commission_run {
+                return Err(ServiceError::Recovery(format!(
+                    "OpenCode prompt outcome is unknown for submitted run {}: {error}",
+                    submission.run_id
+                )));
+            }
+            if matches!(&error, ServiceError::OpenCode(message) if {
+                let message = message.to_ascii_lowercase();
+                message.contains("timeout") || message.contains("timed out")
+            }) {
+                return Err(ServiceError::Recovery(format!(
+                    "OpenCode prompt outcome is unknown for submitted run {}: {error}",
+                    submission.run_id
+                )));
+            }
             fail_run(&s, &id, &submission, error.to_string()).await?;
             record_history(
                 &s,
@@ -5433,6 +5817,27 @@ async fn prompt(
             Err(error)
         }
     }
+}
+
+fn commission_attempt_for_session(
+    store: &store::ControllerStore,
+    session_id: &str,
+) -> Result<bool, ServiceError> {
+    for attempt in store
+        .active_attempts()
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+        .into_iter()
+        .filter(|attempt| attempt.session_id.as_deref() == Some(session_id))
+    {
+        if store
+            .get_commission(&attempt.task_id)
+            .map_err(|error| ServiceError::Store(error.to_string()))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn materialize_request(
@@ -8654,6 +9059,205 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
+    fn runtime_only_creation_has_no_initial_run_id() {
+        assert_eq!(RunRecord::default().run_id(), None);
+    }
+
+    #[test]
+    fn campaign_work_instruction_uses_persisted_hierarchy_and_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let db =
+            store::ControllerStore::open(directory.path().join("campaign-instruction.sqlite3"))
+                .unwrap();
+        let request = json!({"campaign":{"purpose":"Persisted purpose","shared_contracts":["API compatibility"]},"commissions":[
+            {"local_key":"work","objective":"Implement the feature","obligations":[{"id":"obligation","version":1,"requirement":"Preserve compatibility","acceptance_expectations":["test passes"]}],"execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},"budget":{"max_attempts":2,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},"start_after":[],"integration_after":[]}
+        ]});
+        let validated = anvil_core::validate_campaign_submission(
+            serde_json::from_value(request.clone()).unwrap(),
+        )
+        .unwrap();
+        let accepted = db
+            .accept_campaign("instruction-key", "test", &request, &validated)
+            .unwrap();
+        let commission_id = accepted.task["commissions"][0]["commission_id"]
+            .as_str()
+            .unwrap();
+        db.start_commission(commission_id, 1).unwrap();
+        let claim = db.claim_runnable(1, 0, 2, 0).unwrap().remove(0);
+        let commission = db.get_commission(commission_id).unwrap().unwrap();
+        let campaign = db
+            .get_campaign(commission["campaign_id"].as_str().unwrap(), None, 1)
+            .unwrap()
+            .unwrap();
+        let instruction =
+            campaign_work_instruction(&campaign, &commission, &claim.task, &claim.attempt);
+        assert!(instruction.contains("Persisted purpose"));
+        assert!(instruction.contains("API compatibility"));
+        assert!(instruction.contains("Implement the feature"));
+        assert!(instruction.contains("Preserve compatibility"));
+        assert!(instruction.contains("https://example.test/repo"));
+        assert!(instruction.contains(claim.attempt["attempt_id"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn commission_detection_supports_unbatched_campaign_attempts() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = store::ControllerStore::open(directory.path().join("campaign-detection.sqlite3"))
+            .unwrap();
+        let request = json!({"campaign":{"purpose":"test","shared_contracts":[]},"commissions":[
+            {"local_key":"work","objective":"Implement the feature","obligations":[{"id":"obligation","version":1,"requirement":"Deliver","acceptance_expectations":["test passes"]}],"execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},"budget":{"max_attempts":2,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},"start_after":[],"integration_after":[]}
+        ]});
+        let validated = anvil_core::validate_campaign_submission(
+            serde_json::from_value(request.clone()).unwrap(),
+        )
+        .unwrap();
+        let accepted = db
+            .accept_campaign("detection-key", "test", &request, &validated)
+            .unwrap();
+        let commission_id = accepted.task["commissions"][0]["commission_id"]
+            .as_str()
+            .unwrap();
+        db.start_commission(commission_id, 1).unwrap();
+        let claim = db.claim_runnable(1, 0, 2, 0).unwrap().remove(0);
+        db.bind_attempt_session(
+            claim.attempt["attempt_id"].as_str().unwrap(),
+            "commission-session",
+        )
+        .unwrap();
+
+        assert!(commission_attempt_for_session(&db, "commission-session").unwrap());
+        assert!(!commission_attempt_for_session(&db, "other-session").unwrap());
+    }
+
+    #[tokio::test]
+    async fn campaign_http_contract_replays_pages_restarts_and_checks_versions() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("campaign-http.sqlite3");
+        let mut app_config = config("http://127.0.0.1:4097".into());
+        app_config.store_path = database.clone();
+        let app = router(AppState::new(app_config.clone(), FakeSandbox));
+        let body = json!({"campaign":{"purpose":"persisted purpose","shared_contracts":["shared contract"]},"commissions":[
+            {"local_key":"first","objective":"first objective","obligations":[{"id":"obligation-1","version":1,"requirement":"deliver","acceptance_expectations":["test"]}],"execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},"budget":{"max_attempts":2,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},"start_after":[],"integration_after":[]},
+            {"local_key":"second","objective":"second objective","obligations":[{"id":"obligation-2","version":1,"requirement":"integrate","acceptance_expectations":["review"]}],"execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},"budget":{"max_attempts":2,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},"start_after":[],"integration_after":[]}
+        ]});
+        let submit = |value: Value, key: Option<&str>| {
+            let mut builder = Request::builder().method("POST").uri("/v1/campaigns");
+            if let Some(key) = key {
+                builder = builder.header("idempotency-key", key);
+            }
+            builder
+                .header("content-type", "application/json")
+                .body(Body::from(value.to_string()))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(submit(body.clone(), None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let accepted = app
+            .clone()
+            .oneshot(submit(body.clone(), Some("campaign-http-key")))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+        let accepted: Value = serde_json::from_slice(
+            &axum::body::to_bytes(accepted.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let replay = app
+            .clone()
+            .oneshot(submit(body.clone(), Some("campaign-http-key")))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: Value = serde_json::from_slice(
+            &axum::body::to_bytes(replay.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay, accepted);
+        let mut changed = body.clone();
+        changed["campaign"]["purpose"] = json!("changed payload");
+        assert_eq!(
+            app.clone()
+                .oneshot(submit(changed, Some("campaign-http-key")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        let campaign_id = accepted["campaign_id"].as_str().unwrap();
+        let aggregate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/campaigns/{campaign_id}?limit=1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(aggregate.status(), StatusCode::OK);
+        let aggregate: Value = serde_json::from_slice(
+            &axum::body::to_bytes(aggregate.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(aggregate["purpose"], "persisted purpose");
+        let cursor = aggregate["next_page_cursor"].as_str().unwrap();
+        drop(app);
+        let restarted = router(AppState::new(app_config, FakeSandbox));
+        let page = restarted
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/campaigns/{campaign_id}?limit=1&after={cursor}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        let page: Value = serde_json::from_slice(
+            &axum::body::to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page["commissions"][0]["local_key"], "second");
+        let commission_id = accepted["commissions"][0]["commission_id"]
+            .as_str()
+            .unwrap();
+        let start = |version| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/commissions/{commission_id}/start"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"expected_version":version}).to_string()))
+                .unwrap()
+        };
+        assert_eq!(
+            restarted.clone().oneshot(start(99)).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            restarted.oneshot(start(1)).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+
+    #[test]
     fn git_metadata_selects_latest_open_pull_request_deterministically() {
         let pr = pull_request_from_github(vec![
             json!({"number": 9, "title": "Old", "html_url": "https://github.com/acme/repo/pull/9", "state": "open", "updated_at": "2026-01-01T00:00:00Z"}),
@@ -10848,6 +11452,64 @@ mod tests {
                 .unwrap();
         assert_eq!(capacity.running + capacity.provisioning, 0);
         assert_eq!(capacity.available_slots, 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_submitted_run_does_not_block_other_scheduler_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        config.concurrency_limit = 2;
+        let mut record = active_run_record(activity_session());
+        record.session.id = "submitted-session".into();
+        record.run_record.current = Some(ActiveRunState::Submitted {
+            run_id: RunId("submitted-run".into()),
+            user_message_id: OpenCodeMessageId("submitted-message".into()),
+            started_at: "2026-01-01T10:00:00Z".into(),
+        });
+        record.session.current_run = record.run_record.current.as_ref().map(|run| match run {
+            ActiveRunState::Submitted {
+                run_id,
+                user_message_id,
+                started_at,
+            } => Run {
+                id: run_id.clone(),
+                state: RunState::Submitted,
+                user_message_id: Some(user_message_id.clone()),
+                assistant_message_id: None,
+                started_at: started_at.clone(),
+                finished_at: None,
+                error: None,
+            },
+            ActiveRunState::Running { .. } => unreachable!(),
+        });
+        let state = AppState::new(
+            config,
+            OccupancySandbox {
+                records: vec![record],
+            },
+        );
+        let store = state.store().unwrap();
+        accept_scheduler_batch(
+            store,
+            "submitted-legacy",
+            2,
+            &[("submitted-task", vec![]), ("other-task", vec![])],
+        );
+        store
+            .create_attempt("submitted-task", "submitted-attempt", "submitted-key")
+            .unwrap();
+        store
+            .bind_attempt_session("submitted-attempt", "submitted-session")
+            .unwrap();
+        store
+            .set_attempt_state("submitted-attempt", "running")
+            .unwrap();
+
+        run_batch_scheduler_tick(&state).await.unwrap();
+
+        assert_eq!(store.attempts_for_task("submitted-task").unwrap().len(), 1);
+        assert_eq!(store.attempts_for_task("other-task").unwrap().len(), 1);
     }
 
     #[tokio::test]
