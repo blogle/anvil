@@ -108,6 +108,16 @@ Git TLS verification; never carry that environment into a real deployment.
 
 ## Decision Log
 
+2026-11-08 — Operator selected `addrspace/anvil-validation` as the first
+isolated target and prefers a real model plus repository scenario over a
+fixture-only first live run. These are planning preferences, **not** approval
+to apply manifests, publish images, spend model budget or mutate a repository.
+When prompted for repository/branch/task/USD/time bounds, the operator selected
+the response option to provide exact bounds but did not supply the values;
+the integration target, registered PR and bounded scenario remain unassigned.
+The operator confirmed independent credentials and validation-only routing
+still need provisioning. Do not infer authority or reuse incumbent credentials.
+
 2026-11-08 — Operator direction for prospective deployment preparation: use a
 separate addrspace validation namespace in dotfiles alongside the pinned incumbent.
 This is planning direction only, not approval to deploy or alter production. Until
@@ -727,6 +737,37 @@ target only resources created for the approved isolated run and must not delete
 shared profile/Nix storage, production resources or unrelated user work.
 
 ## Artifacts and Notes
+
+2026-11-08 local image-readiness evidence: on Anvil HEAD `db017c9` before
+the documentation-only `d03af10` commit, from repository root `nix flake
+check` exited 0 and
+`nix build .#anvil-image .#anvil-sandbox-image .#anvil-nix-daemon-image --no-link`
+exited 0. The resulting local store paths are Anvil
+`/nix/store/ddwy2g0sssr5raawl8slgd1yz78nla5m-anvil.tar.gz`, sandbox
+`/nix/store/97gfi052kdj8aja6nczwqylqp7snl17x-image-anvil-sandbox.json`,
+and Nix daemon
+`/nix/store/yvyzx77id9lq16qr08fh0l3w658yf91b-image-anvil-nix-daemon.json`.
+Logs: `/tmp/opencode/anvil-db017c9-flake-check-20261108.log`,
+`/tmp/opencode/anvil-db017c9-images-build-20261108.log`, and
+`/tmp/opencode/anvil-db017c9-image-paths-20261108.log`. Nix emitted a
+`system`-rename evaluation warning, not a failure. These are **local image
+outputs**, not published image/registry digests; the JSON outputs' layer
+digests are not substitutes. No image was loaded, pushed or deployed, and
+the validation overlay still renders historical image tags. Since `d03af10`
+changed only this plan, the executable source remains `db017c9`.
+
+Manifest-only credential inventory for the selected real-model scenario:
+`k8s/base/github-app-secret.yaml` is an empty placeholder. The incumbent
+namespace's sealed credential contains the key names
+`ANVIL_OPENCODE_SERVER_PASSWORD`, `ANVIL_GITHUB_APP_ID`,
+`ANVIL_GITHUB_INSTALLATION_ID`, `ANVIL_GITHUB_PRIVATE_KEY` and
+`ANVIL_SESSION_SIGNING_SECRET`; none is a model-provider key. A distinct
+namespace-scoped Secret/App installation, a securely configured validation
+profile with approved model credentials, independent profile/history/Nix
+PVCs, validation-only controller and wildcard preview DNS/TLS/ingress and
+reviewed SSO policy are still required. No credential values or cluster
+readiness were inspected. Do not copy production SealedSecrets into the
+proposal.
 
 2026-11-08 render-only preparation (no EH acceptance): Anvil HEAD
 `db017c932b05852ef4e0a903b5c0c4ff82c3509a` clean before this plan edit;
