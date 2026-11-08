@@ -46,12 +46,44 @@ against an assumed environment. Production promotion is outside this campaign.
 - [x] (2026-11-08 04:21Z) EH-C1 local deployment-readiness checks completed after v16 safety migration: workspace build, fmt, all-feature Clippy, 276 workspace tests, frontend, security and fixture E2E passed. The fixture PR is local-only, and the unknown submitted run was not replayed. EH-C1 remains open for approved integration/live observations.
 - [x] (2026-11-08) Operator-requested frontend replacement increment on `8d9ef4b`: migrate the existing Session UI to a Next.js static-export Campaign/Commission/Session workspace, align daemon and local fixture serving, restore Session conversation/attach navigation, and fence uncertain browser command retries. Local checks are recorded below; this does not accept EH-C1 or unblock EH-C2.
 - [x] (2026-11-08) Render-only addrspace preparation: on a separate dotfiles worktree, committed a standalone, unregistered `anvil-validation` overlay and audited its local render beside the pinned incumbent. It has no ingress or credentials and is **not deployable**; it was not merged, pushed, registered with Flux, diffed against the cluster, or applied. Live deployment remains blocked pending explicit approval and all gates below.
+- [ ] (2026-11-08) Deployment-readiness Go credential boundary: opt-in worker-only SealedSecret *reference* and private Workspace SQLite bootstrap are under local test/review; no Go key, SealedSecret or OAuth credential provisioned. Reverify after fixes before accepting even local readiness. No live run approved.
 - [ ] EH-C2: Obligation-driven progress and reporting.
 - [ ] EH-C3: Deterministic convergence and bounded recovery.
 - [ ] EH-C4: Human control and review workspace.
 - [ ] EH-C5: Authoritative delivery and end-to-end assurance.
 
 ## Surprises & Discoveries
+
+Pinned OpenCode `v2.0.26+9b4ec57` uses SQLite for live credentials;
+`auth.json` is only a legacy migration input. The existing profile PVC mounts
+in default workers, so moving the profile database onto that same PVC would
+expose persisted OAuth/Go credentials to every worker UID 1000. A local
+prototype of that profile-DB change was **reverted before commit**; OAuth
+profile persistence/worker handoff is unresolved and must not be claimed by
+this Go-only path. The isolated Go worker instead imports a namespace-local
+Secret in its root init into its own Workspace DB and omits the profile PVC.
+The pin's `opencode auth import --standalone` was checked offline with a dummy
+key: repeat import skipped the same ID, but key rotation into an existing
+Workspace also skips rather than replacing credentials. Rotation requires
+an explicit recovery procedure, not an assumption that updating a Secret
+replaces an in-flight worker's credential.
+
+The opt-in Go-only worker path is committed at Anvil
+`7bfde976a174c8933d34660e6c777cf038963dfd`: a Secret **name** in daemon
+configuration causes the worker's init container alone to mount `go-key`,
+import it into its private Workspace SQLite DB and omit the shared profile
+PVC altogether. The default sandbox path remains unchanged. This does not
+provision a Secret, select a model, prove live runtime auth, enable OAuth
+handoff or constrain the worker to 1–2% of a subscription tier.
+
+In the *unregistered, never-applied* dotfiles overlay's first Go reference
+draft, `ANVIL_OPENCODE_GO_SECRET` was accidentally wired through
+`valueFrom.secretKeyRef`, which would have placed raw Go key bytes in the
+controller environment instead of the required Secret **name**. No key was
+present or read and the draft was never pushed, merged or applied. The
+subsequent local corrective commit uses a literal Secret name, and a render
+assertion guards against future valueFrom regression. The rejected draft
+and its correction remain in the local worktree history for audit.
 
 Deployment-readiness reconnaissance at Anvil `db017c9` and dotfiles
 `c456abb`: the incumbent dotfiles overlay still pins base and all three image
@@ -107,6 +139,34 @@ must not run alongside another service using them. Its temporary fixture disable
 Git TLS verification; never carry that environment into a real deployment.
 
 ## Decision Log
+
+2026-11-08 — Operator clarified that Anvil declares Secret requirements but
+**all SealedSecrets are provisioned from dotfiles**, not this repository.
+Use `blogle/anvil` as the likely first real-model trial repository, subject
+to explicit approval of integration branch and small task; no target branch,
+registered PR or permission to mutate it has yet been bound. The operator
+uses OpenCode Go and ChatGPT Plus subscriptions and prefers a cheap Luna or
+Go free model, aiming for at most 1–2% of either tier's usage, without a USD
+budget. Current Go Console reports usage and Extra Usage can be disabled;
+Anvil cannot enforce a percentage of remaining subscription allowance from
+its current budget records. Prefer one explicitly authorized Go/free-model
+trial with Extra Usage off and measured usage before/after; do not claim that
+`max_execution_seconds` or `max_attempts` guarantees the requested fraction.
+ OpenAI OAuth is not a fallback for the Go-only credential path. No key should
+ be pasted into this conversation; dotfiles' approved SealedSecret workflow
+ must supply an independently scoped validation key when authorized.
+
+2026-11-08 — Operator bound the **proposed first trial target and scope**:
+repository `blogle/anvil`, new worker branch with an `integration:review` PR
+targeting `main`, no automatic merge or production promotion; docs-only task
+to write a short guide for the local Next frontend/UI E2E. This selection
+does not approve deployment, image publication, model execution or the GitHub
+App installation. If the trial runs, use one explicitly started Commission,
+one strategy Attempt and no autonomous continuation; observe Go Console usage
+before and after, with Extra Usage disabled, and stop rather than silently
+switching to a paid model. A single initial prompt can itself make multiple
+provider calls; this plan cannot promise a 1–2% hard cap. Do not register a
+runtime PR or bind its ID before it actually exists.
 
 2026-11-08 — Operator selected `addrspace/anvil-validation` as the first
 isolated target and prefers a real model plus repository scenario over a
@@ -737,6 +797,35 @@ target only resources created for the approved isolated run and must not delete
 shared profile/Nix storage, production resources or unrelated user work.
 
 ## Artifacts and Notes
+
+2026-11-08 pinned-runtime Go auth and dotfiles correction (local-only, no
+provider invocation): `nix develop --offline -c opencode --version` reported
+`opencode v2.0.26+9b4ec57`. With isolated `HOME`/XDG paths under
+`/tmp/opencode/auth-import-Ow5TPy`, a dummy `FAKE_…` key sent via **stdin**
+to `opencode auth import --standalone` exited 0, reporting one import without
+printing the key; a repeat exited 0 and reported zero imports/one skip.
+Metadata-only SQLite inspection found one `cred_anvil_go` entry for
+`opencode-go` and DB mode `600`; the directory initially had mode `755`,
+which the opt-in init script explicitly tightens to `700`. Network isolation
+could not be established (`unshare -n` was not permitted); no auth login,
+model turn, paid request or real credential was used. This validates CLI
+format/path and idempotent import, not the entire Kubernetes init/Secret flow.
+
+The standalone dotfiles proposal at `/tmp/opencode/anvil-validation-dotfiles`
+added a reference to future namespace-local Secret `anvil-validation-go`
+(`go-key`) in local commit `349edcf`. The rendered draft mistakenly used
+`valueFrom.secretKeyRef` on `anvild`, which would have injected the key *value*
+instead of the name. This was caught before any Secret existed or any
+apply/merge/push and corrected in commit
+`d7b87f1acf9b9e804918cfcf49def91e263117fc`: render-only
+`ANVIL_OPENCODE_GO_SECRET` is now literally `anvil-validation-go`. From the
+dotfiles worktree `nix develop -c python
+addrspace/tests/check-anvil-validation-render.py` exited 0; its render
+asserts name-only daemon configuration and no Secret/SealedSecret, production
+namespace or Ingress. A CI validation hook was added in the separate dotfiles
+worktree; that branch is unmerged/unpushed and its overlay remains unregistered
+with Flux. Provisioning the actual SealedSecret, GitHub App credentials, DNS,
+TLS and published images requires later review and authority.
 
 2026-11-08 local image-readiness evidence: on Anvil HEAD `db017c9` before
 the documentation-only `d03af10` commit, from repository root `nix flake
