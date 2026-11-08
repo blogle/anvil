@@ -241,6 +241,16 @@ impl ControllerStore {
         )?;
         let mut attempt: Value = serde_json::from_str(&raw_attempt)?;
         let ordinal = attempt["ordinal"].as_u64().unwrap_or(0) as u32;
+        let raw_task: String = tx.query_row(
+            "SELECT payload_json FROM tasks WHERE task_id=?1",
+            [&task_id],
+            |row| row.get(0),
+        )?;
+        let task: Value = serde_json::from_str(&raw_task)?;
+        let attempt_limit = task["budget"]["max_attempts"]
+            .as_u64()
+            .map(|limit| limit.min(u64::from(max_attempts)) as u32)
+            .unwrap_or(max_attempts);
         let commission: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM commissions WHERE commission_id=?1)",
             [&task_id],
@@ -257,7 +267,7 @@ impl ControllerStore {
         // after any Session has been bound, regardless of the configured budget.
         let unsafe_commission_retry = commission && (session_bound || workspace_ambiguous);
         let retry = class == FailureClass::Infrastructure
-            && ordinal < max_attempts
+            && ordinal < attempt_limit
             && !unsafe_commission_retry;
         let wait = base_backoff_ms.saturating_mul(1u64 << ordinal.saturating_sub(1).min(20));
         attempt["state"] = serde_json::json!(if retry {
@@ -937,6 +947,59 @@ mod tests {
             .unwrap()
             .contains("ambiguous"));
         assert!(reopened.claim_runnable(1, 10_000, 5, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn persisted_attempt_budget_exhausts_retry_across_restart() {
+        let (dir, store) = setup(&[("budgeted", 1, vec![("task", vec![])])]);
+        {
+            let connection = store.connection.lock().unwrap();
+            let raw: String = connection
+                .query_row(
+                    "SELECT payload_json FROM tasks WHERE task_id='task'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut task: Value = serde_json::from_str(&raw).unwrap();
+            task["budget"] = serde_json::json!({"max_attempts": 1});
+            connection
+                .execute(
+                    "UPDATE tasks SET payload_json=?1 WHERE task_id='task'",
+                    [task.to_string()],
+                )
+                .unwrap();
+        }
+        let claimed = store.claim_runnable(1, 100, 5, 0).unwrap();
+        let attempt_id = claimed[0].attempt["attempt_id"].as_str().unwrap();
+        assert!(
+            !store
+                .record_attempt_failure(
+                    attempt_id,
+                    FailureClass::Infrastructure,
+                    "temporary failure",
+                    100,
+                    5,
+                    10,
+                )
+                .unwrap()
+        );
+        drop(store);
+
+        let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
+        let attempts = reopened.attempts_for_task("task").unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0]["state"], "exhausted");
+        assert!(attempts[0]["retry_at_ms"].is_null());
+        assert!(reopened.claim_runnable(1, 10_000, 5, 0).unwrap().is_empty());
+        assert_eq!(reopened.attempts_for_task("task").unwrap().len(), 1);
+        assert_eq!(
+            reopened
+                .capacity(1, 10_000, 5, 0, 0)
+                .unwrap()
+                .queued_runnable,
+            0
+        );
     }
 
     #[test]
