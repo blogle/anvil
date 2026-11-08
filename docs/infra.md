@@ -77,8 +77,22 @@ the profile/runtime; operator authentication and any provider credentials requir
 by the agreed integration. Never document secret values. Exact Secret names/keys,
 mounts and adapters should follow the actual implementation of each slice.
 
+An isolated OpenCode Go worker may opt into `ANVIL_OPENCODE_GO_SECRET`, naming a
+namespace-local Secret with key `go-key`. Only its workspace init container
+mounts the key; it imports the credential into OpenCode's private SQLite database
+on that worker's persistent Workspace before starting the server. The serving
+container does not mount either that Secret or the shared profile claim. Without
+the opt-in, existing profile-based sandbox behavior is unchanged. This contract
+declares a required Secret **reference**, not its provisioning or its contents.
+The pinned OpenCode V2 runtime stores live credentials in SQLite rather than the
+legacy `auth.json`; ChatGPT OAuth/profile-to-worker credential continuity is not
+established by the Go-key path. Do not interpret an OpenCode readiness probe as
+proof that provider authentication works.
+
 Environment namespaces, addrspace manifests, ingress domains/certificates, storage
 classes, secret provisioning, rollout/cleanup and production protection belong in
 **dotfiles**. Project specifications describe what deployment must provide; dotfiles
-describes how a particular environment provides it. Draft an ExecPlan under
+describes how a particular environment provides it. In particular, all
+SealedSecrets for an environment are authored and provisioned from dotfiles,
+never from this repository. Draft an ExecPlan under
 `docs/plans/active/` only after these two specifications are agreed.
