@@ -45,13 +45,23 @@ against an assumed environment. Production promotion is outside this campaign.
 - [x] (2026-11-08) Local follow-up implementation: a scripted OpenCode worker committed/pushed to a disposable Git repo and published to a loopback PR fixture; start has durable key/receipt/restart replay; held submitted-run restart did not duplicate model request. Reviewed detached Task admission regression and added explicit held migration. Final validation and external gates remain open.
 - [x] (2026-11-08 04:21Z) EH-C1 local deployment-readiness checks completed after v16 safety migration: workspace build, fmt, all-feature Clippy, 276 workspace tests, frontend, security and fixture E2E passed. The fixture PR is local-only, and the unknown submitted run was not replayed. EH-C1 remains open for approved integration/live observations.
 - [x] (2026-11-08) Operator-requested frontend replacement increment on `8d9ef4b`: migrate the existing Session UI to a Next.js static-export Campaign/Commission/Session workspace, align daemon and local fixture serving, restore Session conversation/attach navigation, and fence uncertain browser command retries. Local checks are recorded below; this does not accept EH-C1 or unblock EH-C2.
-- [ ] (2026-11-08) Prospective isolated addrspace validation preparation: inspect the dotfiles procedure and prepare render-only evidence for a new validation namespace beside the pinned incumbent; do not change production overlays/images/ingress/PVCs/secrets or promote anything. Live deployment remains blocked pending explicit approval and all gates below.
+- [x] (2026-11-08) Render-only addrspace preparation: on a separate dotfiles worktree, committed a standalone, unregistered `anvil-validation` overlay and audited its local render beside the pinned incumbent. It has no ingress or credentials and is **not deployable**; it was not merged, pushed, registered with Flux, diffed against the cluster, or applied. Live deployment remains blocked pending explicit approval and all gates below.
 - [ ] EH-C2: Obligation-driven progress and reporting.
 - [ ] EH-C3: Deterministic convergence and bounded recovery.
 - [ ] EH-C4: Human control and review workspace.
 - [ ] EH-C5: Authoritative delivery and end-to-end assurance.
 
 ## Surprises & Discoveries
+
+Deployment-readiness reconnaissance at Anvil `db017c9` and dotfiles
+`c456abb`: the incumbent dotfiles overlay still pins base and all three image
+tags to historical Anvil `9fdd0b9`, and no validation namespace existed. The
+new render-only overlay deliberately retains that base for shape comparison,
+but current `k8s/base` has since changed. The validation proposal removes the
+base's placeholder GitHub Secret and optional credential reference; it has no
+ingress or real preview/router addresses, so treating a successful render as
+a functional deployment would be incorrect. The normal dotfiles path is
+reviewed PR/merge followed by Flux, **not** `just deploy` or direct apply.
 
 At the 2026-11-08 frontend checkpoint the working tree already contained an
 uncommitted Next.js rewrite, including deleted Vite sources, new untracked Next
@@ -190,6 +200,19 @@ isolation before expanding breadth. Do not gate the first runnable slice on a fu
 Ledger redesign, generalized workflow engine or context-policy benchmark.
 
 ## Outcomes & Retrospective
+
+2026-11-08 deployment-readiness decision point: attempt an **isolated** live
+deployment only after the operator explicitly approves a named addrspace
+validation target and bounded scenario/model cost, reviewed dotfiles
+revision/procedure, a committed Anvil source revision and immutable published
+image digests for all required images, independently scoped credentials, and
+rendered namespace-only diff. The render-only proposal cannot itself be
+applied: it intentionally contains historical image tags, no usable
+credentials, no ingress and invalid example routing. Publish/registry access,
+credential creation, PR/Flux registration, any cluster observation and model
+spend remain separately gated. No approval or external integration identity
+is inferred from the user's request to race toward readiness; EH-C1 remains
+open and EH-C2 remains start-blocked.
 
 2026-11-08 frontend checkpoint: the operator can use a Next.js static-export
 entry point for Campaign submission, aggregate inspection, versioned Commission
@@ -704,6 +727,34 @@ target only resources created for the approved isolated run and must not delete
 shared profile/Nix storage, production resources or unrelated user work.
 
 ## Artifacts and Notes
+
+2026-11-08 render-only preparation (no EH acceptance): Anvil HEAD
+`db017c932b05852ef4e0a903b5c0c4ff82c3509a` clean before this plan edit;
+`gh pr status` reported no associated PR. The operator's dotfiles checkout at
+`c456abb6fd60caad7443d1fe0688700cf7036d80` had unrelated dirty files;
+it was not edited. A new, clean dotfiles worktree at
+`/tmp/opencode/anvil-validation-dotfiles` carries the *local-only* commit
+`b4fcdb0ea28e716827ce9588f9158c8bc65da0de` on
+`feat/anvil-validation-render-only`. It adds only
+`addrspace/apps/anvil-validation/{README.md,kustomization.yaml,runtime-config.patch.yaml,mcp-hosts.patch.yaml}`;
+`addrspace/apps/kustomization.yaml` still excludes the proposal. From that
+worktree `kubectl kustomize addrspace/apps/anvil` and
+`kubectl kustomize addrspace/apps/anvil-validation` both exited 0, producing
+`/tmp/opencode/anvil-validation-{incumbent,proposed}.yaml`. Parsing both with
+`yq`/`jq` and evaluating `/tmp/opencode/anvil-validation-audit.jq` exited 0;
+`/tmp/opencode/anvil-validation-audit.json` reports PASS: 23 incumbent and
+19 validation resources, exactly `Namespace/anvil-validation`, all other
+resources namespaced `anvil-validation`, three namespace-private PVCs and
+namespace Role/RoleBinding, no Secret, SealedSecret, Certificate, Ingress,
+secret data or ingress hosts. An independent read of the rendered JSON
+confirmed no workload secret refs or old production host/namespace strings.
+Rendered images are **historical tags**, not immutable digests or an approval.
+No cluster diff, apply, PR merge, Flux registration, published image, live
+runtime or model call occurred. Before a real rollout, prepare a new reviewed
+dotfiles revision with the intended base, actual digest-pinned images,
+independent credentials/storage/routing and bounded scenario; audit the entire
+rendered diff and obtain explicit target/cost authority. Do not use this
+deliberately nonfunctional overlay as-is.
 
 2026-11-08 EH-C1 frontend increment, obligation mapping EH-C1-O2/O3 and
 EH-01/EH-11/EH-13 (partial local UI/routing evidence only): starting branch
