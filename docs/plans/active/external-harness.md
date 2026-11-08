@@ -44,6 +44,7 @@ against an assumed environment. Production promotion is outside this campaign.
 - [ ] (2026-11-08) EH-C1 deployment-readiness follow-up authorized: finish useful local delivery/recovery/idempotency and capacity/budget evidence, without expanding into EH-C2 or a speculative workflow engine; rerun validation and retain external gates.
 - [x] (2026-11-08) Local follow-up implementation: a scripted OpenCode worker committed/pushed to a disposable Git repo and published to a loopback PR fixture; start has durable key/receipt/restart replay; held submitted-run restart did not duplicate model request. Reviewed detached Task admission regression and added explicit held migration. Final validation and external gates remain open.
 - [x] (2026-11-08 04:21Z) EH-C1 local deployment-readiness checks completed after v16 safety migration: workspace build, fmt, all-feature Clippy, 276 workspace tests, frontend, security and fixture E2E passed. The fixture PR is local-only, and the unknown submitted run was not replayed. EH-C1 remains open for approved integration/live observations.
+- [x] (2026-11-08) Operator-requested frontend replacement increment on `8d9ef4b`: migrate the existing Session UI to a Next.js static-export Campaign/Commission/Session workspace, align daemon and local fixture serving, restore Session conversation/attach navigation, and fence uncertain browser command retries. Local checks are recorded below; this does not accept EH-C1 or unblock EH-C2.
 - [ ] (2026-11-08) Prospective isolated addrspace validation preparation: inspect the dotfiles procedure and prepare render-only evidence for a new validation namespace beside the pinned incumbent; do not change production overlays/images/ingress/PVCs/secrets or promote anything. Live deployment remains blocked pending explicit approval and all gates below.
 - [ ] EH-C2: Obligation-driven progress and reporting.
 - [ ] EH-C3: Deterministic convergence and bounded recovery.
@@ -51,6 +52,18 @@ against an assumed environment. Production promotion is outside this campaign.
 - [ ] EH-C5: Authoritative delivery and end-to-end assurance.
 
 ## Surprises & Discoveries
+
+At the 2026-11-08 frontend checkpoint the working tree already contained an
+uncommitted Next.js rewrite, including deleted Vite sources, new untracked Next
+routes/components and changes to Nix/daemon static serving. These changes were
+preserved and reviewed rather than discarded. The old local E2E default still
+pointed at `web/dist`, and its smoke check only searched for Vite `/assets`;
+the daemon's optional built-asset test similarly skipped when `web/dist` was
+absent. Both now exercise the Next export and its `/_next/static` assets. The
+browser's stored idempotency key is tied to the exact payload/version; a reset
+after an ambiguous transport or server outcome could duplicate effects, so
+reset is only offered after a definite rejection. This browser guard is not a
+substitute for durable backend receipts or recovery of unknown external effects.
 
 EH-C1 source reconnaissance at `a4d3665`: the legacy batch scheduler can dispatch
 worker turns, while the Reconciler executor currently dispatches CreateAttempt only;
@@ -177,6 +190,16 @@ isolation before expanding breadth. Do not gate the first runnable slice on a fu
 Ledger redesign, generalized workflow engine or context-policy benchmark.
 
 ## Outcomes & Retrospective
+
+2026-11-08 frontend checkpoint: the operator can use a Next.js static-export
+entry point for Campaign submission, aggregate inspection, versioned Commission
+start and Session conversation navigation against existing APIs. It is a minimal
+EH-C1 entry point, not the full Ledger, interactive control, obligation reporting
+or autonomous convergence in EH-C2–C5. No registered PR/approved integration
+target, external model budget, live deployment approval or authoritative merge
+has been supplied. The sequential EH-C2 start gate remains closed. Existing
+historical EH acceptance rows remain unverified; this checkpoint adds local
+frontend and routing evidence only, with results and limits below.
 
 2026-11-07 22:44Z EH-C1 resumed from committed planning revision `a4d3665`, not
 the historical baseline at line 21. No EH-C1 obligation is accepted by this
@@ -681,6 +704,63 @@ target only resources created for the approved isolated run and must not delete
 shared profile/Nix storage, production resources or unrelated user work.
 
 ## Artifacts and Notes
+
+2026-11-08 EH-C1 frontend increment, obligation mapping EH-C1-O2/O3 and
+EH-01/EH-11/EH-13 (partial local UI/routing evidence only): starting branch
+`anvil/incremental-roadmap`, HEAD `8d9ef4b1b55e1ea2639aeba00e43b3ae050c4376`,
+ahead 13 of `origin/main`; `gh pr status` showed no associated PR. The initial
+working tree already contained uncommitted Vite-to-Next migration edits and
+untracked Next routes/components; those were preserved and completed. The
+static export serves Campaign creation and aggregate/Commission reads, explicit
+versioned start, and Session activity/attach/OpenCode navigation. Browser
+fixtures cover changed-payload keys, 503 uncertainty versus definitive 422
+rejection, unsafe preview URL rejection and stale Session navigation; they do
+not exercise a real paid model, live preview, provider or merge. The old Vite
+component tests were removed; the replacement is narrower, especially for
+Session diagnostics, polling and end-to-end operator actions. No EH acceptance
+row is promoted from this fixture evidence.
+
+From repository root on the dirty frontend revision, `just build` exited 0,
+workspace all-feature Clippy exited 0, `cargo nextest run --workspace` passed
+**277 tests**, `just frontend-check` passed **6 tests**, and
+`just security-check` exited 0; `cargo fmt --check` initially failed on
+pre-existing `store/scheduler.rs:972` layout, corrected with rustfmt. Logs:
+`/tmp/opencode/anvil-verification-*`. A later dirty-tree validation recorded
+`just build`, fmt, Clippy, nextest (**278 passed**), frontend (**8 passed**),
+security, Chromium browser test (**1 passed**) and local fixture E2E exiting
+0 (`/tmp/opencode/anvil-verify-IVM3MSw2/`), but changes were staged and the
+E2E smoke script corrected during this run, so it is not a single frozen-tree
+acceptance record. The fixture is local-only.
+
+Nix packaging exposed a real failed check: initial `nix build .#frontend
+--no-link` exited 1 because the proposed npm dependency hash selected Next
+15.5.6 while `web/package-lock.json` requested 15.5.29. Preserved diagnostics:
+`/tmp/opencode/anvil-next-nix-verification/RESULTS.md`. Correcting both Nix
+hash fields to the fake-hash build's actual
+`sha256-Ggps6Vi7SpFUDmOSH6nmQUHd62mNTE7fhPJVkp545/s=` made
+`nix build .#frontend --no-link` and
+`nix build .#ci.x86_64-linux.verify.frontendTests --no-link` exit 0;
+the latter checked exported HTML routes. `nix run .#sdlc -- changelog check`
+also exited 0 (2 fragments). This is packaging evidence, not isolated runtime
+validation. The implementation checkpoint was committed as
+`4d1bf88f8eed05a8fb289a8c596a7d50ce77a2b4` on
+`anvil/incremental-roadmap`; no PR or approved integration target is attached.
+The final local rerun from repository root recorded `just build`,
+`cargo fmt --check`,
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+`cargo nextest run --workspace` (**278 passed**), `just frontend-check`
+(**8 passed**, export built), `just security-check`, `git diff --check`,
+Chromium `npm run test:browser` from `web` (**1 passed**) and
+`ANVIL_PREBUILT_BIN_DIR="$PWD/target/debug" ANVIL_E2E_TMPDIR=/tmp/opencode
+just e2e-ui` all exiting 0. Logs:
+`/tmp/opencode/anvil-verify-*.log`,
+`/tmp/opencode/anvil-verify-final-*.log`,
+`/tmp/opencode/anvil-verify-e2e-ui.log`. The staged diff fingerprint changed
+during the run (Nix hash correction and implementation commit), so this is a
+sequence of successful local checks, not a single frozen-tree acceptance run;
+the Nix frontend and CI frontend derivation were independently verified with
+the final hash. No external integration, live isolation or EH acceptance is
+inferred from these local checks.
 
 2026-11-08 00:03Z EH-C1 checkpoint, source HEAD `a4d36658a81001c572174906b96b6efe40f0eb92`
 plus uncommitted core/daemon/store/MCP/test/plan changes; `node_modules/` was
