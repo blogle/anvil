@@ -29,6 +29,7 @@ let
       || pkgs.lib.hasSuffix "/web" (toString path)
       || pkgs.lib.hasInfix "/web/" (toString path)
       || pkgs.lib.hasSuffix "/runtime" (toString path)
+      || pkgs.lib.hasSuffix "/runtime/sandbox-entrypoint" (toString path)
       || pkgs.lib.hasSuffix "/runtime/git-identity" (toString path);
   };
   runtimeSrc = pkgs.lib.cleanSourceWith {
@@ -43,6 +44,7 @@ let
         || pkgs.lib.hasSuffix "/web" p
         || pkgs.lib.hasInfix "/web/" p
         || pkgs.lib.hasSuffix "/runtime" p
+        || pkgs.lib.hasSuffix "/runtime/sandbox-entrypoint" p
         || pkgs.lib.hasSuffix "/runtime/git-identity" p;
   };
   fixtureSourceSmoke =
@@ -58,6 +60,7 @@ let
       test -f "${src}/crates/anvild/tests/fixtures/controller-v8-sanitized.json"
       test -f "${src}/crates/anvild/tests/fixtures/task-migration-mappings-v1.json"
       test -d "${src}/crates/anvil-core/tests/fixtures/task-snapshot-v1"
+      test -f "${src}/runtime/sandbox-entrypoint"
       if [ -d "${src}/crates/anvil-reconcile" ]; then
         test -d "${src}/crates/anvil-reconcile/fixtures"
       fi
