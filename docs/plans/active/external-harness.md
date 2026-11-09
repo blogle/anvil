@@ -46,7 +46,7 @@ against an assumed environment. Production promotion is outside this campaign.
 - [x] (2026-11-08 04:21Z) EH-C1 local deployment-readiness checks completed after v16 safety migration: workspace build, fmt, all-feature Clippy, 276 workspace tests, frontend, security and fixture E2E passed. The fixture PR is local-only, and the unknown submitted run was not replayed. EH-C1 remains open for approved integration/live observations.
 - [x] (2026-11-08) Operator-requested frontend replacement increment on `8d9ef4b`: migrate the existing Session UI to a Next.js static-export Campaign/Commission/Session workspace, align daemon and local fixture serving, restore Session conversation/attach navigation, and fence uncertain browser command retries. Local checks are recorded below; this does not accept EH-C1 or unblock EH-C2.
 - [x] (2026-11-08) Render-only addrspace preparation: on a separate dotfiles worktree, committed a standalone, unregistered `anvil-validation` overlay and audited its local render beside the pinned incumbent. It has no ingress or credentials and is **not deployable**; it was not merged, pushed, registered with Flux, diffed against the cluster, or applied. Live deployment remains blocked pending explicit approval and all gates below.
-- [ ] (2026-11-08) Deployment-readiness Go credential boundary: opt-in worker-only SealedSecret *reference* and private Workspace SQLite bootstrap are under local test/review; no Go key, SealedSecret or OAuth credential provisioned. Reverify after fixes before accepting even local readiness. No live run approved.
+- [x] (2026-11-08) Local Go credential boundary and checks: committed opt-in worker-only Secret *reference* and private Workspace SQLite bootstrap, fixed Nix filtered-source regression, reran workspace, fixture and Nix checks. No Go key, SealedSecret, published digest or OAuth credential provisioned; local readiness is not live acceptance and no live run is approved.
 - [ ] EH-C2: Obligation-driven progress and reporting.
 - [ ] EH-C3: Deterministic convergence and bounded recovery.
 - [ ] EH-C4: Human control and review workspace.
@@ -797,6 +797,40 @@ target only resources created for the approved isolated run and must not delete
 shared profile/Nix storage, production resources or unrelated user work.
 
 ## Artifacts and Notes
+
+2026-11-08 local Go-path validation after Anvil `7bfde97` (later
+documentation-only `4cb4751`) and before the Nix source-filter fix:
+`just build`, `cargo fmt --check`,
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+`cargo nextest run --workspace` (**284 passed, 0 skipped, 1 slow**),
+`just frontend-check`, `just security-check`,
+`bash -n runtime/sandbox-entrypoint`, `git diff --check`, and local prebuilt
+`just e2e` then `just e2e-ui` all exited 0. `nix build
+.#anvil-image-ci --no-link` and `nix build .#anvil-sandbox-image --no-link`
+also exited 0. Logs: `/tmp/opencode/go-trial-verify-*.log`. No real model,
+credential, repository mutation or deployment. The first `nix flake check`
+**failed** (exit 1): Nix's filtered Rust test source omitted
+`runtime/sandbox-entrypoint`, referenced by `include_str!` in the new Rust
+test. Failure also reproduced by a separate artifact check
+(`/tmp/opencode/go-trial-nix-flake-check.log`); do not report the original
+image build as a passing flake check.
+
+After adding that one file to both Nix Rust source filters in commit
+`77cd0ef` (with a filtered-source smoke assertion), `nix flake check`
+exited 0 (16 checks, `/tmp/opencode/nix-flake-check-sandbox-entrypoint.log`),
+`nix build .#anvil-image .#anvil-sandbox-image --no-link` exited 0
+(`/tmp/opencode/nix-build-images-sandbox-entrypoint.log`), and fmt and
+`git diff --check` exited 0. On committed source `77cd0ef`, `nix build
+.#anvil-image .#anvil-sandbox-image .#anvil-nix-daemon-image --no-link
+--print-out-paths` exited 0, reporting local store outputs
+`/nix/store/8dkwxq8c17y5sjp1gnd3hnnsafpj78ay-anvil.tar.gz`,
+`/nix/store/p2yk75z8dfld3ysspghcprn6r7ramznb-image-anvil-sandbox.json`,
+and `/nix/store/vwk7jqpzdjpxsa384jd5i90wq88kzq5h-image-anvil-nix-daemon.json`.
+Nix warned that `system` was renamed to `stdenv.hostPlatform.system` but
+did not fail. Filtered-source inclusion changed the local Anvil image identity;
+all outputs remain **unpublished local artifacts, not registry digests**.
+The profile/OAuth and subscription quota limitations in the Decision Log
+remain open; no real paid or free model has yet been exercised.
 
 2026-11-08 pinned-runtime Go auth and dotfiles correction (local-only, no
 provider invocation): `nix develop --offline -c opencode --version` reported
