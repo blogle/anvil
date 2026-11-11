@@ -10,9 +10,13 @@
     nix2containerNixpkgs.follows = "nix2container/nixpkgs";
     opencode.url = "github:anomalyco/opencode/9b4ec5714d481559990db0a816d5dec19541a814";
     sdlc.url = "github:blogle/sdlc/v2";
+    fieldnotes = {
+      url = "github:blogle/fieldnotes/60f863bc41820fffda1ad8e950438a19b1dbdc2b";
+      inputs.sdlc.follows = "sdlc";
+    };
   };
 
-  outputs = { self, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode, sdlc }:
+  outputs = { self, flake-utils, crane, nix2container, nix2containerNixpkgs, opencode, sdlc, fieldnotes }:
     flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
         packageSets = sdlc.lib.importPackages { inherit system; };
@@ -26,6 +30,7 @@
         rust = import ./nix/rust.nix {
           inherit pkgs craneLib;
           inherit opencodePackage;
+          skillsPackage = sdlc.packages.${system}.skills;
           nix2containerPkgs = nix2container.packages.${system};
           repoRoot = ./.;
         };
@@ -33,11 +38,11 @@
           pname = "anvil-web";
           version = "0.1.0";
           src = ./web;
-          npmDepsHash = "sha256-jSbL4XIRQbOg6DGmouNpFpiVHE9MNKLJn3Wxzfn0yfk=";
+          npmDepsHash = "sha256-Ggps6Vi7SpFUDmOSH6nmQUHd62mNTE7fhPJVkp545/s=";
           npmBuildScript = "build";
           installPhase = ''
             mkdir -p $out
-            cp -r dist/. $out/
+            cp -r out/. $out/
           '';
         };
         sandbox = import ./nix/sandbox.nix {
@@ -73,6 +78,10 @@
       in
       {
         packages.sdlc = sdlc.packages.${system}.sdlc;
+        apps.docs = {
+          type = "app";
+          program = "${fieldnotes.packages.${system}.default}/bin/fieldnotes";
+        };
         packages.default = images.anvilImage;
         packages.anvild = rust.releaseBinaries.anvild;
         packages.frontend = frontend;

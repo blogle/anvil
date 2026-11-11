@@ -8,3 +8,5 @@ result-*
 *.swp
 /web/node_modules/
 /web/dist/
+/web/.next/
+/web/out/

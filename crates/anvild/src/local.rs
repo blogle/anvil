@@ -969,6 +969,7 @@ mod tests {
             workspace_size: "1Gi".into(),
             opencode_port: 4096,
             opencode_server_password: "anvil-local-development-only-password".into(),
+            opencode_go_secret: None,
             request_timeout: Duration::from_secs(10),
             preview_domain: "localhost".into(),
             annotation_prefix: "anvil.local".into(),

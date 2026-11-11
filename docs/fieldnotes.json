@@ -1,0 +1,10 @@
+{
+  "title": "Anvil",
+  "entry": "index.md",
+  "navigation": [
+    { "label": "Overview", "href": "index.md" },
+    { "label": "Controller", "href": "spec.md" },
+    { "label": "Infrastructure", "href": "infra.md" },
+    { "label": "UI reference", "href": "ui.html" }
+  ]
+}

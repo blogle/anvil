@@ -117,6 +117,45 @@ fn continuity_response(request: &Value) -> Option<&'static str> {
     None
 }
 
+fn prompt_marker(input: &Value, marker: &str) -> bool {
+    input.to_string().contains(marker)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CampaignStage {
+    Edit,
+    Publish,
+    Complete,
+    Failed,
+}
+
+fn campaign_stage(outputs: &[Value]) -> CampaignStage {
+    match outputs {
+        [] => CampaignStage::Edit,
+        [edit] if function_output_succeeded(edit) => CampaignStage::Publish,
+        [_] => CampaignStage::Failed,
+        [_, publish] if function_output_succeeded(publish) => CampaignStage::Complete,
+        [_, _] => CampaignStage::Failed,
+        _ => CampaignStage::Failed,
+    }
+}
+
+fn function_output_succeeded(output: &Value) -> bool {
+    if output.is_null() {
+        return false;
+    }
+    if output.get("is_error").and_then(Value::as_bool) == Some(true)
+        || matches!(
+            output.get("status").and_then(Value::as_str),
+            Some("error" | "failed")
+        )
+    {
+        return false;
+    }
+    let text = output.to_string();
+    !text.contains("Exited with code ") && !text.contains("Error:")
+}
+
 async fn completion(
     State(state): State<std::sync::Arc<AppState>>,
     Json(request): Json<Value>,
@@ -160,7 +199,7 @@ async fn completion(
             return (
                 StatusCode::OK,
                 Json(finish("Deterministic fixture edit completed.", &request)),
-            )
+            );
         }
     };
     let tool_call = json!({"id":format!("call_anvil_{index}"),"type":"function","function":{"name":tool,"arguments":args.to_string()}});
@@ -187,6 +226,7 @@ async fn responses(
         .get("tools")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
+    let campaign_publish = prompt_marker(&input, "ANVIL-E2E:campaign-publish-local-fixture");
     let mut prompt = String::new();
     let mut tool_responses = 0usize;
     if let Some(items) = input.as_array() {
@@ -218,6 +258,65 @@ async fn responses(
     }
     if let Some(confirmation) = continuity_response(&request) {
         let value = response_text(confirmation, &request);
+        return if stream {
+            response_sse(&value)
+        } else {
+            Json(value).into_response()
+        };
+    }
+    if campaign_publish {
+        if tool_count == 0 {
+            let value = response_text(
+                "I will run the local Campaign publication fixture using the shell tool.",
+                &request,
+            );
+            return if stream {
+                response_sse(&value)
+            } else {
+                Json(value).into_response()
+            };
+        }
+        let outputs = input.as_array().map_or_else(Vec::new, |items| {
+            items
+                .iter()
+                .filter(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                })
+                .map(|item| item.get("output").cloned().unwrap_or(Value::Null))
+                .collect()
+        });
+        let arguments = match campaign_stage(&outputs) {
+            CampaignStage::Edit => Some((
+                "edit",
+                json!({"path":"target.txt","oldString":"before\n","newString":"after\n"}),
+            )),
+            CampaignStage::Publish => Some((
+                "shell",
+                json!({"command":"set -eu; test \"$(cat target.txt)\" = after; git add target.txt; git -c user.name='Anvil E2E' -c user.email=anvil-e2e@example.invalid commit -m 'Campaign local fixture delivery'; branch=$(git branch --show-current); sha=$(git rev-parse HEAD); git push origin HEAD:refs/heads/$branch; curl -kfsS -X POST https://127.0.0.1:8443/__fixture/pr -H 'content-type: application/json' -d \"{\\\"repository\\\":\\\"campaign-e2e\\\",\\\"branch\\\":\\\"$branch\\\",\\\"commit_sha\\\":\\\"$sha\\\",\\\"title\\\":\\\"Campaign local fixture delivery\\\"}\""}),
+            )),
+            CampaignStage::Complete | CampaignStage::Failed => None,
+        };
+        if let Some((name, arguments)) = arguments {
+            let call_id = format!(
+                "call_anvil_{}",
+                state.completion.fetch_add(1, Ordering::SeqCst)
+            );
+            let output = json!({"id":format!("fc_{call_id}"),"type":"function_call","call_id":call_id,"name":name,"arguments":arguments.to_string(),"status":"completed"});
+            let value = json!({"id":format!("resp_{call_id}"),"object":"response","created_at":0,"status":"completed","model":"anvil-scripted","output":[output],"output_text":"","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}});
+            return if stream {
+                response_sse(&value)
+            } else {
+                Json(value).into_response()
+            };
+        }
+        let value = response_text(
+            if campaign_stage(&outputs) == CampaignStage::Complete {
+                "Local Campaign delivery commit, push, and fixture PR request completed."
+            } else {
+                "TEST_FAILURE: Campaign file edit or local publication tool failed; delivery was not completed."
+            },
+            &request,
+        );
         return if stream {
             response_sse(&value)
         } else {
@@ -392,6 +491,35 @@ fn finish(content: &str, request: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn campaign_publication_requires_successful_edit_then_shell() {
+        assert_eq!(campaign_stage(&[]), CampaignStage::Edit);
+        assert_eq!(
+            campaign_stage(&[json!([{"type":"input_text","text":"edited"}])]),
+            CampaignStage::Publish
+        );
+        assert_eq!(
+            campaign_stage(&[json!([{"text":"edited"}]), json!([{"text":"published"}])]),
+            CampaignStage::Complete
+        );
+    }
+
+    #[test]
+    fn campaign_tool_errors_stop_publication_and_success_claims() {
+        assert_eq!(
+            campaign_stage(&[json!([{"text":"Exited with code 1"}])]),
+            CampaignStage::Failed
+        );
+        assert_eq!(
+            campaign_stage(&[
+                json!([{"text":"edited"}]),
+                json!([{"text":"Exited with code 1"}])
+            ]),
+            CampaignStage::Failed
+        );
+        assert_eq!(campaign_stage(&[Value::Null]), CampaignStage::Failed);
+    }
 
     #[tokio::test]
     async fn title_generation_does_not_consume_the_scripted_worker_release_gate() {

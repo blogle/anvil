@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "skills": {
+    "sdlc": {
+      "source": "blogle/sdlc",
+      "ref": "21ae48a50a3a39a9e45dc84c6f244ce038bb166f",
+      "sourceType": "github",
+      "skillPath": "skills/sdlc/SKILL.md",
+      "computedHash": "cfcbd9cdc24ba958af33ad3a69cc99a773e760050f044f6ee3b1497f7eeb8a3e"
+    }
+  }
+}

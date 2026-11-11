@@ -104,8 +104,21 @@ impl ControllerStore {
             if operator_hold || controller_mode != "legacy" {
                 continue;
             }
-            let batch_id = batch_id.unwrap_or_default();
+            // Standalone Tasks are owned by the Reconciler, not the legacy
+            // scheduler. Legacy scheduling remains responsible for Batch work
+            // and explicitly-started Commissions.
             let task: Value = serde_json::from_str(&task_json)?;
+            if batch_id.is_none() && !task["commission_id"].is_string() {
+                continue;
+            }
+            let batch_id = batch_id.unwrap_or_default();
+            if task["commission_id"].is_string() && task["start_authorized"] != true {
+                continue;
+            }
+            let attempt_limit = task["budget"]["max_attempts"]
+                .as_u64()
+                .map(|limit| limit.min(u64::from(max_attempts)) as u32)
+                .unwrap_or(max_attempts);
             let batch: Value = batch_json
                 .as_deref()
                 .map(serde_json::from_str)
@@ -149,7 +162,12 @@ impl ControllerStore {
                 let _ = n;
                 continue;
             }
-            if !task_is_runnable(&task_state, previous_payload.as_ref(), now_ms, max_attempts) {
+            if !task_is_runnable(
+                &task_state,
+                previous_payload.as_ref(),
+                now_ms,
+                attempt_limit,
+            ) {
                 continue;
             }
             if task_state == "queued"
@@ -176,7 +194,7 @@ impl ControllerStore {
             }
             let (ordinal, attempt_id) = match previous {
                 Some((n, _json, _)) => {
-                    if n as u32 >= max_attempts {
+                    if n as u32 >= attempt_limit {
                         continue;
                     }
                     ((n + 1) as u32, format!("{task_id}-attempt-{}", n + 1))
@@ -223,7 +241,34 @@ impl ControllerStore {
         )?;
         let mut attempt: Value = serde_json::from_str(&raw_attempt)?;
         let ordinal = attempt["ordinal"].as_u64().unwrap_or(0) as u32;
-        let retry = class == FailureClass::Infrastructure && ordinal < max_attempts;
+        let raw_task: String = tx.query_row(
+            "SELECT payload_json FROM tasks WHERE task_id=?1",
+            [&task_id],
+            |row| row.get(0),
+        )?;
+        let task: Value = serde_json::from_str(&raw_task)?;
+        let attempt_limit = task["budget"]["max_attempts"]
+            .as_u64()
+            .map(|limit| limit.min(u64::from(max_attempts)) as u32)
+            .unwrap_or(max_attempts);
+        let commission: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM commissions WHERE commission_id=?1)",
+            [&task_id],
+            |row| row.get(0),
+        )?;
+        let session_bound: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE task_id=?1 AND session_id IS NOT NULL)",
+            [&task_id],
+            |row| row.get(0),
+        )?;
+        let workspace_ambiguous = attempt["workspace_creation_ambiguous"] == true;
+        // Commission retries create a fresh deterministic Session/branch. Until
+        // recovery can reuse the existing Workspace, never take that transition
+        // after any Session has been bound, regardless of the configured budget.
+        let unsafe_commission_retry = commission && (session_bound || workspace_ambiguous);
+        let retry = class == FailureClass::Infrastructure
+            && ordinal < attempt_limit
+            && !unsafe_commission_retry;
         let wait = base_backoff_ms.saturating_mul(1u64 << ordinal.saturating_sub(1).min(20));
         attempt["state"] = serde_json::json!(if retry {
             "retry_wait"
@@ -233,7 +278,18 @@ impl ControllerStore {
             "failed"
         });
         attempt["failure_class"] = serde_json::json!(class);
-        attempt["failure_reason"] = Value::String(reason.to_owned());
+        attempt["failure_reason"] = Value::String(if unsafe_commission_retry {
+            format!("{reason}; retry blocked: existing Commission Workspace requires recovery")
+        } else {
+            reason.to_owned()
+        });
+        if unsafe_commission_retry {
+            attempt["recovery_required_reason"] = Value::String(if workspace_ambiguous {
+                "Commission retry blocked because sandbox creation outcome is ambiguous; recover the deterministic sandbox before retrying".into()
+            } else {
+                "Commission retry blocked because a Session/Workspace is already bound; recover the existing Workspace before retrying".into()
+            });
+        }
         attempt["retry_at_ms"] = if retry {
             serde_json::json!(now_ms.saturating_add(wait.min(i64::MAX as u64) as i64))
         } else {
@@ -255,6 +311,30 @@ impl ControllerStore {
         Ok(retry)
     }
 
+    /// Fence retries when sandbox creation may have succeeded but the caller
+    /// did not receive a durable Session binding. This is a durable observation,
+    /// not permission to replay the create operation.
+    pub fn mark_workspace_creation_ambiguous(&self, attempt_id: &str) -> Result<(), StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let raw_attempt: String = tx
+            .query_row(
+                "SELECT payload_json FROM attempts WHERE attempt_id=?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        let mut attempt: Value = serde_json::from_str(&raw_attempt)?;
+        attempt["workspace_creation_ambiguous"] = Value::Bool(true);
+        persist_attempt(&tx, attempt_id, &attempt)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn set_attempt_state(&self, attempt_id: &str, state: &str) -> Result<(), StoreError> {
         let mut c = self
             .connection
@@ -269,6 +349,89 @@ impl ControllerStore {
         let mut attempt: Value = serde_json::from_str(&raw_attempt)?;
         attempt["state"] = Value::String(state.to_owned());
         persist_attempt(&tx, attempt_id, &attempt)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record a completed OpenCode turn without closing its strategy Attempt.
+    /// The Session and Attempt remain available for a later continuation.
+    pub fn set_attempt_turn_completed(&self, attempt_id: &str) -> Result<(), StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (version, raw_attempt): (i64, String) = tx
+            .query_row(
+                "SELECT version,payload_json FROM attempts WHERE attempt_id=?1",
+                [attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        let mut attempt: Value = serde_json::from_str(&raw_attempt)?;
+        let controller_mode: String = tx.query_row(
+            "SELECT controller_mode FROM task_durable_state WHERE task_id=?1",
+            [attempt["task_id"]
+                .as_str()
+                .ok_or_else(|| StoreError::InvalidState("Attempt has no Task identity".into()))?],
+            |row| row.get(0),
+        )?;
+        let campaign_commission: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM commissions WHERE commission_id=?1)",
+            [attempt["task_id"].as_str().unwrap_or_default()],
+            |row| row.get(0),
+        )?;
+        if controller_mode != "reconciler" && !campaign_commission {
+            return Err(StoreError::InvalidState(
+                "only the Reconciler may complete turns without ending the Attempt".into(),
+            ));
+        }
+        if attempt["lifecycle"] != "running" {
+            return Err(StoreError::InvalidState(
+                "only a running Attempt can complete a turn".into(),
+            ));
+        }
+        attempt["state"] = Value::String("completed".into());
+        attempt["turn_state"] = Value::String("completed".into());
+        attempt["lifecycle"] = Value::String("running".into());
+        attempt["exit_reason"] = Value::Null;
+        attempt["ended_at"] = Value::Null;
+        let next_version = version + 1;
+        attempt["version"] = serde_json::json!(next_version);
+        let encoded = serde_json::to_string(&attempt)?;
+        let updated = tx.execute(
+            "UPDATE attempts SET payload_json=?2,version=?3 WHERE attempt_id=?1 AND version=?4",
+            params![attempt_id, encoded, next_version, version],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::Conflict);
+        }
+        tx.execute(
+            "UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='attempt' AND resource_id=?1",
+            params![attempt_id, encoded, chrono::Utc::now().to_rfc3339()],
+        )?;
+        super::append_resource_change(&tx, "attempt", attempt_id, &attempt)?;
+        let task_id = attempt["task_id"].as_str().unwrap_or_default();
+        if tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM commissions WHERE commission_id=?1)",
+            [task_id],
+            |r| r.get::<_, bool>(0),
+        )? {
+            let raw: String = tx.query_row(
+                "SELECT payload_json FROM tasks WHERE task_id=?1",
+                [task_id],
+                |r| r.get(0),
+            )?;
+            let mut task: Value = serde_json::from_str(&raw)?;
+            task["turn_completed"] = Value::Bool(true);
+            tx.execute(
+                "UPDATE tasks SET payload_json=?2 WHERE task_id=?1",
+                params![task_id, task.to_string()],
+            )?;
+            tx.execute("UPDATE orchestration_resources SET payload_json=?2,updated_at=?3 WHERE resource_type='task' AND resource_id=?1", params![task_id, task.to_string(), chrono::Utc::now().to_rfc3339()])?;
+            super::append_resource_change(&tx, "task", task_id, &task)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -337,7 +500,7 @@ impl ControllerStore {
             .connection
             .lock()
             .expect("controller store lock poisoned");
-        let mut statement = c.prepare("SELECT attempt_id,task_id,json_extract(payload_json,'$.state'),session_id FROM attempts WHERE json_extract(payload_json,'$.state') IN ('provisioning','running') ORDER BY rowid")?;
+        let mut statement = c.prepare("SELECT attempt_id,task_id,json_extract(payload_json,'$.state'),session_id FROM attempts a WHERE json_extract(payload_json,'$.state') IN ('provisioning','running') OR (json_extract(payload_json,'$.lifecycle')='running' AND EXISTS(SELECT 1 FROM commissions c WHERE c.commission_id=a.task_id)) ORDER BY rowid")?;
         let attempts = statement
             .query_map([], |r| {
                 Ok(ActiveAttempt {
@@ -414,7 +577,7 @@ fn active_count(tx: &Transaction<'_>, batch_id: Option<&str>) -> Result<u32, Sto
     let sql = if batch_id.is_some() {
         "SELECT COUNT(*) FROM attempts a JOIN tasks t USING(task_id) WHERE t.batch_id=?1 AND json_extract(a.payload_json,'$.state') IN ('provisioning','running')"
     } else {
-        "SELECT COUNT(*) FROM attempts WHERE json_extract(payload_json,'$.state') IN ('provisioning','running')"
+        "SELECT COUNT(*) FROM attempts a WHERE json_extract(payload_json,'$.state') IN ('provisioning','running') OR (json_extract(payload_json,'$.lifecycle')='running' AND EXISTS(SELECT 1 FROM commissions c WHERE c.commission_id=a.task_id))"
     };
     Ok(match batch_id {
         Some(id) => tx.query_row(sql, [id], |r| r.get(0))?,
@@ -422,11 +585,16 @@ fn active_count(tx: &Transaction<'_>, batch_id: Option<&str>) -> Result<u32, Sto
     })
 }
 fn count_state(c: &rusqlite::Connection, state: &str) -> Result<u32, StoreError> {
-    Ok(c.query_row(
-        "SELECT COUNT(*) FROM attempts WHERE json_extract(payload_json,'$.state')=?1",
-        [state],
-        |r| r.get(0),
-    )?)
+    let sql = if state == "running" {
+        "SELECT COUNT(*) FROM attempts a WHERE json_extract(a.payload_json,'$.state')='running' OR (json_extract(a.payload_json,'$.lifecycle')='running' AND EXISTS(SELECT 1 FROM commissions c WHERE c.commission_id=a.task_id))"
+    } else {
+        "SELECT COUNT(*) FROM attempts WHERE json_extract(payload_json,'$.state')=?1"
+    };
+    Ok(if state == "running" {
+        c.query_row(sql, [], |r| r.get(0))?
+    } else {
+        c.query_row(sql, [state], |r| r.get(0))?
+    })
 }
 fn dependencies_satisfied(tx: &Connection, task: &Value) -> Result<bool, StoreError> {
     for dep in task["dependencies"]
@@ -486,8 +654,8 @@ pub(super) fn persist_attempt(
     )?;
     let next = current + 1;
     let mut attempt = attempt.clone();
-    let state = attempt["state"].as_str().unwrap_or_default();
-    let (lifecycle, exit_reason) = match state {
+    let state = attempt["state"].as_str().unwrap_or_default().to_owned();
+    let (lifecycle, exit_reason) = match state.as_str() {
         "queued" => ("queued", Value::Null),
         "provisioning" => ("provisioning", Value::Null),
         "running" => ("running", Value::Null),
@@ -502,6 +670,9 @@ pub(super) fn persist_attempt(
     };
     attempt["lifecycle"] = Value::String(lifecycle.into());
     attempt["exit_reason"] = exit_reason;
+    if state == "running" {
+        attempt["turn_state"] = Value::Null;
+    }
     let transition_time = chrono::Utc::now().to_rfc3339();
     if lifecycle == "running" && attempt["started_at"].is_null() {
         attempt["started_at"] = Value::String(transition_time.clone());
@@ -580,10 +751,10 @@ fn count_runnable(
 ) -> Result<u32, StoreError> {
     let sql = match batch_id {
         Some(_) => {
-            "SELECT t.task_id,t.state,t.payload_json FROM tasks t JOIN task_durable_state d USING(task_id) WHERE t.batch_id=?1 AND t.state IN ('queued','retry_wait') AND d.operator_hold=0 AND d.controller_mode='legacy' ORDER BY t.rowid"
+            "SELECT t.task_id,t.batch_id,t.state,t.payload_json FROM tasks t JOIN task_durable_state d USING(task_id) WHERE t.batch_id=?1 AND t.state IN ('queued','retry_wait') AND d.operator_hold=0 AND d.controller_mode='legacy' ORDER BY t.rowid"
         }
         None => {
-            "SELECT t.task_id,t.state,t.payload_json FROM tasks t JOIN task_durable_state d USING(task_id) WHERE t.state IN ('queued','retry_wait') AND d.operator_hold=0 AND d.controller_mode='legacy' ORDER BY t.rowid"
+            "SELECT t.task_id,t.batch_id,t.state,t.payload_json FROM tasks t JOIN task_durable_state d USING(task_id) WHERE t.state IN ('queued','retry_wait') AND d.operator_hold=0 AND d.controller_mode='legacy' ORDER BY t.rowid"
         }
     };
     let mut statement = c.prepare(sql)?;
@@ -594,8 +765,19 @@ fn count_runnable(
     };
     while let Some(row) = rows.next()? {
         let task_id: String = row.get(0)?;
-        let task_state: String = row.get(1)?;
-        let task: Value = serde_json::from_str(&row.get::<_, String>(2)?)?;
+        let task_batch_id: Option<String> = row.get(1)?;
+        let task_state: String = row.get(2)?;
+        let task: Value = serde_json::from_str(&row.get::<_, String>(3)?)?;
+        if batch_id.is_none() && task_batch_id.is_none() && !task["commission_id"].is_string() {
+            continue;
+        }
+        if task["commission_id"].is_string() && task["start_authorized"] != true {
+            continue;
+        }
+        let attempt_limit = task["budget"]["max_attempts"]
+            .as_u64()
+            .map(|limit| limit.min(u64::from(max_attempts)) as u32)
+            .unwrap_or(max_attempts);
         let prior: Option<String> = c
             .query_row(
                 "SELECT payload_json FROM attempts WHERE task_id=?1 ORDER BY ordinal DESC LIMIT 1",
@@ -604,7 +786,7 @@ fn count_runnable(
             )
             .optional()?;
         let prior: Option<Value> = prior.as_deref().map(serde_json::from_str).transpose()?;
-        if task_is_runnable(&task_state, prior.as_ref(), now_ms, max_attempts)
+        if task_is_runnable(&task_state, prior.as_ref(), now_ms, attempt_limit)
             && dependencies_satisfied(c, &task)?
         {
             count += 1;
@@ -641,6 +823,181 @@ mod tests {
                 .unwrap();
         }
         (dir, store)
+    }
+
+    fn mark_as_commission(store: &ControllerStore, task_id: &str) {
+        let connection = store
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        connection
+            .execute(
+                "INSERT INTO campaigns(campaign_id,scope,payload_json,created_at) VALUES('campaign','demo','{}','now')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO commissions(commission_id,campaign_id,local_key,payload_json,created_at) VALUES(?1,'campaign',?1,'{}','now')",
+                [task_id],
+            )
+            .unwrap();
+        let mut task: Value = serde_json::from_str(
+            &connection
+                .query_row(
+                    "SELECT payload_json FROM tasks WHERE task_id=?1",
+                    [task_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        task["commission_id"] = Value::String(task_id.to_owned());
+        task["start_authorized"] = Value::Bool(true);
+        connection
+            .execute(
+                "UPDATE tasks SET payload_json=?2 WHERE task_id=?1",
+                params![task_id, task.to_string()],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn commission_retry_with_bound_session_is_blocked_across_restart() {
+        let (dir, store) = setup(&[("batch", 1, vec![("commission", vec![])])]);
+        mark_as_commission(&store, "commission");
+        let claimed = store.claim_runnable(1, 100, 5, 0).unwrap();
+        let attempt_id = claimed[0].attempt["attempt_id"].as_str().unwrap();
+        store
+            .bind_attempt_session(attempt_id, "session-prior")
+            .unwrap();
+        store
+            .record_attempt_failure(
+                attempt_id,
+                FailureClass::Infrastructure,
+                "provisioning failed",
+                100,
+                5,
+                10,
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
+        let prior = reopened.attempts_for_task("commission").unwrap();
+        assert_eq!(prior.len(), 1);
+        assert_eq!(prior[0]["session_id"], "session-prior");
+        assert_eq!(prior[0]["state"], "exhausted");
+        assert!(prior[0]["recovery_required_reason"]
+            .as_str()
+            .unwrap()
+            .contains("Workspace"));
+        assert!(reopened.claim_runnable(1, 10_000, 5, 0).unwrap().is_empty());
+        assert_eq!(reopened.attempts_for_task("commission").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn commission_without_bound_session_can_retry_across_restart() {
+        let (dir, store) = setup(&[("batch", 1, vec![("commission", vec![])])]);
+        mark_as_commission(&store, "commission");
+        let claimed = store.claim_runnable(1, 100, 5, 0).unwrap();
+        store
+            .record_attempt_failure(
+                claimed[0].attempt["attempt_id"].as_str().unwrap(),
+                FailureClass::Infrastructure,
+                "provisioning failed before Workspace creation",
+                100,
+                5,
+                10,
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
+        let retry = reopened.claim_runnable(1, 110, 5, 0).unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].attempt["ordinal"], 2);
+    }
+
+    #[test]
+    fn commission_unbound_creation_crash_is_fenced_but_known_no_workspace_can_retry() {
+        let (dir, store) = setup(&[("batch", 1, vec![("commission", vec![])])]);
+        mark_as_commission(&store, "commission");
+        let claimed = store.claim_runnable(1, 100, 5, 0).unwrap();
+        let attempt_id = claimed[0].attempt["attempt_id"].as_str().unwrap();
+        store.mark_workspace_creation_ambiguous(attempt_id).unwrap();
+        store
+            .record_attempt_failure(
+                attempt_id,
+                FailureClass::Infrastructure,
+                "create response lost",
+                100,
+                5,
+                10,
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
+        let attempts = reopened.attempts_for_task("commission").unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0]["state"], "exhausted");
+        assert!(attempts[0]["recovery_required_reason"]
+            .as_str()
+            .unwrap()
+            .contains("ambiguous"));
+        assert!(reopened.claim_runnable(1, 10_000, 5, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn persisted_attempt_budget_exhausts_retry_across_restart() {
+        let (dir, store) = setup(&[("budgeted", 1, vec![("task", vec![])])]);
+        {
+            let connection = store.connection.lock().unwrap();
+            let raw: String = connection
+                .query_row(
+                    "SELECT payload_json FROM tasks WHERE task_id='task'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut task: Value = serde_json::from_str(&raw).unwrap();
+            task["budget"] = serde_json::json!({"max_attempts": 1});
+            connection
+                .execute(
+                    "UPDATE tasks SET payload_json=?1 WHERE task_id='task'",
+                    [task.to_string()],
+                )
+                .unwrap();
+        }
+        let claimed = store.claim_runnable(1, 100, 5, 0).unwrap();
+        let attempt_id = claimed[0].attempt["attempt_id"].as_str().unwrap();
+        assert!(!store
+            .record_attempt_failure(
+                attempt_id,
+                FailureClass::Infrastructure,
+                "temporary failure",
+                100,
+                5,
+                10,
+            )
+            .unwrap());
+        drop(store);
+
+        let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
+        let attempts = reopened.attempts_for_task("task").unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0]["state"], "exhausted");
+        assert!(attempts[0]["retry_at_ms"].is_null());
+        assert!(reopened.claim_runnable(1, 10_000, 5, 0).unwrap().is_empty());
+        assert_eq!(reopened.attempts_for_task("task").unwrap().len(), 1);
+        assert_eq!(
+            reopened
+                .capacity(1, 10_000, 5, 0, 0)
+                .unwrap()
+                .queued_runnable,
+            0
+        );
     }
 
     #[test]
@@ -900,5 +1257,71 @@ mod tests {
         assert_eq!(capacity.provisioning, 1);
         assert_eq!(capacity.available_slots, 0);
         assert_eq!(capacity.queued_runnable, 2);
+    }
+
+    #[test]
+    fn detached_tasks_are_explicitly_held_while_batch_and_commission_work_run() {
+        let (_dir, store) = setup(&[(
+            "batch",
+            3,
+            vec![("batch-task", vec![]), ("commission", vec![])],
+        )]);
+        mark_as_commission(&store, "commission");
+        let standalone = serde_json::json!({
+            "outcome":"standalone reconciler task",
+            "execution_target":{
+                "kind":"git_repository",
+                "repository":"https://example.test/repo.git",
+                "base_ref":"main",
+                "delivery":"pull_request"
+            }
+        });
+        let accepted = store
+            .accept_task(
+                "standalone-key",
+                "demo",
+                &standalone,
+                "standalone",
+                &standalone,
+            )
+            .unwrap();
+        assert_eq!(accepted.task["state"], "open");
+        assert_eq!(accepted.task["operator_hold"], true);
+        assert_eq!(accepted.task["hold_reason"], "awaiting_controller_mode");
+        let projection = store.get_resource("task", "standalone").unwrap().unwrap();
+        assert_eq!(projection["hold_reason"], "awaiting_controller_mode");
+        let control = store.task_control("standalone").unwrap().unwrap();
+        assert_eq!(control["operator_hold"], true);
+        assert_eq!(control["hold_reason"], "awaiting_controller_mode");
+
+        let capacity = store.capacity(3, 0, 3, 0, 0).unwrap();
+        assert_eq!(capacity.queued_runnable, 2);
+        let claims = store.claim_runnable(3, 0, 3, 0).unwrap();
+        assert_eq!(
+            claims
+                .iter()
+                .map(|claim| claim.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["batch-task", "commission"]
+        );
+        assert!(store.attempts_for_task("standalone").unwrap().is_empty());
+
+        // A versioned controller ownership transition clears the admission hold;
+        // the legacy scheduler still cannot claim Reconciler-owned work.
+        assert_eq!(
+            store
+                .set_task_control("standalone", 1, false, "reconciler")
+                .unwrap(),
+            2
+        );
+        let transferred = store.get_resource("task", "standalone").unwrap().unwrap();
+        assert_eq!(transferred["operator_hold"], false);
+        assert!(transferred["hold_reason"].is_null());
+        assert!(store
+            .claim_runnable(3, 0, 3, 0)
+            .unwrap()
+            .iter()
+            .all(|claim| claim.task_id != "standalone"));
+        assert!(store.attempts_for_task("standalone").unwrap().is_empty());
     }
 }

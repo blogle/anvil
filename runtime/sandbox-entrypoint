@@ -35,8 +35,11 @@ export DISPLAY="${DISPLAY:-:99}"
 project_dir="$HOME/workspace/${ANVIL_PROJECT}"
 
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" \
-  "$XDG_STATE_HOME" "$HOME/.local/share/opencode"
-mkdir -p "$XDG_DATA_HOME/opencode" "$HOME/workspace"
+  "$XDG_STATE_HOME"
+if [ "${ANVIL_ISOLATED_GO_AUTH:-}" != 1 ]; then
+  mkdir -p "$HOME/.local/share/opencode" "$XDG_DATA_HOME/opencode"
+fi
+mkdir -p "$HOME/workspace"
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 
@@ -49,30 +52,34 @@ fi
 git config --global credential.helper /bin/anvil-credential
 source /bin/anvil-git-identity
 
-profile_dir=/anvil/profile
-mkdir -p "$profile_dir/config" "$profile_dir/auth"
-profile_auth="$profile_dir/auth/auth.json"
-if [ ! -e "$profile_auth" ]; then
-  (umask 077; : > "$profile_auth")
-fi
-chmod 600 "$profile_auth"
-auth_link="$HOME/.local/share/opencode/auth.json"
-if [ -L "$auth_link" ]; then
-  if [ "$(readlink "$auth_link")" != "$profile_auth" ]; then
-    ln -sfn "$profile_auth" "$auth_link"
-  fi
-elif [ ! -e "$auth_link" ]; then
-  ln -s "$profile_auth" "$auth_link"
+if [ "${ANVIL_ISOLATED_GO_AUTH:-}" = 1 ]; then
+  umask 077
 else
-  echo "warning: preserving existing sandbox OpenCode auth.json" >&2
-fi
-data_auth_link="$XDG_DATA_HOME/opencode/auth.json"
-if [ -L "$data_auth_link" ]; then
-  if [ "$(readlink "$data_auth_link")" != "$profile_auth" ]; then
-    ln -sfn "$profile_auth" "$data_auth_link"
+  profile_dir=/anvil/profile
+  mkdir -p "$profile_dir/config" "$profile_dir/auth"
+  profile_auth="$profile_dir/auth/auth.json"
+  if [ ! -e "$profile_auth" ]; then
+    (umask 077; : > "$profile_auth")
   fi
-elif [ ! -e "$data_auth_link" ]; then
-  ln -s "$profile_auth" "$data_auth_link"
+  chmod 600 "$profile_auth"
+  auth_link="$HOME/.local/share/opencode/auth.json"
+  if [ -L "$auth_link" ]; then
+    if [ "$(readlink "$auth_link")" != "$profile_auth" ]; then
+      ln -sfn "$profile_auth" "$auth_link"
+    fi
+  elif [ ! -e "$auth_link" ]; then
+    ln -s "$profile_auth" "$auth_link"
+  else
+    echo "warning: preserving existing sandbox OpenCode auth.json" >&2
+  fi
+  data_auth_link="$XDG_DATA_HOME/opencode/auth.json"
+  if [ -L "$data_auth_link" ]; then
+    if [ "$(readlink "$data_auth_link")" != "$profile_auth" ]; then
+      ln -sfn "$profile_auth" "$data_auth_link"
+    fi
+  elif [ ! -e "$data_auth_link" ]; then
+    ln -s "$profile_auth" "$data_auth_link"
+  fi
 fi
 
 git config --global --add safe.directory "$project_dir"

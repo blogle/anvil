@@ -1,0 +1,5 @@
+{
+  "type": "feat",
+  "semver": "minor",
+  "summary": "Allow opt-in sealed OpenCode Go credentials in isolated worker workspaces"
+}
