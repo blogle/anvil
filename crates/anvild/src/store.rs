@@ -1228,6 +1228,151 @@ impl ControllerStore {
         Ok(Some(value))
     }
 
+    /// Read a bounded, consistent projection of every Commission and its current execution
+    /// state. The cursor is an opaque exclusive (campaign_id, local_key) keyset boundary;
+    /// subsequent pages are live reads, not continuations of a frozen snapshot.
+    pub fn inbox(&self, after: Option<&str>, limit: usize) -> Result<Value, StoreError> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        if !(1..=100).contains(&limit) {
+            return Err(StoreError::InvalidState(
+                "inbox limit must be between 1 and 100".into(),
+            ));
+        }
+        let after = after
+            .map(|cursor| {
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(cursor)
+                    .map_err(|_| StoreError::InvalidState("invalid inbox cursor".into()))?;
+                let key: (String, String) = serde_json::from_slice(&bytes)
+                    .map_err(|_| StoreError::InvalidState("invalid inbox cursor".into()))?;
+                if key.0.is_empty() || key.1.is_empty() || URL_SAFE_NO_PAD.encode(&bytes) != cursor
+                {
+                    return Err(StoreError::InvalidState("invalid inbox cursor".into()));
+                }
+                Ok(key)
+            })
+            .transpose()?;
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let mut statement = tx.prepare(
+            "SELECT c.campaign_id,c.local_key,c.commission_id,c.payload_json,
+                    t.payload_json,d.controller_mode,d.operator_hold,d.hold_reason,d.retry_due_ms,
+                    a.attempt_id,a.ordinal,a.payload_json,a.session_id
+             FROM commissions c
+             JOIN tasks t ON t.task_id=c.commission_id
+             LEFT JOIN task_durable_state d ON d.task_id=t.task_id
+             LEFT JOIN attempts a ON a.task_id=t.task_id AND a.ordinal=(
+                 SELECT MAX(latest.ordinal) FROM attempts latest WHERE latest.task_id=t.task_id
+             )
+             WHERE (?1 IS NULL OR c.campaign_id>?1 OR (c.campaign_id=?1 AND c.local_key>?2))
+             ORDER BY c.campaign_id,c.local_key LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                after.as_ref().map(|key| key.0.as_str()),
+                after.as_ref().map(|key| key.1.as_str()),
+                (limit + 1) as i64
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<bool>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                ))
+            },
+        )?;
+        let rows = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let has_more = rows.len() > limit;
+        let mut items = Vec::new();
+        for (
+            campaign_id,
+            local_key,
+            commission_id,
+            commission_json,
+            task_json,
+            mode,
+            hold,
+            reason,
+            retry_due,
+            attempt_id,
+            ordinal,
+            attempt_json,
+            session_id,
+        ) in rows.into_iter().take(limit)
+        {
+            let commission: Value = serde_json::from_str(&commission_json)?;
+            let task: Value = serde_json::from_str(&task_json)?;
+            let attempt = match (attempt_id, ordinal, attempt_json) {
+                (Some(attempt_id), Some(ordinal), Some(payload)) => {
+                    let payload: Value = serde_json::from_str(&payload)?;
+                    Some(json!({
+                        "attempt_id":attempt_id,
+                        "ordinal":ordinal,
+                        "state":payload.get("state").cloned().unwrap_or(Value::Null),
+                        "failure_reason":payload.get("failure_reason").cloned().unwrap_or(Value::Null),
+                        "session_id":session_id,
+                    }))
+                }
+                _ => None,
+            };
+            items.push(json!({
+                "campaign_id":campaign_id,
+                "commission_id":commission_id,
+                "local_key":local_key,
+                "objective":commission["objective"],
+                "commission":{
+                    "state":commission["state"],
+                    "version":commission["version"],
+                    "start_authorized":task["start_authorized"],
+                },
+                "task":{
+                    "state":task["state"],
+                    "controller_mode":mode,
+                    "operator_hold":hold,
+                    "hold_reason":reason,
+                    "retry_due_ms":retry_due,
+                },
+                "start_after":commission["start_after"],
+                "integration_after":commission["integration_after"],
+                "attempt":attempt,
+            }));
+        }
+        let next_cursor = if has_more {
+            items.last().map(|item| {
+                URL_SAFE_NO_PAD.encode(
+                    serde_json::to_vec(&(
+                        item["campaign_id"]
+                            .as_str()
+                            .expect("inbox item campaign id is non-null"),
+                        item["local_key"]
+                            .as_str()
+                            .expect("inbox item local key is non-null"),
+                    ))
+                    .expect("inbox cursor key serializes"),
+                )
+            })
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok(json!({"schema_version":1,"items":items,"next_cursor":next_cursor}))
+    }
+
     /// Persist the explicit operator dispatch gate and its durable idempotency receipt.
     pub fn start_commission(
         &self,
@@ -4149,6 +4294,108 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn inbox_keyset_pages_cross_campaign_boundary_and_project_latest_state() {
+        let (_dir, store) = store();
+        let commission = |key: &str| {
+            json!({
+                "local_key":key,"objective":format!("Objective {key}"),"obligations":[{"id":"deliver","version":1,"requirement":"Deliver the objective","acceptance_expectations":["verified"]}],
+                "execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},
+                "budget":{"max_attempts":2,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},
+                "start_after":[],"integration_after":[]
+            })
+        };
+        let submit = |key: &str, purpose: &str| {
+            let request = json!({"campaign":{"purpose":purpose,"shared_contracts":[]},"commissions":[commission("alpha"),commission("omega")]});
+            let validated = anvil_core::validate_campaign_submission(
+                serde_json::from_value(request.clone()).unwrap(),
+            )
+            .unwrap();
+            store
+                .accept_campaign(key, "test", &request, &validated)
+                .unwrap()
+        };
+        let one = submit("inbox-key-one", "inbox test one");
+        let two = submit("inbox-key-two", "inbox test two");
+        let mut campaign_ids = [
+            one.task["campaign_id"].as_str().unwrap(),
+            two.task["campaign_id"].as_str().unwrap(),
+        ];
+        campaign_ids.sort_unstable();
+
+        let first = store.inbox(None, 1).unwrap();
+        assert_eq!(first["schema_version"], 1);
+        assert_eq!(first["items"].as_array().unwrap().len(), 1);
+        let first_items = first["items"].as_array().unwrap();
+        assert_eq!(first_items[0]["campaign_id"], campaign_ids[0]);
+        assert_eq!(first_items[0]["local_key"], "alpha");
+        assert_eq!(first_items[0]["commission"]["start_authorized"], false);
+        assert!(first_items[0]["attempt"].is_null());
+        let cursor = first["next_cursor"].as_str().unwrap();
+        let second = store.inbox(Some(cursor), 1).unwrap();
+        assert_eq!(second["items"][0]["local_key"], "omega");
+        let boundary_cursor = second["next_cursor"].as_str().unwrap();
+        let third = store.inbox(Some(boundary_cursor), 2).unwrap();
+        assert_eq!(third["items"].as_array().unwrap().len(), 2);
+        assert_eq!(third["items"][0]["campaign_id"], campaign_ids[1]);
+        assert_eq!(third["items"][0]["local_key"], "alpha");
+        assert_eq!(third["items"][1]["local_key"], "omega");
+        assert!(third["next_cursor"].is_null());
+
+        let commission_id = one.task["commissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["local_key"] == "alpha")
+            .unwrap()["commission_id"]
+            .as_str()
+            .unwrap();
+        store
+            .start_commission("inbox-start", commission_id, 1)
+            .unwrap();
+        store
+            .create_attempt(commission_id, "inbox-attempt-1", "inbox-attempt-key-1")
+            .unwrap();
+        store
+            .set_attempt_state("inbox-attempt-1", "failed")
+            .unwrap();
+        store
+            .create_attempt(commission_id, "inbox-attempt-2", "inbox-attempt-key-2")
+            .unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection.execute(
+                "UPDATE task_durable_state SET operator_hold=1,hold_reason='test_hold' WHERE task_id=?1",
+                [commission_id],
+            ).unwrap();
+        }
+        let refreshed = store.inbox(None, 4).unwrap();
+        let changed = refreshed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["commission_id"] == commission_id)
+            .unwrap();
+        assert_eq!(changed["commission"]["start_authorized"], true);
+        assert_eq!(changed["commission"]["version"], 2);
+        assert_eq!(changed["attempt"]["attempt_id"], "inbox-attempt-2");
+        assert_eq!(changed["attempt"]["ordinal"], 2);
+        assert_eq!(changed["task"]["operator_hold"], true);
+        assert_eq!(changed["task"]["hold_reason"], "test_hold");
+        assert!(matches!(
+            store.inbox(Some("not-a-cursor"), 2),
+            Err(StoreError::InvalidState(_))
+        ));
+        assert!(matches!(
+            store.inbox(None, 0),
+            Err(StoreError::InvalidState(_))
+        ));
+        assert!(matches!(
+            store.inbox(None, 101),
+            Err(StoreError::InvalidState(_))
+        ));
     }
 
     #[test]

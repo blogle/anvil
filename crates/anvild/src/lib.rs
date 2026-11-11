@@ -2286,6 +2286,7 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
         .route("/v1/batches/:id/digest", get(get_batch_digest))
         .route("/v1/campaigns", post(submit_campaign))
         .route("/v1/campaigns/:id", get(get_campaign))
+        .route("/v1/inbox", get(get_inbox))
         .route("/v1/commissions/:id", get(get_commission))
         .route("/v1/commissions/:id/start", post(start_commission))
         .route("/v1/capacity", get(get_capacity))
@@ -2358,6 +2359,33 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
 struct CampaignPageQuery {
     after: Option<String>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InboxQuery {
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn get_inbox(
+    State(state): State<AppState>,
+    Query(query): Query<InboxQuery>,
+) -> Result<Json<Value>, ServiceError> {
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=campaign::INBOX_MAX_PAGE_SIZE).contains(&limit) {
+        return Err(ServiceError::Invalid(format!(
+            "limit must be between 1 and {}",
+            campaign::INBOX_MAX_PAGE_SIZE
+        )));
+    }
+    campaign::inbox(
+        state
+            .store()
+            .map_err(|error| ServiceError::Store(error.into()))?,
+        query.after.as_deref(),
+        limit,
+    )
+    .map(Json)
 }
 
 async fn submit_campaign(
@@ -9262,6 +9290,106 @@ mod tests {
             web_root_from_env(Some("/tmp/custom-web".into())),
             PathBuf::from("/tmp/custom-web")
         );
+    }
+
+    #[tokio::test]
+    async fn inbox_http_paginates_and_rejects_invalid_cursor_or_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app_config = config("http://127.0.0.1:4097".into());
+        app_config.store_path = directory.path().join("inbox.sqlite3");
+        let db = store::ControllerStore::open(&app_config.store_path).unwrap();
+        let commission = |key: &str| {
+            json!({
+                "local_key":key,"objective":format!("Objective {key}"),"obligations":[{"id":"deliver","version":1,"requirement":"Deliver the objective","acceptance_expectations":["verified"]}],
+                "execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},
+                "budget":{"max_attempts":2,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},
+                "start_after":[],"integration_after":[]
+            })
+        };
+        let submission = json!({"campaign":{"purpose":"inbox HTTP test","shared_contracts":[]},"commissions":[commission("b"),commission("a")]});
+        let validated = anvil_core::validate_campaign_submission(
+            serde_json::from_value(submission.clone()).unwrap(),
+        )
+        .unwrap();
+        let accepted = db
+            .accept_campaign("http-inbox-key", "test", &submission, &validated)
+            .unwrap();
+        let app = router(AppState::new(app_config, FakeSandbox));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/inbox?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(first["schema_version"], 1);
+        assert_eq!(first["items"][0]["local_key"], "a");
+        let cursor = first["next_cursor"].as_str().unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/inbox?after={cursor}&limit=1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let second: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(second["items"][0]["local_key"], "b");
+        assert!(second["next_cursor"].is_null());
+        let commission_id = accepted.task["commissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["local_key"] == "a")
+            .unwrap()["commission_id"]
+            .as_str()
+            .unwrap();
+        db.start_commission("http-inbox-start", commission_id, 1)
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/inbox?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let refreshed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            refreshed["items"][0]["commission"]["start_authorized"],
+            true
+        );
+        for uri in [
+            "/v1/inbox?limit=0",
+            "/v1/inbox?limit=101",
+            "/v1/inbox?after=bad-cursor",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
     }
 
     #[test]

@@ -110,6 +110,11 @@ struct CampaignPage {
     limit: Option<usize>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
+struct InboxPage {
+    after: Option<String>,
+    limit: Option<usize>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
 struct CommissionStart {
     id: String,
     expected_version: u64,
@@ -250,6 +255,7 @@ const CONTROLLER_OPERATIONS: &[&str] = &[
     "anvil_submit_campaign",
     "anvil_get_campaign",
     "anvil_get_commission",
+    "anvil_get_inbox",
     "anvil_start_commission",
     "anvil_submit_batch",
     "anvil_get_batch",
@@ -275,6 +281,54 @@ const CONTROLLER_OPERATIONS: &[&str] = &[
 
 #[rmcp::tool_router]
 impl AnvilMcp {
+    #[rmcp::tool(
+        description = "Read one bounded page from the Anvil inbox. `after` is an opaque cursor; limit is 1–100 (default 20)."
+    )]
+    async fn anvil_get_inbox(
+        &self,
+        Parameters(p): Parameters<InboxPage>,
+    ) -> Result<Json<Value>, ErrorData> {
+        let limit = p.limit.unwrap_or(20);
+        if !(1..=100).contains(&limit) {
+            return Err(ErrorData::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "limit must be between 1 and 100",
+                None,
+            ));
+        }
+        let mut url = self
+            .base
+            .join("v1/inbox")
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("limit", &limit.to_string());
+            if let Some(after) = p.after.as_deref() {
+                query.append_pair("after", after);
+            }
+        }
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        if !status.is_success() {
+            let detail = serde_json::from_slice::<Value>(&bytes).unwrap_or_else(
+                |_| json!({"message":String::from_utf8_lossy(&bytes).into_owned()}),
+            );
+            return Err(api_error(status, detail));
+        }
+        let value = serde_json::from_slice(&bytes)
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        Ok(Json(value))
+    }
+
     #[rmcp::tool(
         description = "Atomically submit one Campaign and its Commission contracts. Requires an idempotency key; all Commissions are sent in this single request."
     )]
@@ -781,7 +835,8 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::{
         AnvilMcp, BatchDigestRequest, BatchSubmission, BatchTask, CampaignPage, CampaignSubmission,
-        CommissionStart, MutationRecovery, ResourceId, TaskResourceId, CONTROLLER_OPERATIONS,
+        CommissionStart, InboxPage, MutationRecovery, ResourceId, TaskResourceId,
+        CONTROLLER_OPERATIONS,
     };
     use httpmock::{Method::GET, MockServer};
     use rmcp::handler::server::wrapper::Parameters;
@@ -949,6 +1004,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbox_tool_forwards_bounded_pagination_and_returns_backend_json() {
+        let server = MockServer::start_async().await;
+        let page = json!({"items":[{"id":"item-1"}],"next":"opaque+/="});
+        let paged = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/inbox")
+                .query_param("limit", "37")
+                .query_param("after", "opaque+/=");
+            then.status(200).json_body(page.clone());
+        });
+        let default = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/inbox")
+                .query_param("limit", "20");
+            then.status(200).json_body(page.clone());
+        });
+        let mcp = AnvilMcp::new(reqwest::Url::parse(&format!("{}/", server.base_url())).unwrap())
+            .unwrap();
+
+        let response = mcp
+            .anvil_get_inbox(Parameters(InboxPage {
+                after: Some("opaque+/=".into()),
+                limit: Some(37),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(response, page);
+        paged.assert_hits(1);
+
+        let response = mcp
+            .anvil_get_inbox(Parameters(InboxPage {
+                after: None,
+                limit: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(response, page);
+        default.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn inbox_limit_is_bounded_before_http_request() {
+        let server = MockServer::start_async().await;
+        let unexpected = server.mock(|when, then| {
+            when.method(GET).path("/v1/inbox");
+            then.status(200).json_body(json!({}));
+        });
+        let mcp = AnvilMcp::new(reqwest::Url::parse(&format!("{}/", server.base_url())).unwrap())
+            .unwrap();
+        let result = mcp
+            .anvil_get_inbox(Parameters(InboxPage {
+                after: None,
+                limit: Some(101),
+            }))
+            .await;
+        let Err(error) = result else {
+            panic!("out-of-range page must be rejected")
+        };
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        unexpected.assert_hits(0);
+    }
+
+    #[tokio::test]
     async fn batch_tool_surfaces_http_idempotency_conflicts() {
         let server = MockServer::start_async().await;
         server.mock(|when, then| {
@@ -1094,6 +1214,7 @@ mod tests {
         for operation in [
             "anvil_submit_campaign",
             "anvil_get_campaign",
+            "anvil_get_inbox",
             "anvil_get_commission",
             "anvil_start_commission",
             "anvil_submit_batch",
@@ -1213,6 +1334,7 @@ mod tests {
             "anvil_get_attempt",
             "anvil_get_campaign",
             "anvil_get_commission",
+            "anvil_get_inbox",
         ] {
             let tool = tools.iter().find(|tool| tool["name"] == readonly).unwrap();
             assert!(

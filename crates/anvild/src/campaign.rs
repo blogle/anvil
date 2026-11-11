@@ -7,6 +7,7 @@ use crate::{store, ServiceError};
 
 const API_SCOPE: &str = "api";
 pub const MAX_PAGE_SIZE: usize = 256;
+pub const INBOX_MAX_PAGE_SIZE: usize = 100;
 
 pub fn submit(
     store: &store::ControllerStore,
@@ -37,6 +38,17 @@ pub fn aggregate(
         .get_campaign(id, after, limit)
         .map_err(|error| ServiceError::Store(error.to_string()))?
         .ok_or(ServiceError::NotFound)
+}
+
+pub fn inbox(
+    store: &store::ControllerStore,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<Value, ServiceError> {
+    store.inbox(after, limit).map_err(|error| match error {
+        store::StoreError::InvalidState(message) => ServiceError::Invalid(message),
+        other => ServiceError::Store(other.to_string()),
+    })
 }
 
 pub fn commission(store: &store::ControllerStore, id: &str) -> Result<Value, ServiceError> {

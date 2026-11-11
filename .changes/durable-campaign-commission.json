@@ -1,0 +1,5 @@
+{
+  "type": "feat",
+  "semver": "minor",
+  "summary": "Add durable supervised Campaign and Commission execution with restart-safe scheduling"
+}
