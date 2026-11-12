@@ -8,11 +8,12 @@ on:
 permissions:
   checks: read
   contents: read
+  packages: write
   pull-requests: read
 jobs:
   merge:
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
-    uses: blogle/sdlc/.github/workflows/release-merge.yml@3ae4301d945d1b5365fcec08332fc7bc080ca093
+    uses: blogle/sdlc/.github/workflows/release-merge.yml@d99589dc689da047dbf7f4f0f97936ccc6991db8
     with:
-      sdlc_ref: 3ae4301d945d1b5365fcec08332fc7bc080ca093
+      sdlc_ref: d99589dc689da047dbf7f4f0f97936ccc6991db8
     secrets: inherit
