@@ -21,6 +21,10 @@ ci = {
 
 `check` and `verify` are named sets of independently buildable Nix derivations. `publish` is an executable Nix app. The flake outputs are `ci.<system>.check`, `ci.<system>.verify`, and `ci.<system>.publish`. Do not add `apps.sdlc-publish`, a package alias, a Just release recipe, a custom CI matrix, or synthetic stage derivations. SDLC owns evaluation, parallel scheduling, Hestia builds/caching, stable status aggregation, protection policy, release orchestration, and receipt validation.
 
+## Nixpkgs channels
+
+Consumers subscribe with `inputs.sdlc.url = "github:blogle/sdlc/v2"`; a separate top-level `nixpkgs` input is unnecessary. SDLC exposes `nixpkgs-latest` (`nixos-unstable`) and `nixpkgs-stable` (the current stable NixOS branch). Use `sdlc.lib.importPackages { system; latest = { config; overlays; }; stable = { config; overlays; }; }` when each package set needs its own options. Other flake inputs may follow `sdlc/nixpkgs-latest` or `sdlc/nixpkgs-stable` when they should share the corresponding locked node.
+
 Anvil's accepted verification scope for this integration is Rust formatting, clippy and workspace tests; frontend tests/build; static checks; local-process E2E; and product image builds. Do not restore Kubernetes acceptance, VM, QEMU, nested OCI, or sandbox lifecycle suites in this lane. Follow-up coverage is tracked separately.
 
 ## CI, cache, and protection

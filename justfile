@@ -3,7 +3,7 @@ default:
 
 # Install/update the pinned shared SDLC skill through Vercel's official CLI.
 skills:
-    skills add https://github.com/blogle/sdlc/tree/21ae48a50a3a39a9e45dc84c6f244ce038bb166f/skills/sdlc --skill sdlc --agent opencode --yes
+    skills add https://github.com/blogle/sdlc/tree/3ae4301d945d1b5365fcec08332fc7bc080ca093/skills/sdlc --skill sdlc --agent opencode --yes
 
 skills-update:
     skills update -p -y
