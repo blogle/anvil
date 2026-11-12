@@ -2,217 +2,139 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { readFile } from 'node:fs/promises'
-import { extname, join } from 'node:path'
+import { extname, join, normalize, sep } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { chromium } from '@playwright/test'
 
-test('Preact Sessions workspace preserves routing, detail state, factual polling, and responsive layout', async () => {
-  const baseSession = { id: 'demo', project: 'Demo', work_branch: 'main', environment_state: 'ready', execution_state: 'idle', created_at: '2026-09-19T11:00:00Z', sandbox: 'sandbox', repository: 'https://example.test/repo', base_ref: 'main' }
-  const sessions = [baseSession, ...Array.from({ length: 35 }, (_, index) => ({ ...baseSession, id: `demo-${index}`, project: `Project ${index}`, work_branch: `branch-${index}`, environment_state: index === 2 ? 'suspended' : index === 3 ? 'failed' : 'ready', execution_state: index === 1 ? 'running' : index === 4 ? 'unavailable' : 'idle' }))]
-  const selectedState = { environment: 'ready', execution: 'idle', changedAt: new Date(Date.now() - 1000).toISOString(), requestCount: 2 }
-  const activityFor = (id) => {
-    const session = sessions.find((item) => item.id === id) || baseSession
-    const environment = id === 'demo' ? selectedState.environment : session.environment_state
-    const execution = id === 'demo' ? selectedState.execution : session.execution_state
-    const requestCount = id === 'demo' ? selectedState.requestCount : 1
-    return {
-      session: { ...session, environment_state: environment, execution_state: execution },
-      environment_state: environment,
-      execution_state: execution,
-      attach_command: `anvilctl sessions attach ${id}`,
-      preview_url: 'https://preview.example.test',
-      opencode_url: 'https://opencode.example.test',
-      lifecycle: id === 'demo'
-        ? [{ id: 'created', kind: 'created', at: session.created_at }, { id: 'ready', kind: 'ready', at: '2026-09-19T11:01:00Z', detail: 'Sandbox ready' }, { id: 'run-started', kind: 'run_started', at: '2026-09-19T11:58:30Z' }, { id: 'turn-finished', kind: 'opencode_idle', at: '2026-09-19T12:01:00Z' }]
-        : [{ id: 'created', kind: 'created', at: session.created_at }, { id: 'ready', kind: 'ready', at: '2026-09-19T11:01:00Z', detail: 'Sandbox ready' }],
-      requests: Array.from({ length: requestCount }, (_, index) => ({ id: `request-${index + 1}`, number: index + 1, origin: 'operator', state: index === 0 ? 'completed' : 'running', started_at: id === 'demo' ? ['2026-09-19T11:58:00Z', '2026-09-19T11:59:00Z', '2026-09-19T12:02:00Z'][index] : session.created_at, completed_at: index === 0 ? '2026-09-19T11:58:20Z' : undefined, last_activity_at: selectedState.changedAt, prompt: index === 0 ? `Representative prompt ${index + 1}: ${'inspect session '.repeat(45)}` : `Follow-up request ${index + 1}` })),
-      events: [{ id: `${id}:prompt`, at: '2026-09-19T11:58:00Z', kind: 'prompt', title: 'You', detail: 'Review the authentication flow.' }, { id: `${id}:tool`, at: '2026-09-19T11:58:30Z', kind: 'tool', tool: 'read', title: 'src/auth.js', detail: '24 lines read', status: 'completed' }, { id: `${id}:agent`, at: '2026-09-19T11:59:00Z', kind: 'message', title: 'Agent', detail: 'The session helper owns authentication.' }],
-      event_window: { message_limit: 100, returned_messages: 3, loaded_messages: 3, next_cursor: null, truncated: false },
+test('static workspace routes render and campaign contract validation is usable', async t => {
+  const root = join(import.meta.dirname, 'out')
+  let campaignSubmissions = 0, inboxCalls = 0, decisionCalls = 0
+  const decisionCursors = []
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://localhost'), path = url.pathname
+    if (path === '/v1/inbox') {
+      inboxCalls++
+      const item = (commission_id, local_key, overrides = {}) => ({ campaign_id: 'campaign/1', commission_id, local_key, objective: `Work ${local_key}`, commission: { state: 'active', version: 2, start_authorized: true }, task: { state: 'running', controller_mode: 'automatic', operator_hold: false, hold_reason: null, retry_due_ms: null }, start_after: [], integration_after: [], attempt: { attempt_id: 'attempt-1', ordinal: 1, state: 'running', failure_reason: null, session_id: 'session/1' }, ...overrides })
+      const first = item('commission/1', 'held', { task: { state: 'paused', controller_mode: 'operator', operator_hold: true, hold_reason: 'Review requested', retry_due_ms: 1234 }, attempt: null })
+      const second = item('commission/2', 'normal', { commission: { state: 'draft', version: 1, start_authorized: false } })
+      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ schema_version: 1, items: url.searchParams.has('after') ? [second] : [first], next_cursor: url.searchParams.has('after') ? null : 'page-2' })); return
     }
-  }
-  const server = createServer(async (request, response) => {
-    const url = new URL(request.url, 'http://localhost')
-    if (url.pathname === '/__test/recover-selected' && request.method === 'POST') {
-      sessions[0].opencode_session_id = 'ses/recovered?#1'
-      response.writeHead(204); response.end(); return
+    if (req.method === 'POST' && path === '/v1/campaigns') {
+      campaignSubmissions++
+      const status = campaignSubmissions === 1 ? 503 : 422
+      res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify({ message: status === 503 ? 'service unavailable' : 'invalid campaign' })); return
     }
-    if (url.pathname === '/__test/change-selected' && request.method === 'POST') {
-      selectedState.execution = 'running'
-      selectedState.changedAt = new Date().toISOString()
-      selectedState.requestCount = 3
-      response.writeHead(204); response.end(); return
+    if (path === '/v1/commissions/decision-task') {
+      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ campaign_id: 'campaign/1', local_key: 'history', objective: 'History fixture', version: 1, state: 'active', start_authorized: true, obligations: [], execution_target: {} })); return
     }
-    if (url.pathname === '/__test/rebind-selected' && request.method === 'POST') {
-      sessions[0].opencode_session_id = 'ses/rebound'
-      response.writeHead(204); response.end(); return
+    if (path === '/v1/tasks/decision-task/decisions') {
+      decisionCalls++
+      decisionCursors.push(url.searchParams.get('cursor'))
+      const first = { decision_sequence: 1, rule_id: 'no_progress', logical_time_ms: 1234, authorization_blocked_reason: 'shadow_mode', canonical_actions_json: [{ kind: 'observe', content: 'fixture-secret-prompt' }] }
+      const second = { decision_sequence: 2, rule_id: 'retry', logical_time_ms: 2345, authorization_blocked_reason: null, canonical_actions_json: [{ kind: 'retry' }] }
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(url.searchParams.has('cursor') ? { decisions: [second], next_cursor: null } : { decisions: [first], next_cursor: 987654 })); return
     }
-    if (url.pathname === '/v1/sessions') {
-      response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify(sessions)); return
+    if (path === '/v1/sessions') {
+      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify([{ id: 'safe/?#id', project: 'Fixture session', environment_state: 'ready', execution_state: 'idle' }, { id: 'other', project: 'Failed activity fixture' }])); return
     }
-    const activityMatch = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/activity$/)
-    if (activityMatch) {
-      response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify(activityFor(decodeURIComponent(activityMatch[1])))); return
+    if (path === '/v1/sessions/safe%2F%3F%23id/activity') {
+      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ session: { opencode_session_id: 'ses/safe?#id' }, opencode_url: 'https://opencode.example.test/path', preview_url: 'javascript:alert(1)', attach_command: 'anvilctl sessions attach safe/?#id', events: [{ id: 'fixture-event', kind: 'message', title: 'Agent', detail: 'Fixture conversation' }] })); return
     }
-    if (url.pathname === '/v1/sessions/demo/files') {
-      response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify({ status: 'ready', diff: { base_revision: 'abc123', files: [], truncated: false } })); return
+    if (path === '/v1/sessions/other/activity') {
+      res.writeHead(503, { 'content-type': 'application/json' }); res.end(JSON.stringify({ message: 'activity unavailable' })); return
     }
-    const asset = url.pathname === '/' || !url.pathname.startsWith('/assets/') ? 'index.html' : url.pathname.slice(1)
+    const safe = normalize(decodeURIComponent(path)).replace(/^([/\\]|\.\.(?:[/\\]|$))+/, '')
+    if (safe.split(sep).includes('..')) { res.writeHead(404); res.end('not found'); return }
+    const asset = join(root, safe, path.endsWith('/') || !extname(path) ? 'index.html' : '')
     try {
-      const body = await readFile(join(import.meta.dirname, 'dist', asset))
-      const type = extname(asset) === '.html' ? 'text/html' : extname(asset) === '.js' ? 'text/javascript' : extname(asset) === '.css' ? 'text/css' : 'application/octet-stream'
-      response.writeHead(200, { 'content-type': type }); response.end(body)
-    } catch { response.writeHead(404); response.end('not found') }
+      const body = await readFile(asset)
+      const ext = extname(asset)
+      res.writeHead(200, { 'content-type': ext === '.html' ? 'text/html' : ext === '.js' ? 'text/javascript' : ext === '.css' ? 'text/css' : 'application/octet-stream' }); res.end(body)
+    } catch { res.writeHead(404); res.end('not found') }
   })
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
-  const origin = `http://127.0.0.1:${server.address().port}`
-  const executablePath = process.env.CHROMIUM_PATH || execFileSync('which', ['chromium'], { encoding: 'utf8' }).trim()
-  const browser = await chromium.launch({ executablePath, args: ['--no-sandbox'] })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  let browser
   try {
-    const page = await browser.newPage({ viewport: { width: 1440, height: 900 } })
-    await page.goto(`${origin}/#sessions`)
-    const workspace = page.locator('.session-workspace'), detail = page.locator('.detail')
-    const row = page.locator('[data-session="demo"]')
-    await row.waitFor()
-    assert.equal(await page.locator('.app-rail [aria-label="Sessions"]').count(), 1)
-    assert.equal(await detail.locator('h2').count(), 0, 'landing has useful session content without a detail placeholder')
-    assert.equal(await page.getByText('Select a session').count(), 0)
-    assert.ok(await workspace.evaluate((element) => element.getBoundingClientRect().width > 900))
-    assert.equal(await page.locator('.session-row').count(), sessions.length)
-    assert.match(await row.textContent(), /Environment: ready/)
-    assert.match(await row.textContent(), /Execution: idle/)
-    assert.equal(await row.locator('.session-status-label').count(), 0, 'no semantic WorkState label is rendered')
-    await workspace.evaluate((element) => { element.scrollTop = 150 })
-
-    await page.locator('[data-session="demo-1"]').click()
-    await page.waitForFunction(() => location.hash === '#session/demo-1')
-    assert.equal(await detail.locator('h2').textContent(), 'Project 1 session')
-    assert.ok(await detail.evaluate((element) => element.getBoundingClientRect().left > 700), 'desktop selection opens a right drawer')
-    await page.goBack(); await page.waitForFunction(() => location.hash === '#sessions')
-    await page.goForward(); await page.waitForFunction(() => location.hash === '#session/demo-1')
-    await page.locator('#execution-filter').selectOption('idle')
-    assert.equal(await detail.locator('.filter-context').isVisible(), true, 'a filtered-out selection remains in its drawer')
-    assert.equal(await detail.locator('h2').textContent(), 'Project 1 session')
-    assert.equal(await page.locator('[data-session="demo-1"]').count(), 0, 'factual execution filters hide non-matching sessions')
-    await workspace.evaluate((element) => { element.scrollTop = 150 })
-    await page.locator('.filter-context button').click()
-    assert.equal(await page.locator('#execution-filter').inputValue(), '')
-    await page.locator('.back-link').click()
-    await page.waitForFunction(() => location.hash === '#sessions')
-    assert.equal(await workspace.evaluate((element) => element.scrollTop), 150, 'close retains list scroll')
-    await page.goBack(); await page.waitForFunction(() => location.hash === '#session/demo-1')
-    await page.goForward(); await page.waitForFunction(() => location.hash === '#sessions')
-
-    await row.click()
-    await page.waitForFunction(() => location.hash === '#session/demo')
-    assert.equal(await detail.locator('h2').textContent(), 'Demo session')
-    await detail.locator('#activity-panel [data-event-id="demo:prompt"]').waitFor()
-    assert.equal(await detail.locator('#activity-tab').getAttribute('aria-selected'), 'true')
-    assert.deepEqual(await detail.locator('#activity-panel [data-event-id]').evaluateAll((entries) => entries.map((entry) => entry.dataset.eventId)), ['demo:prompt', 'demo:tool', 'demo:agent'])
-    assert.equal((await detail.locator('#activity-panel').textContent()).includes('Sandbox ready'), false)
-    const unavailableOpenCode = detail.locator('[data-opencode-disabled]')
-    assert.equal(await unavailableOpenCode.isDisabled(), true)
-    assert.match(await unavailableOpenCode.getAttribute('aria-label'), /waiting for conversation/)
-    assert.equal(await detail.locator('[data-opencode-link]').count(), 0, 'missing conversation metadata never links to the OpenCode root')
-    const recoveredActivity = page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/sessions/demo/activity')
-    await page.evaluate("fetch('/__test/recover-selected', {method:'POST'})")
-    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
-    await (await recoveredActivity).finished()
-    const recoveredLink = detail.locator('[data-opencode-link]')
-    await recoveredLink.waitFor()
-    const expectedServerKey = btoa('https://opencode.example.test').replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')
-    assert.equal(await recoveredLink.getAttribute('href'), `https://opencode.example.test/server/${expectedServerKey}/session/ses%2Frecovered%3F%231`)
-    const reboundActivity = page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/sessions/demo/activity')
-    await page.evaluate("fetch('/__test/rebind-selected', {method:'POST'})")
-    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
-    await (await reboundActivity).finished()
-    await page.waitForFunction(() => document.querySelector('[data-opencode-link]')?.getAttribute('href')?.endsWith('/session/ses%2Frebound'))
-    assert.match(await detail.locator('.factual-state').textContent(), /Environment: ready.*Execution: idle/)
-    await detail.locator('#activity-panel [data-event-id="demo:prompt"]').waitFor()
-    assert.equal(await detail.locator('#activity-tab').getAttribute('aria-selected'), 'true')
-    assert.deepEqual(await detail.locator('#activity-panel [data-event-id]').evaluateAll((rows) => rows.map((event) => event.dataset.eventId)), ['demo:prompt', 'demo:tool', 'demo:agent'])
-    assert.equal((await detail.locator('#activity-panel').textContent()).includes('Sandbox ready'), false)
-    assert.deepEqual(await detail.locator('.tabs [role="tab"]').allTextContents(), ['Activity', 'Trail', 'Runtime', 'Files'])
-    await detail.locator('#files-tab').click()
-    await detail.locator('#files-panel').getByText('No file changes').waitFor()
-    await detail.locator('#activity-tab').click()
-    assert.equal(await detail.locator('#activity-panel').isVisible(), true)
-    await detail.locator('#logs-tab').click()
-    assert.match(await detail.locator('#logs-panel').textContent(), /Trail · Lifecycle & requests/)
-    assert.match(await detail.locator('#runtime-panel').textContent(), /Runtime details/)
-    const timeline = detail.locator('.timeline > .timeline-event')
-    assert.deepEqual(await timeline.evaluateAll((entries) => entries.map((entry) => entry.dataset.timelineItem === 'request' ? `request:${entry.dataset.requestNumber}` : `event:${entry.dataset.eventKind}`)), [
-      'event:created', 'event:ready', 'request:1', 'event:run_started', 'request:2', 'event:opencode_idle',
-    ])
-    assert.deepEqual(await timeline.evaluateAll((entries) => entries.map((entry) => entry.querySelectorAll('.event-marker').length)), [1, 1, 1, 1, 1, 1])
-    assert.equal(await timeline.locator('.request-card').count(), 2)
-    assert.equal(await timeline.locator('.request-card').first().evaluate((card) => getComputedStyle(card, '::before').content), 'none')
-    await page.locator('.attach summary').click()
-    const prompt = detail.locator('.prompt').first()
-    const promptToggle = page.locator('.prompt-toggle')
-    await promptToggle.scrollIntoViewIfNeeded(); await promptToggle.click()
-    await page.locator('#runtime-tab').click(); await page.locator('#runtime-tab').focus()
-    const detailScroll = await detail.evaluate((element) => { element.querySelector('.detail-inner').style.minHeight = '1400px'; element.scrollTop = 120; return element.scrollTop })
-    assert.equal(detailScroll, 120)
-    await page.evaluate(() => {
-      window.initialNodes = { row: document.querySelector('[data-session="demo"]'), detail: document.querySelector('.detail'), shell: document.querySelector('.detail-inner'), header: document.querySelector('.detail-header'), factual: document.querySelector('.detail .factual-state'), actions: document.querySelector('.actions'), tabs: document.querySelector('.tabs'), activityTab: document.querySelector('#activity-tab'), activity: document.querySelector('#activity-panel'), logs: document.querySelector('#logs-panel'), runtime: document.querySelector('#runtime-panel'), files: document.querySelector('#files-panel'), focus: document.activeElement }
-      window.noOpMutations = []
-      window.noOpObserver = new MutationObserver((records) => window.noOpMutations.push(...records))
-      window.noOpObserver.observe(window.initialNodes.row, { subtree: true, childList: true, characterData: true, attributes: true })
-    })
-    const noOpResponse = page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/sessions/demo/activity')
-    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
-    await (await noOpResponse).finished()
-    const noOpMutations = await page.evaluate(async () => {
-      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
-      window.noOpMutations.push(...window.noOpObserver.takeRecords())
-      window.noOpObserver.disconnect()
-      return window.noOpMutations.map(({ type, target }) => `${type}:${target.nodeName}`)
-    })
-    assert.deepEqual(noOpMutations, [], 'no-op refresh produces no DOM mutations')
-    assert.equal(await row.evaluate((element) => element === window.initialNodes.row), true)
-    await page.evaluate("fetch('/__test/change-selected', {method:'POST'})")
-    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
-    await page.waitForFunction(() => document.querySelector('.detail .factual-state')?.textContent.includes('Execution: running'))
-    assert.match(await detail.locator('.factual-state').textContent(), /Execution: running/)
-    for (const [selector, key] of [['[data-session="demo"]', 'row'], ['.detail', 'detail'], ['.detail-inner', 'shell'], ['.detail-header', 'header'], ['.detail .factual-state', 'factual'], ['.actions', 'actions'], ['.tabs', 'tabs'], ['#activity-tab', 'activityTab'], ['#activity-panel', 'activity'], ['#logs-panel', 'logs'], ['#runtime-panel', 'runtime'], ['#files-panel', 'files']]) {
-      assert.equal(await page.locator(selector).evaluate((element, name) => element === window.initialNodes[name], key), true, `${selector} remains mounted across selected factual updates`)
-    }
-    assert.equal(await row.locator('.session-status-label').count(), 0)
-    assert.equal(await detail.locator('text=Work state').count(), 0)
-    assert.equal(await page.locator('#runtime-tab').evaluate((element) => element === document.activeElement), true)
-    assert.equal(await page.locator('#runtime-tab').getAttribute('aria-selected'), 'true')
-    assert.equal(await detail.evaluate((element) => element.scrollTop), detailScroll)
-    assert.equal(await detail.locator('details').evaluate((element) => element.open), true)
-    assert.equal(await prompt.evaluate((element) => element.classList.contains('expanded')), true)
-
-    await page.locator('.back-link').click(); await page.waitForFunction(() => location.hash === '#sessions')
-    await page.goBack(); await page.waitForFunction(() => location.hash === '#session/demo')
-    await page.goForward(); await page.waitForFunction(() => location.hash === '#sessions')
-    const direct = await browser.newPage({ viewport: { width: 1280, height: 900 } })
-    await direct.goto(`${origin}/#session/demo`)
-    await direct.locator('[data-session-detail] h2').waitFor({ state: 'attached' })
-    assert.equal(await direct.locator('.detail h2').textContent(), 'Demo session', 'direct links open the drawer')
-    await direct.close()
-
-    const tablet = await browser.newPage({ viewport: { width: 900, height: 900 } })
-    await tablet.goto(`${origin}/#session/demo`)
-    await tablet.locator('[data-session-detail] h2').waitFor({ state: 'attached' })
-    assert.ok(await tablet.locator('.detail').evaluate((element) => element.getBoundingClientRect().width < 900))
-    await tablet.close()
+    const executablePath = process.env.CHROMIUM_PATH || execFileSync('which', ['chromium'], { encoding: 'utf8' }).trim()
+    browser = await chromium.launch({ executablePath, args: ['--no-sandbox'] })
+    const page = await browser.newPage({ viewport: { width: 1360, height: 900 } })
+    await page.goto(`http://127.0.0.1:${server.address().port}/`)
+    await page.getByRole('heading', { name: 'Inbox' }).waitFor()
+    assert.match(await page.locator('.crumb').textContent(), /Workspace\s*\/\s*Inbox/, 'home breadcrumb matches the Inbox navigation label')
+    await page.getByText('Operator hold: Review requested').waitFor()
+    assert.match(await page.locator('.inbox-note').textContent(), /not an assessment of scheduler readiness/)
+    assert.match(await page.locator('.inbox-panel').textContent(), /No attempt recorded/)
+    assert.equal(inboxCalls, 1, 'first page loads without fetching all pages')
+    await page.getByRole('button', { name: 'Everything' }).click()
+    await page.getByRole('button', { name: 'Load 20 more' }).click()
+    await page.getByText('Work normal').waitFor()
+    assert.equal(inboxCalls, 2, 'next page is fetched only after explicit request')
+    await page.getByRole('button', { name: 'Focused' }).click()
+    await page.getByText('Commission v1 · Start not authorized').waitFor()
+    assert.match(await page.locator('.inbox-panel').textContent(), /Start not authorized/)
+    assert.equal(await page.locator('.inbox-links a').count(), 5, 'campaign, commission, and latest-attempt session links are present')
+    await page.getByRole('heading', { name: /Make work legible/ }).waitFor()
+    await page.getByRole('link', { name: /Create a Campaign/ }).click()
+    await page.getByRole('heading', { name: /Create a Campaign/ }).waitFor()
+    await page.locator('#submission').fill('{"campaign":{"purpose":""},"commissions":[]}')
+    await page.getByRole('button', { name: /Submit Campaign/ }).click()
+    await page.locator('.notice.error').waitFor()
+    assert.match(await page.locator('.notice.error').textContent(), /purpose is required/)
+    await page.locator('#submission').fill(JSON.stringify({ campaign: { purpose: 'Browser test campaign', shared_contracts: [] }, commissions: [{
+      local_key: 'one', objective: 'Browser test', obligations: [{ id: 'test', version: 1, requirement: 'Works', acceptance_expectations: ['Works'] }],
+    }] }))
+    const resetCampaign = page.getByRole('button', { name: 'Reset rejected request' })
+    assert.equal(await resetCampaign.isDisabled(), true, 'must not reset before a definitive rejection')
+    await page.getByRole('button', { name: /Submit Campaign/ }).click()
+    await page.getByRole('alert').filter({ hasText: 'outcome is uncertain' }).waitFor()
+    assert.equal(await resetCampaign.isDisabled(), true, '5xx does not make reset safe')
+    assert.match(await page.locator('.form-footer').textContent(), /retained for retry/)
+    await page.getByRole('button', { name: /Submit Campaign/ }).click()
+    await page.getByRole('alert').filter({ hasText: 'server rejected this request' }).waitFor()
+    assert.equal(await resetCampaign.isDisabled(), false, 'definitive 4xx rejection permits reset')
+    await resetCampaign.click()
+    assert.match(await page.locator('.form-footer').textContent(), /created and retained until accepted/)
     await page.setViewportSize({ width: 390, height: 844 })
-    await row.click()
-    await page.waitForFunction(() => location.hash === '#session/demo')
-    assert.equal(await workspace.evaluate((element) => getComputedStyle(element).display), 'none')
-    assert.equal(await detail.evaluate((element) => getComputedStyle(element).display), 'block')
-    assert.equal(await detail.evaluate((element) => element.getBoundingClientRect().width), 390)
-    await page.locator('.back-link').click()
-    assert.equal(await workspace.evaluate((element) => getComputedStyle(element).display), 'block')
-    await page.goBack(); await page.waitForFunction(() => location.hash === '#session/demo')
-    assert.equal(await page.locator('.app-shell').evaluate((element) => element.classList.contains('mobile-detail')), true)
-    await page.goForward(); await page.waitForFunction(() => location.hash === '#sessions')
-    assert.equal(await page.locator('.app-shell').evaluate((element) => element.classList.contains('mobile-detail')), false)
+    assert.ok(await page.locator('.content').evaluate(el => el.getBoundingClientRect().width <= 390))
+    await page.goto(`http://127.0.0.1:${server.address().port}/sessions/`)
+    await page.getByRole('link', { name: /Fixture session/ }).click()
+    await page.locator('[data-opencode-link]').waitFor()
+    const serverKey = btoa('https://opencode.example.test/path').replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')
+    assert.equal(await page.locator('[data-opencode-link]').getAttribute('href'), `https://opencode.example.test/server/${serverKey}/session/ses%2Fsafe%3F%23id`)
+    assert.equal(await page.getByRole('link', { name: 'Open Preview' }).count(), 0, 'unsafe preview schemes are not rendered')
+    assert.match(await page.locator('.attach').textContent(), /anvilctl sessions attach safe\/?\?#id/)
+    await page.locator('[data-event-id="fixture-event"]').waitFor()
+    await page.getByRole('link', { name: /Failed activity fixture/ }).click()
+    await page.getByRole('alert').filter({ hasText: 'activity unavailable' }).waitFor()
+    assert.equal(await page.locator('[data-opencode-link]').count(), 0, 'failed detail fetch does not retain the previous session link')
+    assert.equal(await page.locator('[data-event-id="fixture-event"]').count(), 0, 'failed detail fetch does not retain previous activity')
+    await page.goto(`http://127.0.0.1:${server.address().port}/sessions?id=missing`)
+    await page.getByRole('heading', { name: 'Session unavailable' }).waitFor()
+    assert.match(await page.locator('section.data-card').textContent(), /not present in the current session list/)
+    await page.goto(`http://127.0.0.1:${server.address().port}/commission?id=decision-task`)
+    await page.getByRole('heading', { name: 'History fixture' }).waitFor()
+    await page.getByText('Decision 1').waitFor()
+    assert.match(await page.locator('.decision-history').textContent(), /no_progress.*Historical rule result/s)
+    assert.match(await page.locator('.decision-history').textContent(), /not a live watchdog/)
+    assert.match(await page.locator('.decision-history').textContent(), /Authorization blocked reason[\s\S]*shadow_mode/)
+    assert.match(await page.locator('.decision-history').textContent(), /Proposed actions: 1/)
+    assert.doesNotMatch(await page.locator('.decision-history').textContent(), /fixture-secret-prompt/)
+    assert.match(await page.locator('.decision-history').textContent(), /no latest decision is asserted until every page has been fetched/)
+    assert.equal(decisionCalls, 1, 'only the first history page is fetched automatically')
+    await page.getByRole('button', { name: 'Load next decision page' }).click()
+    await page.getByText('Decision 2').waitFor()
+    assert.equal(decisionCalls, 2, 'the next history page is fetched only on request')
+    assert.deepEqual(decisionCursors, [null, '987654'], 'the next page uses the returned global cursor, not decision_sequence')
+    assert.match(await page.locator('.decision-history').textContent(), /Logical time \(ms\)[\s\S]*1234[\s\S]*2345/)
+    for (const route of ['/campaign/', '/commission/', '/sessions/']) {
+      const response = await page.request.get(`http://127.0.0.1:${server.address().port}${route}`)
+      assert.equal(response.status(), 200)
+    }
+    const routeWithoutSlash = await page.request.get(`http://127.0.0.1:${server.address().port}/sessions`)
+    assert.equal(routeWithoutSlash.status(), 200, 'non-slash static route resolves to its exported index')
   } finally {
-    await browser.close()
-    await new Promise((resolve) => server.close(resolve))
+    await browser?.close()
+    await new Promise(resolve => server.close(resolve))
   }
 })

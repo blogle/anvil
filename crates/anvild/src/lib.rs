@@ -1,5 +1,6 @@
 //! HTTP control plane for Anvil Kubernetes sandboxes.
 
+mod campaign;
 mod github;
 mod local;
 pub mod store;
@@ -33,6 +34,102 @@ use regex::Regex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+const ANVIL_REPORTING_SKILL: &str = r#"---
+name: anvil-reporting
+description: Report progress, obligation evidence, artifacts, and blockers to Anvil.
+---
+
+# Anvil reporting
+
+When working on an Anvil-managed commission, report meaningful progress as you go
+and before ending a turn. Include the current Candidate commit SHA when available.
+
+For each obligation you address, report its obligation ID and version, your claim,
+the Candidate SHA, and concise artifact references (tests, files, or URLs). State
+blockers explicitly and identify any required decision. Do not invent an obligation,
+version, Candidate, test result, or artifact. If a fact is unavailable, say so.
+
+Reports are claims for human review, not approval or proof of integration. Do not
+claim that work is integrated: only Anvil's observation of the registered pull
+request merged into its approved target establishes integration.
+"#;
+
+fn workspace_init_script() -> String {
+    format!(
+        "set -euo pipefail\nmkdir -p /home/anvil/workspace/\"$ANVIL_PROJECT\"/.opencode/skills/anvil-reporting /home/anvil/.config /home/anvil/.cache /home/anvil/.local/share /home/anvil/.local/state/runtime\ncat > /home/anvil/workspace/\"$ANVIL_PROJECT\"/.opencode/skills/anvil-reporting/SKILL.md <<'ANVIL_SKILL'\n{}\nANVIL_SKILL\nchown -R 1000:1000 /home/anvil",
+        ANVIL_REPORTING_SKILL
+    )
+}
+
+fn workspace_go_auth_script() -> &'static str {
+    r#"
+umask 077
+if [[ ! -s /run/secrets/opencode-go/go-key ]]; then
+  echo "OpenCode Go credential Secret is missing or empty" >&2
+  exit 1
+fi
+mkdir -p /home/anvil/.local/share/opencode
+if ! jq -n --rawfile key /run/secrets/opencode-go/go-key '[{id:"cred_anvil_go",integrationID:"opencode-go",label:"Anvil OpenCode Go",active:true,value:{type:"key",key:$key}}]' | opencode auth import --standalone >/dev/null 2>&1; then
+  echo "OpenCode Go credential import failed" >&2
+  exit 1
+fi
+if [[ ! -f /home/anvil/.local/share/opencode/opencode.db ]]; then
+  echo "OpenCode Go credential import did not create its private database" >&2
+  exit 1
+fi
+chown 1000:1000 /home/anvil/.local/share/opencode
+chmod 700 /home/anvil/.local/share/opencode
+for database_file in /home/anvil/.local/share/opencode/opencode.db /home/anvil/.local/share/opencode/opencode.db-wal /home/anvil/.local/share/opencode/opencode.db-shm; do
+  if [[ -e "$database_file" ]]; then
+    chown 1000:1000 "$database_file"
+    chmod 600 "$database_file"
+  fi
+done
+"#
+}
+
+fn set_env_value(env: &mut Vec<Value>, name: &str, value: &str) {
+    if let Some(entry) = env
+        .iter_mut()
+        .find(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
+    {
+        entry["value"] = Value::String(value.into());
+    } else {
+        env.push(json!({"name":name,"value":value}));
+    }
+}
+
+fn set_named_value(entries: &mut Vec<Value>, name: &str, entry: Value) {
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|existing| existing.get("name").and_then(Value::as_str) == Some(name))
+    {
+        *existing = entry;
+    } else {
+        entries.push(entry);
+    }
+}
+
+fn valid_secret_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+                && label
+                    .chars()
+                    .last()
+                    .is_some_and(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+                && label
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        })
+}
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -112,9 +209,61 @@ fn sandbox_manifest(
     env: Vec<Value>,
 ) -> Value {
     let mut env = env;
+    let isolated_go_auth = config.opencode_go_secret.is_some();
+    if isolated_go_auth {
+        set_env_value(
+            &mut env,
+            "OPENCODE_CONFIG",
+            "/home/anvil/.config/opencode/opencode.jsonc",
+        );
+        set_env_value(
+            &mut env,
+            "OPENCODE_CONFIG_DIR",
+            "/home/anvil/.config/opencode",
+        );
+        set_env_value(&mut env, "ANVIL_ISOLATED_GO_AUTH", "1");
+    }
     env.push(json!({"name":"OPENCODE_SERVER_PASSWORD","valueFrom":{"secretKeyRef":{"name":"github-app-credentials","key":"ANVIL_OPENCODE_SERVER_PASSWORD"}}}));
-    let container = json!({"name":"sandbox","image":config.image,"ports":[{"name":"opencode","containerPort":config.opencode_port}],"env":env,"volumeMounts":[{"name":"workspace","mountPath":"/home/anvil"},{"name":"shared-profile","mountPath":"/anvil/profile"},shared_nix_store_mount(),shared_nix_socket_mount()]});
-    json!({"apiVersion":"agents.x-k8s.io/v1beta1","kind":"Sandbox","metadata":{"name":name,"namespace":config.namespace,"labels":labels,"annotations":annotations},"spec":{"service":true,"podTemplate":{"spec":{"initContainers":[workspace_init],"containers":[container],"volumes":[{"name":"shared-profile","persistentVolumeClaim":{"claimName":config.profile_pvc}},shared_nix_volume(&config.nix_pvc)]}},"volumeClaimTemplates":[{"metadata":{"name":"workspace"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":config.workspace_size}}}}]}})
+    let mut container_mounts = vec![json!({"name":"workspace","mountPath":"/home/anvil"})];
+    if !isolated_go_auth {
+        container_mounts.push(json!({"name":"shared-profile","mountPath":"/anvil/profile"}));
+    }
+    container_mounts.extend([shared_nix_store_mount(), shared_nix_socket_mount()]);
+    let container = json!({"name":"sandbox","image":config.image,"ports":[{"name":"opencode","containerPort":config.opencode_port}],"env":env,"volumeMounts":container_mounts});
+    let mut workspace_init = workspace_init;
+    let mut volumes = Vec::new();
+    if !isolated_go_auth {
+        volumes.push(json!({"name":"shared-profile","persistentVolumeClaim":{"claimName":config.profile_pvc}}));
+    }
+    volumes.push(shared_nix_volume(&config.nix_pvc));
+    if let Some(secret) = &config.opencode_go_secret {
+        volumes.push(json!({"name":"opencode-go-auth","secret":{"secretName":secret,"items":[{"key":"go-key","path":"go-key","mode":256}]}}));
+        let mounts = workspace_init["volumeMounts"]
+            .as_array_mut()
+            .expect("init container volumeMounts must be an array");
+        set_named_value(
+            mounts,
+            "opencode-go-auth",
+            json!({"name":"opencode-go-auth","mountPath":"/run/secrets/opencode-go","readOnly":true}),
+        );
+        let init_env = workspace_init["env"]
+            .as_array_mut()
+            .expect("init container env must be an array");
+        for (name, value) in [
+            ("HOME", "/home/anvil"),
+            ("XDG_DATA_HOME", "/home/anvil/.local/share"),
+            ("OPENCODE_DISABLE_CHANNEL_DB", "1"),
+        ] {
+            set_named_value(init_env, name, json!({"name":name,"value":value}));
+        }
+        workspace_init["args"] = json!([format!(
+            "{}\n{}\n{}",
+            workspace_init_script(),
+            "umask 077\nmkdir -p /home/anvil/.config/opencode\nprintf '%s\\n' '{\"$schema\":\"https://opencode.ai/config.json\",\"permission\":\"allow\"}' > /home/anvil/.config/opencode/opencode.jsonc\nchown -R 1000:1000 /home/anvil/.config/opencode\nchmod 700 /home/anvil/.config/opencode\nchmod 600 /home/anvil/.config/opencode/opencode.jsonc",
+            workspace_go_auth_script()
+        )]);
+    }
+    json!({"apiVersion":"agents.x-k8s.io/v1beta1","kind":"Sandbox","metadata":{"name":name,"namespace":config.namespace,"labels":labels,"annotations":annotations},"spec":{"service":true,"podTemplate":{"spec":{"initContainers":[workspace_init],"containers":[container],"volumes":volumes}},"volumeClaimTemplates":[{"metadata":{"name":"workspace"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":config.workspace_size}}}}]}})
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +275,7 @@ pub struct Config {
     pub workspace_size: String,
     pub opencode_port: u16,
     pub opencode_server_password: String,
+    pub opencode_go_secret: Option<String>,
     pub request_timeout: Duration,
     pub preview_domain: String,
     pub annotation_prefix: String,
@@ -165,6 +315,17 @@ impl Config {
             }
         };
         let production = sandbox_backend == SandboxBackend::Kubernetes;
+        let opencode_go_secret = env::var("ANVIL_OPENCODE_GO_SECRET")
+            .ok()
+            .filter(|value| !value.is_empty());
+        if opencode_go_secret
+            .as_deref()
+            .is_some_and(|name| !valid_secret_name(name))
+        {
+            return Err(ServiceError::Config(
+                "ANVIL_OPENCODE_GO_SECRET must be a valid Kubernetes Secret name".into(),
+            ));
+        }
         let configured_opencode_password = env::var("ANVIL_OPENCODE_SERVER_PASSWORD")
             .ok()
             .filter(|value| !value.is_empty());
@@ -265,6 +426,7 @@ impl Config {
                 .parse()
                 .map_err(|_| ServiceError::Config("OPENCODE_PORT".into()))?,
             opencode_server_password,
+            opencode_go_secret,
             request_timeout: Duration::from_secs(
                 get("ANVIL_PROVISION_TIMEOUT", "180")
                     .parse()
@@ -1445,9 +1607,7 @@ impl SandboxApi for KubeSandboxApi {
         let ns = &self.config.namespace;
         let name = format!("anvil-{id}");
         let now = chrono_like_now();
-        let run_id = initial_run
-            .run_id()
-            .expect("initial run record must contain its submitted run");
+        let run_id = initial_run.run_id();
         let l = labels();
         let work_branch = branch_name(&SessionId::parse(id).unwrap());
         let mut annotations = serde_json::Map::new();
@@ -1503,7 +1663,6 @@ impl SandboxApi for KubeSandboxApi {
             json!({"name":"ANVIL_REPOSITORY","value":r.repository}),
             json!({"name":"ANVIL_REF","value":r.base_ref}),
             json!({"name":"ANVIL_WORK_BRANCH","value":work_branch}),
-            json!({"name":"ANVIL_RUN_ID","value":run_id}),
             json!({"name":"OPENCODE_CONFIG","value":"/anvil/profile/config/opencode.jsonc"}),
             json!({"name":"OPENCODE_CONFIG_DIR","value":"/anvil/profile/config"}),
             json!({"name":"OPENCODE_DISABLE_CHANNEL_DB","value":"1"}),
@@ -1515,6 +1674,9 @@ impl SandboxApi for KubeSandboxApi {
             json!({"name":"XDG_RUNTIME_DIR","value":"/home/anvil/.local/state/runtime"}),
             json!({"name":"DISPLAY","value":":99"}),
         ];
+        if let Some(run_id) = run_id {
+            env.push(json!({"name":"ANVIL_RUN_ID","value":run_id}));
+        }
         env.extend(
             git_committer_environment(&self.config)
                 .into_iter()
@@ -1529,9 +1691,7 @@ impl SandboxApi for KubeSandboxApi {
             "name": "fix-workspace-permissions",
             "image": self.config.image,
             "command": ["/bin/bash", "-c"],
-            "args": [
-                  "set -euo pipefail\nmkdir -p /home/anvil/workspace/\"$ANVIL_PROJECT\" /home/anvil/.config /home/anvil/.cache /home/anvil/.local/share /home/anvil/.local/state/runtime\nchown -R 1000:1000 /home/anvil"
-            ],
+            "args": [workspace_init_script()],
             "env": [{"name": "ANVIL_PROJECT", "value": r.project}],
             "securityContext": {"runAsUser": 0, "runAsGroup": 0},
             "volumeMounts": [{"name": "workspace", "mountPath": "/home/anvil"}]
@@ -1887,6 +2047,7 @@ pub struct AppState {
     materializations_reconciled: Arc<AtomicBool>,
     materialization_reconcile_lock: Arc<AsyncMutex<()>>,
     admission_lock: Arc<AsyncMutex<()>>,
+    commission_prompt_workers: Arc<Mutex<HashMap<String, Instant>>>,
     capability_signer: Option<github::CapabilitySigner>,
     github: Option<github::GithubBroker>,
     #[allow(dead_code)]
@@ -1942,6 +2103,7 @@ impl AppState {
             materializations_reconciled: Arc::new(AtomicBool::new(false)),
             materialization_reconcile_lock: Arc::new(AsyncMutex::new(())),
             admission_lock: Arc::new(AsyncMutex::new(())),
+            commission_prompt_workers: Arc::new(Mutex::new(HashMap::new())),
             capability_signer,
             github,
             git_pr_checks: Arc::new(Mutex::new(HashMap::new())),
@@ -2105,10 +2267,13 @@ fn normalized_sandbox_value(record: &SandboxRecord) -> Value {
     json!({"session":session,"run_record":record.run_record,"binding_state":binding_state,"operating_mode":record.operating_mode,"created_at":record.created_at,"telemetry":record.telemetry})
 }
 pub fn router(state: AppState) -> Router {
-    let web_root = env::var_os("ANVIL_WEB_DIR")
+    router_with_web_root(state, web_root_from_env(env::var_os("ANVIL_WEB_DIR")))
+}
+
+fn web_root_from_env(configured: Option<std::ffi::OsString>) -> PathBuf {
+    configured
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("web/dist"));
-    router_with_web_root(state, web_root)
+        .unwrap_or_else(|| PathBuf::from("web/out"))
 }
 
 fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
@@ -2119,6 +2284,11 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
         .route("/v1/batches", post(submit_batch))
         .route("/v1/batches/:id", get(get_batch))
         .route("/v1/batches/:id/digest", get(get_batch_digest))
+        .route("/v1/campaigns", post(submit_campaign))
+        .route("/v1/campaigns/:id", get(get_campaign))
+        .route("/v1/inbox", get(get_inbox))
+        .route("/v1/commissions/:id", get(get_commission))
+        .route("/v1/commissions/:id/start", post(start_commission))
         .route("/v1/capacity", get(get_capacity))
         .route("/v1/tasks", post(create_task).get(list_tasks))
         .route("/v1/tasks/graph", post(create_task_graph))
@@ -2167,6 +2337,7 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
             post(github_credentials),
         )
         .route("/assets/*path", get(static_asset))
+        .route("/_next/static/*path", get(next_static_asset))
         .route("/", get(index))
         .route("/v1/providers", get(providers))
         .route("/v1/providers/:provider/login", post(begin_provider_login))
@@ -2182,6 +2353,126 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
         .fallback(get(spa_fallback))
         .layer(Extension(web_root))
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+struct CampaignPageQuery {
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InboxQuery {
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn get_inbox(
+    State(state): State<AppState>,
+    Query(query): Query<InboxQuery>,
+) -> Result<Json<Value>, ServiceError> {
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=campaign::INBOX_MAX_PAGE_SIZE).contains(&limit) {
+        return Err(ServiceError::Invalid(format!(
+            "limit must be between 1 and {}",
+            campaign::INBOX_MAX_PAGE_SIZE
+        )));
+    }
+    campaign::inbox(
+        state
+            .store()
+            .map_err(|error| ServiceError::Store(error.into()))?,
+        query.after.as_deref(),
+        limit,
+    )
+    .map(Json)
+}
+
+async fn submit_campaign(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Result<(StatusCode, Json<Value>), ServiceError> {
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ServiceError::Invalid("Idempotency-Key header is required".into()))?;
+    let acceptance = campaign::submit(
+        state
+            .store()
+            .map_err(|error| ServiceError::Store(error.into()))?,
+        key,
+        &request,
+    )?;
+    Ok((
+        if acceptance.created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(acceptance.task),
+    ))
+}
+
+async fn get_campaign(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<CampaignPageQuery>,
+) -> Result<Json<Value>, ServiceError> {
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=campaign::MAX_PAGE_SIZE).contains(&limit) {
+        return Err(ServiceError::Invalid(format!(
+            "limit must be between 1 and {}",
+            campaign::MAX_PAGE_SIZE
+        )));
+    }
+    campaign::aggregate(
+        state
+            .store()
+            .map_err(|error| ServiceError::Store(error.into()))?,
+        &id,
+        query.after.as_deref(),
+        limit,
+    )
+    .map(Json)
+}
+
+async fn get_commission(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ServiceError> {
+    campaign::commission(
+        state
+            .store()
+            .map_err(|error| ServiceError::Store(error.into()))?,
+        &id,
+    )
+    .map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+struct StartCommissionRequest {
+    expected_version: u64,
+}
+
+async fn start_commission(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<StartCommissionRequest>,
+) -> Result<Json<Value>, ServiceError> {
+    let key = headers
+        .get("Idempotency-Key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ServiceError::Invalid("Idempotency-Key header is required".into()))?;
+    let store = state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?;
+    campaign::start_commission(store, &id, key, request.expected_version).map(Json)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2593,7 +2884,7 @@ fn scan_batch_changes(
                             .tasks_for_session(session_id)
                             .map_err(|error| ServiceError::Store(error.to_string()))?;
                         changed.extend(tasks.into_iter().filter_map(|(task_id, owner_batch)| {
-                            (owner_batch == batch_id).then_some(task_id)
+                            (owner_batch.as_deref() == Some(batch_id)).then_some(task_id)
                         }));
                     }
                 }
@@ -2887,6 +3178,37 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
             }
             Err(error) => return Err(error),
         };
+        let is_commission = store
+            .get_commission(&active.task_id)
+            .map_err(|error| ServiceError::Store(error.to_string()))?
+            .is_some();
+        if record.session.environment_state == "ready"
+            && record.run_record.current.is_none()
+            && record.run_record.last.is_none()
+            && is_commission
+        {
+            // A ready sandbox with no run record is durable evidence that
+            // begin_run never marked a submission. Dispatch once; prompt()
+            // persists Submitted before the external request, so later
+            // observations never blindly replay an uncertain submission.
+            let task = store
+                .get_resource("task", &active.task_id)
+                .map_err(|error| ServiceError::Store(error.to_string()))?
+                .ok_or(ServiceError::NotFound)?;
+            let attempt = store
+                .get_resource("attempt", &active.attempt_id)
+                .map_err(|error| ServiceError::Store(error.to_string()))?
+                .ok_or(ServiceError::NotFound)?;
+            store
+                .set_attempt_and_task_state(&active.attempt_id, "running", "running")
+                .map_err(|error| ServiceError::Store(error.to_string()))?;
+            dispatch_commission_prompt(
+                state,
+                &session_id,
+                commission_instruction(store, &task, &attempt)?,
+            );
+            continue;
+        }
         let disposition = if record.session.environment_state == "suspended" {
             Some("suspended")
         } else if record.session.environment_state == "failed" {
@@ -2909,7 +3231,21 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
             Some("provisioning")
         } else {
             match (&record.run_record.current, &record.run_record.last) {
-                (Some(_), _) => Some("running"),
+                (Some(ActiveRunState::Running { .. }), _) => Some("running"),
+                (Some(ActiveRunState::Submitted { .. }), _) => {
+                    if state
+                        .commission_prompt_workers
+                        .lock()
+                        .expect("commission worker map poisoned")
+                        .contains_key(&session_id)
+                    {
+                        continue;
+                    }
+                    // The durable Submitted marker means the external prompt
+                    // may have been accepted. Never replay it automatically,
+                    // but do not stop scheduling unrelated work.
+                    continue;
+                }
                 (None, Some(FinishedRun::Completed(_))) => Some("completed"),
                 (None, Some(FinishedRun::Failed(run))) => {
                     store
@@ -2929,16 +3265,37 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
         };
         if let Some(attempt_state) = disposition {
             if active.state != attempt_state {
-                store
-                    .set_attempt_state(&active.attempt_id, attempt_state)
-                    .map_err(|error| ServiceError::Store(error.to_string()))?;
+                let campaign_turn = store
+                    .get_commission(&active.task_id)
+                    .map_err(|error| ServiceError::Store(error.to_string()))?
+                    .is_some();
+                if attempt_state == "completed"
+                    && (campaign_turn
+                        || store
+                            .task_control(&active.task_id)
+                            .map_err(|error| ServiceError::Store(error.to_string()))?
+                            .is_some_and(|control| control["controller_mode"] == "reconciler"))
+                {
+                    store
+                        .set_attempt_turn_completed(&active.attempt_id)
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                } else {
+                    store
+                        .set_attempt_state(&active.attempt_id, attempt_state)
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                }
             }
             if attempt_state == "completed" {
                 let control = store
                     .task_control(&active.task_id)
                     .map_err(|error| ServiceError::Store(error.to_string()))?
                     .ok_or(ServiceError::NotFound)?;
-                if control["controller_mode"] == "legacy" {
+                if control["controller_mode"] == "legacy"
+                    && store
+                        .get_commission(&active.task_id)
+                        .map_err(|error| ServiceError::Store(error.to_string()))?
+                        .is_none()
+                {
                     store
                         .complete_legacy_scheduler_attempt(
                             &active.task_id,
@@ -2965,41 +3322,105 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
         )
         .map_err(|error| ServiceError::Store(error.to_string()))?;
     for claim in claims {
-        let project = claim.task["project"].as_str().unwrap_or("batch");
+        let target = &claim.task["execution_target"];
+        let project = claim.task["project"]
+            .as_str()
+            .or(target["project"].as_str())
+            .unwrap_or("commission");
         let attempt_id = claim.attempt["attempt_id"].as_str().unwrap_or_default();
         let session_id = deterministic_attempt_session_id(project, attempt_id);
         match state.kube.get(&session_id).await {
             Ok(_) => {
+                let record = state.kube.get(&session_id).await?;
                 store
-                    .bind_attempt_session(
-                        claim.attempt["attempt_id"].as_str().unwrap_or_default(),
-                        &session_id,
-                    )
-                    .and_then(|_| {
-                        store.set_attempt_and_task_state(
-                            claim.attempt["attempt_id"].as_str().unwrap_or_default(),
-                            "running",
-                            "running",
-                        )
-                    })
+                    .bind_attempt_session(attempt_id, &session_id)
                     .map_err(|error| ServiceError::Store(error.to_string()))?;
+                if claim.task["commission_id"].is_null() {
+                    // Preserve the legacy scheduler's existing-sandbox recovery path.
+                    store
+                        .set_attempt_and_task_state(attempt_id, "running", "running")
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                    continue;
+                }
+                if claim.task["commission_id"].is_string()
+                    && record.run_record.current.is_none()
+                    && record.run_record.last.is_none()
+                {
+                    if record.session.environment_state != "ready" {
+                        continue;
+                    }
+                    // Run records are committed before prompt dispatch. Their
+                    // absence therefore proves this provisioned sandbox has
+                    // not yet submitted its initial turn.
+                    store
+                        .set_attempt_and_task_state(attempt_id, "running", "running")
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                    let instruction = commission_instruction(store, &claim.task, &claim.attempt)?;
+                    dispatch_commission_prompt(state, &session_id, instruction);
+                    continue;
+                }
+                if matches!(
+                    record.run_record.current,
+                    Some(ActiveRunState::Running { .. })
+                ) {
+                    store
+                        .set_attempt_and_task_state(attempt_id, "running", "running")
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                } else if matches!(
+                    record.run_record.current,
+                    Some(ActiveRunState::Submitted { .. })
+                ) {
+                    if state
+                        .commission_prompt_workers
+                        .lock()
+                        .expect("commission worker map poisoned")
+                        .contains_key(&session_id)
+                    {
+                        continue;
+                    }
+                    // Submitted is durable evidence of an attempted dispatch;
+                    // preserve the attempt for recovery without replaying it.
+                    continue;
+                } else if matches!(record.run_record.last, Some(FinishedRun::Completed(_))) {
+                    store
+                        .set_attempt_turn_completed(attempt_id)
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                } else if let Some(FinishedRun::Failed(run)) = record.run_record.last {
+                    store
+                        .record_attempt_failure(
+                            attempt_id,
+                            store::scheduler::FailureClass::Execution,
+                            &run.error,
+                            chrono::Utc::now().timestamp_millis(),
+                            state.config.provisioning_max_attempts,
+                            state.config.provisioning_retry_base.as_millis() as u64,
+                        )
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                }
                 continue;
             }
             Err(ServiceError::NotFound) => {}
             Err(error) => return Err(error),
         }
+        let is_commission = claim.task["commission_id"].is_string();
         let request = CreateRequest {
             project: project.to_owned(),
             repository: claim.task["repository"]
                 .as_str()
+                .or(target["repository"].as_str())
                 .unwrap_or_default()
                 .to_owned(),
             base_ref: claim.task["base_commit"]
                 .as_str()
                 .or_else(|| claim.task["requested_revision"].as_str())
+                .or_else(|| target["base_ref"].as_str())
                 .unwrap_or("main")
                 .to_owned(),
-            prompt: claim.task["prompt"].as_str().unwrap_or_default().to_owned(),
+            prompt: if is_commission {
+                commission_instruction(store, &claim.task, &claim.attempt)?
+            } else {
+                claim.task["prompt"].as_str().unwrap_or_default().to_owned()
+            },
             model: claim.task["model"]
                 .as_str()
                 .or_else(|| claim.task["policy"]["model"].as_str())
@@ -3007,14 +3428,28 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
             author_name: None,
             author_email: None,
             session_id_override: Some(session_id.clone()),
-            runtime_only: false,
+            runtime_only: is_commission,
         };
+        let initial_instruction = is_commission.then(|| request.prompt.clone());
         match create(State(state.clone()), None, Json(request)).await {
             Ok((_, Json(session))) => {
                 store
                     .bind_attempt_session(attempt_id, &session.id)
-                    .and_then(|_| store.set_attempt_state(attempt_id, "running"))
                     .map_err(|error| ServiceError::Store(error.to_string()))?;
+                if is_commission {
+                    store
+                        .set_attempt_and_task_state(attempt_id, "running", "running")
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                    dispatch_commission_prompt(
+                        state,
+                        &session.id,
+                        initial_instruction.expect("commission instruction exists"),
+                    );
+                } else {
+                    store
+                        .set_attempt_state(attempt_id, "running")
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                }
             }
             Err(error) => {
                 let class = if matches!(
@@ -3025,6 +3460,15 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
                 } else {
                     store::scheduler::FailureClass::NonRetryable
                 };
+                if is_commission && class == store::scheduler::FailureClass::Infrastructure {
+                    // The backend create may have persisted the deterministic
+                    // Sandbox before returning an error. Without a transactional
+                    // backend existence check, fence retries rather than risk
+                    // creating a second Workspace.
+                    store
+                        .mark_workspace_creation_ambiguous(attempt_id)
+                        .map_err(|store_error| ServiceError::Store(store_error.to_string()))?;
+                }
                 store
                     .record_attempt_failure(
                         attempt_id,
@@ -3047,6 +3491,135 @@ fn deterministic_attempt_session_id(project: &str, attempt_id: &str) -> String {
         "{project}-{:02x}{:02x}{:02x}{:02x}",
         digest[0], digest[1], digest[2], digest[3]
     )
+}
+
+fn commission_instruction(
+    store: &store::ControllerStore,
+    task: &Value,
+    attempt: &Value,
+) -> Result<String, ServiceError> {
+    let commission = store
+        .get_commission(task["commission_id"].as_str().unwrap_or_default())
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+        .unwrap_or(Value::Null);
+    let campaign = store
+        .get_campaign(
+            commission["campaign_id"].as_str().unwrap_or_default(),
+            None,
+            1,
+        )
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+        .unwrap_or(Value::Null);
+    Ok(campaign_work_instruction(
+        &campaign,
+        &commission,
+        task,
+        attempt,
+    ))
+}
+
+fn dispatch_commission_prompt(state: &AppState, session_id: &str, instruction: String) {
+    {
+        let mut workers = state
+            .commission_prompt_workers
+            .lock()
+            .expect("commission worker map poisoned");
+        if workers.contains_key(session_id) {
+            return;
+        }
+        workers.insert(session_id.to_owned(), Instant::now());
+    }
+    let state = state.clone();
+    let session_id = session_id.to_owned();
+    tokio::spawn(async move {
+        info!(session_id, "Commission OpenCode prompt worker started");
+        let result = prompt(
+            Path(session_id.clone()),
+            State(state.clone()),
+            Json(PromptRequest {
+                prompt: instruction,
+            }),
+        )
+        .await;
+        match result {
+            Ok(_) => info!(session_id, "Commission OpenCode prompt worker returned"),
+            Err(error) => {
+                warn!(session_id, %error, "Commission OpenCode prompt worker ended without confirmation");
+                match fail_unsubmitted_commission_attempt(&state, &session_id, &error.to_string())
+                    .await
+                {
+                    Ok(true) => warn!(
+                        session_id,
+                        "Commission prompt failed before submission; bounded attempt failure recorded"
+                    ),
+                    Ok(false) => {}
+                    Err(failure) => warn!(
+                        session_id,
+                        %failure,
+                        "Could not record Commission pre-submission failure"
+                    ),
+                }
+            }
+        }
+        state
+            .commission_prompt_workers
+            .lock()
+            .expect("commission worker map poisoned")
+            .remove(&session_id);
+    });
+}
+
+async fn fail_unsubmitted_commission_attempt(
+    state: &AppState,
+    session_id: &str,
+    error: &str,
+) -> Result<bool, String> {
+    let record = match state.kube.get(session_id).await {
+        Ok(record) => record,
+        Err(ServiceError::NotFound) => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    // begin_run durably writes Submitted before contacting OpenCode. Only the
+    // absence of both active and finished run records proves no turn was sent.
+    if record.run_record.current.is_some() || record.run_record.last.is_some() {
+        return Ok(false);
+    }
+    let store = state.store().map_err(str::to_owned)?;
+    let Some(attempt) = store
+        .active_attempts()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|attempt| attempt.session_id.as_deref() == Some(session_id))
+    else {
+        return Ok(false);
+    };
+    if store
+        .get_commission(&attempt.task_id)
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    store
+        .record_attempt_failure(
+            &attempt.attempt_id,
+            store::scheduler::FailureClass::Infrastructure,
+            error,
+            Utc::now().timestamp_millis(),
+            state.config.provisioning_max_attempts,
+            state.config.provisioning_retry_base.as_millis() as u64,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+fn campaign_work_instruction(
+    campaign: &Value,
+    commission: &Value,
+    task: &Value,
+    attempt: &Value,
+) -> String {
+    format!("Campaign: {}\nShared contracts: {}\nCommission: {}\nObligations: {}\nTarget: {}\nAttempt: {}\nCurrent facts: session new; candidate SHA unavailable.\nNext action: implement.\nReport progress with the installed Anvil reporting skill.", campaign["purpose"], campaign["shared_contracts"], commission["objective"], commission["obligations"], task["execution_target"], attempt)
 }
 
 async fn get_task(
@@ -4141,6 +4714,10 @@ async fn idempotency_middleware(
         || method == axum::http::Method::DELETE;
     if key.is_none()
         || path == "/v1/batches"
+        || (path == "/v1/campaigns" && method == axum::http::Method::POST)
+        || (method == axum::http::Method::POST
+            && path.starts_with("/v1/commissions/")
+            && path.ends_with("/start"))
         || (method == axum::http::Method::POST
             && matches!(path.as_str(), "/v1/tasks" | "/v1/tasks/graph"))
         || (path.starts_with("/v1/tasks/") && path.ends_with("/attempts"))
@@ -4282,12 +4859,24 @@ async fn health() -> Json<Value> {
 }
 
 async fn index(Extension(root): Extension<PathBuf>) -> Response {
-    static_file_at(&root, std::path::Path::new("index.html")).await
+    static_file_at(&root, std::path::Path::new("index.html"), false).await
 }
 
 async fn static_asset(Extension(root): Extension<PathBuf>, Path(path): Path<String>) -> Response {
     let relative = std::path::Path::new("assets").join(path);
-    static_file_at(&root, &relative).await
+    static_file_at(&root, &relative, true).await
+}
+
+async fn next_static_asset(
+    Extension(root): Extension<PathBuf>,
+    Path(path): Path<String>,
+) -> Response {
+    static_file_at(
+        &root,
+        &std::path::Path::new("_next/static").join(path),
+        true,
+    )
+    .await
 }
 
 async fn spa_fallback(Extension(root): Extension<PathBuf>, uri: axum::http::Uri) -> Response {
@@ -4298,17 +4887,35 @@ async fn spa_fallback_at(uri: axum::http::Uri, root: &std::path::Path) -> Respon
     if uri.path().starts_with("/v1/") || uri.path() == "/healthz" || uri.path() == "/readyz" {
         return StatusCode::NOT_FOUND.into_response();
     }
-    static_file_at(root, std::path::Path::new("index.html")).await
+    let relative = match uri.path() {
+        "/" => std::path::PathBuf::from("index.html"),
+        "/campaign" | "/campaign/" => std::path::PathBuf::from("campaign/index.html"),
+        "/commission" | "/commission/" => std::path::PathBuf::from("commission/index.html"),
+        "/sessions" | "/sessions/" => std::path::PathBuf::from("sessions/index.html"),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    static_file_at(root, &relative, false).await
 }
 
-async fn static_file_at(root: &std::path::Path, relative_path: &std::path::Path) -> Response {
+async fn static_file_at(
+    root: &std::path::Path,
+    relative_path: &std::path::Path,
+    immutable: bool,
+) -> Response {
     if relative_path
         .components()
         .any(|component| !matches!(component, std::path::Component::Normal(_)))
     {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let path = root.join(relative_path);
+    let root = match tokio::fs::canonicalize(root).await {
+        Ok(root) => root,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let path = match tokio::fs::canonicalize(root.join(relative_path)).await {
+        Ok(path) if path.starts_with(&root) => path,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
     let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -4316,14 +4923,28 @@ async fn static_file_at(root: &std::path::Path, relative_path: &std::path::Path)
     let content_type = match relative_path.extension().and_then(|value| value.to_str()) {
         Some("html") => "text/html; charset=utf-8",
         Some("js") => "text/javascript; charset=utf-8",
+        Some("mjs") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("svg") => "image/svg+xml",
         Some("json") => "application/json",
         Some("woff2") => "font/woff2",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("txt") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     };
+    let cache_control = if immutable {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
     (
-        [(axum::http::header::CONTENT_TYPE, content_type)],
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (axum::http::header::CACHE_CONTROL, cache_control),
+        ],
         axum::body::Body::from(bytes),
     )
         .into_response()
@@ -5340,6 +5961,10 @@ async fn prompt(
         ));
     }
     let oc = OpenCode::new(service_url(&x, &s.config), s.config.request_timeout);
+    let prompt_store = s
+        .store()
+        .map_err(|error| ServiceError::Store(error.to_owned()))?;
+    let commission_run = commission_attempt_for_session(prompt_store, &id)?;
     let model = match x.model.as_deref() {
         Some(requested) => Some(oc.resolve_model(requested).await?),
         None => None,
@@ -5380,6 +6005,21 @@ async fn prompt(
             Ok(Json(response))
         }
         Err(error) => {
+            if commission_run {
+                return Err(ServiceError::Recovery(format!(
+                    "OpenCode prompt outcome is unknown for submitted run {}: {error}",
+                    submission.run_id
+                )));
+            }
+            if matches!(&error, ServiceError::OpenCode(message) if {
+                let message = message.to_ascii_lowercase();
+                message.contains("timeout") || message.contains("timed out")
+            }) {
+                return Err(ServiceError::Recovery(format!(
+                    "OpenCode prompt outcome is unknown for submitted run {}: {error}",
+                    submission.run_id
+                )));
+            }
             fail_run(&s, &id, &submission, error.to_string()).await?;
             record_history(
                 &s,
@@ -5397,6 +6037,27 @@ async fn prompt(
             Err(error)
         }
     }
+}
+
+fn commission_attempt_for_session(
+    store: &store::ControllerStore,
+    session_id: &str,
+) -> Result<bool, ServiceError> {
+    for attempt in store
+        .active_attempts()
+        .map_err(|error| ServiceError::Store(error.to_string()))?
+        .into_iter()
+        .filter(|attempt| attempt.session_id.as_deref() == Some(session_id))
+    {
+        if store
+            .get_commission(&attempt.task_id)
+            .map_err(|error| ServiceError::Store(error.to_string()))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn materialize_request(
@@ -8618,6 +9279,410 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
+    fn runtime_only_creation_has_no_initial_run_id() {
+        assert_eq!(RunRecord::default().run_id(), None);
+    }
+
+    #[test]
+    fn default_web_root_is_next_static_export_directory() {
+        assert_eq!(web_root_from_env(None), PathBuf::from("web/out"));
+        assert_eq!(
+            web_root_from_env(Some("/tmp/custom-web".into())),
+            PathBuf::from("/tmp/custom-web")
+        );
+    }
+
+    #[tokio::test]
+    async fn inbox_http_paginates_and_rejects_invalid_cursor_or_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app_config = config("http://127.0.0.1:4097".into());
+        app_config.store_path = directory.path().join("inbox.sqlite3");
+        let db = store::ControllerStore::open(&app_config.store_path).unwrap();
+        let commission = |key: &str| {
+            json!({
+                "local_key":key,"objective":format!("Objective {key}"),"obligations":[{"id":"deliver","version":1,"requirement":"Deliver the objective","acceptance_expectations":["verified"]}],
+                "execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},
+                "budget":{"max_attempts":2,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},
+                "start_after":[],"integration_after":[]
+            })
+        };
+        let submission = json!({"campaign":{"purpose":"inbox HTTP test","shared_contracts":[]},"commissions":[commission("b"),commission("a")]});
+        let validated = anvil_core::validate_campaign_submission(
+            serde_json::from_value(submission.clone()).unwrap(),
+        )
+        .unwrap();
+        let accepted = db
+            .accept_campaign("http-inbox-key", "test", &submission, &validated)
+            .unwrap();
+        let app = router(AppState::new(app_config, FakeSandbox));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/inbox?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(first["schema_version"], 1);
+        assert_eq!(first["items"][0]["local_key"], "a");
+        let cursor = first["next_cursor"].as_str().unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/inbox?after={cursor}&limit=1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let second: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(second["items"][0]["local_key"], "b");
+        assert!(second["next_cursor"].is_null());
+        let commission_id = accepted.task["commissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["local_key"] == "a")
+            .unwrap()["commission_id"]
+            .as_str()
+            .unwrap();
+        db.start_commission("http-inbox-start", commission_id, 1)
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/inbox?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let refreshed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            refreshed["items"][0]["commission"]["start_authorized"],
+            true
+        );
+        for uri in [
+            "/v1/inbox?limit=0",
+            "/v1/inbox?limit=101",
+            "/v1/inbox?after=bad-cursor",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+    }
+
+    #[test]
+    fn campaign_work_instruction_uses_persisted_hierarchy_and_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let db =
+            store::ControllerStore::open(directory.path().join("campaign-instruction.sqlite3"))
+                .unwrap();
+        let request = json!({"campaign":{"purpose":"Persisted purpose","shared_contracts":["API compatibility"]},"commissions":[
+            {"local_key":"work","objective":"Implement the feature","obligations":[{"id":"obligation","version":1,"requirement":"Preserve compatibility","acceptance_expectations":["test passes"]}],"execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},"budget":{"max_attempts":2,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},"start_after":[],"integration_after":[]}
+        ]});
+        let validated = anvil_core::validate_campaign_submission(
+            serde_json::from_value(request.clone()).unwrap(),
+        )
+        .unwrap();
+        let accepted = db
+            .accept_campaign("instruction-key", "test", &request, &validated)
+            .unwrap();
+        let commission_id = accepted.task["commissions"][0]["commission_id"]
+            .as_str()
+            .unwrap();
+        db.start_commission("instruction-start", commission_id, 1)
+            .unwrap();
+        let claim = db.claim_runnable(1, 0, 2, 0).unwrap().remove(0);
+        let commission = db.get_commission(commission_id).unwrap().unwrap();
+        let campaign = db
+            .get_campaign(commission["campaign_id"].as_str().unwrap(), None, 1)
+            .unwrap()
+            .unwrap();
+        let instruction =
+            campaign_work_instruction(&campaign, &commission, &claim.task, &claim.attempt);
+        assert!(instruction.contains("Persisted purpose"));
+        assert!(instruction.contains("API compatibility"));
+        assert!(instruction.contains("Implement the feature"));
+        assert!(instruction.contains("Preserve compatibility"));
+        assert!(instruction.contains("https://example.test/repo"));
+        assert!(instruction.contains(claim.attempt["attempt_id"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn commission_detection_supports_unbatched_campaign_attempts() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = store::ControllerStore::open(directory.path().join("campaign-detection.sqlite3"))
+            .unwrap();
+        let request = json!({"campaign":{"purpose":"test","shared_contracts":[]},"commissions":[
+            {"local_key":"work","objective":"Implement the feature","obligations":[{"id":"obligation","version":1,"requirement":"Deliver","acceptance_expectations":["test passes"]}],"execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},"budget":{"max_attempts":2,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},"start_after":[],"integration_after":[]}
+        ]});
+        let validated = anvil_core::validate_campaign_submission(
+            serde_json::from_value(request.clone()).unwrap(),
+        )
+        .unwrap();
+        let accepted = db
+            .accept_campaign("detection-key", "test", &request, &validated)
+            .unwrap();
+        let commission_id = accepted.task["commissions"][0]["commission_id"]
+            .as_str()
+            .unwrap();
+        db.start_commission("detection-start", commission_id, 1)
+            .unwrap();
+        let claim = db.claim_runnable(1, 0, 2, 0).unwrap().remove(0);
+        db.bind_attempt_session(
+            claim.attempt["attempt_id"].as_str().unwrap(),
+            "commission-session",
+        )
+        .unwrap();
+
+        assert!(commission_attempt_for_session(&db, "commission-session").unwrap());
+        assert!(!commission_attempt_for_session(&db, "other-session").unwrap());
+    }
+
+    #[test]
+    fn fast_commission_turn_can_complete_before_scheduler_observation() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = store::ControllerStore::open(directory.path().join("fast-turn.sqlite3")).unwrap();
+        let request = json!({"campaign":{"purpose":"test","shared_contracts":[]},"commissions":[
+            {"local_key":"work","objective":"Implement the feature","obligations":[{"id":"obligation","version":1,"requirement":"Deliver","acceptance_expectations":["test passes"]}],"execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},"budget":{"max_attempts":2,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},"start_after":[],"integration_after":[]}
+        ]});
+        let validated = anvil_core::validate_campaign_submission(
+            serde_json::from_value(request.clone()).unwrap(),
+        )
+        .unwrap();
+        let accepted = db
+            .accept_campaign("fast-turn-key", "test", &request, &validated)
+            .unwrap();
+        let commission_id = accepted.task["commissions"][0]["commission_id"]
+            .as_str()
+            .unwrap();
+        db.start_commission("fast-turn-start", commission_id, 1)
+            .unwrap();
+        let claim = db.claim_runnable(1, 0, 2, 0).unwrap().remove(0);
+        let attempt_id = claim.attempt["attempt_id"].as_str().unwrap();
+        db.bind_attempt_session(attempt_id, "fast-turn-session")
+            .unwrap();
+
+        // Dispatch follows this durable transition, so a turn completing
+        // before the next scheduler observation is valid state.
+        db.set_attempt_and_task_state(attempt_id, "running", "running")
+            .unwrap();
+        db.set_attempt_turn_completed(attempt_id).unwrap();
+        let attempt = db.get_resource("attempt", attempt_id).unwrap().unwrap();
+        assert_eq!(attempt["state"], "completed");
+    }
+
+    #[tokio::test]
+    async fn campaign_http_contract_replays_pages_restarts_and_checks_versions() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("campaign-http.sqlite3");
+        let mut app_config = config("http://127.0.0.1:4097".into());
+        app_config.store_path = database.clone();
+        let app = router(AppState::new(app_config.clone(), FakeSandbox));
+        let body = json!({"campaign":{"purpose":"persisted purpose","shared_contracts":["shared contract"]},"commissions":[
+            {"local_key":"first","objective":"first objective","obligations":[{"id":"obligation-1","version":1,"requirement":"deliver","acceptance_expectations":["test"]}],"execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},"budget":{"max_attempts":2,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},"start_after":[],"integration_after":[]},
+            {"local_key":"second","objective":"second objective","obligations":[{"id":"obligation-2","version":1,"requirement":"integrate","acceptance_expectations":["review"]}],"execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},"budget":{"max_attempts":2,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},"start_after":[],"integration_after":[]}
+        ]});
+        let submit = |value: Value, key: Option<&str>| {
+            let mut builder = Request::builder().method("POST").uri("/v1/campaigns");
+            if let Some(key) = key {
+                builder = builder.header("idempotency-key", key);
+            }
+            builder
+                .header("content-type", "application/json")
+                .body(Body::from(value.to_string()))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(submit(body.clone(), None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let accepted = app
+            .clone()
+            .oneshot(submit(body.clone(), Some("campaign-http-key")))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+        let accepted: Value = serde_json::from_slice(
+            &axum::body::to_bytes(accepted.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let replay = app
+            .clone()
+            .oneshot(submit(body.clone(), Some("campaign-http-key")))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: Value = serde_json::from_slice(
+            &axum::body::to_bytes(replay.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay, accepted);
+        let mut changed = body.clone();
+        changed["campaign"]["purpose"] = json!("changed payload");
+        assert_eq!(
+            app.clone()
+                .oneshot(submit(changed, Some("campaign-http-key")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        let campaign_id = accepted["campaign_id"].as_str().unwrap();
+        let aggregate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/campaigns/{campaign_id}?limit=1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(aggregate.status(), StatusCode::OK);
+        let aggregate: Value = serde_json::from_slice(
+            &axum::body::to_bytes(aggregate.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(aggregate["purpose"], "persisted purpose");
+        let cursor = aggregate["next_page_cursor"].as_str().unwrap();
+        drop(app);
+        let restarted = router(AppState::new(app_config, FakeSandbox));
+        let page = restarted
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/campaigns/{campaign_id}?limit=1&after={cursor}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        let page: Value = serde_json::from_slice(
+            &axum::body::to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page["commissions"][0]["local_key"], "second");
+        let commission_id = accepted["commissions"][0]["commission_id"]
+            .as_str()
+            .unwrap();
+        let start = |version, key: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/commissions/{commission_id}/start"))
+                .header("Idempotency-Key", key)
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"expected_version":version}).to_string()))
+                .unwrap()
+        };
+        assert_eq!(
+            restarted
+                .clone()
+                .oneshot(start(99, "bad-version"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let current = restarted
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/commissions/{commission_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let current: Value = serde_json::from_slice(
+            &axum::body::to_bytes(current.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let accepted_version = current["version"].as_u64().unwrap();
+        let started = restarted
+            .clone()
+            .oneshot(start(accepted_version, "http-start-key"))
+            .await
+            .unwrap();
+        let started_status = started.status();
+        let started: Value = serde_json::from_slice(
+            &axum::body::to_bytes(started.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(started_status, StatusCode::OK, "{started}");
+        assert_eq!(started["receipt"]["idempotency_key"], "http-start-key");
+        assert_eq!(started["receipt"]["commission_id"], commission_id);
+        assert_eq!(started["receipt"]["accepted_version"], accepted_version);
+        assert_eq!(started["commission"]["version"], accepted_version + 1);
+
+        // A retry after the durable transition uses the original precondition and
+        // returns the current projection alongside the stable acceptance receipt.
+        let replay = restarted
+            .clone()
+            .oneshot(start(accepted_version, "http-start-key"))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: Value = serde_json::from_slice(
+            &axum::body::to_bytes(replay.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay["receipt"], started["receipt"]);
+        assert_eq!(replay["commission"]["version"], accepted_version + 1);
+        assert_eq!(
+            restarted
+                .oneshot(start(accepted_version, "another-start-key"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
     fn git_metadata_selects_latest_open_pull_request_deterministically() {
         let pr = pull_request_from_github(vec![
             json!({"number": 9, "title": "Old", "html_url": "https://github.com/acme/repo/pull/9", "state": "open", "updated_at": "2026-01-01T00:00:00Z"}),
@@ -10815,6 +11880,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_submitted_run_does_not_block_other_scheduler_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        config.concurrency_limit = 2;
+        let mut record = active_run_record(activity_session());
+        record.session.id = "submitted-session".into();
+        record.run_record.current = Some(ActiveRunState::Submitted {
+            run_id: RunId("submitted-run".into()),
+            user_message_id: OpenCodeMessageId("submitted-message".into()),
+            started_at: "2026-01-01T10:00:00Z".into(),
+        });
+        record.session.current_run = record.run_record.current.as_ref().map(|run| match run {
+            ActiveRunState::Submitted {
+                run_id,
+                user_message_id,
+                started_at,
+            } => Run {
+                id: run_id.clone(),
+                state: RunState::Submitted,
+                user_message_id: Some(user_message_id.clone()),
+                assistant_message_id: None,
+                started_at: started_at.clone(),
+                finished_at: None,
+                error: None,
+            },
+            ActiveRunState::Running { .. } => unreachable!(),
+        });
+        let state = AppState::new(
+            config,
+            OccupancySandbox {
+                records: vec![record],
+            },
+        );
+        let store = state.store().unwrap();
+        accept_scheduler_batch(
+            store,
+            "submitted-legacy",
+            2,
+            &[("submitted-task", vec![]), ("other-task", vec![])],
+        );
+        store
+            .create_attempt("submitted-task", "submitted-attempt", "submitted-key")
+            .unwrap();
+        store
+            .bind_attempt_session("submitted-attempt", "submitted-session")
+            .unwrap();
+        store
+            .set_attempt_state("submitted-attempt", "running")
+            .unwrap();
+
+        run_batch_scheduler_tick(&state).await.unwrap();
+
+        assert_eq!(store.attempts_for_task("submitted-task").unwrap().len(), 1);
+        assert_eq!(store.attempts_for_task("other-task").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn batch_scheduler_counts_non_batch_live_and_provisioning_sessions() {
         let directory = tempfile::tempdir().unwrap();
         let mut config = config("http://127.0.0.1:4097".into());
@@ -11105,6 +12228,7 @@ mod tests {
             workspace_size: "1Gi".into(),
             opencode_port: 4096,
             opencode_server_password: "anvil-local-development-only-password".into(),
+            opencode_go_secret: None,
             request_timeout: Duration::from_secs(5),
             preview_domain: "preview.example.test".into(),
             annotation_prefix: "anvil.example".into(),
@@ -11508,6 +12632,299 @@ mod tests {
         assert!(spec["volumes"][1]["persistentVolumeClaim"]
             .get("readOnly")
             .is_none());
+        assert_eq!(spec["volumes"].as_array().unwrap().len(), 2);
+        assert!(spec["volumes"].to_string().contains("shared-profile"));
+        assert!(spec["containers"][0]["volumeMounts"]
+            .to_string()
+            .contains("shared-profile"));
+        assert_eq!(
+            spec["initContainers"][0],
+            json!({"name":"fix-workspace-permissions"})
+        );
+    }
+
+    #[test]
+    fn workspace_bootstrap_installs_anvil_reporting_skill() {
+        let script = workspace_init_script();
+        assert!(script.contains(".opencode/skills/anvil-reporting/SKILL.md"));
+        assert!(script.contains("obligation ID and version"));
+        assert!(script.contains("Do not\nclaim that work is integrated"));
+    }
+
+    #[test]
+    fn opt_in_go_secret_is_mounted_only_for_workspace_init() {
+        let mut config = config("http://profile".into());
+        config.opencode_go_secret = Some("opencode-go-sealed".into());
+        let init = json!({
+            "name":"fix-workspace-permissions",
+            "command":["/bin/bash", "-c"],
+            "args":[workspace_init_script()],
+            "env":[{"name":"ANVIL_PROJECT","value":"test"}],
+            "volumeMounts":[{"name":"workspace","mountPath":"/home/anvil"}]
+        });
+        let manifest = sandbox_manifest(
+            &config,
+            "sandbox",
+            labels(),
+            serde_json::Map::new(),
+            init,
+            vec![],
+        );
+        let spec = &manifest["spec"]["podTemplate"]["spec"];
+        assert_eq!(
+            spec["volumes"][1],
+            json!({
+                "name":"opencode-go-auth",
+                "secret":{"secretName":"opencode-go-sealed","items":[{"key":"go-key","path":"go-key","mode":256}]}
+            })
+        );
+        let init = &spec["initContainers"][0];
+        assert!(init["volumeMounts"].as_array().unwrap().contains(&json!({
+            "name":"opencode-go-auth",
+            "mountPath":"/run/secrets/opencode-go",
+            "readOnly":true
+        })));
+        assert_eq!(
+            init["env"],
+            json!([
+                {"name":"ANVIL_PROJECT","value":"test"},
+                {"name":"HOME","value":"/home/anvil"},
+                {"name":"XDG_DATA_HOME","value":"/home/anvil/.local/share"},
+                {"name":"OPENCODE_DISABLE_CHANNEL_DB","value":"1"}
+            ])
+        );
+        let script = init["args"][0].as_str().unwrap();
+        for expected in [
+            "jq -n --rawfile key /run/secrets/opencode-go/go-key",
+            "opencode auth import --standalone",
+            "id:\"cred_anvil_go\"",
+            "integrationID:\"opencode-go\"",
+            "chmod 700 /home/anvil/.local/share/opencode",
+            "chmod 600 \"$database_file\"",
+            "umask 077",
+            "opencode.jsonc",
+        ] {
+            assert!(script.contains(expected), "script omitted {expected}");
+        }
+        let workspace_chown = script.find("chown -R 1000:1000 /home/anvil\n").unwrap();
+        let config_creation = script
+            .find("umask 077\nmkdir -p /home/anvil/.config/opencode")
+            .unwrap();
+        let config_chown = script
+            .find("chown -R 1000:1000 /home/anvil/.config/opencode")
+            .unwrap();
+        assert!(workspace_chown < config_creation && config_creation < config_chown);
+        let config_body = script
+            .split("printf '%s\\n' '")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("' > /home/anvil/.config/opencode/opencode.jsonc")
+                    .next()
+            })
+            .unwrap();
+        assert!(!config_body.contains("key"));
+        assert!(!spec["containers"][0]["volumeMounts"]
+            .to_string()
+            .contains("opencode-go-auth"));
+        assert!(!spec["containers"][0]["env"]
+            .to_string()
+            .contains("ANVIL_OPENCODE_GO_SECRET"));
+        assert!(!spec["containers"][0]["env"].to_string().contains("go-key"));
+        assert!(!spec["volumes"].to_string().contains("shared-profile"));
+        assert!(!spec["containers"][0]["volumeMounts"]
+            .to_string()
+            .contains("shared-profile"));
+        assert!(spec["containers"][0]["env"]
+            .to_string()
+            .contains("ANVIL_ISOLATED_GO_AUTH"));
+        assert!(spec["containers"][0]["env"]
+            .to_string()
+            .contains("/home/anvil/.config/opencode/opencode.jsonc"));
+        assert!(spec["containers"][0]["env"]
+            .to_string()
+            .contains("/home/anvil/.config/opencode"));
+    }
+
+    #[test]
+    fn default_sandbox_init_args_and_environment_remain_unchanged() {
+        let config = config("http://profile".into());
+        let init = json!({
+            "name":"fix-workspace-permissions",
+            "command":["/bin/bash", "-c"],
+            "args":[workspace_init_script()],
+            "env":[{"name":"ANVIL_PROJECT","value":"test"}],
+            "volumeMounts":[{"name":"workspace","mountPath":"/home/anvil"}]
+        });
+        let manifest = sandbox_manifest(
+            &config,
+            "sandbox",
+            labels(),
+            serde_json::Map::new(),
+            init.clone(),
+            vec![],
+        );
+        let rendered = &manifest["spec"]["podTemplate"]["spec"];
+        assert_eq!(rendered["initContainers"][0], init);
+        assert_eq!(
+            rendered["containers"][0]["env"],
+            json!([{
+                "name":"OPENCODE_SERVER_PASSWORD",
+                "valueFrom":{"secretKeyRef":{"name":"github-app-credentials","key":"ANVIL_OPENCODE_SERVER_PASSWORD"}}
+            }])
+        );
+        assert_eq!(
+            rendered["containers"][0]["volumeMounts"][0],
+            json!({
+                "name":"workspace","mountPath":"/home/anvil"
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_opencode_go_secret_name_is_rejected() {
+        assert!(!valid_secret_name("Invalid.Secret"));
+        assert!(!valid_secret_name("invalid..secret"));
+        assert!(!valid_secret_name("-invalid"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opt_in_config_files_are_private_and_owned_by_uid_1000_when_available() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home/anvil");
+        std::fs::create_dir_all(&home).unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let chown = bin.join("chown");
+        std::fs::write(&chown, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&chown).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&chown, permissions).unwrap();
+        let init_script = format!(
+            "{}\numask 077\nmkdir -p {}/.config/opencode\nprintf '%s\\n' '{{\"$schema\":\"https://opencode.ai/config.json\",\"permission\":\"allow\"}}' > {}/.config/opencode/opencode.jsonc\nchown -R 1000:1000 {}/.config/opencode\nchmod 700 {}/.config/opencode\nchmod 600 {}/.config/opencode/opencode.jsonc",
+            "set -euo pipefail",
+            home.display(), home.display(), home.display(), home.display(), home.display()
+        );
+        let inherited_path = std::env::var_os("PATH").unwrap();
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(init_script)
+            .env(
+                "PATH",
+                std::env::join_paths(
+                    [bin]
+                        .into_iter()
+                        .chain(std::env::split_paths(&inherited_path)),
+                )
+                .unwrap(),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let config_dir = home.join(".config/opencode");
+        let config_file = config_dir.join("opencode.jsonc");
+        assert_eq!(
+            std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&config_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(std::fs::read_to_string(&config_file)
+            .unwrap()
+            .contains("\"permission\":\"allow\""));
+        if std::fs::metadata(root.path()).unwrap().uid() == 1000 {
+            assert_eq!(std::fs::metadata(&config_dir).unwrap().uid(), 1000);
+            assert_eq!(std::fs::metadata(&config_file).unwrap().uid(), 1000);
+        }
+    }
+
+    #[test]
+    fn isolated_go_entrypoint_skips_shared_profile_auth_setup() {
+        let script = include_str!("../../../runtime/sandbox-entrypoint");
+        assert!(script.contains("if [ \"${ANVIL_ISOLATED_GO_AUTH:-}\" = 1 ]; then\n  umask 077\nelse\n  profile_dir=/anvil/profile"));
+        assert!(script.contains("if [ \"${ANVIL_ISOLATED_GO_AUTH:-}\" != 1 ]; then\n  mkdir -p \"$HOME/.local/share/opencode\""));
+    }
+
+    #[test]
+    fn go_auth_init_script_reimports_without_external_auth_or_workspace_key_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let secret_dir = root.path().join("secrets");
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(secret_dir.join("go-key"), "dummy-test-key").unwrap();
+        let jq = bin.join("jq");
+        std::fs::write(&jq, "#!/bin/sh\nprintf '%s' '{\"fixture\":true}'\n").unwrap();
+        let opencode = bin.join("opencode");
+        std::fs::write(
+            &opencode,
+            "#!/bin/sh\n[ \"$1 $2 $3\" = 'auth import --standalone' ] || exit 2\ncat >> \"$CAPTURE\"\nmkdir -p \"$(dirname \"$DB_PATH\")\"\n: > \"$DB_PATH\"\n",
+        )
+        .unwrap();
+        let chown = bin.join("chown");
+        std::fs::write(&chown, "#!/bin/sh\nexit 0\n").unwrap();
+        for executable in [&jq, &opencode, &chown] {
+            let mut permissions = std::fs::metadata(executable).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(executable, permissions).unwrap();
+        }
+
+        let auth_script = workspace_go_auth_script()
+            .replace("/run/secrets/opencode-go", secret_dir.to_str().unwrap())
+            .replace("/home/anvil", workspace.to_str().unwrap());
+        let inherited_path = std::env::var_os("PATH").unwrap();
+        let bash = std::env::split_paths(&inherited_path)
+            .map(|directory| directory.join("bash"))
+            .find(|candidate| candidate.is_file())
+            .unwrap();
+        let run = || {
+            std::process::Command::new(&bash)
+                .arg("-c")
+                .arg(&auth_script)
+                .env(
+                    "PATH",
+                    std::env::join_paths(
+                        [bin.clone()]
+                            .into_iter()
+                            .chain(std::env::split_paths(&inherited_path)),
+                    )
+                    .unwrap(),
+                )
+                .env("CAPTURE", root.path().join("stdin.json"))
+                .env(
+                    "DB_PATH",
+                    workspace.join(".local/share/opencode/opencode.db"),
+                )
+                .output()
+                .unwrap()
+        };
+        assert!(run().status.success());
+        assert!(run().status.success());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("stdin.json")).unwrap(),
+            "{\"fixture\":true}{\"fixture\":true}"
+        );
+        assert!(workspace
+            .join(".local/share/opencode/opencode.db")
+            .is_file());
+        assert!(!workspace.join("go-key").exists());
     }
 
     #[test]
@@ -12443,57 +13860,134 @@ mod tests {
             "export const app = true"
         );
 
-        let session_route = static_app
+        let not_a_page = static_app
             .clone()
             .oneshot(Request::get("/session/demo").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(session_route.status(), StatusCode::OK);
-        assert_eq!(
-            session_route.headers()["content-type"],
-            "text/html; charset=utf-8"
-        );
-        let session_body = axum::body::to_bytes(session_route.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(std::str::from_utf8(&session_body)
-            .unwrap()
-            .contains("/assets/app-abc.js"));
+        assert_eq!(not_a_page.status(), StatusCode::NOT_FOUND);
         let missing_api = static_app
+            .clone()
             .oneshot(Request::get("/v1/missing").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(missing_api.status(), StatusCode::NOT_FOUND);
 
-        let built_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/dist");
-        if let Ok(built_index) = tokio::fs::read_to_string(built_root.join("index.html")).await {
+        for page in ["campaign", "commission", "sessions"] {
+            tokio::fs::create_dir_all(assets.path().join(page))
+                .await
+                .unwrap();
+            tokio::fs::write(
+                assets.path().join(page).join("index.html"),
+                format!("<!doctype html><main>{page}</main>"),
+            )
+            .await
+            .unwrap();
+        }
+        for (route, page) in [
+            ("/campaign?id=cmp_123", "campaign"),
+            ("/commission?id=cm_456", "commission"),
+            ("/sessions", "sessions"),
+        ] {
+            let response = static_app
+                .clone()
+                .oneshot(Request::get(route).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "page {route}");
+            assert_eq!(response.headers()["cache-control"], "no-cache");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(std::str::from_utf8(&body).unwrap().contains(page));
+        }
+
+        tokio::fs::create_dir_all(assets.path().join("_next/static/chunks"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            assets.path().join("_next/static/chunks/app.js"),
+            "export const next = true",
+        )
+        .await
+        .unwrap();
+        let next_asset = static_app
+            .clone()
+            .oneshot(
+                Request::get("/_next/static/chunks/app.js?v=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(next_asset.status(), StatusCode::OK);
+        assert_eq!(
+            next_asset.headers()["content-type"],
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            next_asset.headers()["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(outside.path(), "secret").await.unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                outside.path(),
+                assets.path().join("_next/static/chunks/leak.js"),
+            )
+            .unwrap();
+            let traversal = static_app
+                .oneshot(
+                    Request::get("/_next/static/chunks/leak.js")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(traversal.status(), StatusCode::NOT_FOUND);
+        }
+
+        let built_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/out");
+        if built_root.is_dir() {
+            let built_index = tokio::fs::read_to_string(built_root.join("index.html"))
+                .await
+                .expect("Next export should contain index.html");
             let built_app = router_with_web_root(app_state, built_root);
             let asset_urls = built_index
-                .split("/assets/")
+                .split("/_next/static/")
                 .skip(1)
                 .filter_map(|part| part.split(['\"', '\'']).next())
-                .filter(|path| !path.is_empty())
+                .filter(|path| path.ends_with(".js") || path.ends_with(".css"))
                 .collect::<Vec<_>>();
-            assert!(!asset_urls.is_empty(), "Vite index should reference assets");
+            assert!(
+                !asset_urls.is_empty(),
+                "Next index should reference script or CSS assets"
+            );
             for path in asset_urls {
                 let response = built_app
                     .clone()
                     .oneshot(
-                        Request::get(format!("/assets/{path}"))
+                        Request::get(format!("/_next/static/{path}"))
                             .body(Body::empty())
                             .unwrap(),
                     )
                     .await
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::OK, "asset {path}");
-                assert!(response.headers()["content-type"]
-                    .to_str()
-                    .unwrap()
-                    .starts_with(if path.ends_with(".css") {
-                        "text/css"
-                    } else {
-                        "text/javascript"
-                    }));
+                assert!(
+                    response.headers()["content-type"]
+                        .to_str()
+                        .unwrap()
+                        .starts_with(if path.ends_with(".css") {
+                            "text/css"
+                        } else {
+                            "text/javascript"
+                        }),
+                    "asset {path}"
+                );
             }
         }
     }
