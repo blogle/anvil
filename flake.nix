@@ -6,7 +6,7 @@
     crane.url = "github:ipetkov/crane";
     # Temporary pin for nlewo/nix2container#199 / issue #192.
     # Remove this fork pin after the upstream fix lands in nlewo/nix2container.
-    nix2container.url = "github:Dauliac/nix2container/8fd02c842686a528fd37508283853de0ed1462b1";
+    nix2container.url = "github:Dauliac/nix2container/76be9608a7f4d6c985d28b0e7be903ae2547df3e";
     nix2containerNixpkgs.follows = "nix2container/nixpkgs";
     opencode.url = "github:anomalyco/opencode/9b4ec5714d481559990db0a816d5dec19541a814";
     sdlc.url = "github:blogle/sdlc/v2";
