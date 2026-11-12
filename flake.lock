@@ -1,5 +1,26 @@
 {
   "nodes": {
+    "agent-skills-nix": {
+      "inputs": {
+        "nixpkgs": [
+          "sdlc",
+          "nixpkgs-latest"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792594212,
+        "narHash": "sha256-XWx3R/AIeYdyZ3guuZVNqirEUPPpehICrIRV3VabR+U=",
+        "owner": "Kyure-A",
+        "repo": "agent-skills-nix",
+        "rev": "f48aa227f3d157ae3abda12cd9c4ab867f400419",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Kyure-A",
+        "repo": "agent-skills-nix",
+        "type": "github"
+      }
+    },
     "crane": {
       "locked": {
         "lastModified": 1788465171,
@@ -237,16 +258,17 @@
     },
     "sdlc": {
       "inputs": {
+        "agent-skills-nix": "agent-skills-nix",
         "mergify-nix": "mergify-nix",
         "nixpkgs-latest": "nixpkgs-latest",
         "nixpkgs-stable": "nixpkgs-stable"
       },
       "locked": {
-        "lastModified": 1792810233,
-        "narHash": "sha256-3I8kukKM2rLKbokbOll/wBAsNHE9M21TJhVaoH/4FKI=",
+        "lastModified": 1794511520,
+        "narHash": "sha256-UD5PH8lDtuAPugRQCTIK093NFBVow/8KVocX+p/YtpQ=",
         "owner": "blogle",
         "repo": "sdlc",
-        "rev": "21ae48a50a3a39a9e45dc84c6f244ce038bb166f",
+        "rev": "3ae4301d945d1b5365fcec08332fc7bc080ca093",
         "type": "github"
       },
       "original": {
