@@ -1,5 +1,0 @@
-{
-  "type": "feat",
-  "semver": "minor",
-  "summary": "Add paginated Commission inbox and recorded control decisions to the operator UI and MCP API"
-}

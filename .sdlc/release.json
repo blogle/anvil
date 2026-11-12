@@ -1,0 +1,34 @@
+{
+  "changelog_sha256": "3e9effb942057a2c153353d0018307117ba40220bba209a427cd5e768f130ed2",
+  "fragments": [
+    {
+      "blob_sha": "10322daf568d712f0ec81ee4a398da84e76f57fb",
+      "path": ".changes/durable-campaign-commission.json"
+    },
+    {
+      "blob_sha": "3d0388644fc444bbdea918007f89be5bb3ff22a8",
+      "path": ".changes/inbox-and-decision-history.json"
+    },
+    {
+      "blob_sha": "f2fcd5b7d07b629e863f941f8e3e1b43df6577aa",
+      "path": ".changes/isolated-go-worker-auth.json"
+    },
+    {
+      "blob_sha": "3e7080877ec46f11db333dcad1e483ec7cb980b6",
+      "path": ".changes/next-operator-workspace.json"
+    },
+    {
+      "blob_sha": "225c4d0dd481f3566b0bb4ce9ac573056b7964a1",
+      "path": ".changes/sdlc-onboarding.json"
+    }
+  ],
+  "generated_tree": "d4d50c2858d69797c730322e7771d09a24a035b8a47ca9b1db0d170721a5ce69",
+  "prior_released_boundary": null,
+  "publication": {
+    "source_main_sha": "dbd012db5dbefe2212e6d42534931f31ea0ee8da",
+    "version": "0.1.0"
+  },
+  "schema": 1,
+  "source_main_sha": "dbd012db5dbefe2212e6d42534931f31ea0ee8da",
+  "version": "0.1.0"
+}
