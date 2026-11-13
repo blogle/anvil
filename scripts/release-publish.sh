@@ -40,10 +40,9 @@ while IFS='|' read -r source target; do
   expected_identity="$(content_identity "$source_config" < "$source_manifest")"
   for tag in "$SDLC_RELEASE_VERSION" "sha-$SDLC_RELEASE_MERGED_SHA" main latest; do
     remote="docker://$target:$tag"
-    if skopeo inspect --authfile "$HOME/.docker/config.json" --raw "$remote" >/dev/null 2>&1; then
+    if bash scripts/registry-inspect-existing.sh "$HOME/.docker/config.json" "$remote" "$remote_manifest_tmp"; then
       remote_config="$(mktemp "$receipt_dir/.remote-config.XXXXXX")"
       skopeo inspect --authfile "$HOME/.docker/config.json" --config "$remote" > "$remote_config"
-      skopeo inspect --authfile "$HOME/.docker/config.json" --raw "$remote" > "$remote_manifest_tmp"
       actual_identity="$(content_identity "$remote_config" < "$remote_manifest_tmp")"
       rm -f "$remote_config"
       remote_config=""
@@ -53,6 +52,10 @@ while IFS='|' read -r source target; do
         skopeo copy --all --dest-authfile "$HOME/.docker/config.json" "docker-daemon:$source" "$remote"
       fi
     else
+      inspect_status=$?
+      if [[ "$inspect_status" -ne 1 ]]; then
+        exit "$inspect_status"
+      fi
       skopeo copy --all --dest-authfile "$HOME/.docker/config.json" "docker-daemon:$source" "$remote"
     fi
     actual="$(bash scripts/registry-manifest-digest.sh "$HOME/.docker/config.json" "$remote" "$remote_manifest_tmp")"

@@ -62,7 +62,7 @@ let
           "nix-daemon-smoke.sh" "sandbox.nix" "nix-deployment-canary"
           "nix-daemon-entrypoint" "anvil-credential" "anvil-session-capability"
           "lib.rs" "release-publish.sh" "image-content-identity.sh"
-          "registry-manifest-digest.sh"
+          "registry-manifest-digest.sh" "registry-inspect-existing.sh" "registry-inspect.sh"
         ];
       in (type == "directory" && builtins.any (suffix: pkgs.lib.hasSuffix suffix p) dirs)
         || pkgs.lib.hasInfix "/.github/workflows/" p
@@ -79,6 +79,7 @@ let
     bash tests/manifest-security.sh
     bash tests/image-content-identity.sh
     bash tests/registry-manifest-digest.sh
+    bash tests/registry-inspect.sh
     kubectl kustomize k8s/overlays/dev >/dev/null
     kubectl kustomize k8s/overlays/kind >/dev/null
     mkdir -p "$out"
