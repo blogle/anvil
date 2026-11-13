@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "Verify published image content by validated config and ordered layer descriptors"
+}
