@@ -14,28 +14,57 @@ daemon_image_id="$(docker image inspect --format '{{.Id}}' ghcr.io/blogle/anvil-
 nix develop .#release-smoke --command bash tests/nix-daemon-smoke.sh "$daemon_image_id"
 
 receipts="${SDLC_RELEASE_RECEIPTS:-.sdlc/publication-receipts.json}"
-mkdir -p "$(dirname "$receipts")"
-receipt_tmp="$(mktemp)"
-trap 'rm -f "$receipt_tmp"' EXIT
+receipt_dir="$(dirname "$receipts")"
+mkdir -p "$receipt_dir"
+receipt_tmp="$(mktemp "$receipt_dir/.publication-receipts.XXXXXX")"
+remote_manifest_tmp="$(mktemp "$receipt_dir/.remote-manifest.XXXXXX")"
+source_manifest="$(mktemp "$receipt_dir/.source-manifest.XXXXXX")"
+source_config="$(mktemp "$receipt_dir/.source-config.XXXXXX")"
+remote_config=""
+cleanup() {
+  rm -f "$receipt_tmp" "$receipt_tmp.next" "$remote_manifest_tmp" "$source_manifest" "$source_config"
+  if [[ -n "$remote_config" ]]; then
+    rm -f "$remote_config"
+  fi
+}
+trap cleanup EXIT
 printf '{"schema":1,"artifacts":[]}' > "$receipt_tmp"
 
+content_identity() {
+  bash scripts/image-content-identity.sh "$1"
+}
+
 while IFS='|' read -r source target; do
-  expected="$(skopeo inspect --raw "docker-daemon:$source" | sha256sum | cut -d' ' -f1)"
+  skopeo inspect --raw "docker-daemon:$source" > "$source_manifest"
+  skopeo inspect --config "docker-daemon:$source" > "$source_config"
+  expected_identity="$(content_identity "$source_config" < "$source_manifest")"
   for tag in "$SDLC_RELEASE_VERSION" "sha-$SDLC_RELEASE_MERGED_SHA" main latest; do
     remote="docker://$target:$tag"
-    if skopeo inspect --authfile "$HOME/.docker/config.json" --raw "$remote" >/dev/null 2>&1; then
-      actual="$(skopeo inspect --authfile "$HOME/.docker/config.json" --raw "$remote" | sha256sum | cut -d' ' -f1)"
+    if bash scripts/registry-inspect-existing.sh "$HOME/.docker/config.json" "$remote" "$remote_manifest_tmp"; then
+      remote_config="$(mktemp "$receipt_dir/.remote-config.XXXXXX")"
+      skopeo inspect --authfile "$HOME/.docker/config.json" --config "$remote" > "$remote_config"
+      actual_identity="$(content_identity "$remote_config" < "$remote_manifest_tmp")"
+      rm -f "$remote_config"
+      remote_config=""
       if [[ "$tag" == "$SDLC_RELEASE_VERSION" || "$tag" == "sha-$SDLC_RELEASE_MERGED_SHA" ]]; then
-        [[ "$actual" == "$expected" ]] || { echo "immutable image tag $target:$tag already points to a different digest" >&2; exit 1; }
-      elif [[ "$actual" != "$expected" ]]; then
+        [[ "$actual_identity" == "$expected_identity" ]] || { echo "immutable image tag $target:$tag already points to different image content" >&2; exit 1; }
+      elif [[ "$actual_identity" != "$expected_identity" ]]; then
         skopeo copy --all --dest-authfile "$HOME/.docker/config.json" "docker-daemon:$source" "$remote"
       fi
     else
+      inspect_status=$?
+      if [[ "$inspect_status" -ne 1 ]]; then
+        exit "$inspect_status"
+      fi
       skopeo copy --all --dest-authfile "$HOME/.docker/config.json" "docker-daemon:$source" "$remote"
-      actual="$expected"
     fi
-    actual="$(skopeo inspect --authfile "$HOME/.docker/config.json" --raw "$remote" | sha256sum | cut -d' ' -f1)"
-    [[ "$actual" == "$expected" ]] || { echo "published image $target:$tag digest differs from the built image" >&2; exit 1; }
+    actual="$(bash scripts/registry-manifest-digest.sh "$HOME/.docker/config.json" "$remote" "$remote_manifest_tmp")"
+    remote_config="$(mktemp "$receipt_dir/.remote-config.XXXXXX")"
+    skopeo inspect --authfile "$HOME/.docker/config.json" --config "$remote" > "$remote_config"
+    actual_identity="$(content_identity "$remote_config" < "$remote_manifest_tmp")"
+    rm -f "$remote_config"
+    remote_config=""
+    [[ "$actual_identity" == "$expected_identity" ]] || { echo "published image $target:$tag content differs from the built image" >&2; exit 1; }
     if [[ "$tag" == "$SDLC_RELEASE_VERSION" || "$tag" == "sha-$SDLC_RELEASE_MERGED_SHA" ]]; then
       jq --arg name "$target:$tag" --arg digest "sha256:$actual" \
         --arg version "$SDLC_RELEASE_VERSION" --arg merged "$SDLC_RELEASE_MERGED_SHA" \
@@ -52,4 +81,3 @@ ghcr.io/blogle/anvil-nix-daemon:main|ghcr.io/blogle/anvil-nix-daemon
 EOF
 
 mv "$receipt_tmp" "$receipts"
-trap - EXIT

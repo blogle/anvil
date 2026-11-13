@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "version": "0.1.0",
+  "source_main_sha": "dbd012db5dbefe2212e6d42534931f31ea0ee8da",
+  "merged_sha": "17b4640ff5b27d3282cef9ac9e9a384c223ee4e6",
+  "reason": "Publication failed after writing an Anvil image to GHCR: the immutable hook compared a Docker-daemon manifest digest with a transformed registry manifest. Rebuilding the same source also produced different frontend bytes. Retain the draft, tag, and partial image; publish a corrected successor without reusing their identities."
+}
