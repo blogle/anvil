@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.1] - 2026-11-13
+
+- **fix**: Verify published image content by validated config and ordered layer descriptors
+
 ## [0.1.0] - 2026-11-12
 
 - **feat**: Add durable supervised Campaign and Commission execution with restart-safe scheduling
