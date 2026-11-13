@@ -264,11 +264,11 @@
         "nixpkgs-stable": "nixpkgs-stable"
       },
       "locked": {
-        "lastModified": 1794516225,
-        "narHash": "sha256-AZvlGs5wUIKvzI/gAYABHKF3YmJTKadI13crsFYdyOQ=",
+        "lastModified": 1794530026,
+        "narHash": "sha256-UZkpqOvSYoUCEivlzPnZtm99tzHXtpIbGyTpMMufcVw=",
         "owner": "blogle",
         "repo": "sdlc",
-        "rev": "d99589dc689da047dbf7f4f0f97936ccc6991db8",
+        "rev": "275a247ee9544b011eeb7748c6ebf2cb3b4390ce",
         "type": "github"
       },
       "original": {
