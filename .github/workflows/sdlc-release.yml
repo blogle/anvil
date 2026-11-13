@@ -11,11 +11,12 @@ on:
     types: [completed]
 permissions:
   contents: read
+  packages: write
   pull-requests: read
 jobs:
   release:
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
-    uses: blogle/sdlc/.github/workflows/release.yml@e871939d77e15295e40893f3d6c2bad57e1da508
+    uses: blogle/sdlc/.github/workflows/release.yml@da9d60391bb480d685b795fce4461d11daf1f576
     with:
-      sdlc_ref: e871939d77e15295e40893f3d6c2bad57e1da508
+      sdlc_ref: da9d60391bb480d685b795fce4461d11daf1f576
     secrets: inherit
