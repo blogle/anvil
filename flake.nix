@@ -8,7 +8,7 @@
     # Remove this fork pin after the upstream fix lands in nlewo/nix2container.
     nix2container.url = "github:Dauliac/nix2container/8fd02c842686a528fd37508283853de0ed1462b1";
     nix2containerNixpkgs.follows = "nix2container/nixpkgs";
-    opencode.url = "github:anomalyco/opencode/9b4ec5714d481559990db0a816d5dec19541a814";
+    opencode.url = "github:anomalyco/opencode/83960f8a56b2f2b8ad0b751f23baaf9d0eb65ad9";
     sdlc.url = "github:blogle/sdlc/v2";
     fieldnotes = {
       url = "github:blogle/fieldnotes/60f863bc41820fffda1ad8e950438a19b1dbdc2b";
