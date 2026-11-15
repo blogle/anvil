@@ -65,14 +65,29 @@ test('live-matched workbench shell uses returned records and exposes unavailable
     }
     if (path === '/v1/provider-credentials/fixture-provider/methods') {
       oauthAuth.push(req.headers.authorization)
-      return json(200, { methods: [{ id: 'fixture-auto', label: 'Fixture automatic sign-in' }, { id: 'fixture-code', label: 'Fixture code sign-in' }] })
+      return json(200, { methods: [
+        { id: 'fixture-auto', label: 'Fixture automatic sign-in' },
+        { id: 'fixture-code', label: 'Fixture code sign-in' },
+        { id: 'fixture-form', label: 'Fixture form sign-in', form: [
+          { key: 'account', type: 'string', title: 'Fixture account', required: true },
+          { key: 'remember', type: 'boolean', title: 'Remember fixture account' },
+        ] },
+      ] })
     }
     if (path === '/v1/provider-credentials/fixture-provider/oauth' && req.method === 'POST') {
       oauthAuth.push(req.headers.authorization)
-      const id = JSON.parse(rawBody).method_id === 'fixture-auto' ? 'login-auto-fixture' : 'login-code-fixture'
-      return json(200, { login_id: id, mode: id.includes('auto') ? 'auto' : 'code', time: { expires: Date.now() + 60000 }, url: 'https://provider.example.invalid/sign-in', instructions: 'Fixture only: complete provider sign-in.' })
+      const body = JSON.parse(rawBody)
+      const id = body.method_id === 'fixture-auto' ? 'login-auto-fixture' : body.method_id === 'fixture-code' ? 'login-code-fixture' : 'login-fixture-form-fixture'
+      if (body.method_id === 'fixture-form') assert.deepEqual(body.answer, { account: 'synthetic-form-secret-DO-NOT-STORE', remember: true })
+      else assert.equal(Object.hasOwn(body, 'answer'), false, 'zero-form OAuth request omits answer')
+      const mode = body.method_id === 'fixture-code' ? 'code' : 'auto'
+      return json(200, { login_id: id, mode, time: { expires: Date.now() + 60000 }, url: 'https://provider.example.invalid/sign-in', instructions: 'Fixture only: complete provider sign-in.' })
     }
     if (path === '/v1/provider-credentials/fixture-provider/oauth/login-auto-fixture') {
+      oauthAuth.push(req.headers.authorization); oauthPolls++
+      return json(200, { status: 'complete' })
+    }
+    if (path === '/v1/provider-credentials/fixture-provider/oauth/login-fixture-form-fixture') {
       oauthAuth.push(req.headers.authorization); oauthPolls++
       return json(200, { status: 'complete' })
     }
@@ -181,6 +196,15 @@ test('live-matched workbench shell uses returned records and exposes unavailable
     await page.getByLabel('Sign-in method').selectOption('fixture-auto')
     await page.getByRole('button', { name: 'Start OAuth sign-in' }).click()
     await page.getByText('Sign-in complete.').waitFor({ timeout: 5000 })
+    await page.getByLabel('Sign-in method').selectOption('fixture-form')
+    await page.getByRole('button', { name: 'Start OAuth sign-in' }).click()
+    await page.getByRole('alert').filter({ hasText: 'Complete the required field: Fixture account.' }).waitFor()
+    assert.equal(calls.filter(call => call.method === 'POST' && call.path === '/v1/provider-credentials/fixture-provider/oauth').length, 1, 'missing required form answer blocks POST')
+    await page.getByRole('textbox', { name: 'Fixture account', exact: true }).fill('synthetic-form-secret-DO-NOT-STORE')
+    await page.getByLabel('Remember fixture account').check()
+    await page.getByRole('button', { name: 'Start OAuth sign-in' }).click()
+    await page.getByText('Sign-in complete.').waitFor({ timeout: 5000 })
+    assert.doesNotMatch(await page.locator('body').innerText(), /synthetic-form-secret-DO-NOT-STORE/)
     assert.ok(oauthPolls > 0, 'automatic OAuth mode polls status with GET')
     await page.getByLabel('Sign-in method').selectOption('fixture-code')
     await page.getByRole('button', { name: 'Start OAuth sign-in' }).click()

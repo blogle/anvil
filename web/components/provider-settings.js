@@ -9,6 +9,56 @@ const dateLabel = value => {
   return Number.isNaN(date.getTime()) ? 'Date unavailable' : date.toLocaleString()
 }
 
+const safeHttpUrl = value => {
+  try {
+    const url = new URL(value)
+    return ['http:', 'https:'].includes(url.protocol) ? url.href : ''
+  } catch { return '' }
+}
+
+const inspectForm = form => {
+  if (form === undefined) return { fields: [], valid: true }
+  if (!Array.isArray(form) || form.length === 0) return { fields: [], valid: false }
+  const keys = new Set()
+  let valid = true
+  for (const field of form) {
+    if (!field || typeof field !== 'object' || typeof field.key !== 'string' || !field.key || keys.has(field.key)) { valid = false; continue }
+    if (!['string', 'number', 'integer', 'boolean', 'multiselect', 'external'].includes(field.type)) valid = false
+    if (field.type === 'external' && (!safeHttpUrl(field.url) || field.required !== undefined || field.hidden !== undefined || field.when !== undefined || field.default !== undefined)) valid = false
+    if (field.type === 'string' && field.options !== undefined && (!Array.isArray(field.options) || !field.options.every(option => option && typeof option.value === 'string' && typeof option.label === 'string'))) valid = false
+    if (field.type === 'multiselect' && (!Array.isArray(field.options) || !field.options.every(option => option && typeof option.value === 'string' && typeof option.label === 'string'))) valid = false
+    if (field.required !== undefined && typeof field.required !== 'boolean') valid = false
+    if (field.hidden !== undefined && typeof field.hidden !== 'boolean') valid = false
+    if (field.when !== undefined && (!Array.isArray(field.when) || !field.when.every(condition => condition && keys.has(condition.key) && ['eq', 'neq'].includes(condition.op) && ['string', 'number', 'boolean'].some(type => typeof condition.value === type)))) valid = false
+    if (field.default !== undefined && !(
+      (field.type === 'string' && typeof field.default === 'string') ||
+      ((field.type === 'number' || field.type === 'integer') && typeof field.default === 'number' && Number.isFinite(field.default)) ||
+      (field.type === 'boolean' && typeof field.default === 'boolean') ||
+      (field.type === 'multiselect' && Array.isArray(field.default) && field.default.every(value => typeof value === 'string'))
+    )) valid = false
+    keys.add(field.key)
+  }
+  return { fields: form, valid }
+}
+
+const isActiveField = (field, answers) => !field.hidden && (!field.when || field.when.every(condition => {
+  if (!Object.hasOwn(answers, condition.key)) return false
+  const answer = answers[condition.key]
+  const matches = Array.isArray(answer) ? answer.includes(condition.value) : answer === condition.value
+  return condition.op === 'eq' ? matches : !matches
+}))
+
+const effectiveAnswers = (fields, answers) => {
+  const effective = {}
+  for (const field of fields) {
+    if (!isActiveField(field, effective)) continue
+    if (Object.hasOwn(answers, field.key)) effective[field.key] = answers[field.key]
+    else if (field.default !== undefined) effective[field.key] = field.default
+    else if (field.type === 'boolean') effective[field.key] = false
+  }
+  return effective
+}
+
 export default function ProviderSettings() {
   const [token, setToken] = useState('')
   const [provider, setProvider] = useState('openai')
@@ -20,6 +70,7 @@ export default function ProviderSettings() {
   const [catalogError, setCatalogError] = useState('')
   const [methods, setMethods] = useState([])
   const [methodId, setMethodId] = useState('')
+  const [formAnswers, setFormAnswers] = useState({})
   const [oauth, setOauth] = useState(null)
   const [code, setCode] = useState('')
   const [message, setMessage] = useState('')
@@ -51,6 +102,7 @@ export default function ProviderSettings() {
     setCode('')
     setMethods([])
     setMethodId('')
+    setFormAnswers({})
   }, [provider])
 
   const authorized = () => ({ Authorization: `Bearer ${tokenRef.current}` })
@@ -109,7 +161,9 @@ export default function ProviderSettings() {
       if (mounted.current && providerRef.current.trim() === currentProvider) {
         const available = Array.isArray(result?.methods) ? result.methods : []
         setMethods(available)
-        setMethodId(available.find(method => method.id === 'chatgpt-headless')?.id || available[0]?.id || '')
+        const selectedMethod = available.find(method => method.id === 'chatgpt-headless') || available[0]
+        setMethodId(selectedMethod?.id || '')
+        setFormAnswers({})
       }
     } catch {
       if (mounted.current && providerRef.current.trim() === currentProvider) setError('Sign-in methods are unavailable. Check the operator token, provider ID, and API availability.')
@@ -191,12 +245,35 @@ export default function ProviderSettings() {
     event.preventDefault()
     if (!tokenRef.current.trim()) { setError('Enter the operator token before starting OAuth sign-in.'); return }
     if (!provider.trim() || !methodId) { setError(methods.length ? 'Choose a sign-in method.' : 'Load available sign-in methods first.'); return }
+    const selectedMethod = methods.find(method => method.id === methodId)
+    const form = inspectForm(selectedMethod?.form)
+    if (!form.valid) { setError('This method form is not supported; choose another method.'); return }
+    const values = effectiveAnswers(form.fields, formAnswers)
+    const answer = {}
+    for (const field of form.fields) {
+      if (!isActiveField(field, values) || field.type === 'external') continue
+      const value = values[field.key]
+      if (field.required && (value === undefined || value === '' || (Array.isArray(value) && value.length === 0))) {
+        setError(`Complete the required field: ${field.title || field.key}.`)
+        return
+      }
+      if (value !== undefined && ((field.type === 'number' && (typeof value !== 'number' || !Number.isFinite(value))) || (field.type === 'integer' && (typeof value !== 'number' || !Number.isInteger(value))))) {
+        setError(`Enter a valid ${field.type} for ${field.title || field.key}.`)
+        return
+      }
+      if (typeof value === 'number' && ((field.minimum !== undefined && value < field.minimum) || (field.maximum !== undefined && value > field.maximum))) {
+        setError(`Enter a value within the allowed range for ${field.title || field.key}.`)
+        return
+      }
+      if (value !== undefined) answer[field.key] = value
+    }
     const currentProvider = provider.trim()
     setBusy(true); setError(''); setMessage(''); setOauth(null); setCode('')
     try {
       const result = await request(`/provider-credentials/${encodeURIComponent(currentProvider)}/oauth`, {
-        method: 'POST', headers: authorized(), body: JSON.stringify({ method_id: methodId }),
+        method: 'POST', headers: authorized(), body: JSON.stringify(form.fields.length ? { method_id: methodId, answer } : { method_id: methodId }),
       })
+      setFormAnswers({})
       if (!result?.login_id || !['auto', 'code'].includes(result.mode)) throw new Error('Unexpected OAuth response')
       const expiresAt = Number(result.time?.expires)
       if (!Number.isFinite(expiresAt)) throw new Error('OAuth expiry is missing')
@@ -264,9 +341,31 @@ export default function ProviderSettings() {
       <section className="settings-card" aria-labelledby="oauth-title">
         <h2 id="oauth-title">OAuth sign-in</h2>
         <p className="dim">Sign-in is managed by the provider flow; no browser callback is assumed.</p>
-        <label className="field" htmlFor="oauth-method">Sign-in method<select id="oauth-method" value={methodId} onChange={event => setMethodId(event.target.value)} disabled={!methods.length}><option value="">{methods.length ? 'Choose a method' : 'Load methods to begin'}</option>{methods.map(method => <option key={method.id} value={method.id}>{method.label}</option>)}</select></label>
+        <label className="field" htmlFor="oauth-method">Sign-in method<select id="oauth-method" value={methodId} onChange={event => { setMethodId(event.target.value); setFormAnswers({}); setError(''); setOauth(null) }} disabled={!methods.length}><option value="">{methods.length ? 'Choose a method' : 'Load methods to begin'}</option>{methods.map(method => <option key={method.id} value={method.id}>{method.label}</option>)}</select></label>
+        {(() => {
+          const selected = methods.find(method => method.id === methodId)
+          if (!selected || selected.form === undefined) return null
+          const form = inspectForm(selected.form)
+          if (!form.valid) return <p className="muted" role="alert">This method form is not supported; choose another method.</p>
+          const values = effectiveAnswers(form.fields, formAnswers)
+          return form.fields.map(field => {
+            if (!isActiveField(field, values)) return null
+            if (field.type === 'external') {
+              const href = safeHttpUrl(field.url)
+              return href ? <p className="field" key={field.key}><a href={href} target="_blank" rel="noopener noreferrer">{field.title || field.key}</a>{field.description && <span>{field.description}</span>}</p> : null
+            }
+            const value = values[field.key]
+            const id = `oauth-field-${field.key}`
+            const update = next => setFormAnswers(current => ({ ...current, [field.key]: next }))
+            const title = <>{field.title || field.key}{field.required && <> <span aria-hidden="true">*</span></>}</>
+            if (field.type === 'boolean') return <label className="field oauth-form-check" key={field.key} htmlFor={id}><span>{title}</span><input id={id} type="checkbox" checked={value ?? false} onChange={event => update(event.target.checked)} />{field.description && <span>{field.description}</span>}</label>
+            if (field.type === 'multiselect') return <fieldset className="field oauth-form-options" key={field.key}><legend>{title}</legend>{field.description && <span>{field.description}</span>}{field.options.map(option => <label key={option.value}><input type="checkbox" checked={(value || []).includes(option.value)} onChange={event => update(event.target.checked ? [...(value || []), option.value] : (value || []).filter(item => item !== option.value))} /> {option.label}</label>)}</fieldset>
+            const select = field.type === 'string' && Array.isArray(field.options) && field.options.length > 0
+            return <label className="field" key={field.key} htmlFor={id}>{title}{field.description && <span>{field.description}</span>}{select ? <select id={id} value={value ?? ''} onChange={event => update(event.target.value)}><option value="">Choose an option</option>{field.options.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select> : <input id={id} type={field.type === 'number' || field.type === 'integer' ? 'number' : 'text'} step={field.type === 'integer' ? '1' : undefined} value={value ?? ''} placeholder={field.placeholder} onChange={event => update(field.type === 'number' || field.type === 'integer' ? (event.target.value === '' ? '' : Number(event.target.value)) : event.target.value)} />}</label>
+          })
+        })()}
         <button className="btn" type="button" onClick={loadMethods} disabled={busy}>{busy ? 'Working…' : 'Load methods'}</button>
-        <form onSubmit={startOAuth}><button className="btn primary" disabled={busy || !methods.length}>{busy ? 'Working…' : 'Start OAuth sign-in'}</button></form>
+        <form onSubmit={startOAuth}><button className="btn primary" disabled={busy || !methods.length || (methodId && !inspectForm(methods.find(method => method.id === methodId)?.form).valid)}>{busy ? 'Working…' : 'Start OAuth sign-in'}</button></form>
         {methods.length === 0 && <p className="muted">No sign-in methods loaded. The provider may have no available OAuth methods.</p>}
         {oauth && <div className="oauth-session" aria-live="polite">
           {oauth.url && <p><a href={oauth.url} target="_blank" rel="noopener noreferrer">Open provider sign-in</a></p>}

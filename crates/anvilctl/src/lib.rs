@@ -580,15 +580,15 @@ async fn run_operator_oauth(
             }
         ));
     };
-    let answer = method
-        .form
-        .as_ref()
-        .and_then(Value::as_array)
-        .map(|prompts| {
-            collect_prompt_inputs(Some(prompts))
-                .and_then(|inputs| serde_json::to_value(inputs).context("encoding OAuth answer"))
-        })
-        .transpose()?;
+    let answer = match method.form.as_ref() {
+        None => None,
+        Some(Value::Array(fields)) if fields.is_empty() => None,
+        Some(Value::Array(_)) | Some(_) => {
+            return Err(anyhow!(
+                "This OAuth method needs form answers; use Settings for supported forms"
+            ));
+        }
+    };
     let start = client
         .operator_oauth_start(provider, &method.id, answer, token)
         .await?;
@@ -1110,6 +1110,43 @@ mod tests {
         start.assert_async().await;
         status.assert_async().await;
         assert_eq!(complete.hits_async().await, 0);
+    }
+
+    #[tokio::test]
+    async fn operator_oauth_rejects_methods_with_forms_without_posting() {
+        let server = MockServer::start_async().await;
+        let methods = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/provider-credentials/example/methods")
+                .header("authorization", "Bearer operator-secret");
+            then.status(200).json_body(serde_json::json!({"methods":[
+                {"id":"form-method","label":"Form method","form":[
+                    {"type":"string","key":"region","title":"Region"}
+                ]}
+            ]}));
+        });
+        let start = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/provider-credentials/example/oauth");
+            then.status(200).json_body(serde_json::json!({
+                "login_id":"unexpected","mode":"auto"
+            }));
+        });
+
+        let error = run_operator_oauth(
+            &ApiClient::new(&server.base_url()).unwrap(),
+            "example",
+            Some("form-method"),
+            "operator-secret",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        methods.assert_async().await;
+        assert_eq!(start.hits_async().await, 0);
+        assert!(error
+            .contains("This OAuth method needs form answers; use Settings for supported forms"));
     }
 
     #[tokio::test]
