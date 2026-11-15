@@ -382,6 +382,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
             ProvidersSubcommand::Login { provider, method } => {
+                eprintln!(
+                    "WARNING: Profile-only login does not configure worker credentials. Use provider-credentials oauth PROVIDER or provider-credentials set PROVIDER for workers."
+                );
                 let available = client.providers().await?;
                 let provider_info = available
                     .providers
