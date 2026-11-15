@@ -17,6 +17,19 @@ test "$(grep -c 'name: github-app-credentials' "$repo_root/k8s/base/deployments.
 grep -A2 -B2 -F 'name: github-app-credentials' "$repo_root/k8s/base/deployments.yaml" \
   | grep -Fq 'secretRef:'
 
+profile_manifest="$repo_root/k8s/base/anvil-profile-deployment.yaml"
+require_text 'profile OAuth database data directory' 'value: /anvil/profile/data' "$profile_manifest"
+require_text 'profile OAuth data directory environment' 'name: XDG_DATA_HOME' "$profile_manifest"
+require_text 'profile creates OAuth storage under XDG_DATA_HOME' 'data="$XDG_DATA_HOME/opencode"' "$profile_manifest"
+require_text 'profile restricts OAuth storage permissions' 'chmod 700 "$data"' "$profile_manifest"
+require_text 'legacy auth file link under durable OAuth storage' 'link="$data/auth.json"' "$profile_manifest"
+if grep -Fq '$HOME/.local/share/opencode' "$profile_manifest"; then
+  printf 'manifest-security: profile OAuth storage must not use ephemeral HOME data directory\n' >&2
+  exit 1
+fi
+require_text 'profile PVC mount' 'mountPath: /anvil/profile' "$profile_manifest"
+require_text 'profile PVC claim' 'claimName: anvil-opencode-profile' "$profile_manifest"
+
 secret_manifest="$repo_root/k8s/base/github-app-secret.yaml"
 grep -Fq 'stringData: {}' "$secret_manifest"
 ! grep -Eiq 'gh[pousr]_[A-Za-z0-9_]+|-----BEGIN|private[_-]?key|client[_-]?secret' "$secret_manifest"

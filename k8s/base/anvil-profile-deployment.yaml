@@ -28,10 +28,13 @@ spec:
               set -euo pipefail
               profile=/anvil/profile
               auth="$profile/auth/auth.json"
-              mkdir -p "$profile/config" "$profile/auth" "$HOME/.local/share/opencode"
+              : "${XDG_DATA_HOME:?}"
+              data="$XDG_DATA_HOME/opencode"
+              mkdir -p "$profile/config" "$profile/auth" "$data"
+              chmod 700 "$data"
               if [ ! -e "$auth" ]; then (umask 077; : > "$auth"); fi
               chmod 600 "$auth"
-              link="$HOME/.local/share/opencode/auth.json"
+              link="$data/auth.json"
               if [ -L "$link" ]; then
                 [ "$(readlink "$link")" = "$auth" ] || ln -sfn "$auth" "$link"
               elif [ ! -e "$link" ]; then
@@ -50,6 +53,8 @@ spec:
                   key: ANVIL_OPENCODE_SERVER_PASSWORD
             - name: HOME
               value: /home/anvil
+            - name: XDG_DATA_HOME
+              value: /anvil/profile/data
             - name: OPENCODE_CONFIG
               value: /anvil/profile/config/opencode.jsonc
             - name: OPENCODE_CONFIG_DIR

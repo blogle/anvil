@@ -44,7 +44,7 @@ export default function DecisionHistory({ taskId }) {
   }
 
   const complete = !loading && !error && !hasMore
-  return <section className="data-card decision-history" aria-label="Recorded control decisions">
+  return <section className="panel decision-history" aria-label="Recorded control decisions">
     <h3>Recorded control decisions</h3>
     <p>Durable decision history for this Task (the Commission ID is used as the Task ID). This is recorded history, not a live watchdog view.</p>
     {loading && decisions.length === 0 && <p className="muted">Loading decision history…</p>}
