@@ -34,6 +34,7 @@ use regex::Regex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use store::provider_credentials::{ProviderCredentialMetadata, ProviderSealer};
 
 const ANVIL_REPORTING_SKILL: &str = r#"---
 name: anvil-reporting
@@ -86,6 +87,73 @@ for database_file in /home/anvil/.local/share/opencode/opencode.db /home/anvil/.
     chmod 600 "$database_file"
   fi
 done
+"#
+}
+
+fn workspace_provider_auth_script() -> &'static str {
+    r#"
+umask 077
+# If redemption consumes the capability but import fails before the database is persisted,
+# an operator must manually issue a new capability; this is not a full restart guarantee.
+provider_credential_id="cred_anvil_${ANVIL_PROVIDER_ID}_${ANVIL_PROVIDER_GENERATION}"
+if ! auth_metadata=$(opencode auth list --standalone --format json 2>/dev/null); then
+  echo "Provider credential metadata lookup failed" >&2
+  exit 1
+fi
+if jq -e --arg id "$provider_credential_id" \
+  'any(.[]?.connections[]?; .type == "credential" and .id == $id)' \
+  <<<"$auth_metadata" >/dev/null 2>&1; then
+  provider_credential_already_imported=1
+else
+  provider_credential_already_imported=0
+fi
+if [[ "$provider_credential_already_imported" != 1 ]]; then
+provider_credential_file=$(mktemp /tmp/anvil-provider-key.XXXXXX)
+trap 'rm -f "$provider_credential_file"' EXIT
+if ! curl --fail --silent --show-error --max-time 30 \
+  -H "Authorization: Bearer $ANVIL_PROVIDER_BOOTSTRAP_TOKEN" \
+  "$ANVIL_CREDENTIAL_URL/v1/sessions/$ANVIL_SESSION_ID/credentials/provider" \
+  -o "$provider_credential_file"; then
+  echo "Provider credential bootstrap failed" >&2
+  exit 1
+fi
+if ! jq -e --arg provider "$ANVIL_PROVIDER_ID" --argjson generation "$ANVIL_PROVIDER_GENERATION" \
+  '.provider_id == $provider and .generation == $generation and (.key | type == "string" and length > 0)' \
+  "$provider_credential_file" >/dev/null; then
+  echo "Provider credential response was invalid" >&2
+  exit 1
+fi
+mkdir -p /home/anvil/.local/share/opencode
+mkdir -p /home/anvil/.config/opencode
+printf '%s\n' '{"$schema":"https://opencode.ai/config.json","permission":"allow"}' > /home/anvil/.config/opencode/opencode.jsonc
+chown -R 1000:1000 /home/anvil/.config/opencode
+chmod 700 /home/anvil/.config/opencode
+chmod 600 /home/anvil/.config/opencode/opencode.jsonc
+if ! jq -n --arg id "$provider_credential_id" \
+  --arg integration "$ANVIL_PROVIDER_ID" --arg label "Anvil $ANVIL_PROVIDER_ID" \
+  --slurpfile response "$provider_credential_file" \
+  '[{id:$id,integrationID:$integration,label:$label,active:true,value:{type:"key",key:$response[0].key}}]' \
+  | opencode auth import --standalone >/dev/null 2>&1; then
+  echo "Provider credential import failed" >&2
+  exit 1
+fi
+if [[ ! -f /home/anvil/.local/share/opencode/opencode.db ]]; then
+  echo "Provider credential import did not create its private database" >&2
+  exit 1
+fi
+fi
+chown 1000:1000 /home/anvil/.local/share/opencode
+chmod 700 /home/anvil/.local/share/opencode
+for database_file in /home/anvil/.local/share/opencode/opencode.db /home/anvil/.local/share/opencode/opencode.db-wal /home/anvil/.local/share/opencode/opencode.db-shm; do
+  if [[ -e "$database_file" ]]; then
+    chown 1000:1000 "$database_file"
+    chmod 600 "$database_file"
+  fi
+done
+if [[ -n "${provider_credential_file:-}" ]]; then
+  rm -f "$provider_credential_file"
+  trap - EXIT
+fi
 "#
 }
 
@@ -209,7 +277,34 @@ fn sandbox_manifest(
     env: Vec<Value>,
 ) -> Value {
     let mut env = env;
-    let isolated_go_auth = config.opencode_go_secret.is_some();
+    let mut bootstrap_env = HashMap::new();
+    if let Some(session_id) = env
+        .iter()
+        .find(|entry| entry.get("name").and_then(Value::as_str) == Some("ANVIL_SESSION_ID"))
+        .and_then(|entry| entry.get("value").and_then(Value::as_str))
+    {
+        bootstrap_env.insert("ANVIL_SESSION_ID".to_owned(), session_id.to_owned());
+    }
+    env.retain(|entry| {
+        let Some(name) = entry.get("name").and_then(Value::as_str) else {
+            return true;
+        };
+        if matches!(
+            name,
+            "ANVIL_PROVIDER_BOOTSTRAP_TOKEN" | "ANVIL_PROVIDER_ID" | "ANVIL_PROVIDER_GENERATION"
+        ) {
+            if let Some(value) = entry.get("value").and_then(Value::as_str) {
+                bootstrap_env.insert(name.to_owned(), value.to_owned());
+            }
+            false
+        } else {
+            true
+        }
+    });
+    let provider_bootstrap = bootstrap_env.contains_key("ANVIL_PROVIDER_BOOTSTRAP_TOKEN");
+    // The serving container still needs its session ID for GitHub credential
+    // renewal; only the provider bootstrap capability is init-only.
+    let isolated_go_auth = config.opencode_go_secret.is_some() || provider_bootstrap;
     if isolated_go_auth {
         set_env_value(
             &mut env,
@@ -236,19 +331,71 @@ fn sandbox_manifest(
         volumes.push(json!({"name":"shared-profile","persistentVolumeClaim":{"claimName":config.profile_pvc}}));
     }
     volumes.push(shared_nix_volume(&config.nix_pvc));
-    if let Some(secret) = &config.opencode_go_secret {
-        volumes.push(json!({"name":"opencode-go-auth","secret":{"secretName":secret,"items":[{"key":"go-key","path":"go-key","mode":256}]}}));
-        let mounts = workspace_init["volumeMounts"]
-            .as_array_mut()
-            .expect("init container volumeMounts must be an array");
-        set_named_value(
-            mounts,
-            "opencode-go-auth",
-            json!({"name":"opencode-go-auth","mountPath":"/run/secrets/opencode-go","readOnly":true}),
-        );
+    // Provider database bootstrap takes precedence over Go Secret injection. In
+    // particular, do not mount or execute the Go credential path for a provider
+    // credential session, even if a programmatically-built Config has both set.
+    if !provider_bootstrap {
+        if let Some(secret) = &config.opencode_go_secret {
+            volumes.push(json!({"name":"opencode-go-auth","secret":{"secretName":secret,"items":[{"key":"go-key","path":"go-key","mode":256}]}}));
+            let mounts = workspace_init["volumeMounts"]
+                .as_array_mut()
+                .expect("init container volumeMounts must be an array");
+            set_named_value(
+                mounts,
+                "opencode-go-auth",
+                json!({"name":"opencode-go-auth","mountPath":"/run/secrets/opencode-go","readOnly":true}),
+            );
+            let init_env = workspace_init["env"]
+                .as_array_mut()
+                .expect("init container env must be an array");
+            for (name, value) in [
+                ("HOME", "/home/anvil"),
+                ("XDG_DATA_HOME", "/home/anvil/.local/share"),
+                ("OPENCODE_DISABLE_CHANNEL_DB", "1"),
+            ] {
+                set_named_value(init_env, name, json!({"name":name,"value":value}));
+            }
+            workspace_init["args"] = json!([format!(
+            "{}\n{}\n{}",
+            workspace_init_script(),
+            "umask 077\nmkdir -p /home/anvil/.config/opencode\nprintf '%s\\n' '{\"$schema\":\"https://opencode.ai/config.json\",\"permission\":\"allow\"}' > /home/anvil/.config/opencode/opencode.jsonc\nchown -R 1000:1000 /home/anvil/.config/opencode\nchmod 700 /home/anvil/.config/opencode\nchmod 600 /home/anvil/.config/opencode/opencode.jsonc",
+            workspace_go_auth_script()
+        )]);
+        }
+    }
+    if provider_bootstrap {
         let init_env = workspace_init["env"]
             .as_array_mut()
             .expect("init container env must be an array");
+        for (name, value) in [
+            (
+                "ANVIL_PROVIDER_BOOTSTRAP_TOKEN",
+                bootstrap_env["ANVIL_PROVIDER_BOOTSTRAP_TOKEN"].as_str(),
+            ),
+            (
+                "ANVIL_PROVIDER_ID",
+                bootstrap_env["ANVIL_PROVIDER_ID"].as_str(),
+            ),
+            (
+                "ANVIL_PROVIDER_GENERATION",
+                bootstrap_env["ANVIL_PROVIDER_GENERATION"].as_str(),
+            ),
+            (
+                "ANVIL_SESSION_ID",
+                bootstrap_env
+                    .get("ANVIL_SESSION_ID")
+                    .map(String::as_str)
+                    .unwrap_or(name.strip_prefix("anvil-").unwrap_or(name)),
+            ),
+            ("ANVIL_CREDENTIAL_URL", config.credential_url.as_str()),
+            (
+                "OPENCODE_CONFIG",
+                "/home/anvil/.config/opencode/opencode.jsonc",
+            ),
+            ("OPENCODE_CONFIG_DIR", "/home/anvil/.config/opencode"),
+        ] {
+            set_named_value(init_env, name, json!({"name":name,"value":value}));
+        }
         for (name, value) in [
             ("HOME", "/home/anvil"),
             ("XDG_DATA_HOME", "/home/anvil/.local/share"),
@@ -256,17 +403,20 @@ fn sandbox_manifest(
         ] {
             set_named_value(init_env, name, json!({"name":name,"value":value}));
         }
+        let current_args = workspace_init["args"][0]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
         workspace_init["args"] = json!([format!(
-            "{}\n{}\n{}",
-            workspace_init_script(),
-            "umask 077\nmkdir -p /home/anvil/.config/opencode\nprintf '%s\\n' '{\"$schema\":\"https://opencode.ai/config.json\",\"permission\":\"allow\"}' > /home/anvil/.config/opencode/opencode.jsonc\nchown -R 1000:1000 /home/anvil/.config/opencode\nchmod 700 /home/anvil/.config/opencode\nchmod 600 /home/anvil/.config/opencode/opencode.jsonc",
-            workspace_go_auth_script()
+            "{}\n{}",
+            current_args,
+            workspace_provider_auth_script()
         )]);
     }
     json!({"apiVersion":"agents.x-k8s.io/v1beta1","kind":"Sandbox","metadata":{"name":name,"namespace":config.namespace,"labels":labels,"annotations":annotations},"spec":{"service":true,"podTemplate":{"spec":{"initContainers":[workspace_init],"containers":[container],"volumes":volumes}},"volumeClaimTemplates":[{"metadata":{"name":"workspace"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":config.workspace_size}}}}]}})
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub sandbox_backend: SandboxBackend,
     pub bind_port: u16,
@@ -283,6 +433,10 @@ pub struct Config {
     pub profile_pvc: String,
     pub nix_pvc: String,
     pub credential_url: String,
+    /// Operator bearer token for provider credential management. Never logged.
+    pub provider_operator_token: Option<String>,
+    /// Hex-encoded provider encryption key. Never logged.
+    pub provider_encryption_key: Option<String>,
     pub github_app_id: Option<String>,
     pub github_installation_id: Option<u64>,
     pub github_private_key: Option<String>,
@@ -325,6 +479,48 @@ impl Config {
             return Err(ServiceError::Config(
                 "ANVIL_OPENCODE_GO_SECRET must be a valid Kubernetes Secret name".into(),
             ));
+        }
+        let provider_encryption_key = env::var("ANVIL_PROVIDER_ENCRYPTION_KEY")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let provider_operator_token = env::var("ANVIL_PROVIDER_OPERATOR_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty());
+        if provider_encryption_key.is_some() != provider_operator_token.is_some() {
+            return Err(ServiceError::Config("ANVIL_PROVIDER_ENCRYPTION_KEY and ANVIL_PROVIDER_OPERATOR_TOKEN must be configured together".into()));
+        }
+        if provider_operator_token
+            .as_ref()
+            .is_some_and(|value| value.len() < 32)
+        {
+            return Err(ServiceError::Config(
+                "ANVIL_PROVIDER_OPERATOR_TOKEN must be at least 32 characters".into(),
+            ));
+        }
+        if provider_encryption_key.is_some() && opencode_go_secret.is_some() {
+            return Err(ServiceError::Config("ANVIL_OPENCODE_GO_SECRET cannot be configured while provider credential storage is enabled".into()));
+        }
+        if let Some(key) = provider_encryption_key.as_deref() {
+            ProviderSealer::from_hex(key).map_err(|_| {
+                ServiceError::Config(
+                    "ANVIL_PROVIDER_ENCRYPTION_KEY must be 64 hexadecimal characters".into(),
+                )
+            })?;
+            let url =
+                Url::parse(&get("ANVIL_CREDENTIAL_URL", "http://anvild:8080")).map_err(|_| {
+                    ServiceError::Config(
+                        "ANVIL_CREDENTIAL_URL must be an absolute HTTP(S) URL".into(),
+                    )
+                })?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(ServiceError::Config("ANVIL_CREDENTIAL_URL must be an HTTP(S) origin/path without userinfo, query, or fragment".into()));
+            }
         }
         let configured_opencode_password = env::var("ANVIL_OPENCODE_SERVER_PASSWORD")
             .ok()
@@ -453,6 +649,8 @@ impl Config {
             profile_pvc: get("ANVIL_PROFILE_PVC", "anvil-opencode-profile"),
             nix_pvc: get("ANVIL_NIX_PVC", "anvil-nix"),
             credential_url: get("ANVIL_CREDENTIAL_URL", "http://anvild:8080"),
+            provider_operator_token,
+            provider_encryption_key,
             github_app_id,
             github_installation_id,
             github_private_key,
@@ -613,6 +811,136 @@ pub struct ProviderCompleteRequest {
 struct GithubCredentialRequest {
     #[serde(default)]
     purpose: github::GithubCredentialPurpose,
+}
+
+#[derive(Deserialize)]
+struct ProviderCredentialRequest {
+    key: String,
+}
+
+fn bearer_matches(headers: &HeaderMap, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    let supplied = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .as_bytes();
+    let expected = expected.as_bytes();
+    let mut difference = supplied.len() ^ expected.len();
+    for index in 0..supplied.len().max(expected.len()) {
+        difference |= usize::from(
+            supplied.get(index).copied().unwrap_or(0) ^ expected.get(index).copied().unwrap_or(0),
+        );
+    }
+    difference == 0
+}
+
+fn provider_credentials_enabled(state: &AppState) -> bool {
+    state.provider_sealer.is_some() && state.provider_operator_token.is_some()
+}
+
+async fn list_provider_credentials(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ProviderCredentialMetadata>>, ServiceError> {
+    if !provider_credentials_enabled(&state) {
+        return Err(ServiceError::Provisioning(
+            "provider credential management is disabled".into(),
+        ));
+    }
+    if !bearer_matches(&headers, state.provider_operator_token.as_deref()) {
+        return Err(ServiceError::Unauthorized);
+    }
+    let metadata = state
+        .store()
+        .map_err(|e| ServiceError::Store(e.into()))?
+        .list_provider_keys()
+        .map_err(|e| ServiceError::Store(e.to_string()))?;
+    Ok(Json(metadata))
+}
+
+async fn upsert_provider_credential(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<ProviderCredentialMetadata>, ServiceError> {
+    if !provider_credentials_enabled(&state) {
+        return Err(ServiceError::Provisioning(
+            "provider credential management is disabled".into(),
+        ));
+    }
+    if !bearer_matches(&headers, state.provider_operator_token.as_deref()) {
+        return Err(ServiceError::Unauthorized);
+    }
+    let request: ProviderCredentialRequest = serde_json::from_slice(&body)
+        .map_err(|_| ServiceError::Invalid("invalid provider credential request".into()))?;
+    let sealer = state
+        .provider_sealer
+        .as_deref()
+        .expect("enabled credentials have a sealer");
+    let metadata = state
+        .store()
+        .map_err(|e| ServiceError::Store(e.into()))?
+        .upsert_provider_key(&provider, &request.key, sealer)
+        .map_err(|e| ServiceError::Invalid(e.to_string()))?;
+    Ok(Json(metadata))
+}
+
+async fn provider_bootstrap_credential(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ServiceError> {
+    if !provider_credentials_enabled(&state) {
+        return Err(ServiceError::Provisioning(
+            "provider credential bootstrap is disabled".into(),
+        ));
+    }
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+        .ok_or(ServiceError::Unauthorized)?;
+    // Check session existence and model/provider binding before consuming the capability.
+    let record = state.kube.get(&session_id).await?;
+    let provider = record
+        .session
+        .model
+        .as_deref()
+        .and_then(|model| model.split_once('/').map(|(provider, _)| provider))
+        .ok_or(ServiceError::Unauthorized)?;
+    let token_hash = Sha256::digest(bearer.as_bytes());
+    let binding = state
+        .store()
+        .map_err(|e| ServiceError::Store(e.into()))?
+        .consume_provider_bootstrap(
+            &token_hash,
+            &session_id,
+            provider,
+            chrono::Utc::now().timestamp(),
+        )
+        .map_err(|e| ServiceError::Store(e.to_string()))?;
+    let Some((bound_provider, generation)) = binding else {
+        return Err(ServiceError::Unauthorized);
+    };
+    let sealer = state
+        .provider_sealer
+        .as_deref()
+        .expect("enabled credentials have a sealer");
+    let key = state
+        .store()
+        .map_err(|e| ServiceError::Store(e.into()))?
+        .get_provider_key(&bound_provider, generation, sealer)
+        .map_err(|e| ServiceError::Store(e.to_string()))?
+        .ok_or(ServiceError::Unauthorized)?;
+    Ok(Json(
+        json!({"provider_id":bound_provider,"generation":generation,"key":key}),
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2050,6 +2378,8 @@ pub struct AppState {
     commission_prompt_workers: Arc<Mutex<HashMap<String, Instant>>>,
     capability_signer: Option<github::CapabilitySigner>,
     github: Option<github::GithubBroker>,
+    provider_sealer: Option<Arc<ProviderSealer>>,
+    provider_operator_token: Option<String>,
     #[allow(dead_code)]
     git_pr_checks: GitPrChecks,
 }
@@ -2089,6 +2419,12 @@ impl AppState {
             }
             _ => None,
         };
+        let provider_sealer = config
+            .provider_encryption_key
+            .as_deref()
+            .and_then(|key| ProviderSealer::from_hex(key).ok())
+            .map(Arc::new);
+        let provider_operator_token = config.provider_operator_token.clone();
         Self {
             history: HistoryStore::new(config.history_path.clone()),
             store,
@@ -2106,6 +2442,8 @@ impl AppState {
             commission_prompt_workers: Arc::new(Mutex::new(HashMap::new())),
             capability_signer,
             github,
+            provider_sealer,
+            provider_operator_token,
             git_pr_checks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -2336,10 +2674,19 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
             "/v1/sessions/:id/credentials/github",
             post(github_credentials),
         )
+        .route(
+            "/v1/sessions/:id/credentials/provider",
+            get(provider_bootstrap_credential),
+        )
         .route("/assets/*path", get(static_asset))
         .route("/_next/static/*path", get(next_static_asset))
         .route("/", get(index))
         .route("/v1/providers", get(providers))
+        .route("/v1/provider-credentials", get(list_provider_credentials))
+        .route(
+            "/v1/provider-credentials/:provider",
+            axum::routing::put(upsert_provider_credential),
+        )
         .route("/v1/providers/:provider/login", post(begin_provider_login))
         .route(
             "/v1/providers/:provider/login/:login_id/complete",
@@ -3421,10 +3768,7 @@ async fn run_batch_scheduler_tick(state: &AppState) -> Result<(), ServiceError> 
             } else {
                 claim.task["prompt"].as_str().unwrap_or_default().to_owned()
             },
-            model: claim.task["model"]
-                .as_str()
-                .or_else(|| claim.task["policy"]["model"].as_str())
-                .map(str::to_owned),
+            model: attempt_model(&claim.attempt, &claim.task),
             author_name: None,
             author_email: None,
             session_id_override: Some(session_id.clone()),
@@ -4010,7 +4354,7 @@ async fn run_reconciler_executor_tick(state: &AppState) -> Result<(), String> {
             .map(str::to_owned)
             .unwrap_or_else(|| reconciler_attempt_id(&intent.action_key));
 
-        let _attempt = match (intent.action_state.as_str(), existing) {
+        let attempt = match (intent.action_state.as_str(), existing) {
             ("executing", Some(attempt)) => attempt,
             ("executing", None) => continue,
             ("pending", _) => {
@@ -4076,10 +4420,7 @@ async fn run_reconciler_executor_tick(state: &AppState) -> Result<(), String> {
                         .or_else(|| project["outcome"].as_str())
                         .unwrap_or_default()
                         .to_owned(),
-                    model: project["model"]
-                        .as_str()
-                        .or_else(|| project["policy"]["model"].as_str())
-                        .map(str::to_owned),
+                    model: attempt_model(&attempt, &project),
                     author_name: None,
                     author_email: None,
                     session_id_override: Some(session_id.clone()),
@@ -4548,7 +4889,28 @@ async fn create_attempt(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    body: axum::body::Bytes,
 ) -> Result<(StatusCode, Json<Value>), ServiceError> {
+    let model = parse_create_attempt_model(&body)?
+        .map(|model| {
+            let trimmed = model.trim();
+            let valid = model.len() <= 256
+                && !trimmed.is_empty()
+                && trimmed.split_once('/').is_some_and(|(provider, name)| {
+                    !provider.is_empty()
+                        && !name.is_empty()
+                        && !name.contains('/')
+                        && provider.trim() == provider
+                        && name.trim() == name
+                });
+            if !valid {
+                return Err(ServiceError::Invalid(
+                    "model must be a qualified provider/model string of at most 256 bytes".into(),
+                ));
+            }
+            Ok(trimmed.to_owned())
+        })
+        .transpose()?;
     let key = headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
@@ -4559,11 +4921,11 @@ async fn create_attempt(
     let acceptance = state
         .store()
         .map_err(|error| ServiceError::Store(error.into()))?
-        .create_attempt(&id, &attempt_id, &key)
+        .create_attempt_with_model(&id, &attempt_id, &key, model.as_deref())
         .map_err(|error| match error {
             store::StoreError::NotFound => ServiceError::NotFound,
             store::StoreError::Conflict => ServiceError::Conflict(
-                "attempt idempotency key is bound to a different task".into(),
+                "attempt idempotency key is bound to a different task or model".into(),
             ),
             other => ServiceError::Store(other.to_string()),
         })?;
@@ -4573,6 +4935,29 @@ async fn create_attempt(
         StatusCode::OK
     };
     Ok((status, Json(acceptance.attempt)))
+}
+
+fn parse_create_attempt_model(body: &[u8]) -> Result<Option<String>, ServiceError> {
+    if body.is_empty() {
+        return Ok(None);
+    }
+    let request: CreateAttemptRequest = serde_json::from_slice(body)
+        .map_err(|_| ServiceError::Invalid("invalid create attempt request".into()))?;
+    Ok(request.model)
+}
+
+fn attempt_model(attempt: &Value, task: &Value) -> Option<String> {
+    attempt["model"]
+        .as_str()
+        .or_else(|| task["model"].as_str())
+        .or_else(|| task["policy"]["model"].as_str())
+        .map(str::to_owned)
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateAttemptRequest {
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -4722,6 +5107,7 @@ async fn idempotency_middleware(
             && matches!(path.as_str(), "/v1/tasks" | "/v1/tasks/graph"))
         || (path.starts_with("/v1/tasks/") && path.ends_with("/attempts"))
         || path.ends_with("/credentials/github")
+        || path.starts_with("/v1/provider-credentials")
         || !is_mutation
         || !path.starts_with("/v1/")
     {
@@ -5063,6 +5449,63 @@ async fn create(
                 .mint(&id, &r.repository)
                 .map_err(ServiceError::Config)?,
         ));
+    }
+    if let (Some(model), Some(sealer)) = (r.model.as_deref(), s.provider_sealer.as_deref()) {
+        if let Some((provider, model_id)) = model.split_once('/') {
+            if !provider.is_empty() && !model_id.is_empty() {
+                if s.config.sandbox_backend != SandboxBackend::Kubernetes {
+                    return Err(ServiceError::Provisioning(
+                        "provider credential bootstrap requires the Kubernetes sandbox init container".into(),
+                    ));
+                }
+                let metadata = s
+                    .store()
+                    .map_err(|e| ServiceError::Store(e.into()))?
+                    .list_provider_keys()
+                    .map_err(|e| ServiceError::Store(e.to_string()))?
+                    .into_iter()
+                    .filter(|item| item.provider_id == provider)
+                    .max_by_key(|item| item.generation);
+                if metadata.is_none() && provider_credentials_enabled(&s) {
+                    return Err(ServiceError::Invalid(format!(
+                        "model provider {provider} has no stored credential"
+                    )));
+                }
+                if let Some(metadata) = metadata {
+                    // Ensure the configured generation is decryptable before making a worker.
+                    let _credential = s
+                        .store()
+                        .map_err(|e| ServiceError::Store(e.into()))?
+                        .get_provider_key(provider, metadata.generation, sealer)
+                        .map_err(|e| ServiceError::Store(e.to_string()))?
+                        .ok_or_else(|| {
+                            ServiceError::Provisioning(
+                                "configured provider credential is unavailable".into(),
+                            )
+                        })?;
+                    let token = uuid::Uuid::new_v4().to_string();
+                    let token_hash = Sha256::digest(token.as_bytes());
+                    s.store()
+                        .map_err(|e| ServiceError::Store(e.into()))?
+                        .insert_provider_bootstrap(
+                            &token_hash,
+                            &id,
+                            provider,
+                            metadata.generation,
+                            chrono::Utc::now().timestamp().saturating_add(600),
+                        )
+                        .map_err(|e| ServiceError::Store(e.to_string()))?;
+                    sandbox_env.extend([
+                        ("ANVIL_PROVIDER_BOOTSTRAP_TOKEN".into(), token),
+                        ("ANVIL_PROVIDER_ID".into(), provider.into()),
+                        (
+                            "ANVIL_PROVIDER_GENERATION".into(),
+                            metadata.generation.to_string(),
+                        ),
+                    ]);
+                }
+            }
+        }
     }
     sandbox_env.extend(git_author_environment(
         r.author_name.as_deref(),
@@ -9279,6 +9722,158 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
+    fn create_attempt_body_accepts_absent_body_and_rejects_malformed_json() {
+        assert_eq!(parse_create_attempt_model(b"").unwrap(), None);
+        assert_eq!(
+            parse_create_attempt_model(br#"{"model":"openai/gpt-5"}"#).unwrap(),
+            Some("openai/gpt-5".into())
+        );
+        assert!(matches!(
+            parse_create_attempt_model(b"{"),
+            Err(ServiceError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_credential_management_denies_missing_operator_bearer() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.store_path = directory.path().join("controller.sqlite3");
+        let mut state = AppState::new(config, FakeSandbox);
+        state.provider_sealer = Some(Arc::new(
+            ProviderSealer::from_hex(
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            )
+            .unwrap(),
+        ));
+        state.provider_operator_token = Some("operator-token-which-is-at-least-32-chars".into());
+        let response = router_with_web_root(state, directory.path().to_owned())
+            .oneshot(
+                Request::put("/v1/provider-credentials/openai")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"key":"must-not-be-persisted"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("must-not-be-persisted"));
+    }
+
+    #[test]
+    fn provider_bootstrap_capability_is_init_only_and_key_never_enters_manifest() {
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.opencode_go_secret = Some("go-auth-secret".into());
+        let init = json!({"name":"init","image":"sandbox","command":["/bin/bash","-c"],"args":[workspace_init_script()],"env":[{"name":"ANVIL_PROJECT","value":"project"}],"volumeMounts":[{"name":"workspace","mountPath":"/home/anvil"}]});
+        let manifest = sandbox_manifest(
+            &config,
+            "anvil-session",
+            labels(),
+            serde_json::Map::new(),
+            init,
+            vec![
+                json!({"name":"ANVIL_SESSION_ID","value":"session"}),
+                json!({"name":"ANVIL_PROVIDER_BOOTSTRAP_TOKEN","value":"one-time-capability"}),
+                json!({"name":"ANVIL_PROVIDER_ID","value":"openai"}),
+                json!({"name":"ANVIL_PROVIDER_GENERATION","value":"2"}),
+            ],
+        );
+        let serialized = manifest.to_string();
+        assert!(
+            manifest["spec"]["podTemplate"]["spec"]["initContainers"][0]["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["name"] == "ANVIL_PROVIDER_BOOTSTRAP_TOKEN")
+        );
+        assert_eq!(
+            manifest["spec"]["podTemplate"]["spec"]["initContainers"][0]["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == "ANVIL_SESSION_ID")
+                .and_then(|entry| entry["value"].as_str()),
+            Some("session")
+        );
+        assert!(
+            manifest["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["name"] == "ANVIL_SESSION_ID" && entry["value"] == "session")
+        );
+        assert!(manifest["spec"]["podTemplate"]["spec"]["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|volume| volume["name"] != "opencode-go-auth"));
+        assert!(
+            manifest["spec"]["podTemplate"]["spec"]["initContainers"][0]["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|mount| mount["name"] != "opencode-go-auth")
+        );
+        assert!(
+            !manifest["spec"]["podTemplate"]["spec"]["initContainers"][0]["args"]
+                .to_string()
+                .contains("OpenCode Go credential import")
+        );
+        let script = manifest["spec"]["podTemplate"]["spec"]["initContainers"][0]["args"][0]
+            .as_str()
+            .unwrap();
+        let metadata_check = script
+            .find("opencode auth list --standalone --format json")
+            .unwrap();
+        let curl = script.find("curl --fail --silent --show-error").unwrap();
+        assert!(
+            metadata_check < curl,
+            "metadata lookup must precede redemption"
+        );
+        assert!(script.contains("any(.[]?.connections[]?; .type == \"credential\" and .id == $id)"));
+        assert!(script.contains(
+            "provider_credential_id=\"cred_anvil_${ANVIL_PROVIDER_ID}_${ANVIL_PROVIDER_GENERATION}\""
+        ));
+        assert!(script.contains("--arg id \"$provider_credential_id\""));
+        assert!(!script.contains("auth export"));
+        assert!(script.contains("opencode auth list --standalone --format json 2>/dev/null"));
+        assert!(script.contains("auth_metadata=$(opencode auth list"));
+        assert!(
+            script.find("opencode auth list").unwrap()
+                < script
+                    .find("chmod 700 /home/anvil/.local/share/opencode")
+                    .unwrap()
+        );
+        assert!(!serialized.contains("must-not-be-persisted"));
+        assert!(!serialized.contains("provider-secret"));
+        assert!(
+            !manifest["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
+                .to_string()
+                .contains("one-time-capability")
+        );
+    }
+
+    #[test]
+    fn attempt_model_overrides_task_and_policy_model() {
+        let task = json!({"model":"task/model","policy":{"model":"policy/model"}});
+        assert_eq!(
+            attempt_model(&json!({"model":"attempt/model"}), &task).as_deref(),
+            Some("attempt/model")
+        );
+        assert_eq!(
+            attempt_model(&json!({}), &task).as_deref(),
+            Some("task/model")
+        );
+        assert_eq!(
+            attempt_model(&json!({}), &json!({"policy":{"model":"policy/model"}})).as_deref(),
+            Some("policy/model")
+        );
+    }
+
+    #[test]
     fn runtime_only_creation_has_no_initial_run_id() {
         assert_eq!(RunRecord::default().run_id(), None);
     }
@@ -12236,6 +12831,8 @@ mod tests {
             profile_pvc: "anvil-opencode-profile".into(),
             nix_pvc: "anvil-nix".into(),
             credential_url: "http://anvild:8080".into(),
+            provider_operator_token: None,
+            provider_encryption_key: None,
             github_app_id: None,
             github_installation_id: None,
             github_private_key: None,
@@ -12250,6 +12847,21 @@ mod tests {
             provisioning_max_attempts: 3,
             provisioning_retry_base: Duration::from_millis(10),
         }
+    }
+
+    #[test]
+    fn app_state_uses_provider_credentials_from_config() {
+        let mut config = config("http://127.0.0.1:4097".into());
+        config.provider_operator_token = Some("operator-token-at-least-32-characters".into());
+        config.provider_encryption_key =
+            Some("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into());
+        let state = AppState::new(config, FakeSandbox);
+        assert!(provider_credentials_enabled(&state));
+        assert_eq!(
+            state.provider_operator_token.as_deref(),
+            Some("operator-token-at-least-32-characters")
+        );
+        assert!(state.provider_sealer.is_some());
     }
 
     #[tokio::test]
