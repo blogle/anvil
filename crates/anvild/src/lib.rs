@@ -6043,7 +6043,8 @@ async fn create(
         })?;
     let model = match r.model.as_deref() {
         Some(requested) => {
-            let model = oc.resolve_model(requested).await?;
+            let model =
+                resolve_model_after_catalog_warmup(&oc, requested, Duration::from_secs(30)).await?;
             s.kube.set_model(&id, &model.qualified_id()).await?;
             Some(model)
         }
@@ -6428,6 +6429,46 @@ async fn wait_opencode(opencode: &OpenCode, timeout: Duration) -> Result<(), Ser
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
+
+async fn resolve_model_after_catalog_warmup(
+    opencode: &OpenCode,
+    requested: &str,
+    timeout: Duration,
+) -> Result<OpenCodeModel, ServiceError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_unavailable = None;
+    loop {
+        let resolution =
+            match tokio::time::timeout_at(deadline, opencode.resolve_model(requested)).await {
+                Ok(resolution) => resolution,
+                Err(_) => {
+                    return Err(last_unavailable.unwrap_or_else(|| {
+                        ServiceError::OpenCode("model catalog warmup timed out".into())
+                    }));
+                }
+            };
+        match resolution {
+            Ok(model) => return Ok(model),
+            Err(error) => {
+                let retry = matches!(
+                    &error,
+                    ServiceError::OpenCode(message)
+                        if message.starts_with("requested model is unavailable:")
+                );
+                if !retry {
+                    return Err(error);
+                }
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(error);
+                }
+                last_unavailable = Some(error);
+                tokio::time::sleep_until((now + Duration::from_millis(250)).min(deadline)).await;
+            }
+        }
+    }
+}
+
 fn service_url(sess: &Session, _c: &Config) -> String {
     let host = if sess.service.is_empty() {
         format!("anvil-{}", sess.id)
@@ -17010,6 +17051,65 @@ mod tests {
             error.to_string(),
             "OpenCode error: requested model is unavailable: gpt-5.6-luna"
         );
+    }
+
+    #[tokio::test]
+    async fn waits_for_v2_model_catalog_warmup_and_rejects_disabled_models_at_timeout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let catalog_calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/info",
+                get(|| async { Json(json!({"version":"2.0.26+test"})) }),
+            )
+            .route(
+                "/api/model",
+                get(|State(calls): State<Arc<AtomicUsize>>| async move {
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
+                    let data = if call == 0 {
+                        json!([])
+                    } else {
+                        json!([{"modelID":"gpt-5.6-luna","providerID":"openai","enabled":true}])
+                    };
+                    Json(json!({"data":data}))
+                }),
+            )
+            .with_state(catalog_calls.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = OpenCode::new(format!("http://127.0.0.1:{port}"), Duration::from_secs(5));
+        let model =
+            resolve_model_after_catalog_warmup(&client, "gpt-5.6-luna", Duration::from_secs(2))
+                .await
+                .unwrap();
+        assert_eq!(model.qualified_id(), "openai/gpt-5.6-luna");
+        assert!(catalog_calls.load(Ordering::SeqCst) >= 2);
+        server.abort();
+
+        let disabled_server = MockServer::start();
+        disabled_server.mock(|when, then| {
+            when.method(GET).path("/api/info");
+            then.status(200).json_body(json!({"version":"2.0.26+test"}));
+        });
+        let disabled = disabled_server.mock(|when, then| {
+            when.method(GET).path("/api/model");
+            then.status(200).json_body(json!({"data":[
+                {"modelID":"gpt-5.6-luna","providerID":"openai","enabled":false}
+            ]}));
+        });
+        let client = OpenCode::new(disabled_server.base_url(), Duration::from_secs(5));
+        let error =
+            resolve_model_after_catalog_warmup(&client, "gpt-5.6-luna", Duration::from_millis(300))
+                .await
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .starts_with("OpenCode error: requested model is unavailable: gpt-5.6-luna"));
+        assert!(disabled.hits_async().await >= 2);
     }
 
     #[tokio::test]
