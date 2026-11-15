@@ -4,65 +4,107 @@ import { createServer } from 'node:http'
 import { readFile } from 'node:fs/promises'
 import { extname, join, normalize, sep } from 'node:path'
 import { execFileSync } from 'node:child_process'
+import { mkdir } from 'node:fs/promises'
 import { chromium } from '@playwright/test'
 
-test('static workspace routes render and campaign contract validation is usable', async t => {
+test('live-matched workbench shell uses returned records and exposes unavailable data honestly', async t => {
   const root = join(import.meta.dirname, 'out')
-  let campaignSubmissions = 0, inboxCalls = 0, decisionCalls = 0, credentialWrites = 0
-  const credentialAuth = []
-  const decisionCursors = []
+  const screenshotDir = '/tmp/opencode'
+  await mkdir(screenshotDir, { recursive: true })
+  const calls = []
+  const campaignKeys = [], credentialAuth = [], oauthAuth = []
+  let createAttempts = 0, startAttempts = 0, oauthPolls = 0
+  const startKeys = [], startVersions = []
+  const inbox = {
+    schema_version: 1,
+    items: [
+      { campaign_id: 'campaign-fixture-1', commission_id: 'commission-focus-1', local_key: 'first-focused', objective: 'First recorded focus item', commission: { state: 'active', version: 3, start_authorized: false, obligations: [{ id: 'required', version: 1, requirement: 'Retain the work contract', acceptance_expectations: ['Contract remains visible'] }], execution_target: { kind: 'git_repository', repository: 'https://example.invalid/repo' } }, task: { state: 'paused', controller_mode: 'operator', operator_hold: true, hold_reason: 'Operator review', repository: 'fixture-repo' }, start_after: [], integration_after: [], attempt: { attempt_id: 'attempt-fixture-1', ordinal: 1, state: 'failed', session_id: 'session-fixture-1', failure_reason: 'fixture failure' } },
+      { campaign_id: 'campaign-fixture-1', commission_id: 'commission-second', local_key: 'second', objective: 'Second Commission', commission: { state: 'draft', version: 1, start_authorized: false, obligations: [] }, task: { state: 'queued', controller_mode: 'automatic', operator_hold: false }, start_after: [], integration_after: [], attempt: null },
+    ],
+    next_cursor: null,
+  }
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost'), path = url.pathname
-    if (path === '/v1/provider-credentials') {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const rawBody = Buffer.concat(chunks).toString()
+    calls.push({ method: req.method, path, auth: req.headers.authorization, body: rawBody })
+    const json = (status, value) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)) }
+    if (path === '/v1/inbox') return json(200, inbox)
+    if (path === '/v1/sessions') return json(200, [{ id: 'session-fixture-1', project: 'Fixture session', environment_state: 'ready', execution_state: 'idle' }])
+    if (path === '/v1/capacity') return json(200, { running: 2, provisioning: 1, global_limit: 8, available_slots: 5, queued_runnable: 3 })
+    if (path === '/v1/commissions/commission-focus-1') return json(200, { campaign_id: 'campaign-fixture-1', commission_id: 'commission-focus-1', objective: 'First recorded focus item', state: 'active', version: 3, start_authorized: false, obligations: [{ id: 'required', version: 1, requirement: 'Retain the work contract', acceptance_expectations: ['Contract remains visible'] }], execution_target: { kind: 'git_repository' } })
+    if (path === '/v1/commissions/commission-focus-1/start' && req.method === 'POST') {
+      startAttempts++; startKeys.push(req.headers['idempotency-key'])
+      const body = JSON.parse(rawBody); startVersions.push(body.expected_version)
+      assert.equal(body.expected_version, 3)
+      assert.ok(req.headers['idempotency-key'], 'Commission start requires an idempotency key')
+      if (startAttempts === 1) return json(503, { message: 'temporary fixture outage' })
+      return json(202, { commission_id: 'commission-focus-1', state: 'accepted', expected_version: 3 })
+    }
+    if (path === '/v1/tasks/commission-focus-1/attempts') return json(200, { attempts: [{ attempt_id: 'attempt-fixture-1', ordinal: 1, state: 'failed', session_id: 'session-fixture-1' }] })
+    if (path === '/v1/sessions/session-fixture-1/activity' || path === '/v1/sessions/session-fixture-1/diff') { res.writeHead(503, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ message: 'Unavailable in fixture' })) }
+    if (path === '/v1/campaigns/campaign-fixture-1' && req.method === 'GET') return json(200, { campaign: { purpose: 'Fixture campaign purpose', shared_contracts: [] }, commissions: [{ commission_id: 'commission-focus-1', objective: 'First recorded focus item', start_after: [], integration_after: [] }] })
+    if (path === '/v1/campaigns' && req.method === 'POST') {
+      createAttempts++; campaignKeys.push(req.headers['idempotency-key'])
+      if (createAttempts === 1) return json(503, { message: 'temporary fixture outage' })
+      return json(201, { campaign_id: 'campaign-created-fixture' })
+    }
+    if (path === '/v1/provider-credentials' && req.method === 'GET') {
       credentialAuth.push(req.headers.authorization)
-      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify([{ provider_id: 'openai', generation: 1, created_at: '2026-01-01T00:00:00Z' }])); return
+      return json(200, [{ provider_id: 'fixture-provider', generation: 2, created_at: '2026-10-01T00:00:00Z', kind: 'oauth' }])
     }
-    if (req.method === 'PUT' && path === '/v1/provider-credentials/openai') {
+    if (path === '/v1/provider-credentials/catalog' && req.method === 'GET') {
       credentialAuth.push(req.headers.authorization)
-      let body = ''
-      for await (const chunk of req) body += chunk
-      assert.deepEqual(JSON.parse(body), { key: 'fixture-api-key' })
-      credentialWrites++
-      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ provider_id: 'openai', generation: 2, created_at: '2026-01-02T00:00:00Z' })); return
+      // Mirror the backend's safe projection: unsupported entries and their secret-like fields are omitted.
+      return json(200, [
+        { id: 'fixture-provider', name: 'Fixture Provider' },
+        { id: 'openai', name: 'OpenAI' },
+        { id: 'opencode-go', name: 'OpenCode Go' },
+      ])
     }
-    if (path === '/v1/inbox') {
-      inboxCalls++
-      const item = (commission_id, local_key, overrides = {}) => ({ campaign_id: 'campaign/1', commission_id, local_key, objective: `Work ${local_key}`, commission: { state: 'active', version: 2, start_authorized: true }, task: { state: 'running', controller_mode: 'automatic', operator_hold: false, hold_reason: null, retry_due_ms: null }, start_after: [], integration_after: [], attempt: { attempt_id: 'attempt-1', ordinal: 1, state: 'running', failure_reason: null, session_id: 'session/1' }, ...overrides })
-      const first = item('commission/1', 'held', { task: { state: 'paused', controller_mode: 'operator', operator_hold: true, hold_reason: 'Review requested', retry_due_ms: 1234 }, attempt: null })
-      const second = item('commission/2', 'normal', { commission: { state: 'draft', version: 1, start_authorized: false } })
-      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ schema_version: 1, items: url.searchParams.has('after') ? [second] : [first], next_cursor: url.searchParams.has('after') ? null : 'page-2' })); return
+    if (path === '/v1/provider-credentials/fixture-provider/methods') {
+      oauthAuth.push(req.headers.authorization)
+      return json(200, { methods: [
+        { id: 'fixture-auto', label: 'Fixture automatic sign-in' },
+        { id: 'fixture-code', label: 'Fixture code sign-in' },
+        { id: 'fixture-form', label: 'Fixture form sign-in', form: [
+          { key: 'account', type: 'string', title: 'Fixture account', required: true },
+          { key: 'remember', type: 'boolean', title: 'Remember fixture account' },
+        ] },
+      ] })
     }
-    if (req.method === 'POST' && path === '/v1/campaigns') {
-      campaignSubmissions++
-      const status = campaignSubmissions === 1 ? 503 : 422
-      res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify({ message: status === 503 ? 'service unavailable' : 'invalid campaign' })); return
+    if (path === '/v1/provider-credentials/fixture-provider/oauth' && req.method === 'POST') {
+      oauthAuth.push(req.headers.authorization)
+      const body = JSON.parse(rawBody)
+      const id = body.method_id === 'fixture-auto' ? 'login-auto-fixture' : body.method_id === 'fixture-code' ? 'login-code-fixture' : 'login-fixture-form-fixture'
+      if (body.method_id === 'fixture-form') assert.deepEqual(body.answer, { account: 'synthetic-form-secret-DO-NOT-STORE', remember: true })
+      else assert.equal(Object.hasOwn(body, 'answer'), false, 'zero-form OAuth request omits answer')
+      const mode = body.method_id === 'fixture-code' ? 'code' : 'auto'
+      return json(200, { login_id: id, mode, time: { expires: Date.now() + 60000 }, url: 'https://provider.example.invalid/sign-in', instructions: 'Fixture only: complete provider sign-in.' })
     }
-    if (path === '/v1/commissions/decision-task') {
-      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ campaign_id: 'campaign/1', local_key: 'history', objective: 'History fixture', version: 1, state: 'active', start_authorized: true, obligations: [], execution_target: {} })); return
+    if (path === '/v1/provider-credentials/fixture-provider/oauth/login-auto-fixture') {
+      oauthAuth.push(req.headers.authorization); oauthPolls++
+      return json(200, { status: 'complete' })
     }
-    if (path === '/v1/tasks/decision-task/decisions') {
-      decisionCalls++
-      decisionCursors.push(url.searchParams.get('cursor'))
-      const first = { decision_sequence: 1, rule_id: 'no_progress', logical_time_ms: 1234, authorization_blocked_reason: 'shadow_mode', canonical_actions_json: [{ kind: 'observe', content: 'fixture-secret-prompt' }] }
-      const second = { decision_sequence: 2, rule_id: 'retry', logical_time_ms: 2345, authorization_blocked_reason: null, canonical_actions_json: [{ kind: 'retry' }] }
-      res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify(url.searchParams.has('cursor') ? { decisions: [second], next_cursor: null } : { decisions: [first], next_cursor: 987654 })); return
+    if (path === '/v1/provider-credentials/fixture-provider/oauth/login-fixture-form-fixture') {
+      oauthAuth.push(req.headers.authorization); oauthPolls++
+      return json(200, { status: 'complete' })
     }
-    if (path === '/v1/sessions') {
-      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify([{ id: 'safe/?#id', project: 'Fixture session', environment_state: 'ready', execution_state: 'idle' }, { id: 'other', project: 'Failed activity fixture' }])); return
+    if (path === '/v1/provider-credentials/fixture-provider/oauth/login-code-fixture/complete' && req.method === 'POST') {
+      oauthAuth.push(req.headers.authorization)
+      assert.deepEqual(JSON.parse(rawBody), { code: 'synthetic-code-DO-NOT-STORE' })
+      return json(204, null)
     }
-    if (path === '/v1/sessions/safe%2F%3F%23id/activity') {
-      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ session: { opencode_session_id: 'ses/safe?#id' }, opencode_url: 'https://opencode.example.test/path', preview_url: 'javascript:alert(1)', attach_command: 'anvilctl sessions attach safe/?#id', events: [{ id: 'fixture-event', kind: 'message', title: 'Agent', detail: 'Fixture conversation' }] })); return
-    }
-    if (path === '/v1/sessions/other/activity') {
-      res.writeHead(503, { 'content-type': 'application/json' }); res.end(JSON.stringify({ message: 'activity unavailable' })); return
+    if (path === '/v1/provider-credentials/fixture-provider/oauth/login-code-fixture') {
+      oauthAuth.push(req.headers.authorization)
+      return json(200, { status: 'complete' })
     }
     const safe = normalize(decodeURIComponent(path)).replace(/^([/\\]|\.\.(?:[/\\]|$))+/, '')
-    if (safe.split(sep).includes('..')) { res.writeHead(404); res.end('not found'); return }
+    if (safe.split(sep).includes('..')) { res.writeHead(404); return res.end('not found') }
     const asset = join(root, safe, path.endsWith('/') || !extname(path) ? 'index.html' : '')
     try {
-      const body = await readFile(asset)
-      const ext = extname(asset)
+      const body = await readFile(asset), ext = extname(asset)
       res.writeHead(200, { 'content-type': ext === '.html' ? 'text/html' : ext === '.js' ? 'text/javascript' : ext === '.css' ? 'text/css' : 'application/octet-stream' }); res.end(body)
     } catch { res.writeHead(404); res.end('not found') }
   })
@@ -71,105 +113,136 @@ test('static workspace routes render and campaign contract validation is usable'
   try {
     const executablePath = process.env.CHROMIUM_PATH || execFileSync('which', ['chromium'], { encoding: 'utf8' }).trim()
     browser = await chromium.launch({ executablePath, args: ['--no-sandbox'] })
-    const page = await browser.newPage({ viewport: { width: 1360, height: 900 } })
-    await page.goto(`http://127.0.0.1:${server.address().port}/`)
+    const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 })
+    const base = `http://127.0.0.1:${server.address().port}`
+    await page.goto(base)
     await page.getByRole('heading', { name: 'Inbox' }).waitFor()
-    assert.doesNotMatch(await page.locator('body').innerText(), /Connected to local Anvil API|LOCAL API/, 'workspace makes no unconditional API connection claim')
-    assert.match(await page.locator('.crumb').textContent(), /Workspace\s*\/\s*Inbox/, 'home breadcrumb matches the Inbox navigation label')
-    await page.getByText('Operator hold: Review requested').waitFor()
-    assert.match(await page.locator('.inbox-note').textContent(), /not an assessment of scheduler readiness/)
-    assert.match(await page.locator('.inbox-panel').textContent(), /No attempt recorded/)
-    assert.equal(inboxCalls, 1, 'first page loads without fetching all pages')
-    await page.getByRole('button', { name: 'Everything' }).click()
-    await page.getByRole('button', { name: 'Load 20 more' }).click()
-    await page.getByText('Work normal').waitFor()
-    assert.equal(inboxCalls, 2, 'next page is fetched only after explicit request')
-    await page.getByRole('button', { name: 'Focused' }).click()
-    await page.getByText('Commission v1 · Start not authorized').waitFor()
-    assert.match(await page.locator('.inbox-panel').textContent(), /Start not authorized/)
-    assert.equal(await page.locator('.inbox-links a').count(), 5, 'campaign, commission, and latest-attempt session links are present')
-    await page.getByRole('heading', { name: 'Sessions' }).waitFor()
-    await page.getByText('Fixture session').waitFor()
-    await page.getByRole('link', { name: 'Campaigns' }).click()
-    await page.getByRole('heading', { name: /Create a Campaign/ }).waitFor()
-    await page.locator('#submission').fill('{"campaign":{"purpose":""},"commissions":[]}')
-    await page.getByRole('button', { name: /Submit Campaign/ }).click()
-    await page.locator('.notice.error').waitFor()
-    assert.match(await page.locator('.notice.error').textContent(), /purpose is required/)
-    await page.locator('#submission').fill(JSON.stringify({ campaign: { purpose: 'Browser test campaign', shared_contracts: [] }, commissions: [{
-      local_key: 'one', objective: 'Browser test', obligations: [{ id: 'test', version: 1, requirement: 'Works', acceptance_expectations: ['Works'] }],
-    }] }))
-    const resetCampaign = page.getByRole('button', { name: 'Reset rejected request' })
-    assert.equal(await resetCampaign.isDisabled(), true, 'must not reset before a definitive rejection')
+    await page.getByText('First recorded focus item').first().waitFor()
+    const nav = page.getByRole('navigation', { name: 'Primary application areas' })
+    assert.equal(await nav.getByRole('link').count(), 4)
+    for (const label of ['Inbox', 'Campaigns', 'Operations', 'Settings']) assert.equal(await nav.getByRole('link', { name: label }).count(), 1, `${label} is an exact accessible navigation label`)
+    const colors = await page.evaluate(() => ({ app: getComputedStyle(document.querySelector('.anvil-app')).backgroundColor, panel: getComputedStyle(document.querySelector('.primary-view')).backgroundColor }))
+    assert.equal(colors.app, 'rgb(33, 28, 24)')
+    assert.equal(colors.panel, 'rgb(40, 35, 30)')
+    assert.equal(await page.locator('.area-nav').evaluate(el => Math.round(el.getBoundingClientRect().width)), 184)
+    assert.equal(await page.locator('.inspector').evaluate(el => Math.round(el.getBoundingClientRect().width)), 390)
+    assert.equal(await page.locator('.commission-row[aria-current="true"]').innerText().then(text => text.includes('First recorded focus item')), true, 'first returned recorded focus item is selected by default')
+    await page.screenshot({ path: `${screenshotDir}/anvil-workbench-desktop-inbox.png`, fullPage: true })
+    const tabs = page.getByRole('tablist', { name: 'Commission details' }).getByRole('tab')
+    assert.deepEqual(await tabs.allTextContents(), ['Overview', 'Obligations', 'Diff', 'Activity', 'Attempts'])
+    await tabs.nth(0).click()
+    assert.equal(startAttempts, 0, 'no Commission start is sent before an explicit click')
+    await page.getByRole('button', { name: 'Start Commission' }).click()
+    await page.locator('.mock-actions [role="alert"]').filter({ hasText: 'outcome is uncertain' }).waitFor()
+    assert.equal(startAttempts, 1)
+    await page.getByRole('button', { name: 'Start Commission' }).click()
+    await page.locator('.inspector-title').filter({ hasText: 'First recorded focus item' }).waitFor()
+    assert.equal(startAttempts, 2, 'exactly two explicit start requests are issued for the retry')
+    assert.ok(startKeys[0] && startKeys[0] === startKeys[1], 'uncertain Commission start retry retains the same idempotency key')
+    assert.deepEqual(startVersions, [3, 3])
+    assert.equal(calls.filter(call => call.method === 'POST' && call.path === '/v1/commissions/commission-focus-1/start').length, 2, 'there are no unsolicited Commission starts')
+    await tabs.nth(2).click()
+    await page.getByRole('alert').filter({ hasText: 'Could not load diff' }).waitFor()
+    assert.match(await page.locator('[role="tabpanel"]').innerText(), /Could not load diff/)
+    await page.screenshot({ path: `${screenshotDir}/anvil-workbench-selected-inspector.png`, fullPage: true })
+    await tabs.nth(3).click()
+    await page.getByRole('alert').filter({ hasText: 'Could not load activity' }).waitFor()
+    await page.getByRole('navigation', { name: 'Primary application areas' }).getByRole('link', { name: 'Campaigns' }).click()
+    await page.getByRole('heading', { name: 'Create Campaign' }).waitFor()
+    await page.getByRole('button', { name: 'campaign-fixture-1' }).click()
+    await page.getByText('Fixture campaign purpose').waitFor()
     await page.getByRole('button', { name: /Submit Campaign/ }).click()
     await page.getByRole('alert').filter({ hasText: 'outcome is uncertain' }).waitFor()
-    assert.equal(await resetCampaign.isDisabled(), true, '5xx does not make reset safe')
-    assert.match(await page.locator('.form-footer').textContent(), /retained for retry/)
     await page.getByRole('button', { name: /Submit Campaign/ }).click()
-    await page.getByRole('alert').filter({ hasText: 'server rejected this request' }).waitFor()
-    assert.equal(await resetCampaign.isDisabled(), false, 'definitive 4xx rejection permits reset')
-    await resetCampaign.click()
-    assert.match(await page.locator('.form-footer').textContent(), /created and retained until accepted/)
-    await page.setViewportSize({ width: 390, height: 844 })
-    assert.ok(await page.locator('.content').evaluate(el => el.getBoundingClientRect().width <= 390))
-    await page.goto(`http://127.0.0.1:${server.address().port}/sessions/`)
-    await page.getByRole('link', { name: /Fixture session/ }).click()
-    await page.locator('[data-opencode-link]').waitFor()
-    const serverKey = btoa('https://opencode.example.test/path').replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')
-    assert.equal(await page.locator('[data-opencode-link]').getAttribute('href'), `https://opencode.example.test/server/${serverKey}/session/ses%2Fsafe%3F%23id`)
-    assert.equal(await page.getByRole('link', { name: 'Open Preview' }).count(), 0, 'unsafe preview schemes are not rendered')
-    assert.match(await page.locator('.attach').textContent(), /anvilctl sessions attach safe\/?\?#id/)
-    await page.locator('[data-event-id="fixture-event"]').waitFor()
-    await page.getByRole('link', { name: /Failed activity fixture/ }).click()
-    await page.getByRole('alert').filter({ hasText: 'activity unavailable' }).waitFor()
-    assert.equal(await page.locator('[data-opencode-link]').count(), 0, 'failed detail fetch does not retain the previous session link')
-    assert.equal(await page.locator('[data-event-id="fixture-event"]').count(), 0, 'failed detail fetch does not retain previous activity')
-    await page.goto(`http://127.0.0.1:${server.address().port}/sessions?id=missing`)
-    await page.getByRole('heading', { name: 'Session unavailable' }).waitFor()
-    assert.match(await page.locator('section.data-card').textContent(), /not present in the current session list/)
-    await page.goto(`http://127.0.0.1:${server.address().port}/commission?id=decision-task`)
-    await page.getByRole('heading', { name: 'History fixture' }).waitFor()
-    await page.getByText('Decision 1').waitFor()
-    assert.match(await page.locator('.decision-history').textContent(), /no_progress.*Historical rule result/s)
-    assert.match(await page.locator('.decision-history').textContent(), /not a live watchdog/)
-    assert.match(await page.locator('.decision-history').textContent(), /Authorization blocked reason[\s\S]*shadow_mode/)
-    assert.match(await page.locator('.decision-history').textContent(), /Proposed actions: 1/)
-    assert.doesNotMatch(await page.locator('.decision-history').textContent(), /fixture-secret-prompt/)
-    assert.match(await page.locator('.decision-history').textContent(), /no latest decision is asserted until every page has been fetched/)
-    assert.equal(decisionCalls, 1, 'only the first history page is fetched automatically')
-    await page.getByRole('button', { name: 'Load next decision page' }).click()
-    await page.getByText('Decision 2').waitFor()
-    assert.equal(decisionCalls, 2, 'the next history page is fetched only on request')
-    assert.deepEqual(decisionCursors, [null, '987654'], 'the next page uses the returned global cursor, not decision_sequence')
-    assert.match(await page.locator('.decision-history').textContent(), /Logical time \(ms\)[\s\S]*1234[\s\S]*2345/)
-    for (const route of ['/campaign/', '/commission/', '/sessions/']) {
-      const response = await page.request.get(`http://127.0.0.1:${server.address().port}${route}`)
-      assert.equal(response.status(), 200)
-    }
-    const routeWithoutSlash = await page.request.get(`http://127.0.0.1:${server.address().port}/sessions`)
-    assert.equal(routeWithoutSlash.status(), 200, 'non-slash static route resolves to its exported index')
-    await page.goto(`http://127.0.0.1:${server.address().port}/`)
-    await page.getByRole('heading', { name: 'Inbox' }).waitFor()
-    await page.getByRole('link', { name: 'Settings' }).click()
-    await page.getByRole('heading', { name: 'Provider settings.' }).waitFor()
-    await page.locator('#operator-token').fill('fixture-operator-token')
-    await page.getByRole('button', { name: 'Load credentials' }).click()
-    await page.getByText('Generation 1 · 2026-01-01T00:00:00Z').waitFor()
-    await page.locator('#provider-id').fill('openai')
-    await page.locator('#provider-key').fill('fixture-api-key')
-    await page.getByRole('button', { name: 'Save key' }).click()
-    assert.equal(await page.locator('#provider-key').inputValue(), '', 'API key input clears as soon as save is submitted')
-    await page.getByText('Generation 2 · 2026-01-02T00:00:00Z').waitFor()
-    assert.deepEqual(credentialAuth, ['Bearer fixture-operator-token', 'Bearer fixture-operator-token'])
-    assert.equal(credentialWrites, 1)
-    assert.doesNotMatch(await page.locator('body').innerText(), /fixture-api-key|fixture-operator-token/)
+    await page.locator('.inspector-title').filter({ hasText: 'campaign-created-fixture' }).first().waitFor()
+    assert.equal(campaignKeys.length, 2)
+    assert.ok(campaignKeys[0] && campaignKeys[0] === campaignKeys[1], 'uncertain retry retains the same idempotency key')
+    await page.getByRole('navigation', { name: 'Primary application areas' }).getByRole('link', { name: 'Operations' }).click()
+    await page.getByRole('heading', { name: 'Operations' }).waitFor()
+    const opsTabs = page.getByRole('tablist', { name: 'Operations views' }).getByRole('tab')
+    assert.deepEqual(await opsTabs.allTextContents(), ['Fleet', 'Performance', 'Budget'])
+    await page.getByText('2', { exact: true }).first().waitFor()
+    await opsTabs.nth(1).click()
+    assert.match(await page.locator('.workbench-operations').innerText(), /Unavailable/)
+    await opsTabs.nth(2).click()
+    assert.match(await page.locator('.workbench-operations').innerText(), /Spend and quota are unavailable/)
+    await page.screenshot({ path: `${screenshotDir}/anvil-workbench-operations.png`, fullPage: true })
+    await page.getByRole('navigation', { name: 'Primary application areas' }).getByRole('link', { name: 'Settings' }).click()
+    await page.getByRole('heading', { name: 'Provider credentials' }).waitFor()
+    await page.screenshot({ path: `${screenshotDir}/anvil-workbench-settings.png`, fullPage: true })
+    const operatorToken = 'synthetic-operator-token-DO-NOT-STORE'
+    await page.locator('#operator-token').fill(operatorToken)
+    await page.getByRole('button', { name: 'Browse providers' }).click()
+    await page.getByLabel('Search providers').waitFor()
+    const providerSearch = page.getByLabel('Search providers')
+    const providerCatalog = page.locator('#provider-catalog-select')
+    await providerSearch.fill('Fixture Provider')
+    assert.deepEqual(await providerCatalog.locator('option').allTextContents(), ['Choose a provider', 'Fixture Provider (fixture-provider)'], 'catalog search matches provider names')
+    await providerCatalog.selectOption('fixture-provider')
+    assert.equal(await page.locator('#provider-id').inputValue(), 'fixture-provider', 'catalog selection sets the provider field')
+    await providerSearch.fill('opencode-go')
+    assert.deepEqual(await providerCatalog.locator('option').allTextContents(), ['Choose a provider', 'OpenCode Go (opencode-go)'], 'catalog search matches provider IDs')
+    await providerCatalog.selectOption('opencode-go')
+    assert.equal(await page.locator('#provider-id').inputValue(), 'opencode-go')
+    assert.doesNotMatch(await page.locator('body').innerText(), /unsupported-provider|catalog-secret|private-key-material/)
+    assert.deepEqual(await page.evaluate(() => [localStorage.length, sessionStorage.length]), [0, 0], 'provider selection does not persist credentials or tokens')
+    await page.locator('#provider-id').fill('fixture-provider')
+    await page.getByRole('button', { name: 'Load credential metadata' }).click()
+    await page.getByText('Generation 2').waitFor()
+    await page.locator('#provider-id').fill('fixture-provider')
+    await page.getByRole('button', { name: 'Load methods' }).click()
+    await page.locator('#oauth-method').waitFor({ state: 'visible' })
+    await page.waitForFunction(() => !document.querySelector('#oauth-method').disabled)
+    await page.getByLabel('Sign-in method').selectOption('fixture-auto')
+    await page.getByRole('button', { name: 'Start OAuth sign-in' }).click()
+    await page.getByText('Sign-in complete.').waitFor({ timeout: 5000 })
+    await page.getByLabel('Sign-in method').selectOption('fixture-form')
+    await page.getByRole('button', { name: 'Start OAuth sign-in' }).click()
+    await page.getByRole('alert').filter({ hasText: 'Complete the required field: Fixture account.' }).waitFor()
+    assert.equal(calls.filter(call => call.method === 'POST' && call.path === '/v1/provider-credentials/fixture-provider/oauth').length, 1, 'missing required form answer blocks POST')
+    await page.getByRole('textbox', { name: 'Fixture account', exact: true }).fill('synthetic-form-secret-DO-NOT-STORE')
+    await page.getByLabel('Remember fixture account').check()
+    await page.getByRole('button', { name: 'Start OAuth sign-in' }).click()
+    await page.getByText('Sign-in complete.').waitFor({ timeout: 5000 })
+    assert.doesNotMatch(await page.locator('body').innerText(), /synthetic-form-secret-DO-NOT-STORE/)
+    assert.ok(oauthPolls > 0, 'automatic OAuth mode polls status with GET')
+    await page.getByLabel('Sign-in method').selectOption('fixture-code')
+    await page.getByRole('button', { name: 'Start OAuth sign-in' }).click()
+    await page.getByLabel('Paste sign-in code').fill('synthetic-code-DO-NOT-STORE')
+    await page.getByRole('button', { name: 'Complete sign-in' }).click()
+    await page.getByText('Sign-in complete.').waitFor({ timeout: 5000 })
+    assert.ok(credentialAuth.every(value => value === `Bearer ${operatorToken}`))
+    assert.ok(oauthAuth.length && oauthAuth.every(value => value === `Bearer ${operatorToken}`))
+    const secretsInPage = await page.locator('body').innerText()
+    assert.doesNotMatch(secretsInPage, /synthetic-operator-token|synthetic-code-DO-NOT-STORE/)
     assert.deepEqual(await page.evaluate(() => [localStorage.length, sessionStorage.length]), [0, 0])
-    assert.equal(new URL(page.url()).search, '?view=settings', 'operator token is absent from the URL')
-    await page.getByRole('link', { name: 'Inbox' }).click()
+    assert.doesNotMatch(page.url(), /synthetic-operator-token|synthetic-code-DO-NOT-STORE/)
+    await page.setViewportSize({ width: 1024, height: 900 })
+    await page.goto(base)
     await page.getByRole('heading', { name: 'Inbox' }).waitFor()
-    await page.getByRole('link', { name: 'Settings' }).click()
-    await page.getByRole('heading', { name: 'Provider settings.' }).waitFor()
-    assert.equal(await page.locator('#operator-token').inputValue(), '', 'operator token is cleared when leaving Settings')
+    await page.getByRole('button', { name: /First recorded focus item/ }).click()
+    await page.getByRole('button', { name: '← Back' }).waitFor()
+    assert.equal(await page.locator('.primary-view').isVisible(), false, 'selected inspector takes over the compact desktop view')
+    await page.screenshot({ path: `${screenshotDir}/anvil-workbench-1024.png`, fullPage: true })
+    await page.getByRole('button', { name: '← Back' }).click()
+    await page.locator('.primary-view').waitFor({ state: 'visible' })
+    assert.equal(await page.locator('.primary-view').isVisible(), true, 'Back restores the list')
+    await page.getByRole('navigation', { name: 'Primary application areas' }).getByRole('link', { name: 'Settings' }).click()
+    await page.getByRole('heading', { name: 'Provider credentials' }).waitFor()
+    assert.equal(await page.locator('.primary-view').isVisible(), true, 'Settings remains visible at 1024px alongside the inspector')
+    assert.equal(await page.getByRole('heading', { name: 'Provider credentials' }).isVisible(), true)
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.getByRole('navigation', { name: 'Primary application areas' }).waitFor()
+    assert.equal(await page.locator('.area-nav').evaluate(el => getComputedStyle(el).display), 'flex', 'mobile navigation is horizontal')
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, 'mobile page has no horizontal overflow')
+    await page.screenshot({ path: `${screenshotDir}/anvil-workbench-390.png`, fullPage: true })
+    await page.getByRole('navigation', { name: 'Primary application areas' }).getByRole('link', { name: 'Settings' }).click()
+    await page.getByLabel('Operator token').waitFor()
+    assert.equal(await page.locator('#operator-token').isVisible(), true, 'Settings form remains usable at mobile width')
+    await page.screenshot({ path: `${screenshotDir}/anvil-workbench-390-settings.png`, fullPage: true })
+    assert.ok(calls.some(call => call.path === '/v1/capacity') && calls.some(call => call.path === '/v1/sessions'))
+    assert.ok(calls.some(call => call.path === '/v1/sessions/session-fixture-1/diff') && calls.some(call => call.path === '/v1/sessions/session-fixture-1/activity'))
+    assert.ok(calls.some(call => call.method === 'GET' && call.path === '/v1/provider-credentials/catalog'))
   } finally {
     await browser?.close()
     await new Promise(resolve => server.close(resolve))

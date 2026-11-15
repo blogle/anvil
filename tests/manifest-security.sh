@@ -17,6 +17,19 @@ test "$(grep -c 'name: github-app-credentials' "$repo_root/k8s/base/deployments.
 grep -A2 -B2 -F 'name: github-app-credentials' "$repo_root/k8s/base/deployments.yaml" \
   | grep -Fq 'secretRef:'
 
+profile_manifest="$repo_root/k8s/base/anvil-profile-deployment.yaml"
+require_text 'profile OAuth database data directory' 'value: /anvil/profile/data' "$profile_manifest"
+require_text 'profile OAuth data directory environment' 'name: XDG_DATA_HOME' "$profile_manifest"
+require_text 'profile creates OAuth storage under XDG_DATA_HOME' 'data="$XDG_DATA_HOME/opencode"' "$profile_manifest"
+require_text 'profile restricts OAuth storage permissions' 'chmod 700 "$data"' "$profile_manifest"
+require_text 'legacy auth file link under durable OAuth storage' 'link="$data/auth.json"' "$profile_manifest"
+if grep -Fq '$HOME/.local/share/opencode' "$profile_manifest"; then
+  printf 'manifest-security: profile OAuth storage must not use ephemeral HOME data directory\n' >&2
+  exit 1
+fi
+require_text 'profile PVC mount' 'mountPath: /anvil/profile' "$profile_manifest"
+require_text 'profile PVC claim' 'claimName: anvil-opencode-profile' "$profile_manifest"
+
 secret_manifest="$repo_root/k8s/base/github-app-secret.yaml"
 grep -Fq 'stringData: {}' "$secret_manifest"
 ! grep -Eiq 'gh[pousr]_[A-Za-z0-9_]+|-----BEGIN|private[_-]?key|client[_-]?secret' "$secret_manifest"
@@ -60,7 +73,16 @@ if grep -Fq 'fsGroup:' "$repo_root/crates/anvild/src/lib.rs"; then
   printf 'manifest-security: generated sandbox must not set Pod fsGroup on shared volumes\n' >&2
   exit 1
 fi
-require_text "sandbox shared PVC without volume-level read-only" '"claimName":pvc}}' "$repo_root/crates/anvild/src/lib.rs"
+if grep -Eq 'mountPath":"/anvil/profile|persistentVolumeClaim":"claimName":config\.profile_pvc' "$repo_root/crates/anvild/src/lib.rs"; then
+  printf 'manifest-security: sandbox manifests must not mount the shared profile PVC\n' >&2
+  exit 1
+fi
+if grep -Fq '/anvil/profile' "$repo_root/runtime/sandbox-entrypoint"; then
+  printf 'manifest-security: new workers must not reference shared profile storage\n' >&2
+  exit 1
+fi
+require_text 'private worker config' '/home/anvil/.config/opencode/opencode.jsonc' "$repo_root/crates/anvild/src/lib.rs"
+require_text 'isolated auth serving environment' 'ANVIL_ISOLATED_AUTH' "$repo_root/crates/anvild/src/lib.rs"
 smoke_script="$repo_root/tests/nix-daemon-smoke.sh"
 require_text 'daemon executable smoke' 'test -x /bin/anvil-nix-daemon' "$smoke_script"
 require_text 'daemon RPC smoke' 'NIX_REMOTE=daemon nix store info' "$smoke_script"
