@@ -34,7 +34,9 @@ use regex::Regex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use store::provider_credentials::{ProviderCredentialMetadata, ProviderSealer};
+use store::provider_credentials::{
+    ProviderCredentialKind, ProviderCredentialMetadata, ProviderSealer,
+};
 
 const ANVIL_REPORTING_SKILL: &str = r#"---
 name: anvil-reporting
@@ -118,7 +120,7 @@ if ! curl --fail --silent --show-error --max-time 30 \
   exit 1
 fi
 if ! jq -e --arg provider "$ANVIL_PROVIDER_ID" --argjson generation "$ANVIL_PROVIDER_GENERATION" \
-  '.provider_id == $provider and .generation == $generation and (.key | type == "string" and length > 0)' \
+  '.provider_id == $provider and .generation == $generation and (.kind == "key" or .kind == "oauth") and (.credential | type == "object") and (.credential.integrationID | type == "string" and length > 0) and ((.kind == "key" and .credential.integrationID == $provider and .credential.value.type == "key" and (.credential.value.key | type == "string" and length > 0)) or (.kind == "oauth" and .credential.value.type == "oauth"))' \
   "$provider_credential_file" >/dev/null; then
   echo "Provider credential response was invalid" >&2
   exit 1
@@ -129,10 +131,8 @@ printf '%s\n' '{"$schema":"https://opencode.ai/config.json","permission":"allow"
 chown -R 1000:1000 /home/anvil/.config/opencode
 chmod 700 /home/anvil/.config/opencode
 chmod 600 /home/anvil/.config/opencode/opencode.jsonc
-if ! jq -n --arg id "$provider_credential_id" \
-  --arg integration "$ANVIL_PROVIDER_ID" --arg label "Anvil $ANVIL_PROVIDER_ID" \
-  --slurpfile response "$provider_credential_file" \
-  '[{id:$id,integrationID:$integration,label:$label,active:true,value:{type:"key",key:$response[0].key}}]' \
+if ! jq -n --arg id "$provider_credential_id" --slurpfile credential "$provider_credential_file" \
+  '[$credential[0].credential | .id=$id]' \
   | opencode auth import --standalone >/dev/null 2>&1; then
   echo "Provider credential import failed" >&2
   exit 1
@@ -304,32 +304,24 @@ fn sandbox_manifest(
     let provider_bootstrap = bootstrap_env.contains_key("ANVIL_PROVIDER_BOOTSTRAP_TOKEN");
     // The serving container still needs its session ID for GitHub credential
     // renewal; only the provider bootstrap capability is init-only.
-    let isolated_go_auth = config.opencode_go_secret.is_some() || provider_bootstrap;
-    if isolated_go_auth {
-        set_env_value(
-            &mut env,
-            "OPENCODE_CONFIG",
-            "/home/anvil/.config/opencode/opencode.jsonc",
-        );
-        set_env_value(
-            &mut env,
-            "OPENCODE_CONFIG_DIR",
-            "/home/anvil/.config/opencode",
-        );
-        set_env_value(&mut env, "ANVIL_ISOLATED_GO_AUTH", "1");
-    }
+    set_env_value(
+        &mut env,
+        "OPENCODE_CONFIG",
+        "/home/anvil/.config/opencode/opencode.jsonc",
+    );
+    set_env_value(
+        &mut env,
+        "OPENCODE_CONFIG_DIR",
+        "/home/anvil/.config/opencode",
+    );
+    set_env_value(&mut env, "XDG_DATA_HOME", "/home/anvil/.local/share");
+    set_env_value(&mut env, "ANVIL_ISOLATED_AUTH", "1");
     env.push(json!({"name":"OPENCODE_SERVER_PASSWORD","valueFrom":{"secretKeyRef":{"name":"github-app-credentials","key":"ANVIL_OPENCODE_SERVER_PASSWORD"}}}));
     let mut container_mounts = vec![json!({"name":"workspace","mountPath":"/home/anvil"})];
-    if !isolated_go_auth {
-        container_mounts.push(json!({"name":"shared-profile","mountPath":"/anvil/profile"}));
-    }
     container_mounts.extend([shared_nix_store_mount(), shared_nix_socket_mount()]);
     let container = json!({"name":"sandbox","image":config.image,"ports":[{"name":"opencode","containerPort":config.opencode_port}],"env":env,"volumeMounts":container_mounts});
     let mut workspace_init = workspace_init;
     let mut volumes = Vec::new();
-    if !isolated_go_auth {
-        volumes.push(json!({"name":"shared-profile","persistentVolumeClaim":{"claimName":config.profile_pvc}}));
-    }
     volumes.push(shared_nix_volume(&config.nix_pvc));
     // Provider database bootstrap takes precedence over Go Secret injection. In
     // particular, do not mount or execute the Go credential path for a provider
@@ -356,11 +348,17 @@ fn sandbox_manifest(
                 set_named_value(init_env, name, json!({"name":name,"value":value}));
             }
             workspace_init["args"] = json!([format!(
-            "{}\n{}\n{}",
-            workspace_init_script(),
-            "umask 077\nmkdir -p /home/anvil/.config/opencode\nprintf '%s\\n' '{\"$schema\":\"https://opencode.ai/config.json\",\"permission\":\"allow\"}' > /home/anvil/.config/opencode/opencode.jsonc\nchown -R 1000:1000 /home/anvil/.config/opencode\nchmod 700 /home/anvil/.config/opencode\nchmod 600 /home/anvil/.config/opencode/opencode.jsonc",
-            workspace_go_auth_script()
-        )]);
+                "{}\n{}\n{}",
+                workspace_init_script(),
+                "umask 077\nmkdir -p /home/anvil/.config/opencode\nprintf '%s\\n' '{\"$schema\":\"https://opencode.ai/config.json\",\"permission\":\"allow\"}' > /home/anvil/.config/opencode/opencode.jsonc\nchown -R 1000:1000 /home/anvil/.config/opencode\nchmod 700 /home/anvil/.config/opencode\nchmod 600 /home/anvil/.config/opencode/opencode.jsonc",
+                workspace_go_auth_script()
+            )]);
+        } else {
+            workspace_init["args"] = json!([format!(
+                "{}\n{}",
+                workspace_init_script(),
+                "umask 077\nmkdir -p /home/anvil/.config/opencode\nprintf '%s\\n' '{\"$schema\":\"https://opencode.ai/config.json\",\"permission\":\"allow\"}' > /home/anvil/.config/opencode/opencode.jsonc\nchown -R 1000:1000 /home/anvil/.config/opencode\nchmod 700 /home/anvil/.config/opencode\nchmod 600 /home/anvil/.config/opencode/opencode.jsonc"
+            )]);
         }
     }
     if provider_bootstrap {
@@ -403,6 +401,15 @@ fn sandbox_manifest(
         ] {
             set_named_value(init_env, name, json!({"name":name,"value":value}));
         }
+        let current_args = workspace_init["args"][0]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        workspace_init["args"] = json!([format!(
+            "{}\n{}",
+            current_args,
+            "umask 077\nmkdir -p /home/anvil/.config/opencode\nprintf '%s\\n' '{\"$schema\":\"https://opencode.ai/config.json\",\"permission\":\"allow\"}' > /home/anvil/.config/opencode/opencode.jsonc\nchown -R 1000:1000 /home/anvil/.config/opencode\nchmod 700 /home/anvil/.config/opencode\nchmod 600 /home/anvil/.config/opencode/opencode.jsonc"
+        )]);
         let current_args = workspace_init["args"][0]
             .as_str()
             .unwrap_or_default()
@@ -890,6 +897,489 @@ async fn upsert_provider_credential(
     Ok(Json(metadata))
 }
 
+#[derive(Debug, Deserialize)]
+struct ProviderOAuthRequest {
+    method_id: String,
+    #[serde(default)]
+    answer: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderOAuthCompleteRequest {
+    code: String,
+}
+
+fn authorize_provider_operator(state: &AppState, headers: &HeaderMap) -> Result<(), ServiceError> {
+    if !provider_credentials_enabled(state) {
+        return Err(ServiceError::Provisioning(
+            "provider credential management is disabled".into(),
+        ));
+    }
+    if !bearer_matches(headers, state.provider_operator_token.as_deref()) {
+        return Err(ServiceError::Unauthorized);
+    }
+    if env::var("ANVIL_OPENCODE_SERVER_PASSWORD")
+        .ok()
+        .filter(|password| !password.is_empty())
+        .is_none()
+    {
+        return Err(ServiceError::Profile(
+            "profile OpenCode Basic-auth password is unavailable".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_profile_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && !matches!(value, "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+async fn operator_oauth_methods(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ServiceError> {
+    authorize_provider_operator(&state, &headers)?;
+    provider_id(&provider)?;
+    if !state.profile.is_v2().await {
+        return Err(ServiceError::Invalid(
+            "OAuth credential management requires profile OpenCode v2".into(),
+        ));
+    }
+    let integration_id = state.profile.v2_integration_id(&provider).await?;
+    if !valid_profile_id(&integration_id) {
+        return Err(ServiceError::Profile(
+            "invalid profile integration id".into(),
+        ));
+    }
+    let details = state
+        .profile
+        .request_raw(
+            reqwest::Method::GET,
+            &format!("api/integration/{integration_id}"),
+            None,
+        )
+        .await?;
+    let methods = details
+        .pointer("/data/methods")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|method| method.get("type").and_then(Value::as_str) == Some("oauth"))
+        .filter_map(|method| {
+            let id = method.get("id")?.as_str()?;
+            let label = method.get("label").cloned().unwrap_or(Value::Null);
+            let form = method.get("form").cloned();
+            Some(match form {
+                Some(form) => json!({"id":id,"label":label,"form":form}),
+                None => json!({"id":id,"label":label}),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({"methods":methods})))
+}
+
+async fn provider_credentials_catalog(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ServiceError> {
+    // This authentication catalog does not establish model availability.
+    authorize_provider_operator(&state, &headers)?;
+    if !state.profile.is_v2().await {
+        return Err(ServiceError::Invalid(
+            "provider credential catalog requires profile OpenCode v2".into(),
+        ));
+    }
+    let integrations = state
+        .profile
+        .request_raw(reqwest::Method::GET, "api/integration", None)
+        .await?;
+    Ok(Json(provider_credential_catalog(&integrations)?))
+}
+
+fn provider_credential_catalog(integrations: &Value) -> Result<Value, ServiceError> {
+    let integrations = integrations
+        .pointer("/data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ServiceError::Profile("invalid profile integration catalog".into()))?;
+    let mut catalog = Vec::new();
+    for integration in integrations {
+        let object = integration
+            .as_object()
+            .ok_or_else(|| ServiceError::Profile("invalid profile integration catalog".into()))?;
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ServiceError::Profile("invalid profile integration catalog".into()))?;
+        if provider_id(id).is_err() {
+            continue;
+        }
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ServiceError::Profile("invalid profile integration catalog".into()))?;
+        let methods = object
+            .get("methods")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ServiceError::Profile("invalid profile integration catalog".into()))?;
+        let mut key_available = false;
+        let mut oauth_methods = Vec::new();
+        for method in methods {
+            let method = method.as_object().ok_or_else(|| {
+                ServiceError::Profile("invalid profile integration catalog".into())
+            })?;
+            let method_type = method.get("type").and_then(Value::as_str).ok_or_else(|| {
+                ServiceError::Profile("invalid profile integration catalog".into())
+            })?;
+            match method_type {
+                "key" => key_available = true,
+                "oauth" => {
+                    let id = method.get("id").and_then(Value::as_str).ok_or_else(|| {
+                        ServiceError::Profile("invalid profile integration catalog".into())
+                    })?;
+                    let label = method.get("label").and_then(Value::as_str).ok_or_else(|| {
+                        ServiceError::Profile("invalid profile integration catalog".into())
+                    })?;
+                    oauth_methods.push(json!({"id":id,"label":label}));
+                }
+                _ => {}
+            }
+        }
+        if key_available || !oauth_methods.is_empty() {
+            catalog.push(json!({
+                "id":id,
+                "name":name,
+                "key_available":key_available,
+                "oauth_methods":oauth_methods
+            }));
+            if catalog.len() == 1000 {
+                break;
+            }
+        }
+    }
+    Ok(Value::Array(catalog))
+}
+
+async fn begin_provider_oauth(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<ProviderOAuthRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Value>, ServiceError> {
+    authorize_provider_operator(&state, &headers)?;
+    provider_id(&provider)?;
+    let Json(request) = body.map_err(|_| ServiceError::Invalid("invalid OAuth request".into()))?;
+    if !valid_profile_id(&request.method_id) {
+        return Err(ServiceError::Invalid("invalid OAuth method id".into()));
+    }
+    if !state.profile.is_v2().await {
+        return Err(ServiceError::Invalid(
+            "OAuth credential management requires profile OpenCode v2".into(),
+        ));
+    }
+    let integration_id = state.profile.v2_integration_id(&provider).await?;
+    if !valid_profile_id(&integration_id) {
+        return Err(ServiceError::Profile(
+            "invalid profile integration id".into(),
+        ));
+    }
+    let details = state
+        .profile
+        .request_raw(
+            reqwest::Method::GET,
+            &format!("api/integration/{integration_id}"),
+            None,
+        )
+        .await?;
+    let selected = details
+        .pointer("/data/methods")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|method| {
+            method.get("id").and_then(Value::as_str) == Some(&request.method_id)
+                && method.get("type").and_then(Value::as_str) == Some("oauth")
+        });
+    if !selected {
+        return Err(ServiceError::Invalid(
+            "unknown OAuth method for provider".into(),
+        ));
+    }
+    let _begin_guard = state.oauth_begin_lock.lock().await;
+    reject_pending_provider_oauth(&state, &provider)?;
+    // Snapshot IDs before initiating the attempt. Values returned by /api/credential
+    // are secret-bearing and remain only in process memory until sealed in the store.
+    let baseline = state
+        .profile
+        .request_raw(reqwest::Method::GET, "api/credential", None)
+        .await?;
+    let baseline_ids = baseline
+        .pointer("/data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.get("integrationID").and_then(Value::as_str) == Some(&integration_id))
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect::<std::collections::HashSet<_>>();
+    let answer = request.answer.unwrap_or_else(|| json!({}));
+    if !answer.is_object() {
+        return Err(ServiceError::Invalid(
+            "OAuth answer must be an object".into(),
+        ));
+    }
+    let started = state
+        .profile
+        .request_raw(
+            reqwest::Method::POST,
+            &format!("api/integration/{integration_id}/connect/oauth"),
+            Some(json!({"methodID":request.method_id,"answer":answer})),
+        )
+        .await?;
+    let data = started.pointer("/data").unwrap_or(&started);
+    let attempt_id = data
+        .get("attemptID")
+        .and_then(Value::as_str)
+        .filter(|id| valid_profile_id(id))
+        .ok_or_else(|| ServiceError::Profile("invalid OAuth attempt response".into()))?
+        .to_owned();
+    let mode = data.get("mode").and_then(Value::as_str).unwrap_or("");
+    if !matches!(mode, "auto" | "code") {
+        return Err(ServiceError::Profile("invalid OAuth mode response".into()));
+    }
+    let expiry = data.pointer("/time/expires");
+    let remaining = oauth_attempt_remaining(expiry, Utc::now()).ok_or_else(|| {
+        ServiceError::Conflict("OAuth attempt is already expired or invalid".into())
+    })?;
+    let expires_at = Instant::now() + remaining;
+    let login_id = uuid::Uuid::new_v4().simple().to_string();
+    let pending = PendingLogin {
+        provider: provider.clone(),
+        method: PendingLoginMethod::OperatorV2OAuth {
+            integration_id,
+            attempt_id,
+            method_id: request.method_id,
+            baseline_ids,
+            mode: mode.to_owned(),
+            expires_at,
+        },
+        created_at: Instant::now(),
+    };
+    let mut pending_logins = state
+        .pending_logins
+        .lock()
+        .map_err(|_| ServiceError::Profile("login state unavailable".into()))?;
+    pending_logins.retain(|_, flow| flow.created_at.elapsed() < LOGIN_TTL);
+    pending_logins.insert(login_id.clone(), pending);
+    Ok(Json(
+        json!({"login_id":login_id,"mode":mode,"url":data.get("url"),"instructions":data.get("instructions"),"time":data.get("time")}),
+    ))
+}
+
+fn oauth_attempt_remaining(expiry: Option<&Value>, now: DateTime<Utc>) -> Option<Duration> {
+    let expires_at_millis = expiry.and_then(Value::as_i64).or_else(|| {
+        expiry
+            .and_then(Value::as_str)
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.timestamp_millis())
+    })?;
+    let remaining_millis = expires_at_millis.checked_sub(now.timestamp_millis())?;
+    if remaining_millis <= 0 {
+        return None;
+    }
+    Some(Duration::from_millis(remaining_millis as u64).min(LOGIN_TTL))
+}
+
+fn reject_pending_provider_oauth(state: &AppState, provider: &str) -> Result<(), ServiceError> {
+    let now = Instant::now();
+    let mut pending = state
+        .pending_logins
+        .lock()
+        .map_err(|_| ServiceError::Profile("login state unavailable".into()))?;
+    pending.retain(|_, flow| {
+        if flow.created_at.elapsed() >= LOGIN_TTL {
+            return false;
+        }
+        match &flow.method {
+            PendingLoginMethod::OperatorV2OAuth { expires_at, .. } => *expires_at > now,
+            _ => true,
+        }
+    });
+    if pending.values().any(|flow| {
+        flow.provider == provider
+            && matches!(
+                &flow.method,
+                PendingLoginMethod::OperatorV2OAuth { expires_at, .. } if *expires_at > now
+            )
+    }) {
+        return Err(ServiceError::Conflict(
+            "an OAuth attempt is already pending for this provider".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn provider_oauth_status(
+    State(state): State<AppState>,
+    Path((provider, login_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ServiceError> {
+    authorize_provider_operator(&state, &headers)?;
+    provider_id(&provider)?;
+    finalize_provider_oauth(&state, &provider, &login_id, None)
+        .await
+        .map(Json)
+}
+
+async fn complete_provider_oauth(
+    State(state): State<AppState>,
+    Path((provider, login_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Result<Json<ProviderOAuthCompleteRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Value>, ServiceError> {
+    authorize_provider_operator(&state, &headers)?;
+    provider_id(&provider)?;
+    let Json(request) =
+        body.map_err(|_| ServiceError::Invalid("invalid OAuth completion request".into()))?;
+    if request.code.trim().is_empty() {
+        return Err(ServiceError::Invalid("OAuth code is required".into()));
+    }
+    finalize_provider_oauth(&state, &provider, &login_id, Some(request.code))
+        .await
+        .map(Json)
+}
+
+async fn finalize_provider_oauth(
+    state: &AppState,
+    provider: &str,
+    login_id: &str,
+    code: Option<String>,
+) -> Result<Value, ServiceError> {
+    let pending = state
+        .pending_logins
+        .lock()
+        .map_err(|_| ServiceError::Profile("login state unavailable".into()))?
+        .get(login_id)
+        .cloned()
+        .ok_or(ServiceError::NotFound)?;
+    if pending.provider != provider {
+        return Err(ServiceError::NotFound);
+    }
+    let PendingLoginMethod::OperatorV2OAuth {
+        integration_id,
+        attempt_id,
+        method_id,
+        baseline_ids,
+        mode,
+        expires_at,
+    } = pending.method
+    else {
+        return Err(ServiceError::NotFound);
+    };
+    if Instant::now() >= expires_at || pending.created_at.elapsed() >= LOGIN_TTL {
+        state
+            .pending_logins
+            .lock()
+            .map_err(|_| ServiceError::Profile("login state unavailable".into()))?
+            .remove(login_id);
+        return Err(ServiceError::Conflict("OAuth attempt expired".into()));
+    }
+    if let Some(code) = code {
+        if mode != "code" {
+            return Err(ServiceError::Conflict(
+                "OAuth attempt does not accept a completion code".into(),
+            ));
+        }
+        state
+            .profile
+            .request_raw(
+                reqwest::Method::POST,
+                &format!("api/integration/{integration_id}/connect/oauth/{attempt_id}/complete"),
+                Some(json!({"code":code})),
+            )
+            .await?;
+    }
+    let status_value = state
+        .profile
+        .request_raw(
+            reqwest::Method::GET,
+            &format!("api/integration/{integration_id}/connect/oauth/{attempt_id}"),
+            None,
+        )
+        .await?;
+    let status_data = status_value.pointer("/data").unwrap_or(&status_value);
+    let status = status_data
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if status == "pending" {
+        return Ok(json!({"status":"pending","mode":mode,"time":status_data.get("time")}));
+    }
+    if status != "complete" {
+        state
+            .pending_logins
+            .lock()
+            .map_err(|_| ServiceError::Profile("login state unavailable".into()))?
+            .remove(login_id);
+        return Err(ServiceError::Conflict(
+            match status {
+                "failed" => "OAuth attempt failed",
+                "expired" => "OAuth attempt expired",
+                _ => "invalid OAuth attempt status",
+            }
+            .into(),
+        ));
+    }
+    let credentials = state
+        .profile
+        .request_raw(reqwest::Method::GET, "api/credential", None)
+        .await?;
+    let candidates = credentials
+        .pointer("/data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry.get("integrationID").and_then(Value::as_str) == Some(&integration_id)
+                && entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !baseline_ids.contains(id))
+                && entry.pointer("/value/type").and_then(Value::as_str) == Some("oauth")
+                && entry.pointer("/value/methodID").and_then(Value::as_str) == Some(&method_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if candidates.len() != 1 {
+        return Err(ServiceError::Conflict(
+            "OAuth credential export was missing or ambiguous".into(),
+        ));
+    }
+    state
+        .store()
+        .map_err(|error| ServiceError::Store(error.into()))?
+        .upsert_provider_oauth(
+            provider,
+            &integration_id,
+            &candidates[0],
+            state
+                .provider_sealer
+                .as_deref()
+                .expect("operator authorization requires sealer"),
+        )
+        .map_err(|_| ServiceError::Invalid("OAuth credential could not be stored".into()))?;
+    state
+        .pending_logins
+        .lock()
+        .map_err(|_| ServiceError::Profile("login state unavailable".into()))?
+        .remove(login_id);
+    Ok(json!({"status":"complete","provider_id":provider,"kind":"oauth"}))
+}
+
 async fn provider_bootstrap_credential(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -932,14 +1422,20 @@ async fn provider_bootstrap_credential(
         .provider_sealer
         .as_deref()
         .expect("enabled credentials have a sealer");
-    let key = state
+    let credential = state
         .store()
         .map_err(|e| ServiceError::Store(e.into()))?
-        .get_provider_key(&bound_provider, generation, sealer)
+        .get_provider_credential(&bound_provider, generation, sealer)
         .map_err(|e| ServiceError::Store(e.to_string()))?
         .ok_or(ServiceError::Unauthorized)?;
+    let kind = match credential.kind {
+        ProviderCredentialKind::Key => "key",
+        ProviderCredentialKind::OAuth => "oauth",
+    };
+    let mut entry = credential.entry;
+    entry["id"] = Value::String(format!("cred_anvil_{bound_provider}_{generation}"));
     Ok(Json(
-        json!({"provider_id":bound_provider,"generation":generation,"key":key}),
+        json!({"provider_id":bound_provider,"generation":generation,"kind":kind,"credential":entry}),
     ))
 }
 
@@ -1026,6 +1522,14 @@ enum PendingLoginMethod {
     V2OAuth {
         integration_id: String,
         attempt_id: String,
+    },
+    OperatorV2OAuth {
+        integration_id: String,
+        attempt_id: String,
+        method_id: String,
+        baseline_ids: std::collections::HashSet<String>,
+        mode: String,
+        expires_at: Instant,
     },
     ApiKey,
 }
@@ -1991,8 +2495,8 @@ impl SandboxApi for KubeSandboxApi {
             json!({"name":"ANVIL_REPOSITORY","value":r.repository}),
             json!({"name":"ANVIL_REF","value":r.base_ref}),
             json!({"name":"ANVIL_WORK_BRANCH","value":work_branch}),
-            json!({"name":"OPENCODE_CONFIG","value":"/anvil/profile/config/opencode.jsonc"}),
-            json!({"name":"OPENCODE_CONFIG_DIR","value":"/anvil/profile/config"}),
+            json!({"name":"OPENCODE_CONFIG","value":"/home/anvil/.config/opencode/opencode.jsonc"}),
+            json!({"name":"OPENCODE_CONFIG_DIR","value":"/home/anvil/.config/opencode"}),
             json!({"name":"OPENCODE_DISABLE_CHANNEL_DB","value":"1"}),
             json!({"name":"HOME","value":"/home/anvil"}),
             json!({"name":"XDG_CONFIG_HOME","value":"/home/anvil/.config"}),
@@ -2368,6 +2872,7 @@ pub struct AppState {
     store: Arc<Result<store::ControllerStore, String>>,
     profile: ProfileClient,
     pending_logins: Arc<Mutex<HashMap<String, PendingLogin>>>,
+    oauth_begin_lock: Arc<AsyncMutex<()>>,
     binding_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     transition_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     idempotency_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
@@ -2432,6 +2937,7 @@ impl AppState {
             kube,
             profile,
             pending_logins: Arc::new(Mutex::new(HashMap::new())),
+            oauth_begin_lock: Arc::new(AsyncMutex::new(())),
             binding_locks: Arc::new(Mutex::new(HashMap::new())),
             transition_locks: Arc::new(Mutex::new(HashMap::new())),
             idempotency_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -2683,6 +3189,26 @@ fn router_with_web_root(state: AppState, web_root: PathBuf) -> Router {
         .route("/", get(index))
         .route("/v1/providers", get(providers))
         .route("/v1/provider-credentials", get(list_provider_credentials))
+        .route(
+            "/v1/provider-credentials/catalog",
+            get(provider_credentials_catalog),
+        )
+        .route(
+            "/v1/provider-credentials/:provider/methods",
+            get(operator_oauth_methods),
+        )
+        .route(
+            "/v1/provider-credentials/:provider/oauth",
+            post(begin_provider_oauth),
+        )
+        .route(
+            "/v1/provider-credentials/:provider/oauth/:login_id",
+            get(provider_oauth_status),
+        )
+        .route(
+            "/v1/provider-credentials/:provider/oauth/:login_id/complete",
+            post(complete_provider_oauth),
+        )
         .route(
             "/v1/provider-credentials/:provider",
             axum::routing::put(upsert_provider_credential),
@@ -3963,7 +4489,15 @@ fn campaign_work_instruction(
     task: &Value,
     attempt: &Value,
 ) -> String {
-    format!("Campaign: {}\nShared contracts: {}\nCommission: {}\nObligations: {}\nTarget: {}\nAttempt: {}\nCurrent facts: session new; candidate SHA unavailable.\nNext action: implement.\nReport progress with the installed Anvil reporting skill.", campaign["purpose"], campaign["shared_contracts"], commission["objective"], commission["obligations"], task["execution_target"], attempt)
+    format!(
+        "Campaign: {}\nShared contracts: {}\nCommission: {}\nObligations: {}\nTarget: {}\nAttempt: {}\nCurrent facts: session new; candidate SHA unavailable.\nNext action: implement.\nReport progress with the installed Anvil reporting skill.",
+        campaign["purpose"],
+        campaign["shared_contracts"],
+        commission["objective"],
+        commission["obligations"],
+        task["execution_target"],
+        attempt
+    )
 }
 
 async fn get_task(
@@ -5450,63 +5984,7 @@ async fn create(
                 .map_err(ServiceError::Config)?,
         ));
     }
-    if let (Some(model), Some(sealer)) = (r.model.as_deref(), s.provider_sealer.as_deref()) {
-        if let Some((provider, model_id)) = model.split_once('/') {
-            if !provider.is_empty() && !model_id.is_empty() {
-                if s.config.sandbox_backend != SandboxBackend::Kubernetes {
-                    return Err(ServiceError::Provisioning(
-                        "provider credential bootstrap requires the Kubernetes sandbox init container".into(),
-                    ));
-                }
-                let metadata = s
-                    .store()
-                    .map_err(|e| ServiceError::Store(e.into()))?
-                    .list_provider_keys()
-                    .map_err(|e| ServiceError::Store(e.to_string()))?
-                    .into_iter()
-                    .filter(|item| item.provider_id == provider)
-                    .max_by_key(|item| item.generation);
-                if metadata.is_none() && provider_credentials_enabled(&s) {
-                    return Err(ServiceError::Invalid(format!(
-                        "model provider {provider} has no stored credential"
-                    )));
-                }
-                if let Some(metadata) = metadata {
-                    // Ensure the configured generation is decryptable before making a worker.
-                    let _credential = s
-                        .store()
-                        .map_err(|e| ServiceError::Store(e.into()))?
-                        .get_provider_key(provider, metadata.generation, sealer)
-                        .map_err(|e| ServiceError::Store(e.to_string()))?
-                        .ok_or_else(|| {
-                            ServiceError::Provisioning(
-                                "configured provider credential is unavailable".into(),
-                            )
-                        })?;
-                    let token = uuid::Uuid::new_v4().to_string();
-                    let token_hash = Sha256::digest(token.as_bytes());
-                    s.store()
-                        .map_err(|e| ServiceError::Store(e.into()))?
-                        .insert_provider_bootstrap(
-                            &token_hash,
-                            &id,
-                            provider,
-                            metadata.generation,
-                            chrono::Utc::now().timestamp().saturating_add(600),
-                        )
-                        .map_err(|e| ServiceError::Store(e.to_string()))?;
-                    sandbox_env.extend([
-                        ("ANVIL_PROVIDER_BOOTSTRAP_TOKEN".into(), token),
-                        ("ANVIL_PROVIDER_ID".into(), provider.into()),
-                        (
-                            "ANVIL_PROVIDER_GENERATION".into(),
-                            metadata.generation.to_string(),
-                        ),
-                    ]);
-                }
-            }
-        }
-    }
+    append_provider_bootstrap_environment(&s, &id, r.model.as_deref(), &mut sandbox_env)?;
     sandbox_env.extend(git_author_environment(
         r.author_name.as_deref(),
         r.author_email.as_deref(),
@@ -5651,6 +6129,74 @@ async fn create(
             session
         }),
     ))
+}
+
+fn append_provider_bootstrap_environment(
+    state: &AppState,
+    session_id: &str,
+    model: Option<&str>,
+    sandbox_env: &mut Vec<(String, String)>,
+) -> Result<(), ServiceError> {
+    let (Some(model), Some(sealer)) = (model, state.provider_sealer.as_deref()) else {
+        return Ok(());
+    };
+    let Some((provider, model_id)) = model.split_once('/') else {
+        return Ok(());
+    };
+    if provider.is_empty() || model_id.is_empty() {
+        return Ok(());
+    }
+    if state.config.sandbox_backend != SandboxBackend::Kubernetes {
+        return Err(ServiceError::Provisioning(
+            "provider credential bootstrap requires the Kubernetes sandbox init container".into(),
+        ));
+    }
+    let metadata = state
+        .store()
+        .map_err(|e| ServiceError::Store(e.into()))?
+        .list_provider_keys()
+        .map_err(|e| ServiceError::Store(e.to_string()))?
+        .into_iter()
+        .filter(|item| item.provider_id == provider)
+        .max_by_key(|item| item.generation);
+    if metadata.is_none() && provider_credentials_enabled(state) {
+        return Err(ServiceError::Invalid(format!(
+            "model provider {provider} has no stored credential"
+        )));
+    }
+    if let Some(metadata) = metadata {
+        // Ensure the configured generation is decryptable before making a worker.
+        let _credential = state
+            .store()
+            .map_err(|e| ServiceError::Store(e.into()))?
+            .get_provider_credential(provider, metadata.generation, sealer)
+            .map_err(|e| ServiceError::Store(e.to_string()))?
+            .ok_or_else(|| {
+                ServiceError::Provisioning("configured provider credential is unavailable".into())
+            })?;
+        let token = uuid::Uuid::new_v4().to_string();
+        let token_hash = Sha256::digest(token.as_bytes());
+        state
+            .store()
+            .map_err(|e| ServiceError::Store(e.into()))?
+            .insert_provider_bootstrap(
+                &token_hash,
+                session_id,
+                provider,
+                metadata.generation,
+                chrono::Utc::now().timestamp().saturating_add(600),
+            )
+            .map_err(|e| ServiceError::Store(e.to_string()))?;
+        sandbox_env.extend([
+            ("ANVIL_PROVIDER_BOOTSTRAP_TOKEN".into(), token),
+            ("ANVIL_PROVIDER_ID".into(), provider.into()),
+            (
+                "ANVIL_PROVIDER_GENERATION".into(),
+                metadata.generation.to_string(),
+            ),
+        ]);
+    }
+    Ok(())
 }
 
 fn pull_request_from_github(items: Vec<Value>) -> Option<anvil_core::PullRequest> {
@@ -8664,14 +9210,23 @@ impl ProfileClient {
     }
 
     async fn is_v2(&self) -> bool {
-        let mut request = self.client.get(self.base.join("api/info").unwrap());
-        if let Ok(password) = env::var("ANVIL_OPENCODE_SERVER_PASSWORD") {
-            request = request.basic_auth("opencode", Some(password));
-        }
-        request
-            .send()
+        self.request_raw(reqwest::Method::GET, "api/info", None)
             .await
-            .is_ok_and(|response| response.status().is_success())
+            .ok()
+            .and_then(|info| {
+                info.get("version")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .and_then(|version| {
+                version
+                    .split('.')
+                    .next()?
+                    .trim_start_matches('v')
+                    .parse::<u32>()
+                    .ok()
+            })
+            .is_some_and(|major| major >= 2)
     }
 
     async fn v2_integration_id(&self, provider_id: &str) -> Result<String, ServiceError> {
@@ -8825,7 +9380,7 @@ impl ProfileClient {
                 (reqwest::Method::GET, "config") => {
                     return self
                         .request_raw(reqwest::Method::GET, "api/config", None)
-                        .await
+                        .await;
                 }
                 (reqwest::Method::PUT, path) if path.starts_with("auth/") => {
                     let integration = self
@@ -8934,10 +9489,13 @@ impl ProfileClient {
 }
 
 fn provider_id(value: &str) -> Result<(), ServiceError> {
-    if value.is_empty()
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    let bytes = value.as_bytes();
+    if !(1..=63).contains(&bytes.len())
+        || !(bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        || !bytes.iter().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
+        || matches!(value, "." | "..")
     {
         return Err(ServiceError::Invalid("invalid provider id".into()));
     }
@@ -9233,6 +9791,11 @@ async fn complete_provider_login(
                 )
                 .await?;
             true
+        }
+        PendingLoginMethod::OperatorV2OAuth { .. } => {
+            return Err(ServiceError::Conflict(
+                "operator OAuth flows must use the provider-credential routes".into(),
+            ));
         }
     };
     if !completed {
@@ -9722,6 +10285,41 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
+    fn provider_ids_allow_dots_without_accepting_path_or_url_syntax() {
+        for valid in ["a", "wafer.ai", "opencode-go", "a_b.c-1", &"a".repeat(63)] {
+            assert!(provider_id(valid).is_ok(), "{valid:?}");
+        }
+        for invalid in [
+            "", ".", "..", "../", "a?b", "a%b", "a:b", "a b", "A", "_a", ".a", "a/", "a\n",
+        ] {
+            assert!(provider_id(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(provider_id(&"a".repeat(64)).is_err());
+        assert!(!valid_profile_id("."));
+        assert!(!valid_profile_id(".."));
+        for invalid in ["../", "a?b", "a%b", "a:b", "a b"] {
+            assert!(!valid_profile_id(invalid), "{invalid:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_reqwest_keeps_dotted_integration_id_as_one_path_segment() {
+        let server = MockServer::start();
+        let integration = server.mock(|when, then| {
+            when.method(GET).path("/api/integration/wafer.ai");
+            then.status(200)
+                .json_body(json!({"data":{"id":"wafer.ai"}}));
+        });
+        let client = ProfileClient::new(&server.base_url()).unwrap();
+        let response = client
+            .request_raw(reqwest::Method::GET, "api/integration/wafer.ai", None)
+            .await
+            .unwrap();
+        assert_eq!(response["data"]["id"], "wafer.ai");
+        integration.assert();
+    }
+
+    #[test]
     fn create_attempt_body_accepts_absent_body_and_rejects_malformed_json() {
         assert_eq!(parse_create_attempt_model(b"").unwrap(), None);
         assert_eq!(
@@ -9737,9 +10335,9 @@ mod tests {
     #[tokio::test]
     async fn provider_credential_management_denies_missing_operator_bearer() {
         let directory = tempfile::tempdir().unwrap();
-        let mut config = config("http://127.0.0.1:4097".into());
-        config.store_path = directory.path().join("controller.sqlite3");
-        let mut state = AppState::new(config, FakeSandbox);
+        let mut app_config = config("http://127.0.0.1:4097".into());
+        app_config.store_path = directory.path().join("controller.sqlite3");
+        let mut state = AppState::new(app_config, FakeSandbox);
         state.provider_sealer = Some(Arc::new(
             ProviderSealer::from_hex(
                 "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
@@ -9761,6 +10359,586 @@ mod tests {
             .await
             .unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("must-not-be-persisted"));
+        let mut unauthorized_config = config("http://127.0.0.1:4097".into());
+        unauthorized_config.store_path = directory.path().join("unauthorized.sqlite3");
+        let mut unauthorized_state = AppState::new(unauthorized_config, FakeSandbox);
+        unauthorized_state.provider_sealer = Some(Arc::new(
+            ProviderSealer::from_hex(
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            )
+            .unwrap(),
+        ));
+        unauthorized_state.provider_operator_token =
+            Some("operator-token-which-is-at-least-32-chars".into());
+        let response = router_with_web_root(unauthorized_state, directory.path().to_owned())
+            .oneshot(
+                Request::get("/v1/provider-credentials/openai/methods")
+                    .header("authorization", "Bearer wrong-operator-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn provider_credential_catalog_is_a_safe_ordered_projection() {
+        let upstream = json!({"data":[
+            {"id":"openai","name":"OpenAI","methods":[
+                {"id":"key","type":"key","label":"API key","form":[{"name":"key"}]},
+                {"id":"oauth","type":"oauth","label":"OAuth","form":[{"name":"secret"}]}
+            ],"connections":[{"credential":"private"}],"value":{"key":"private"}},
+            {"id":"opencode-go","name":"OpenCode Go","methods":[{"id":"key","type":"key","label":"Key"}]},
+            {"id":"wafer.ai","name":"Wafer","methods":[{"id":"login","type":"oauth","label":"Sign in"}]},
+            {"id":"../unsupported","name":"Ignored","methods":[{"type":"key"}]},
+            {"id":"empty","name":"Ignored","methods":[]}
+        ]});
+        let catalog = provider_credential_catalog(&upstream).unwrap();
+        assert_eq!(
+            catalog,
+            json!([
+                {"id":"openai","name":"OpenAI","key_available":true,"oauth_methods":[{"id":"oauth","label":"OAuth"}]},
+                {"id":"opencode-go","name":"OpenCode Go","key_available":true,"oauth_methods":[]},
+                {"id":"wafer.ai","name":"Wafer","key_available":false,"oauth_methods":[{"id":"login","label":"Sign in"}]}
+            ])
+        );
+        let serialized = catalog.to_string();
+        for forbidden in [
+            "connections",
+            "credential",
+            "private",
+            "form",
+            "secret",
+            "value",
+        ] {
+            assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn provider_credential_catalog_rejects_unexpected_upstream_shape_and_caps_results() {
+        assert!(provider_credential_catalog(&json!({"data":{}})).is_err());
+        assert!(provider_credential_catalog(&json!({"data":[{"id":"openai"}]})).is_err());
+        let integrations = (0..1005)
+            .map(|index| {
+                json!({"id":format!("provider-{index}"),"name":"Provider","methods":[{"type":"key"}]})
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            provider_credential_catalog(&json!({"data":integrations}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1000
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_credential_catalog_authorizes_before_upstream_and_requires_v2() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app_config = config("http://127.0.0.1:1".into());
+        app_config.store_path = directory.path().join("catalog.sqlite3");
+        let mut state = AppState::new(app_config, FakeSandbox);
+        state.provider_sealer = Some(Arc::new(
+            ProviderSealer::from_hex(
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            )
+            .unwrap(),
+        ));
+        state.provider_operator_token = Some("operator-token-which-is-at-least-32-chars".into());
+        let response = router_with_web_root(state, directory.path().to_owned())
+            .oneshot(
+                Request::get("/v1/provider-credentials/catalog")
+                    .header("authorization", "Bearer wrong-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        static PROFILE_PASSWORD_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _env_lock = PROFILE_PASSWORD_ENV.lock().await;
+        let previous_password = env::var_os("ANVIL_OPENCODE_SERVER_PASSWORD");
+        unsafe {
+            env::set_var("ANVIL_OPENCODE_SERVER_PASSWORD", "catalog-test-password");
+        }
+        let server = MockServer::start();
+        let info = server.mock(|when, then| {
+            when.method(GET).path("/api/info");
+            then.status(200).json_body(json!({"version":"1.2.3"}));
+        });
+        let mut app_config = config(server.base_url());
+        app_config.store_path = directory.path().join("mismatch.sqlite3");
+        let mut state = AppState::new(app_config, FakeSandbox);
+        state.provider_sealer = Some(Arc::new(
+            ProviderSealer::from_hex(
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            )
+            .unwrap(),
+        ));
+        state.provider_operator_token = Some("operator-token-which-is-at-least-32-chars".into());
+        let response = router_with_web_root(state, directory.path().to_owned())
+            .oneshot(
+                Request::get("/v1/provider-credentials/catalog")
+                    .header(
+                        "authorization",
+                        "Bearer operator-token-which-is-at-least-32-chars",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        info.assert();
+        if let Some(password) = previous_password {
+            unsafe { env::set_var("ANVIL_OPENCODE_SERVER_PASSWORD", password) };
+        } else {
+            unsafe { env::remove_var("ANVIL_OPENCODE_SERVER_PASSWORD") };
+        }
+    }
+
+    #[test]
+    fn provider_bootstrap_import_script_accepts_oauth_and_preserves_legacy_key_import() {
+        let script = workspace_provider_auth_script();
+        assert!(script.contains(".kind == \"key\" or .kind == \"oauth\""));
+        assert!(script.contains(".credential.integrationID | type == \"string\" and length > 0"));
+        assert!(script.contains(".credential.value.type == \"key\""));
+        assert!(script.contains(".credential.value.type == \"oauth\""));
+        assert!(script.contains("[$credential[0].credential | .id=$id]"));
+        assert!(script.contains(".credential.value.key | type == \"string\""));
+        assert!(workspace_go_auth_script().contains("integrationID:\"opencode-go\""));
+    }
+
+    #[test]
+    fn oauth_generation_is_bound_for_worker_bootstrap_and_opencode_go_key_stays_usable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app_config = config("http://127.0.0.1:4097".into());
+        app_config.store_path = directory.path().join("controller.sqlite3");
+        let mut state = AppState::new(app_config, FakeSandbox);
+        let sealer = Arc::new(
+            ProviderSealer::from_hex(
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            )
+            .unwrap(),
+        );
+        state.provider_sealer = Some(sealer.clone());
+        let store = state.store().unwrap();
+        let oauth_generation = store
+            .upsert_provider_oauth(
+                "openai",
+                "openai-integration",
+                &json!({
+                    "id":"profile-openai-oauth", "integrationID":"openai-integration",
+                    "label":"OpenAI", "active":true,
+                    "value":{"type":"oauth", "methodID":"oauth", "refresh":"refresh-secret",
+                    "access":"access-secret", "expires":123456}
+                }),
+                &sealer,
+            )
+            .unwrap()
+            .generation;
+        store
+            .upsert_provider_key("opencode-go", "go-api-key", &sealer)
+            .unwrap();
+
+        let mut worker_env = Vec::new();
+        append_provider_bootstrap_environment(
+            &state,
+            "session-oauth-worker",
+            Some("openai/gpt-5"),
+            &mut worker_env,
+        )
+        .unwrap();
+        let env_value = |name: &str| {
+            worker_env
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+                .unwrap()
+        };
+        assert_eq!(env_value("ANVIL_PROVIDER_ID"), "openai");
+        assert_eq!(
+            env_value("ANVIL_PROVIDER_GENERATION"),
+            oauth_generation.to_string()
+        );
+        let token_hash = Sha256::digest(env_value("ANVIL_PROVIDER_BOOTSTRAP_TOKEN").as_bytes());
+        let (bound_provider, bound_generation) = state
+            .store()
+            .unwrap()
+            .consume_provider_bootstrap(
+                &token_hash,
+                "session-oauth-worker",
+                "openai",
+                chrono::Utc::now().timestamp(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound_provider, "openai");
+        assert_eq!(bound_generation, oauth_generation);
+        let credential = state
+            .store()
+            .unwrap()
+            .get_provider_credential("openai", bound_generation, &sealer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(credential.kind, ProviderCredentialKind::OAuth);
+        assert_eq!(credential.entry["value"]["type"], "oauth");
+
+        assert_eq!(
+            state
+                .store()
+                .unwrap()
+                .get_provider_key("opencode-go", 0, &sealer)
+                .unwrap()
+                .as_deref(),
+            Some("go-api-key")
+        );
+    }
+
+    #[test]
+    fn operator_oauth_expiry_uses_milliseconds_and_honors_short_expiries() {
+        let now = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        assert_eq!(
+            oauth_attempt_remaining(Some(&json!(1_699_999_999_999_i64)), now),
+            None
+        );
+        assert_eq!(
+            oauth_attempt_remaining(Some(&json!(1_700_000_025_000_i64)), now),
+            Some(Duration::from_secs(25))
+        );
+        assert_eq!(
+            oauth_attempt_remaining(Some(&json!(1_700_001_000_000_i64)), now),
+            Some(LOGIN_TTL)
+        );
+    }
+
+    #[test]
+    fn operator_oauth_rejects_a_second_live_flow_for_the_same_provider() {
+        let state = AppState::new(config("http://127.0.0.1:4097".into()), FakeSandbox);
+        let flow = PendingLogin {
+            provider: "openai".into(),
+            method: PendingLoginMethod::OperatorV2OAuth {
+                integration_id: "openai".into(),
+                attempt_id: "attempt".into(),
+                method_id: "oauth".into(),
+                baseline_ids: Default::default(),
+                mode: "auto".into(),
+                expires_at: Instant::now() + Duration::from_secs(60),
+            },
+            created_at: Instant::now(),
+        };
+        state
+            .pending_logins
+            .lock()
+            .unwrap()
+            .insert("live-flow".into(), flow);
+        assert!(matches!(
+            reject_pending_provider_oauth(&state, "openai"),
+            Err(ServiceError::Conflict(_))
+        ));
+        assert!(reject_pending_provider_oauth(&state, "anthropic").is_ok());
+        state.pending_logins.lock().unwrap().clear();
+        assert!(reject_pending_provider_oauth(&state, "openai").is_ok());
+    }
+
+    #[tokio::test]
+    async fn simultaneous_operator_oauth_begins_only_connect_once_per_provider() {
+        static PROFILE_PASSWORD_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _env_lock = PROFILE_PASSWORD_ENV.lock().await;
+        let previous_password = env::var_os("ANVIL_OPENCODE_SERVER_PASSWORD");
+        unsafe {
+            env::set_var(
+                "ANVIL_OPENCODE_SERVER_PASSWORD",
+                "oauth-concurrency-test-password",
+            );
+        }
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/info");
+            then.status(200).json_body(json!({"version":"2.0.0"}));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/api/provider");
+            then.status(200)
+                .json_body(json!({"data":[{"id":"openai"}]}));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/api/integration/openai");
+            then.status(200)
+                .json_body(json!({"data":{"methods":[{"id":"oauth","type":"oauth"}]}}));
+        });
+        let baseline = server.mock(|when, then| {
+            when.method(GET).path("/api/credential");
+            then.status(200).json_body(json!({"data":[]}));
+        });
+        let connect = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/integration/openai/connect/oauth");
+            then.status(200)
+                .delay(Duration::from_millis(200))
+                .json_body(json!({"data":{
+                    "attemptID":"attempt-concurrent",
+                    "mode":"code",
+                    "time":{"expires":Utc::now().timestamp_millis() + 60_000}
+                }}));
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut app_config = config(server.base_url());
+        app_config.store_path = directory.path().join("controller.sqlite3");
+        let mut state = AppState::new(app_config, FakeSandbox);
+        state.provider_sealer = Some(Arc::new(
+            ProviderSealer::from_hex(
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            )
+            .unwrap(),
+        ));
+        state.provider_operator_token = Some("operator-token-which-is-at-least-32-chars".into());
+        let app = router(state);
+        let request = || {
+            Request::post("/v1/provider-credentials/openai/oauth")
+                .header(
+                    "authorization",
+                    "Bearer operator-token-which-is-at-least-32-chars",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"method_id":"oauth"}"#))
+                .unwrap()
+        };
+        let (first, second) = tokio::join!(app.clone().oneshot(request()), app.oneshot(request()));
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let statuses = [first.status(), second.status()];
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::OK)
+                .count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::CONFLICT)
+                .count(),
+            1
+        );
+        baseline.assert_hits(1);
+        connect.assert_hits(1);
+
+        if let Some(password) = previous_password {
+            unsafe { env::set_var("ANVIL_OPENCODE_SERVER_PASSWORD", password) };
+        } else {
+            unsafe { env::remove_var("ANVIL_OPENCODE_SERVER_PASSWORD") };
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_oauth_auto_polls_and_seals_only_new_credential_without_returning_tokens() {
+        let server = MockServer::start();
+        let mut pending = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/integration/openai/connect/oauth/attempt-auto");
+            then.status(200)
+                .json_body(json!({"data":{"status":"pending"}}));
+        });
+        let complete = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/integration/openai/connect/oauth/attempt-auto");
+            then.status(200)
+                .json_body(json!({"data":{"status":"complete"}}));
+        });
+        let secret = "refresh-secret-never-returned";
+        server.mock(|when, then| {
+            when.method(GET).path("/api/credential");
+            then.status(200).json_body(json!({"data":[{
+                "id":"profile-credential","integrationID":"openai","label":"OpenAI",
+                "active":true,"value":{"type":"oauth","methodID":"oauth-method",
+                "refresh":secret,"access":"access-secret","expires":1234}
+            }]}));
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut app_config = config(server.base_url());
+        app_config.store_path = directory.path().join("controller.sqlite3");
+        let mut state = AppState::new(app_config, FakeSandbox);
+        state.provider_sealer = Some(Arc::new(
+            ProviderSealer::from_hex(
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            )
+            .unwrap(),
+        ));
+        state.provider_operator_token = Some("operator-token-which-is-at-least-32-chars".into());
+        state.pending_logins.lock().unwrap().insert(
+            "auto-login".into(),
+            PendingLogin {
+                provider: "openai".into(),
+                method: PendingLoginMethod::OperatorV2OAuth {
+                    integration_id: "openai".into(),
+                    attempt_id: "attempt-auto".into(),
+                    method_id: "oauth-method".into(),
+                    baseline_ids: Default::default(),
+                    mode: "auto".into(),
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                },
+                created_at: Instant::now(),
+            },
+        );
+        let result = finalize_provider_oauth(&state, "openai", "auto-login", None)
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "pending");
+        pending.assert();
+        pending.delete();
+        let result = finalize_provider_oauth(&state, "openai", "auto-login", None)
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "complete");
+        assert!(!result.to_string().contains(secret));
+        complete.assert();
+        let stored = state
+            .store()
+            .unwrap()
+            .get_provider_credential("openai", 0, state.provider_sealer.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .entry
+                .pointer("/value/refresh")
+                .and_then(Value::as_str),
+            Some(secret)
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_oauth_code_mode_posts_code_then_polls_and_returns_metadata_only() {
+        let server = MockServer::start();
+        let complete = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/integration/openai-integration/connect/oauth/attempt-code/complete")
+                .json_body(json!({"code":"authorization-code"}));
+            then.status(204);
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/integration/openai-integration/connect/oauth/attempt-code");
+            then.status(200)
+                .json_body(json!({"data":{"status":"complete"}}));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/api/credential");
+            then.status(200).json_body(json!({"data":[{
+                "id":"new-credential","integrationID":"openai-integration","label":"OpenAI",
+                "active":true,"value":{"type":"oauth","methodID":"oauth-method",
+                "refresh":"credential-secret","access":"access-secret","expires":1234}
+            }]}));
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut app_config = config(server.base_url());
+        app_config.store_path = directory.path().join("controller.sqlite3");
+        let mut state = AppState::new(app_config, FakeSandbox);
+        state.provider_sealer = Some(Arc::new(
+            ProviderSealer::from_hex(
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            )
+            .unwrap(),
+        ));
+        state.provider_operator_token = Some("operator-token-which-is-at-least-32-chars".into());
+        state.pending_logins.lock().unwrap().insert(
+            "code-login".into(),
+            PendingLogin {
+                provider: "openai".into(),
+                method: PendingLoginMethod::OperatorV2OAuth {
+                    integration_id: "openai-integration".into(),
+                    attempt_id: "attempt-code".into(),
+                    method_id: "oauth-method".into(),
+                    baseline_ids: Default::default(),
+                    mode: "code".into(),
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                },
+                created_at: Instant::now(),
+            },
+        );
+        let result = finalize_provider_oauth(
+            &state,
+            "openai",
+            "code-login",
+            Some("authorization-code".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({"status":"complete","provider_id":"openai","kind":"oauth"})
+        );
+        assert!(!result.to_string().contains("credential-secret"));
+        assert!(!result.to_string().contains("authorization-code"));
+        complete.assert();
+        let stored = state
+            .store()
+            .unwrap()
+            .get_provider_credential("openai", 0, state.provider_sealer.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.entry["integrationID"], "openai-integration");
+        assert!(!state
+            .pending_logins
+            .lock()
+            .unwrap()
+            .contains_key("code-login"));
+    }
+
+    #[tokio::test]
+    async fn operator_oauth_export_failure_keeps_pending_flow_for_retry() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/integration/openai/connect/oauth/attempt-export");
+            then.status(200)
+                .json_body(json!({"data":{"status":"complete"}}));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/api/credential");
+            then.status(200).json_body(json!({"data":[]}));
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut app_config = config(server.base_url());
+        app_config.store_path = directory.path().join("controller.sqlite3");
+        let mut state = AppState::new(app_config, FakeSandbox);
+        state.provider_sealer = Some(Arc::new(
+            ProviderSealer::from_hex(
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            )
+            .unwrap(),
+        ));
+        state.pending_logins.lock().unwrap().insert(
+            "export-login".into(),
+            PendingLogin {
+                provider: "openai".into(),
+                method: PendingLoginMethod::OperatorV2OAuth {
+                    integration_id: "openai".into(),
+                    attempt_id: "attempt-export".into(),
+                    method_id: "oauth-method".into(),
+                    baseline_ids: Default::default(),
+                    mode: "auto".into(),
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                },
+                created_at: Instant::now(),
+            },
+        );
+        assert!(matches!(
+            finalize_provider_oauth(&state, "openai", "export-login", None).await,
+            Err(ServiceError::Conflict(_))
+        ));
+        assert!(state
+            .pending_logins
+            .lock()
+            .unwrap()
+            .contains_key("export-login"));
     }
 
     #[test]
@@ -13228,7 +14406,7 @@ mod tests {
             spec["containers"][0]["ports"],
             json!([{"name":"opencode","containerPort":4096}])
         );
-        assert_eq!(spec["volumes"][1], shared_nix_volume("configured-nix-pvc"));
+        assert_eq!(spec["volumes"][0], shared_nix_volume("configured-nix-pvc"));
         assert!(spec
             .get("securityContext")
             .and_then(|context| context.get("fsGroup"))
@@ -13241,18 +14419,18 @@ mod tests {
             .filter(|m| m["name"] == "shared-nix")
             .all(|m| m["readOnly"] == true));
         assert!(spec["initContainers"][0].get("volumeMounts").is_none());
-        assert!(spec["volumes"][1]["persistentVolumeClaim"]
+        assert!(spec["volumes"][0]["persistentVolumeClaim"]
             .get("readOnly")
             .is_none());
-        assert_eq!(spec["volumes"].as_array().unwrap().len(), 2);
-        assert!(spec["volumes"].to_string().contains("shared-profile"));
-        assert!(spec["containers"][0]["volumeMounts"]
-            .to_string()
-            .contains("shared-profile"));
-        assert_eq!(
-            spec["initContainers"][0],
-            json!({"name":"fix-workspace-permissions"})
-        );
+        assert_eq!(spec["volumes"].as_array().unwrap().len(), 1);
+        assert!(!manifest.to_string().contains("shared-profile"));
+        assert!(!manifest.to_string().contains("/anvil/profile"));
+        let default_init = &spec["initContainers"][0];
+        assert_eq!(default_init["name"], "fix-workspace-permissions");
+        assert!(default_init["args"][0]
+            .as_str()
+            .unwrap()
+            .contains("\"permission\":\"allow\""));
     }
 
     #[test]
@@ -13347,8 +14525,10 @@ mod tests {
             .to_string()
             .contains("shared-profile"));
         assert!(spec["containers"][0]["env"]
-            .to_string()
-            .contains("ANVIL_ISOLATED_GO_AUTH"));
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "ANVIL_ISOLATED_AUTH" && entry["value"] == "1"));
         assert!(spec["containers"][0]["env"]
             .to_string()
             .contains("/home/anvil/.config/opencode/opencode.jsonc"));
@@ -13358,7 +14538,7 @@ mod tests {
     }
 
     #[test]
-    fn default_sandbox_init_args_and_environment_remain_unchanged() {
+    fn default_sandbox_uses_private_auth_and_config_without_shared_credentials() {
         let config = config("http://profile".into());
         let init = json!({
             "name":"fix-workspace-permissions",
@@ -13376,14 +14556,45 @@ mod tests {
             vec![],
         );
         let rendered = &manifest["spec"]["podTemplate"]["spec"];
-        assert_eq!(rendered["initContainers"][0], init);
-        assert_eq!(
-            rendered["containers"][0]["env"],
-            json!([{
-                "name":"OPENCODE_SERVER_PASSWORD",
-                "valueFrom":{"secretKeyRef":{"name":"github-app-credentials","key":"ANVIL_OPENCODE_SERVER_PASSWORD"}}
-            }])
-        );
+        let init_args = rendered["initContainers"][0]["args"][0].as_str().unwrap();
+        assert!(init_args.contains("\"permission\":\"allow\""));
+        assert!(init_args.contains("chown -R 1000:1000 /home/anvil/.config/opencode"));
+        let serialized = manifest.to_string();
+        assert!(!serialized.contains("shared-profile"));
+        assert!(!serialized.contains("/anvil/profile"));
+        assert!(rendered["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|volume| {
+                volume.get("secret").is_none() && volume.get("persistentVolumeClaim").is_some()
+            }));
+        for entry in rendered["containers"][0]["env"].as_array().unwrap() {
+            assert!(!matches!(
+                entry["name"].as_str(),
+                Some("ANVIL_PROVIDER_BOOTSTRAP_TOKEN")
+                    | Some("ANVIL_PROVIDER_ID")
+                    | Some("ANVIL_PROVIDER_GENERATION")
+                    | Some("ANVIL_OPENCODE_GO_SECRET")
+            ));
+        }
+        assert!(!serialized.contains("provider-secret"));
+        assert!(!serialized.contains("one-time-capability"));
+        let serving_env = rendered["containers"][0]["env"].as_array().unwrap();
+        assert!(serving_env
+            .iter()
+            .any(|entry| entry["name"] == "ANVIL_ISOLATED_AUTH" && entry["value"] == "1"));
+        assert!(serving_env
+            .iter()
+            .any(|entry| entry["name"] == "OPENCODE_CONFIG"
+                && entry["value"] == "/home/anvil/.config/opencode/opencode.jsonc"));
+        assert!(serving_env
+            .iter()
+            .any(|entry| entry["name"] == "XDG_DATA_HOME"
+                && entry["value"] == "/home/anvil/.local/share"));
+        assert!(!serving_env
+            .iter()
+            .any(|entry| entry["valueFrom"].to_string().contains("go-auth")));
         assert_eq!(
             rendered["containers"][0]["volumeMounts"][0],
             json!({
@@ -13417,7 +14628,11 @@ mod tests {
         let init_script = format!(
             "{}\numask 077\nmkdir -p {}/.config/opencode\nprintf '%s\\n' '{{\"$schema\":\"https://opencode.ai/config.json\",\"permission\":\"allow\"}}' > {}/.config/opencode/opencode.jsonc\nchown -R 1000:1000 {}/.config/opencode\nchmod 700 {}/.config/opencode\nchmod 600 {}/.config/opencode/opencode.jsonc",
             "set -euo pipefail",
-            home.display(), home.display(), home.display(), home.display(), home.display()
+            home.display(),
+            home.display(),
+            home.display(),
+            home.display(),
+            home.display()
         );
         let inherited_path = std::env::var_os("PATH").unwrap();
         let output = std::process::Command::new("bash")
@@ -13466,8 +14681,9 @@ mod tests {
     #[test]
     fn isolated_go_entrypoint_skips_shared_profile_auth_setup() {
         let script = include_str!("../../../runtime/sandbox-entrypoint");
-        assert!(script.contains("if [ \"${ANVIL_ISOLATED_GO_AUTH:-}\" = 1 ]; then\n  umask 077\nelse\n  profile_dir=/anvil/profile"));
-        assert!(script.contains("if [ \"${ANVIL_ISOLATED_GO_AUTH:-}\" != 1 ]; then\n  mkdir -p \"$HOME/.local/share/opencode\""));
+        assert!(script.contains("${ANVIL_ISOLATED_AUTH:-${ANVIL_ISOLATED_GO_AUTH:-}}"));
+        assert!(!script.contains("/anvil/profile"));
+        assert!(!script.contains("auth.json"));
     }
 
     #[test]

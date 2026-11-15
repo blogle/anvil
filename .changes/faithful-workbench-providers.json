@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "Match the approved workbench screens and support OAuth and API-key provider onboarding for workers"
+}

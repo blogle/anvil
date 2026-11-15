@@ -16,7 +16,9 @@ use thiserror::Error;
 #[path = "provider_credentials.rs"]
 pub mod provider_credentials;
 pub mod scheduler;
-use provider_credentials::{ProviderCredentialMetadata, ProviderSealer};
+use provider_credentials::{
+    ProviderCredential, ProviderCredentialKind, ProviderCredentialMetadata, ProviderSealer,
+};
 
 const CANONICALIZATION_VERSION: i64 = 1;
 #[cfg(test)]
@@ -257,6 +259,52 @@ impl ControllerStore {
             provider_id: provider.to_owned(),
             generation,
             created_at,
+            kind: "key".into(),
+        })
+    }
+
+    /// Encrypt and persist a validated OpenCode OAuth entry as the next generation.
+    pub fn upsert_provider_oauth(
+        &self,
+        provider_id: &str,
+        integration_id: &str,
+        entry: &Value,
+        sealer: &ProviderSealer,
+    ) -> Result<ProviderCredentialMetadata, StoreError> {
+        validate_provider_id(provider_id)?;
+        validate_oauth_entry(integration_id, entry)?;
+        let plaintext =
+            serde_json::to_vec(entry).map_err(|_| StoreError::InvalidProviderCredential)?;
+        if plaintext.len() > 16 * 1024 {
+            return Err(StoreError::InvalidProviderCredential);
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(generation),0) FROM provider_credentials WHERE provider_id=?1",
+            [provider_id],
+            |row| row.get(0),
+        )?;
+        let generation = previous
+            .checked_add(1)
+            .ok_or(StoreError::InvalidProviderCredential)?;
+        let (ciphertext, nonce) = sealer
+            .seal(provider_id, generation, &plaintext)
+            .map_err(|_| StoreError::ProviderCredentialCrypto)?;
+        let created_at = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO provider_credentials(provider_id,generation,ciphertext,nonce,created_at,kind) VALUES(?1,?2,?3,?4,?5,'oauth')",
+            params![provider_id, generation, ciphertext, nonce, created_at],
+        )?;
+        tx.commit()?;
+        Ok(ProviderCredentialMetadata {
+            provider_id: provider_id.to_owned(),
+            generation,
+            created_at,
+            kind: "oauth".into(),
         })
     }
 
@@ -267,13 +315,14 @@ impl ControllerStore {
             .lock()
             .expect("controller store lock poisoned");
         let mut statement = connection.prepare(
-            "SELECT provider_id,generation,created_at FROM provider_credentials ORDER BY provider_id,generation",
+            "SELECT provider_id,generation,created_at,kind FROM provider_credentials ORDER BY provider_id,generation",
         )?;
         let rows = statement.query_map([], |row| {
             Ok(ProviderCredentialMetadata {
                 provider_id: row.get(0)?,
                 generation: row.get(1)?,
                 created_at: row.get(2)?,
+                kind: row.get(3)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -298,7 +347,7 @@ impl ControllerStore {
         let stored = if generation == 0 {
             connection
                 .query_row(
-                    "SELECT generation,ciphertext,nonce FROM provider_credentials WHERE provider_id=?1 ORDER BY generation DESC LIMIT 1",
+                    "SELECT generation,ciphertext,nonce FROM provider_credentials WHERE provider_id=?1 AND kind='key' ORDER BY generation DESC LIMIT 1",
                     [provider],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?)),
                 )
@@ -306,7 +355,7 @@ impl ControllerStore {
         } else {
             connection
                 .query_row(
-                    "SELECT generation,ciphertext,nonce FROM provider_credentials WHERE provider_id=?1 AND generation=?2",
+                    "SELECT generation,ciphertext,nonce FROM provider_credentials WHERE provider_id=?1 AND generation=?2 AND kind='key'",
                     params![provider, generation],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?)),
                 )
@@ -321,6 +370,71 @@ impl ControllerStore {
         String::from_utf8(plaintext)
             .map(Some)
             .map_err(|_| StoreError::ProviderCredentialCrypto)
+    }
+
+    /// Decrypt a credential for internal provider import. Generation zero selects latest.
+    pub(crate) fn get_provider_credential(
+        &self,
+        provider_id: &str,
+        generation: i64,
+        sealer: &ProviderSealer,
+    ) -> Result<Option<ProviderCredential>, StoreError> {
+        validate_provider_id(provider_id)?;
+        if generation < 0 {
+            return Err(StoreError::InvalidProviderCredential);
+        }
+        let connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let stored = if generation == 0 {
+            connection.query_row(
+                "SELECT generation,ciphertext,nonce,kind FROM provider_credentials WHERE provider_id=?1 ORDER BY generation DESC LIMIT 1",
+                [provider_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, String>(3)?)),
+            ).optional()?
+        } else {
+            connection.query_row(
+                "SELECT generation,ciphertext,nonce,kind FROM provider_credentials WHERE provider_id=?1 AND generation=?2",
+                params![provider_id, generation],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, String>(3)?)),
+            ).optional()?
+        };
+        let Some((actual_generation, ciphertext, nonce, stored_kind)) = stored else {
+            return Ok(None);
+        };
+        let kind = match stored_kind.as_str() {
+            "key" => ProviderCredentialKind::Key,
+            "oauth" => ProviderCredentialKind::OAuth,
+            _ => return Err(StoreError::InvalidProviderCredential),
+        };
+        let plaintext = sealer
+            .open(provider_id, actual_generation, &ciphertext, &nonce)
+            .map_err(|_| StoreError::ProviderCredentialCrypto)?;
+        let entry = match kind {
+            ProviderCredentialKind::Key => {
+                let key = String::from_utf8(plaintext)
+                    .map_err(|_| StoreError::ProviderCredentialCrypto)?;
+                serde_json::json!({
+                    "id": format!("cred_anvil_{provider_id}"),
+                    "integrationID": provider_id,
+                    "label": format!("Anvil {provider_id}"),
+                    "active": true,
+                    "value": {"type":"key", "key":key}
+                })
+            }
+            ProviderCredentialKind::OAuth => {
+                let value: Value = serde_json::from_slice(&plaintext)
+                    .map_err(|_| StoreError::ProviderCredentialCrypto)?;
+                let integration_id = value
+                    .get("integrationID")
+                    .and_then(Value::as_str)
+                    .ok_or(StoreError::InvalidProviderCredential)?;
+                validate_oauth_entry(integration_id, &value)?;
+                value
+            }
+        };
+        Ok(Some(ProviderCredential { kind, entry }))
     }
 
     /// Bind a short-lived bootstrap capability to one session and credential generation.
@@ -4440,6 +4554,27 @@ fn migrate_until(connection: &Connection, target_version: i64) -> Result<(), rus
             INSERT INTO schema_migrations(version,applied_at) VALUES(18,datetime('now'));",
         )?;
     }
+    let migration_19_applied: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=19)",
+        [],
+        |row| row.get(0),
+    )?;
+    if !migration_19_applied && target_version >= 19 {
+        let kind_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('provider_credentials') WHERE name='kind')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !kind_exists {
+            tx.execute_batch(
+                "ALTER TABLE provider_credentials ADD COLUMN kind TEXT NOT NULL DEFAULT 'key' CHECK(kind IN ('key','oauth'));",
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO schema_migrations(version,applied_at) VALUES(19,datetime('now'))",
+            [],
+        )?;
+    }
     tx.commit()?;
     connection.execute_batch("PRAGMA foreign_keys=ON;")?;
     let mut check = connection.prepare("PRAGMA foreign_key_check")?;
@@ -4450,11 +4585,53 @@ fn migrate_until(connection: &Connection, target_version: i64) -> Result<(), rus
 }
 
 fn validate_provider_id(provider: &str) -> Result<(), StoreError> {
-    let valid = !provider.is_empty()
-        && provider.len() <= 63
-        && provider
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    let bytes = provider.as_bytes();
+    let valid = (1..=63).contains(&bytes.len())
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+        && provider != "."
+        && provider != "..";
+    if valid {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidProviderCredential)
+    }
+}
+
+fn validate_oauth_entry(integration_id: &str, entry: &Value) -> Result<(), StoreError> {
+    let value = entry.get("value");
+    let valid = entry.is_object()
+        && !integration_id.is_empty()
+        && entry
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+        && entry
+            .get("integrationID")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty() && s == integration_id)
+        && entry
+            .get("label")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+        && entry.get("active").and_then(Value::as_bool).is_some()
+        && value.and_then(|v| v.get("type")).and_then(Value::as_str) == Some("oauth")
+        && value
+            .and_then(|v| v.get("methodID"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+        && ["refresh", "access"].iter().all(|field| {
+            value
+                .and_then(|v| v.get(field))
+                .and_then(Value::as_str)
+                .is_some()
+        })
+        && value
+            .and_then(|v| v.get("expires"))
+            .and_then(Value::as_u64)
+            .is_some();
     if valid {
         Ok(())
     } else {
@@ -4539,6 +4716,19 @@ mod tests {
     fn test_sealer() -> ProviderSealer {
         ProviderSealer::from_hex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
             .unwrap()
+    }
+
+    #[test]
+    fn provider_ids_allow_provider_punctuation_but_not_path_or_url_syntax() {
+        for valid in ["a", "wafer.ai", "opencode-go", "a_b.c-1", &"a".repeat(63)] {
+            assert!(validate_provider_id(valid).is_ok(), "{valid:?}");
+        }
+        for invalid in [
+            "", ".", "..", "../", "a?b", "a%b", "a:b", "a b", "A", "_a", ".a", "a/", "a\n",
+        ] {
+            assert!(validate_provider_id(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(validate_provider_id(&"a".repeat(64)).is_err());
     }
 
     #[test]
@@ -4688,25 +4878,35 @@ mod tests {
             restarted.get_provider_key("openai", 1, &wrong_key),
             Err(StoreError::ProviderCredentialCrypto)
         ));
+        let legacy = restarted
+            .get_provider_credential("openai", 1, &sealer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.kind, ProviderCredentialKind::Key);
+        assert_eq!(legacy.entry["value"]["key"], first_key);
     }
 
     #[test]
-    fn provider_key_schema_migrates_from_version_sixteen() {
+    fn provider_credential_schema_migrates_from_version_eighteen_preserving_keys() {
         let connection = Connection::open_in_memory().unwrap();
-        migrate_until(&connection, 16).unwrap();
-        let version: i64 = connection
-            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(version, 16);
-        migrate(&connection).unwrap();
+        migrate_until(&connection, 18).unwrap();
         let version: i64 = connection
             .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
                 row.get(0)
             })
             .unwrap();
         assert_eq!(version, 18);
+        connection.execute(
+            "INSERT INTO provider_credentials(provider_id,generation,ciphertext,nonce,created_at) VALUES('openai',1,x'0102',x'0304','then')",
+            [],
+        ).unwrap();
+        migrate(&connection).unwrap();
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 19);
         let columns: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('provider_credentials')",
@@ -4714,7 +4914,143 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(columns, 5);
+        assert_eq!(columns, 6);
+        let (kind, ciphertext): (String, Vec<u8>) = connection
+            .query_row(
+                "SELECT kind,ciphertext FROM provider_credentials WHERE provider_id='openai' AND generation=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "key");
+        assert_eq!(ciphertext, [1, 2]);
+    }
+
+    #[test]
+    fn oauth_credentials_are_sealed_and_roundtrip_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller.sqlite3");
+        let sealer = test_sealer();
+        let entry = json!({
+            "id":"cred_test_oauth", "integrationID":"openai-integration", "label":"OpenAI OAuth", "active":true,
+            "value":{"type":"oauth", "methodID":"oauth", "refresh":"refresh-secret", "access":"access-secret", "expires":123456},
+            "metadata":{"opaque":true}
+        });
+        let store = ControllerStore::open(&path).unwrap();
+        let metadata = store
+            .upsert_provider_oauth("openai", "openai-integration", &entry, &sealer)
+            .unwrap();
+        assert_eq!(metadata.generation, 1);
+        assert_eq!(metadata.kind, "oauth");
+        assert!(!serde_json::to_string(&metadata).unwrap().contains("secret"));
+        {
+            let connection = store.connection.lock().unwrap();
+            let (ciphertext, kind): (Vec<u8>, String) = connection.query_row(
+                "SELECT ciphertext,kind FROM provider_credentials WHERE provider_id='openai' AND generation=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(kind, "oauth");
+            assert!(!ciphertext
+                .windows(b"refresh-secret".len())
+                .any(|w| w == b"refresh-secret"));
+            assert!(!ciphertext
+                .windows(b"access-secret".len())
+                .any(|w| w == b"access-secret"));
+        }
+        drop(store);
+        let restarted = ControllerStore::open(&path).unwrap();
+        let credential = restarted
+            .get_provider_credential("openai", 1, &sealer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(credential.kind, ProviderCredentialKind::OAuth);
+        assert_eq!(credential.entry, entry);
+        assert!(restarted
+            .get_provider_key("openai", 1, &sealer)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn oauth_credentials_reject_malformed_and_oversized_entries_without_leaking_tokens() {
+        let (_dir, store) = store();
+        let sealer = test_sealer();
+        let malformed = json!({
+            "id":"cred_test_oauth", "integrationID":"other", "label":"OAuth", "active":true,
+            "value":{"type":"oauth", "methodID":"oauth", "refresh":"hidden-token", "access":"hidden-token", "expires":1}
+        });
+        let error = store
+            .upsert_provider_oauth("openai", "openai", &malformed, &sealer)
+            .unwrap_err();
+        assert!(matches!(error, StoreError::InvalidProviderCredential));
+        assert!(!error.to_string().contains("hidden-token"));
+
+        let valid = json!({
+            "id":"cred_test_oauth", "integrationID":"openai", "label":"OAuth", "active":true,
+            "value":{"type":"oauth", "methodID":"oauth", "refresh":"refresh-token", "access":"access-token", "expires":1},
+            "metadata":{"opaque":true}
+        });
+        for (field, invalid) in [
+            ("methodID", json!(null)),
+            ("methodID", json!({"unexpected":"object"})),
+            ("methodID", json!("")),
+            ("refresh", json!(null)),
+            ("refresh", json!({"unexpected":"object"})),
+            ("refresh", json!(1)),
+            ("access", json!(null)),
+            ("access", json!({"unexpected":"object"})),
+            ("access", json!(1)),
+            ("expires", json!(null)),
+            ("expires", json!({"unexpected":"object"})),
+            ("expires", json!(1.5)),
+            ("expires", json!(-1)),
+            ("expires", json!("1")),
+        ] {
+            let mut entry = valid.clone();
+            entry["value"][field] = invalid;
+            let error = store
+                .upsert_provider_oauth("openai", "openai", &entry, &sealer)
+                .unwrap_err();
+            assert!(matches!(error, StoreError::InvalidProviderCredential));
+            assert!(!error.to_string().contains("refresh-token"));
+            assert!(!error.to_string().contains("access-token"));
+        }
+
+        for field in ["id", "integrationID", "label"] {
+            let mut entry = valid.clone();
+            entry[field] = json!(null);
+            assert!(matches!(
+                store.upsert_provider_oauth("openai", "openai", &entry, &sealer),
+                Err(StoreError::InvalidProviderCredential)
+            ));
+            entry[field] = json!("");
+            assert!(matches!(
+                store.upsert_provider_oauth("openai", "openai", &entry, &sealer),
+                Err(StoreError::InvalidProviderCredential)
+            ));
+        }
+        let mut entry = valid.clone();
+        entry["value"]["type"] = json!("key");
+        assert!(matches!(
+            store.upsert_provider_oauth("openai", "openai", &entry, &sealer),
+            Err(StoreError::InvalidProviderCredential)
+        ));
+        let mut entry = valid.clone();
+        entry["active"] = json!("true");
+        assert!(matches!(
+            store.upsert_provider_oauth("openai", "openai", &entry, &sealer),
+            Err(StoreError::InvalidProviderCredential)
+        ));
+
+        let oversized = json!({
+            "id":"cred_test_oauth", "integrationID":"openai", "label":"OAuth", "active":true,
+            "value":{"type":"oauth", "methodID":"oauth", "refresh":"x", "access":"x", "expires":1, "extra":"x".repeat(17 * 1024)}
+        });
+        assert!(matches!(
+            store.upsert_provider_oauth("openai", "openai", &oversized, &sealer),
+            Err(StoreError::InvalidProviderCredential)
+        ));
     }
 
     #[test]
@@ -5690,7 +6026,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
     }
 
     #[test]
@@ -5854,7 +6190,7 @@ mod tests {
                     row.get(0)
                 })
                 .unwrap();
-            assert_eq!(latest, 18, "restored schema version {target}");
+            assert_eq!(latest, 19, "restored schema version {target}");
         }
     }
 
@@ -6386,7 +6722,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(latest, 18);
+        assert_eq!(latest, 19);
         let index: i64=connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='orchestration_by_attempt'",[],|row|row.get(0)).unwrap();
         assert_eq!(index, 1);
         let state_mappings: i64 = connection
