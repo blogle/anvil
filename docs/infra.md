@@ -100,7 +100,11 @@ it is not returned to or stored in the browser. Browser Settings may initiate or
 display the operator flow, but must not handle the exported secret payload.
 The operator CLI also supports these management operations. The OpenCode profile
 must keep `XDG_DATA_HOME` on storage anchored to the profile PVC, so its SQLite
-database (including profile credential state) survives profile Pod restarts.
+database (including profile credential state) survives profile Pod restarts. No
+Kubernetes worker, including a default or uncredentialed worker, receives or mounts
+the profile PVC. Every worker has private OpenCode config and XDG data; credentials
+are delivered only by the selected init-container import into that worker's private
+SQLite database.
 
 Enable provider credential management only by provisioning both daemon secrets:
 `ANVIL_PROVIDER_OPERATOR_TOKEN` (at least 32 characters) and
@@ -116,11 +120,14 @@ issues a session/provider/generation-bound, one-use bootstrap capability.
 `GET /v1/sessions/{id}/credentials/provider` is a private init-only endpoint: the
 capability is removed from the Sandbox's regular container environment and passed
 only to the Workspace init container. Init imports that selected key or OAuth
-credential into the worker's private OpenCode SQLite database. It does not grant
+credential into the worker's private OpenCode SQLite database. If controller
+credential management is active and an explicitly selected model has no matching
+stored provider credential, execution fails closed. The capability does not grant
 the worker general operator API access. Bootstrap is not fully restart-safe:
-redemption consumes the token before the import completes, so if import fails
-after redemption, an operator must issue a new capability; automatic recovery is
-not available yet.
+redemption consumes the token before the import completes. No supported automatic
+recovery or public capability-reissue endpoint exists; recovery requires operator
+remediation and a new Session (tracked by ANVIL-72), not a reissue command on an
+existing Session.
 
 OpenAI's `chatgpt-headless` device-code method is the supported headless OAuth
 flow. Browser callback-based modes may not work when the profile is remote or
@@ -137,7 +144,7 @@ it is not a substitute or alias for OpenAI OAuth. If explicitly configured via
 `ANVIL_OPENCODE_GO_SECRET`, naming a namespace-local Secret with key `go-key`,
 only the Workspace init container mounts it and imports it into that worker's
 private SQLite database. The serving container does not mount either that Secret
-or the shared profile claim. This contract declares a required Secret
+or the shared profile PVC. This contract declares a required Secret
 **reference**, not its provisioning or contents.
 
 Each Attempt selects one model provider; provider selection is Attempt-scoped,

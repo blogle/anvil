@@ -304,32 +304,24 @@ fn sandbox_manifest(
     let provider_bootstrap = bootstrap_env.contains_key("ANVIL_PROVIDER_BOOTSTRAP_TOKEN");
     // The serving container still needs its session ID for GitHub credential
     // renewal; only the provider bootstrap capability is init-only.
-    let isolated_go_auth = config.opencode_go_secret.is_some() || provider_bootstrap;
-    if isolated_go_auth {
-        set_env_value(
-            &mut env,
-            "OPENCODE_CONFIG",
-            "/home/anvil/.config/opencode/opencode.jsonc",
-        );
-        set_env_value(
-            &mut env,
-            "OPENCODE_CONFIG_DIR",
-            "/home/anvil/.config/opencode",
-        );
-        set_env_value(&mut env, "ANVIL_ISOLATED_GO_AUTH", "1");
-    }
+    set_env_value(
+        &mut env,
+        "OPENCODE_CONFIG",
+        "/home/anvil/.config/opencode/opencode.jsonc",
+    );
+    set_env_value(
+        &mut env,
+        "OPENCODE_CONFIG_DIR",
+        "/home/anvil/.config/opencode",
+    );
+    set_env_value(&mut env, "XDG_DATA_HOME", "/home/anvil/.local/share");
+    set_env_value(&mut env, "ANVIL_ISOLATED_AUTH", "1");
     env.push(json!({"name":"OPENCODE_SERVER_PASSWORD","valueFrom":{"secretKeyRef":{"name":"github-app-credentials","key":"ANVIL_OPENCODE_SERVER_PASSWORD"}}}));
     let mut container_mounts = vec![json!({"name":"workspace","mountPath":"/home/anvil"})];
-    if !isolated_go_auth {
-        container_mounts.push(json!({"name":"shared-profile","mountPath":"/anvil/profile"}));
-    }
     container_mounts.extend([shared_nix_store_mount(), shared_nix_socket_mount()]);
     let container = json!({"name":"sandbox","image":config.image,"ports":[{"name":"opencode","containerPort":config.opencode_port}],"env":env,"volumeMounts":container_mounts});
     let mut workspace_init = workspace_init;
     let mut volumes = Vec::new();
-    if !isolated_go_auth {
-        volumes.push(json!({"name":"shared-profile","persistentVolumeClaim":{"claimName":config.profile_pvc}}));
-    }
     volumes.push(shared_nix_volume(&config.nix_pvc));
     // Provider database bootstrap takes precedence over Go Secret injection. In
     // particular, do not mount or execute the Go credential path for a provider
@@ -360,6 +352,12 @@ fn sandbox_manifest(
                 workspace_init_script(),
                 "umask 077\nmkdir -p /home/anvil/.config/opencode\nprintf '%s\\n' '{\"$schema\":\"https://opencode.ai/config.json\",\"permission\":\"allow\"}' > /home/anvil/.config/opencode/opencode.jsonc\nchown -R 1000:1000 /home/anvil/.config/opencode\nchmod 700 /home/anvil/.config/opencode\nchmod 600 /home/anvil/.config/opencode/opencode.jsonc",
                 workspace_go_auth_script()
+            )]);
+        } else {
+            workspace_init["args"] = json!([format!(
+                "{}\n{}",
+                workspace_init_script(),
+                "umask 077\nmkdir -p /home/anvil/.config/opencode\nprintf '%s\\n' '{\"$schema\":\"https://opencode.ai/config.json\",\"permission\":\"allow\"}' > /home/anvil/.config/opencode/opencode.jsonc\nchown -R 1000:1000 /home/anvil/.config/opencode\nchmod 700 /home/anvil/.config/opencode\nchmod 600 /home/anvil/.config/opencode/opencode.jsonc"
             )]);
         }
     }
@@ -403,6 +401,15 @@ fn sandbox_manifest(
         ] {
             set_named_value(init_env, name, json!({"name":name,"value":value}));
         }
+        let current_args = workspace_init["args"][0]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        workspace_init["args"] = json!([format!(
+            "{}\n{}",
+            current_args,
+            "umask 077\nmkdir -p /home/anvil/.config/opencode\nprintf '%s\\n' '{\"$schema\":\"https://opencode.ai/config.json\",\"permission\":\"allow\"}' > /home/anvil/.config/opencode/opencode.jsonc\nchown -R 1000:1000 /home/anvil/.config/opencode\nchmod 700 /home/anvil/.config/opencode\nchmod 600 /home/anvil/.config/opencode/opencode.jsonc"
+        )]);
         let current_args = workspace_init["args"][0]
             .as_str()
             .unwrap_or_default()
@@ -2488,8 +2495,8 @@ impl SandboxApi for KubeSandboxApi {
             json!({"name":"ANVIL_REPOSITORY","value":r.repository}),
             json!({"name":"ANVIL_REF","value":r.base_ref}),
             json!({"name":"ANVIL_WORK_BRANCH","value":work_branch}),
-            json!({"name":"OPENCODE_CONFIG","value":"/anvil/profile/config/opencode.jsonc"}),
-            json!({"name":"OPENCODE_CONFIG_DIR","value":"/anvil/profile/config"}),
+            json!({"name":"OPENCODE_CONFIG","value":"/home/anvil/.config/opencode/opencode.jsonc"}),
+            json!({"name":"OPENCODE_CONFIG_DIR","value":"/home/anvil/.config/opencode"}),
             json!({"name":"OPENCODE_DISABLE_CHANNEL_DB","value":"1"}),
             json!({"name":"HOME","value":"/home/anvil"}),
             json!({"name":"XDG_CONFIG_HOME","value":"/home/anvil/.config"}),
@@ -14399,7 +14406,7 @@ mod tests {
             spec["containers"][0]["ports"],
             json!([{"name":"opencode","containerPort":4096}])
         );
-        assert_eq!(spec["volumes"][1], shared_nix_volume("configured-nix-pvc"));
+        assert_eq!(spec["volumes"][0], shared_nix_volume("configured-nix-pvc"));
         assert!(spec
             .get("securityContext")
             .and_then(|context| context.get("fsGroup"))
@@ -14412,18 +14419,18 @@ mod tests {
             .filter(|m| m["name"] == "shared-nix")
             .all(|m| m["readOnly"] == true));
         assert!(spec["initContainers"][0].get("volumeMounts").is_none());
-        assert!(spec["volumes"][1]["persistentVolumeClaim"]
+        assert!(spec["volumes"][0]["persistentVolumeClaim"]
             .get("readOnly")
             .is_none());
-        assert_eq!(spec["volumes"].as_array().unwrap().len(), 2);
-        assert!(spec["volumes"].to_string().contains("shared-profile"));
-        assert!(spec["containers"][0]["volumeMounts"]
-            .to_string()
-            .contains("shared-profile"));
-        assert_eq!(
-            spec["initContainers"][0],
-            json!({"name":"fix-workspace-permissions"})
-        );
+        assert_eq!(spec["volumes"].as_array().unwrap().len(), 1);
+        assert!(!manifest.to_string().contains("shared-profile"));
+        assert!(!manifest.to_string().contains("/anvil/profile"));
+        let default_init = &spec["initContainers"][0];
+        assert_eq!(default_init["name"], "fix-workspace-permissions");
+        assert!(default_init["args"][0]
+            .as_str()
+            .unwrap()
+            .contains("\"permission\":\"allow\""));
     }
 
     #[test]
@@ -14518,8 +14525,10 @@ mod tests {
             .to_string()
             .contains("shared-profile"));
         assert!(spec["containers"][0]["env"]
-            .to_string()
-            .contains("ANVIL_ISOLATED_GO_AUTH"));
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "ANVIL_ISOLATED_AUTH" && entry["value"] == "1"));
         assert!(spec["containers"][0]["env"]
             .to_string()
             .contains("/home/anvil/.config/opencode/opencode.jsonc"));
@@ -14529,7 +14538,7 @@ mod tests {
     }
 
     #[test]
-    fn default_sandbox_init_args_and_environment_remain_unchanged() {
+    fn default_sandbox_uses_private_auth_and_config_without_shared_credentials() {
         let config = config("http://profile".into());
         let init = json!({
             "name":"fix-workspace-permissions",
@@ -14547,14 +14556,45 @@ mod tests {
             vec![],
         );
         let rendered = &manifest["spec"]["podTemplate"]["spec"];
-        assert_eq!(rendered["initContainers"][0], init);
-        assert_eq!(
-            rendered["containers"][0]["env"],
-            json!([{
-                "name":"OPENCODE_SERVER_PASSWORD",
-                "valueFrom":{"secretKeyRef":{"name":"github-app-credentials","key":"ANVIL_OPENCODE_SERVER_PASSWORD"}}
-            }])
-        );
+        let init_args = rendered["initContainers"][0]["args"][0].as_str().unwrap();
+        assert!(init_args.contains("\"permission\":\"allow\""));
+        assert!(init_args.contains("chown -R 1000:1000 /home/anvil/.config/opencode"));
+        let serialized = manifest.to_string();
+        assert!(!serialized.contains("shared-profile"));
+        assert!(!serialized.contains("/anvil/profile"));
+        assert!(rendered["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|volume| {
+                volume.get("secret").is_none() && volume.get("persistentVolumeClaim").is_some()
+            }));
+        for entry in rendered["containers"][0]["env"].as_array().unwrap() {
+            assert!(!matches!(
+                entry["name"].as_str(),
+                Some("ANVIL_PROVIDER_BOOTSTRAP_TOKEN")
+                    | Some("ANVIL_PROVIDER_ID")
+                    | Some("ANVIL_PROVIDER_GENERATION")
+                    | Some("ANVIL_OPENCODE_GO_SECRET")
+            ));
+        }
+        assert!(!serialized.contains("provider-secret"));
+        assert!(!serialized.contains("one-time-capability"));
+        let serving_env = rendered["containers"][0]["env"].as_array().unwrap();
+        assert!(serving_env
+            .iter()
+            .any(|entry| entry["name"] == "ANVIL_ISOLATED_AUTH" && entry["value"] == "1"));
+        assert!(serving_env
+            .iter()
+            .any(|entry| entry["name"] == "OPENCODE_CONFIG"
+                && entry["value"] == "/home/anvil/.config/opencode/opencode.jsonc"));
+        assert!(serving_env
+            .iter()
+            .any(|entry| entry["name"] == "XDG_DATA_HOME"
+                && entry["value"] == "/home/anvil/.local/share"));
+        assert!(!serving_env
+            .iter()
+            .any(|entry| entry["valueFrom"].to_string().contains("go-auth")));
         assert_eq!(
             rendered["containers"][0]["volumeMounts"][0],
             json!({
@@ -14641,8 +14681,9 @@ mod tests {
     #[test]
     fn isolated_go_entrypoint_skips_shared_profile_auth_setup() {
         let script = include_str!("../../../runtime/sandbox-entrypoint");
-        assert!(script.contains("if [ \"${ANVIL_ISOLATED_GO_AUTH:-}\" = 1 ]; then\n  umask 077\nelse\n  profile_dir=/anvil/profile"));
-        assert!(script.contains("if [ \"${ANVIL_ISOLATED_GO_AUTH:-}\" != 1 ]; then\n  mkdir -p \"$HOME/.local/share/opencode\""));
+        assert!(script.contains("${ANVIL_ISOLATED_AUTH:-${ANVIL_ISOLATED_GO_AUTH:-}}"));
+        assert!(!script.contains("/anvil/profile"));
+        assert!(!script.contains("auth.json"));
     }
 
     #[test]

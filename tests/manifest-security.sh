@@ -73,7 +73,16 @@ if grep -Fq 'fsGroup:' "$repo_root/crates/anvild/src/lib.rs"; then
   printf 'manifest-security: generated sandbox must not set Pod fsGroup on shared volumes\n' >&2
   exit 1
 fi
-require_text "sandbox shared PVC without volume-level read-only" '"claimName":pvc}}' "$repo_root/crates/anvild/src/lib.rs"
+if grep -Eq 'mountPath":"/anvil/profile|persistentVolumeClaim":"claimName":config\.profile_pvc' "$repo_root/crates/anvild/src/lib.rs"; then
+  printf 'manifest-security: sandbox manifests must not mount the shared profile PVC\n' >&2
+  exit 1
+fi
+if grep -Fq '/anvil/profile' "$repo_root/runtime/sandbox-entrypoint"; then
+  printf 'manifest-security: new workers must not reference shared profile storage\n' >&2
+  exit 1
+fi
+require_text 'private worker config' '/home/anvil/.config/opencode/opencode.jsonc' "$repo_root/crates/anvild/src/lib.rs"
+require_text 'isolated auth serving environment' 'ANVIL_ISOLATED_AUTH' "$repo_root/crates/anvild/src/lib.rs"
 smoke_script="$repo_root/tests/nix-daemon-smoke.sh"
 require_text 'daemon executable smoke' 'test -x /bin/anvil-nix-daemon' "$smoke_script"
 require_text 'daemon RPC smoke' 'NIX_REMOTE=daemon nix store info' "$smoke_script"
