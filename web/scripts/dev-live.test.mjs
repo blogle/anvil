@@ -12,6 +12,20 @@ test('dev-live validates configurable ports', () => {
   }
 })
 
+test('development config skips trailing-slash redirects while keeping export slash behavior', async () => {
+  const originalNodeEnv = process.env.NODE_ENV
+  process.env.NODE_ENV = 'development'
+
+  try {
+    const { default: config } = await import('../next.config.mjs?dev-live-test')
+    assert.equal(config.skipTrailingSlashRedirect, true)
+    assert.equal(config.trailingSlash, true)
+  } finally {
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV
+    else process.env.NODE_ENV = originalNodeEnv
+  }
+})
+
 test('kubectl forwards the anvild service in dotfiles only on loopback', () => {
   assert.deepEqual(kubectlArgs(18080), [
     '-n', 'dotfiles', 'port-forward', '--address', '127.0.0.1', 'service/anvild', '18080:8080',

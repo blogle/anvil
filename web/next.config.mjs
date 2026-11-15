@@ -37,6 +37,7 @@ async function generateBuildId() {
 }
 
 const devConfig = process.env.NODE_ENV === 'development' ? {
+  skipTrailingSlashRedirect: true,
   async rewrites() {
     const port = process.env.ANVIL_FORWARD_PORT || '18080'
     return [{
