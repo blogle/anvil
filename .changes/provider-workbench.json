@@ -1,0 +1,5 @@
+{
+  "type": "feat",
+  "semver": "minor",
+  "summary": "Add attempt-level model selection, encrypted provider-key onboarding, and a live-development workbench"
+}

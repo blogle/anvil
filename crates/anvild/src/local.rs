@@ -977,6 +977,8 @@ mod tests {
             profile_pvc: "unused".into(),
             nix_pvc: "unused".into(),
             credential_url: "http://127.0.0.1:8080".into(),
+            provider_operator_token: None,
+            provider_encryption_key: None,
             github_app_id: None,
             github_installation_id: None,
             github_private_key: None,

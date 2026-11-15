@@ -202,7 +202,7 @@ impl ControllerStore {
                 None => (1, format!("{task_id}-attempt-1")),
             };
             let key = format!("scheduler:{task_id}:{ordinal}");
-            let accepted = super::create_attempt_tx(&tx, &task_id, &attempt_id, &key)?;
+            let accepted = super::create_attempt_tx(&tx, &task_id, &attempt_id, &key, None)?;
             let mut attempt = accepted.attempt;
             attempt["state"] = Value::String("provisioning".into());
             persist_attempt(&tx, &attempt_id, &attempt)?;
@@ -860,6 +860,40 @@ mod tests {
                 params![task_id, task.to_string()],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn attempt_model_is_persisted_and_idempotency_replay_compares_it() {
+        let (dir, store) = setup(&[("batch", 1, vec![("task", vec![])])]);
+        let created = store
+            .create_attempt_with_model("task", "attempt-1", "attempt-key", Some("openai/gpt-5"))
+            .unwrap();
+        assert_eq!(created.attempt["model"], "openai/gpt-5");
+        drop(store);
+
+        let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
+        assert_eq!(
+            reopened.attempts_for_task("task").unwrap()[0]["model"],
+            "openai/gpt-5"
+        );
+        let replay = reopened
+            .create_attempt_with_model("task", "ignored", "attempt-key", Some("openai/gpt-5"))
+            .unwrap();
+        assert!(!replay.created);
+        assert_eq!(replay.attempt["model"], "openai/gpt-5");
+        assert!(matches!(
+            reopened.create_attempt_with_model("task", "ignored", "attempt-key", None),
+            Err(StoreError::Conflict)
+        ));
+        assert!(matches!(
+            reopened.create_attempt_with_model(
+                "task",
+                "ignored",
+                "attempt-key",
+                Some("anthropic/claude")
+            ),
+            Err(StoreError::Conflict)
+        ));
     }
 
     #[test]

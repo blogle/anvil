@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "next dev",
+    "dev:live": "node scripts/dev-live.mjs",
     "build": "next build",
     "test": "npm run test:unit && npm run build",
     "test:unit": "node --test api.test.js",
+    "test:dev-live": "node --test scripts/dev-live.test.mjs",
     "test:browser": "node --test browser.test.js"
   },
   "dependencies": {

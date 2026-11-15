@@ -36,12 +36,24 @@ async function generateBuildId() {
   return hash.digest('hex')
 }
 
+const devConfig = process.env.NODE_ENV === 'development' ? {
+  skipTrailingSlashRedirect: true,
+  async rewrites() {
+    const port = process.env.ANVIL_FORWARD_PORT || '18080'
+    return [{
+      source: '/v1/:path*',
+      destination: `http://127.0.0.1:${port}/v1/:path*`,
+    }]
+  },
+} : {}
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: 'export',
   trailingSlash: true,
   images: { unoptimized: true },
   generateBuildId,
+  ...devConfig,
 }
 
 export default nextConfig
