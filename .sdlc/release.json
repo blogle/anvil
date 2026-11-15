@@ -1,18 +1,18 @@
 {
-  "changelog_sha256": "be5380d11cb0f49c9a316c673de5c8800b4cc122b32b8cd89d455a4e7e1ee30c",
+  "changelog_sha256": "7eb9679c0a1335ced7b85273b39809f820769208b42b943d84c81c5c0f213b51",
   "fragments": [
     {
-      "blob_sha": "635d0e932685108dc141f967f65d62dbba646901",
-      "path": ".changes/provider-workbench.json"
+      "blob_sha": "825cb30da60ff6d1cc7f759b36d84ffd407d8fec",
+      "path": ".changes/faithful-workbench-providers.json"
     }
   ],
-  "generated_tree": "fc6801e5a02c10067d9946b3af6acc28634d9e2cf6eed14ac1ecd5ef659cedf8",
-  "prior_released_boundary": "a550df1422f769d571b1deb2ddcceb4281936c61",
+  "generated_tree": "c205dc9eb3e31c1607d09aa0b53dfff5c5b3dae0c914bd509a41e278c66e87e0",
+  "prior_released_boundary": "ee7d88ed2b07099d70e74e4e922108a8ef42001f",
   "publication": {
-    "source_main_sha": "ee7d88ed2b07099d70e74e4e922108a8ef42001f",
-    "version": "0.2.0"
+    "source_main_sha": "86e1024397cb7a513e5125c9550df6a1a002642c",
+    "version": "0.2.1"
   },
   "schema": 1,
-  "source_main_sha": "ee7d88ed2b07099d70e74e4e922108a8ef42001f",
-  "version": "0.2.0"
+  "source_main_sha": "86e1024397cb7a513e5125c9550df6a1a002642c",
+  "version": "0.2.1"
 }

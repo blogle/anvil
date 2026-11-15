@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.1] - 2026-11-15
+
+- **fix**: Match the approved workbench screens and support OAuth and API-key provider onboarding for workers
+
 ## [0.2.0] - 2026-11-15
 
 - **feat**: Add attempt-level model selection, encrypted provider-key onboarding, and a live-development workbench
