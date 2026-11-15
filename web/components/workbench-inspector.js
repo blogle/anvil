@@ -118,6 +118,10 @@ export default function CommissionInspector({ item, onClose, expanded, onToggleE
     return bNumber - aNumber
   }), [attempts])
   const latestAttempt = sortedAttempts[0] || detail?.latest_attempt || null
+  const latestAttemptState = latestAttempt?.lifecycle?.state ?? latestAttempt?.lifecycle ?? latestAttempt?.state ?? latestAttempt?.status
+  const latestAttemptFailure = latestAttempt?.failure?.summary ?? latestAttempt?.failure ?? latestAttempt?.failure_reason ?? latestAttempt?.error
+  const latestAttemptFailed = String(latestAttemptState ?? '').toLowerCase() === 'failed' || Boolean(latestAttemptFailure)
+  const operatorHold = item?.task?.operator_hold === true
   const selectedAttempt = sortedAttempts.find((attempt, index) => attemptKey(attempt, index) === selectedAttemptKey) || latestAttempt
   const selectedSessionId = sessionFor(selectedAttempt)
   const campaignId = detail?.campaign_id ?? item?.campaign_id
@@ -214,6 +218,23 @@ export default function CommissionInspector({ item, onClose, expanded, onToggleE
       {loading && !detail && <p className="muted" role="status">Loading Commission…</p>}
       {error && <p className="notice" role="alert">Could not load Commission: {error}</p>}
       {tab === 'overview' && <>
+        <Panel title="Recorded next action" className="decision-panel">
+          {detail?.start_authorized === false ? <>
+            <p>Start not authorized in current Commission record; authorization is not scheduler readiness</p>
+            {typeof detail.version === 'number' && Number.isFinite(detail.version) && <form className="mock-actions" onSubmit={startCommission}>
+              <p className="muted">Start this Commission using the currently recorded contract version.</p>
+              {error && <p className="notice" role="alert">{error}</p>}
+              <div className="toolbar">
+                <button type="submit" className="btn primary" disabled={starting}>{starting ? 'Starting…' : 'Start Commission'}</button>
+                {startRejectedKey && <button type="button" className="btn" disabled={starting} onClick={() => { resetIdempotencyRecord(localStorage, startRejectedKey); setStartKey(''); setStartRejectedKey(''); setError('Rejected start request reset. Starting again will use a new key.') }}>Reset rejected request</button>}
+                {startKey && <span className="dim">Idempotency key retained for retry</span>}
+              </div>
+            </form>}
+          </> : null}
+          {latestAttemptFailed && <p className="notice">{latestAttemptFailure ? `Recorded failure: ${text(latestAttemptFailure)}` : 'Latest attempt is recorded as failed.'}</p>}
+          {operatorHold && <p className="notice">{item.task.hold_reason ? `Recorded operator hold: ${text(item.task.hold_reason)}` : 'An operator hold is recorded.'}</p>}
+          {detail?.start_authorized !== false && !latestAttemptFailed && !operatorHold && <p className="muted">No current operator action is established by this view.</p>}
+        </Panel>
         <Panel title="Commission contract">
           {detail ? <>
             <p>{text(detail.objective)}</p>
@@ -224,16 +245,6 @@ export default function CommissionInspector({ item, onClose, expanded, onToggleE
               <ContextCell label="Integration after" value={detail.integration_after?.length ? detail.integration_after.join(', ') : 'None'}/>
               <ContextCell label="Execution target" value={detail.execution_target}/>
             </div>
-            {detail.start_authorized === false && typeof detail.version === 'number' && Number.isFinite(detail.version) && <form className="panel mock-actions" onSubmit={startCommission}>
-              <h3>Operator action</h3>
-              <p className="muted">Start this Commission using the currently recorded contract version.</p>
-              {error && <p className="notice" role="alert">{error}</p>}
-              <div className="toolbar">
-                <button type="submit" className="btn primary" disabled={starting}>{starting ? 'Starting…' : 'Start Commission'}</button>
-                {startRejectedKey && <button type="button" className="btn" disabled={starting} onClick={() => { resetIdempotencyRecord(localStorage, startRejectedKey); setStartKey(''); setStartRejectedKey(''); setError('Rejected start request reset. Starting again will use a new key.') }}>Reset rejected request</button>}
-                {startKey && <span className="dim">Idempotency key retained for retry</span>}
-              </div>
-            </form>}
             <div className="link-list">
               {campaignId && <a className="example-link" href={`/campaign?id=${encodeURIComponent(campaignId)}`}>Campaign · {text(campaignId)}</a>}
               {safeHttpUrl(detail.execution_target?.repository) && <a className="example-link" href={safeHttpUrl(detail.execution_target.repository)} target="_blank" rel="noopener noreferrer">Repository</a>}
