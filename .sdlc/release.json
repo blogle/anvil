@@ -1,18 +1,18 @@
 {
-  "changelog_sha256": "7eb9679c0a1335ced7b85273b39809f820769208b42b943d84c81c5c0f213b51",
+  "changelog_sha256": "97f3904b6bc19aa4da45e1e7b9034c6b3fba73086b0c2e0d4c35ca9d9c410116",
   "fragments": [
     {
-      "blob_sha": "825cb30da60ff6d1cc7f759b36d84ffd407d8fec",
-      "path": ".changes/faithful-workbench-providers.json"
+      "blob_sha": "3b6a1c8bd5d6dcd09f30b91cb5bb451666a88320",
+      "path": ".changes/model-catalog-warmup.json"
     }
   ],
-  "generated_tree": "c205dc9eb3e31c1607d09aa0b53dfff5c5b3dae0c914bd509a41e278c66e87e0",
-  "prior_released_boundary": "ee7d88ed2b07099d70e74e4e922108a8ef42001f",
+  "generated_tree": "2b464fa85f0e6421ede6b74b0093752e6b279c0026799b366c987be674720a1e",
+  "prior_released_boundary": "86e1024397cb7a513e5125c9550df6a1a002642c",
   "publication": {
-    "source_main_sha": "86e1024397cb7a513e5125c9550df6a1a002642c",
-    "version": "0.2.1"
+    "source_main_sha": "a1ede3d414f915d20166faa3e4475b6a138584ae",
+    "version": "0.2.2"
   },
   "schema": 1,
-  "source_main_sha": "86e1024397cb7a513e5125c9550df6a1a002642c",
-  "version": "0.2.1"
+  "source_main_sha": "a1ede3d414f915d20166faa3e4475b6a138584ae",
+  "version": "0.2.2"
 }

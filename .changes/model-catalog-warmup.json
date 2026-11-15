@@ -1,5 +1,0 @@
-{
-  "type": "fix",
-  "semver": "patch",
-  "summary": "Wait briefly for OpenCode's model catalog to warm up when creating sessions"
-}
