@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.2] - 2026-11-15
+
+- **fix**: Wait briefly for OpenCode's model catalog to warm up when creating sessions
+
 ## [0.2.1] - 2026-11-15
 
 - **fix**: Match the approved workbench screens and support OAuth and API-key provider onboarding for workers
