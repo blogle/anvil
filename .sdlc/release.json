@@ -1,18 +1,18 @@
 {
-  "changelog_sha256": "c420e1f01793e805b5432b042c2af8e1b7171a27d2dd34dddb42e2376e6521a3",
+  "changelog_sha256": "be5380d11cb0f49c9a316c673de5c8800b4cc122b32b8cd89d455a4e7e1ee30c",
   "fragments": [
     {
-      "blob_sha": "0a732701801d7e7d995284fa9b38eb6724e552b1",
-      "path": ".changes/publish-image-content-identity.json"
+      "blob_sha": "635d0e932685108dc141f967f65d62dbba646901",
+      "path": ".changes/provider-workbench.json"
     }
   ],
-  "generated_tree": "0cc728cab57321d34ff4a3333b90d1fe233f93524422658a8153b3401cfca3ca",
-  "prior_released_boundary": "dbd012db5dbefe2212e6d42534931f31ea0ee8da",
+  "generated_tree": "fc6801e5a02c10067d9946b3af6acc28634d9e2cf6eed14ac1ecd5ef659cedf8",
+  "prior_released_boundary": "a550df1422f769d571b1deb2ddcceb4281936c61",
   "publication": {
-    "source_main_sha": "a550df1422f769d571b1deb2ddcceb4281936c61",
-    "version": "0.1.1"
+    "source_main_sha": "ee7d88ed2b07099d70e74e4e922108a8ef42001f",
+    "version": "0.2.0"
   },
   "schema": 1,
-  "source_main_sha": "a550df1422f769d571b1deb2ddcceb4281936c61",
-  "version": "0.1.1"
+  "source_main_sha": "ee7d88ed2b07099d70e74e4e922108a8ef42001f",
+  "version": "0.2.0"
 }

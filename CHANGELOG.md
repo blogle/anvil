@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.0] - 2026-11-15
+
+- **feat**: Add attempt-level model selection, encrypted provider-key onboarding, and a live-development workbench
+
 ## [0.1.1] - 2026-11-13
 
 - **fix**: Verify published image content by validated config and ordered layer descriptors
