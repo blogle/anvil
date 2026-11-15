@@ -100,4 +100,20 @@ pub struct ProviderCredentialMetadata {
     pub provider_id: String,
     pub generation: i64,
     pub created_at: String,
+    pub kind: String,
+}
+
+/// Credential data used by the controller when importing provider credentials.
+/// This type deliberately remains crate-private so secret-bearing entries do not
+/// become part of the browser-facing API.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ProviderCredential {
+    pub(crate) kind: ProviderCredentialKind,
+    pub(crate) entry: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderCredentialKind {
+    Key,
+    OAuth,
 }
