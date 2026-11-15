@@ -2,7 +2,7 @@ use anvil_core::{LoginFlow, ProviderListResponse, ProviderStatus, Session};
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use reqwest::{Client, Method, StatusCode, Url};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -29,7 +29,28 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum CommandGroup {
     Providers(ProvidersCommand),
+    ProviderCredentials(ProviderCredentialsCommand),
     Sessions(SessionsCommand),
+}
+
+#[derive(Debug, Args)]
+#[command(name = "provider-credentials")]
+pub struct ProviderCredentialsCommand {
+    #[command(subcommand)]
+    pub command: ProviderCredentialsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProviderCredentialsSubcommand {
+    List,
+    Set { provider: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ProviderCredentialMetadata {
+    pub provider_id: String,
+    pub generation: i64,
+    pub created_at: String,
 }
 
 #[derive(Debug, Args)]
@@ -151,6 +172,57 @@ impl ApiClient {
 
     async fn providers(&self) -> Result<ProviderListResponse> {
         self.request(Method::GET, "v1/providers", None).await
+    }
+
+    async fn provider_credentials(&self, token: &str) -> Result<Vec<ProviderCredentialMetadata>> {
+        self.provider_credentials_request(Method::GET, "v1/provider-credentials", token, None)
+            .await
+    }
+
+    async fn set_provider_credential(
+        &self,
+        provider: &str,
+        key: String,
+        token: &str,
+    ) -> Result<ProviderCredentialMetadata> {
+        let path = format!("v1/provider-credentials/{provider}");
+        self.provider_credentials_request(
+            Method::PUT,
+            &path,
+            token,
+            Some(serde_json::json!({"key": key})),
+        )
+        .await
+    }
+
+    async fn provider_credentials_request<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        body: Option<Value>,
+    ) -> Result<T> {
+        let url = self.base.join(path).context("invalid Anvil API path")?;
+        let mut request = self.client.request(method, url).bearer_auth(token);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request
+            .send()
+            .await
+            .context("provider credential request failed")?;
+        let status = response.status();
+        if !status.is_success() {
+            // Never include an error body here: the service may reflect sensitive input.
+            return Err(anyhow!(
+                "provider credential request failed with status {status}"
+            ));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .context("reading provider credential response failed")?;
+        serde_json::from_slice(&bytes).context("invalid provider credential response")
     }
 
     async fn begin_login(
@@ -323,7 +395,58 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
+        CommandGroup::ProviderCredentials(args) => {
+            let token = std::env::var("ANVIL_PROVIDER_OPERATOR_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty())
+                .context("ANVIL_PROVIDER_OPERATOR_TOKEN is required")?;
+            match args.command {
+                ProviderCredentialsSubcommand::List => {
+                    let credentials = client.provider_credentials(&token).await?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&credentials)?);
+                    } else {
+                        println!("{:<24} {:<12} CREATED AT", "PROVIDER", "GENERATION");
+                        for credential in credentials {
+                            println!(
+                                "{:<24} {:<12} {}",
+                                credential.provider_id,
+                                credential.generation,
+                                credential.created_at
+                            );
+                        }
+                    }
+                }
+                ProviderCredentialsSubcommand::Set { provider } => {
+                    validate_provider_id(&provider)?;
+                    let key = rpassword::prompt_password("Provider key: ")?;
+                    let metadata = client
+                        .set_provider_credential(&provider, key, &token)
+                        .await?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&metadata)?);
+                    } else {
+                        println!(
+                            "Stored provider credential: {} generation {} (created {})",
+                            metadata.provider_id, metadata.generation, metadata.created_at
+                        );
+                    }
+                }
+            }
+        }
         CommandGroup::Sessions(args) => run_sessions(client, args.command, cli.json).await?,
+    }
+    Ok(())
+}
+
+fn validate_provider_id(provider: &str) -> Result<()> {
+    if provider.is_empty()
+        || provider.len() > 63
+        || !provider
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(anyhow!("provider must match [a-z0-9-]{{1,63}}"));
     }
     Ok(())
 }
@@ -581,6 +704,89 @@ mod tests {
             .unwrap();
         mock.assert_async().await;
         assert!(providers.providers[0].authenticated);
+    }
+
+    #[tokio::test]
+    async fn lists_provider_credential_metadata_with_operator_bearer() {
+        let server = MockServer::start_async().await;
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/provider-credentials")
+                .header("authorization", "Bearer operator-secret");
+            then.status(200).json_body(serde_json::json!([
+                {"provider_id":"openai","generation":2,"created_at":"2026-10-01T00:00:00Z"}
+            ]));
+        });
+        let credentials = ApiClient::new(&server.base_url())
+            .unwrap()
+            .provider_credentials("operator-secret")
+            .await
+            .unwrap();
+        mock.assert_async().await;
+        assert_eq!(credentials[0].provider_id, "openai");
+        assert_eq!(credentials[0].generation, 2);
+    }
+
+    #[tokio::test]
+    async fn sets_provider_credential_and_never_exposes_error_body() {
+        let server = MockServer::start_async().await;
+        let success = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/v1/provider-credentials/openai")
+                .header("authorization", "Bearer operator-secret")
+                .json_body(serde_json::json!({"key":"private-key"}));
+            then.status(200).json_body(serde_json::json!({
+                "provider_id":"openai","generation":3,"created_at":"2026-10-02T00:00:00Z"
+            }));
+        });
+        let metadata = ApiClient::new(&server.base_url())
+            .unwrap()
+            .set_provider_credential("openai", "private-key".into(), "operator-secret")
+            .await
+            .unwrap();
+        success.assert_async().await;
+        assert_eq!(metadata.generation, 3);
+
+        let failure = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/v1/provider-credentials");
+            then.status(403).body("private response detail");
+        });
+        let error = ApiClient::new(&server.base_url())
+            .unwrap()
+            .provider_credentials("operator-secret")
+            .await
+            .unwrap_err()
+            .to_string();
+        failure.assert_async().await;
+        assert!(error.contains("403"));
+        assert!(!error.contains("private response detail"));
+    }
+
+    #[test]
+    fn parses_provider_credential_commands_and_validates_provider_id() {
+        let cli = Cli::try_parse_from(["anvilctl", "provider-credentials", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            CommandGroup::ProviderCredentials(ProviderCredentialsCommand {
+                command: ProviderCredentialsSubcommand::List
+            })
+        ));
+        let cli = Cli::try_parse_from(["anvilctl", "provider-credentials", "set", "my-provider1"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            CommandGroup::ProviderCredentials(ProviderCredentialsCommand {
+                command: ProviderCredentialsSubcommand::Set { .. }
+            })
+        ));
+        for valid in ["a", "openai", "provider-1"] {
+            assert!(validate_provider_id(valid).is_ok());
+        }
+        for invalid in ["", "Upper", "foo/bar", "a_b"] {
+            assert!(validate_provider_id(invalid).is_err());
+        }
+        assert!(validate_provider_id(&"a".repeat(64)).is_err());
     }
 
     #[tokio::test]

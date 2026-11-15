@@ -13,7 +13,10 @@ use std::{
 };
 use thiserror::Error;
 
+#[path = "provider_credentials.rs"]
+pub mod provider_credentials;
 pub mod scheduler;
+use provider_credentials::{ProviderCredentialMetadata, ProviderSealer};
 
 const CANONICALIZATION_VERSION: i64 = 1;
 #[cfg(test)]
@@ -86,6 +89,10 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("request canonicalization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid provider credential")]
+    InvalidProviderCredential,
+    #[error("provider credential encryption or authentication failed")]
+    ProviderCredentialCrypto,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +218,165 @@ impl ControllerStore {
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
+    }
+
+    /// Encrypt and persist a provider API key as the next generation for that provider.
+    pub fn upsert_provider_key(
+        &self,
+        provider: &str,
+        key: &str,
+        sealer: &ProviderSealer,
+    ) -> Result<ProviderCredentialMetadata, StoreError> {
+        validate_provider_id(provider)?;
+        if key.is_empty() || key.len() > 16 * 1024 {
+            return Err(StoreError::InvalidProviderCredential);
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(generation),0) FROM provider_credentials WHERE provider_id=?1",
+            [provider],
+            |row| row.get(0),
+        )?;
+        let generation = previous
+            .checked_add(1)
+            .ok_or(StoreError::InvalidProviderCredential)?;
+        let (ciphertext, nonce) = sealer
+            .seal(provider, generation, key.as_bytes())
+            .map_err(|_| StoreError::ProviderCredentialCrypto)?;
+        let created_at = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO provider_credentials(provider_id,generation,ciphertext,nonce,created_at) VALUES(?1,?2,?3,?4,?5)",
+            params![provider, generation, ciphertext, nonce, created_at],
+        )?;
+        tx.commit()?;
+        Ok(ProviderCredentialMetadata {
+            provider_id: provider.to_owned(),
+            generation,
+            created_at,
+        })
+    }
+
+    /// List metadata for every persisted provider key generation. Secret material is omitted.
+    pub fn list_provider_keys(&self) -> Result<Vec<ProviderCredentialMetadata>, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let mut statement = connection.prepare(
+            "SELECT provider_id,generation,created_at FROM provider_credentials ORDER BY provider_id,generation",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ProviderCredentialMetadata {
+                provider_id: row.get(0)?,
+                generation: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Decrypt one generation; generation zero selects the latest generation.
+    pub fn get_provider_key(
+        &self,
+        provider: &str,
+        generation: i64,
+        sealer: &ProviderSealer,
+    ) -> Result<Option<String>, StoreError> {
+        validate_provider_id(provider)?;
+        if generation < 0 {
+            return Err(StoreError::InvalidProviderCredential);
+        }
+        let connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let stored = if generation == 0 {
+            connection
+                .query_row(
+                    "SELECT generation,ciphertext,nonce FROM provider_credentials WHERE provider_id=?1 ORDER BY generation DESC LIMIT 1",
+                    [provider],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?)),
+                )
+                .optional()?
+        } else {
+            connection
+                .query_row(
+                    "SELECT generation,ciphertext,nonce FROM provider_credentials WHERE provider_id=?1 AND generation=?2",
+                    params![provider, generation],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?)),
+                )
+                .optional()?
+        };
+        let Some((actual_generation, ciphertext, nonce)) = stored else {
+            return Ok(None);
+        };
+        let plaintext = sealer
+            .open(provider, actual_generation, &ciphertext, &nonce)
+            .map_err(|_| StoreError::ProviderCredentialCrypto)?;
+        String::from_utf8(plaintext)
+            .map(Some)
+            .map_err(|_| StoreError::ProviderCredentialCrypto)
+    }
+
+    /// Bind a short-lived bootstrap capability to one session and credential generation.
+    pub fn insert_provider_bootstrap(
+        &self,
+        token_hash: &[u8],
+        session_id: &str,
+        provider: &str,
+        generation: i64,
+        expires_at: i64,
+    ) -> Result<(), StoreError> {
+        validate_provider_id(provider)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = chrono::Utc::now().timestamp();
+        tx.execute(
+            "DELETE FROM provider_bootstrap_capabilities WHERE expires_at<=?1",
+            [now],
+        )?;
+        tx.execute(
+            "INSERT INTO provider_bootstrap_capabilities(token_hash,session_id,provider_id,generation,expires_at) VALUES(?1,?2,?3,?4,?5)",
+            params![token_hash, session_id, provider, generation, expires_at],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Consume a matching, unexpired bootstrap capability exactly once.
+    pub fn consume_provider_bootstrap(
+        &self,
+        token_hash: &[u8],
+        session_id: &str,
+        provider: &str,
+        now: i64,
+    ) -> Result<Option<(String, i64)>, StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("controller store lock poisoned");
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = tx.query_row(
+            "SELECT provider_id,generation FROM provider_bootstrap_capabilities WHERE token_hash=?1 AND session_id=?2 AND provider_id=?3 AND expires_at>?4",
+            params![token_hash, session_id, provider, now],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        ).optional()?;
+        if row.is_some() {
+            tx.execute(
+                "DELETE FROM provider_bootstrap_capabilities WHERE token_hash=?1",
+                [token_hash],
+            )?;
+        }
+        tx.commit()?;
+        Ok(row)
     }
 
     /// Persist the current Anvil-owned projection and its change record atomically. `None`
@@ -2801,12 +2967,22 @@ impl ControllerStore {
         attempt_id: &str,
         idempotency_key: &str,
     ) -> Result<AttemptAcceptance, StoreError> {
+        self.create_attempt_with_model(task_id, attempt_id, idempotency_key, None)
+    }
+
+    pub fn create_attempt_with_model(
+        &self,
+        task_id: &str,
+        attempt_id: &str,
+        idempotency_key: &str,
+        model: Option<&str>,
+    ) -> Result<AttemptAcceptance, StoreError> {
         let mut connection = self
             .connection
             .lock()
             .expect("controller store lock poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let acceptance = create_attempt_tx(&tx, task_id, attempt_id, idempotency_key)?;
+        let acceptance = create_attempt_tx(&tx, task_id, attempt_id, idempotency_key, model)?;
         hit_task_store_failpoint("attempt.create.before_commit")?;
         tx.commit()?;
         hit_task_store_failpoint("attempt.create.after_commit")?;
@@ -2988,7 +3164,7 @@ impl ControllerStore {
             "UPDATE reconcile_actions SET state='executing' WHERE task_id=?1 AND idempotency_key=?2 AND state='pending'",
             params![task_id, action_key],
         )?;
-        let accepted = create_attempt_tx(&tx, task_id, attempt_id, action_key)?;
+        let accepted = create_attempt_tx(&tx, task_id, attempt_id, action_key, None)?;
         let mut attempt = accepted.attempt;
         let admitted_attempt_id = attempt["attempt_id"]
             .as_str()
@@ -3421,6 +3597,7 @@ pub(super) fn create_attempt_tx(
     task_id: &str,
     attempt_id: &str,
     idempotency_key: &str,
+    model: Option<&str>,
 ) -> Result<AttemptAcceptance, StoreError> {
     let replay: Option<(String, String)> = tx
         .query_row(
@@ -3438,8 +3615,12 @@ pub(super) fn create_attempt_tx(
             [bound_attempt],
             |row| row.get(0),
         )?;
+        let attempt: Value = serde_json::from_str(&json)?;
+        if attempt["model"].as_str() != model {
+            return Err(StoreError::Conflict);
+        }
         return Ok(AttemptAcceptance {
-            attempt: serde_json::from_str(&json)?,
+            attempt,
             created: false,
         });
     }
@@ -3459,7 +3640,10 @@ pub(super) fn create_attempt_tx(
         |row| row.get(0),
     )?;
     let now = chrono::Utc::now().to_rfc3339();
-    let attempt = serde_json::json!({"attempt_id":attempt_id,"task_id":task_id,"ordinal":ordinal,"version":1,"role":"implementation","session_id":null,"state":"queued","lifecycle":"queued","exit_reason":null,"created_at":now});
+    let mut attempt = serde_json::json!({"attempt_id":attempt_id,"task_id":task_id,"ordinal":ordinal,"version":1,"role":"implementation","session_id":null,"state":"queued","lifecycle":"queued","exit_reason":null,"created_at":now});
+    if let Some(model) = model {
+        attempt["model"] = Value::String(model.to_owned());
+    }
     tx.execute("INSERT INTO attempts(attempt_id,task_id,ordinal,session_id,payload_json,created_at,version) VALUES(?1,?2,?3,NULL,?4,?5,1)", params![attempt_id,task_id,ordinal,serde_json::to_string(&attempt)?,now])?;
     tx.execute(
         "INSERT INTO attempt_submissions(idempotency_key,task_id,attempt_id) VALUES(?1,?2,?3)",
@@ -4177,15 +4361,22 @@ fn migrate_until(connection: &Connection, target_version: i64) -> Result<(), rus
             CREATE TABLE commission_integration_dependencies(predecessor_commission_id TEXT NOT NULL REFERENCES commissions(commission_id),successor_commission_id TEXT NOT NULL REFERENCES commissions(commission_id),PRIMARY KEY(predecessor_commission_id,successor_commission_id));
             INSERT INTO schema_migrations(version,applied_at) VALUES(15,datetime('now'));")?;
     }
-    let latest: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+    let migration_16_applied: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=16)",
         [],
         |row| row.get(0),
     )?;
-    if latest < 16 && target_version >= 16 {
+    if !migration_16_applied && target_version >= 16 {
+        let hold_reason_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('task_durable_state') WHERE name='hold_reason')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !hold_reason_exists {
+            tx.execute_batch("ALTER TABLE task_durable_state ADD COLUMN hold_reason TEXT;")?;
+        }
         tx.execute_batch(
-            "ALTER TABLE task_durable_state ADD COLUMN hold_reason TEXT;
-            INSERT INTO schema_migrations(version,applied_at) VALUES(16,datetime('now'));",
+            "INSERT INTO schema_migrations(version,applied_at) VALUES(16,datetime('now'));",
         )?;
         // Upgrade old detached queue entries without changing their lifecycle or
         // identity. They remain visible as held, with an explicit reason.
@@ -4214,6 +4405,41 @@ fn migrate_until(connection: &Connection, target_version: i64) -> Result<(), rus
             tx.execute("UPDATE orchestration_change_retention SET high_watermark=MAX(high_watermark,?1) WHERE singleton=1", [sequence])?;
         }
     }
+    let migration_17_applied: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=17)",
+        [],
+        |row| row.get(0),
+    )?;
+    if !migration_17_applied && target_version >= 17 {
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS provider_credentials (
+                provider_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation > 0),
+                ciphertext BLOB NOT NULL,
+                nonce BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(provider_id,generation)
+            );
+            INSERT INTO schema_migrations(version,applied_at) VALUES(17,datetime('now'));",
+        )?;
+    }
+    let migration_18_applied: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=18)",
+        [],
+        |row| row.get(0),
+    )?;
+    if !migration_18_applied && target_version >= 18 {
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS provider_bootstrap_capabilities (
+                token_hash BLOB PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation > 0),
+                expires_at INTEGER NOT NULL
+            );
+            INSERT INTO schema_migrations(version,applied_at) VALUES(18,datetime('now'));",
+        )?;
+    }
     tx.commit()?;
     connection.execute_batch("PRAGMA foreign_keys=ON;")?;
     let mut check = connection.prepare("PRAGMA foreign_key_check")?;
@@ -4221,6 +4447,19 @@ fn migrate_until(connection: &Connection, target_version: i64) -> Result<(), rus
         return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(())
+}
+
+fn validate_provider_id(provider: &str) -> Result<(), StoreError> {
+    let valid = !provider.is_empty()
+        && provider.len() <= 63
+        && provider
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidProviderCredential)
+    }
 }
 
 fn sync_task_payload_version(
@@ -4290,10 +4529,210 @@ fn canonical_json(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::provider_credentials::ProviderSealerError;
     fn store() -> (tempfile::TempDir, ControllerStore) {
         let dir = tempfile::tempdir().unwrap();
         let store = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
         (dir, store)
+    }
+
+    fn test_sealer() -> ProviderSealer {
+        ProviderSealer::from_hex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+            .unwrap()
+    }
+
+    #[test]
+    fn provider_bootstrap_capabilities_are_bound_expiring_and_one_time() {
+        let (_dir, store) = store();
+        let hash = Sha256::digest(b"bootstrap-token");
+        store
+            .insert_provider_bootstrap(&hash, "session-a", "openai", 3, 100)
+            .unwrap();
+        assert!(store
+            .consume_provider_bootstrap(&hash, "session-b", "openai", 50)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .consume_provider_bootstrap(&hash, "session-a", "anthropic", 50)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .consume_provider_bootstrap(&hash, "session-a", "openai", 100)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .consume_provider_bootstrap(&hash, "session-a", "openai", 50)
+                .unwrap(),
+            Some(("openai".into(), 3))
+        );
+        assert!(store
+            .consume_provider_bootstrap(&hash, "session-a", "openai", 50)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn inserting_provider_bootstrap_prunes_expired_rows_and_keeps_live_rows() {
+        let (_dir, store) = store();
+        let now = chrono::Utc::now().timestamp();
+        let expired_hash = Sha256::digest(b"expired-bootstrap-token");
+        let live_hash = Sha256::digest(b"live-bootstrap-token");
+        let new_hash = Sha256::digest(b"new-bootstrap-token");
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO provider_bootstrap_capabilities(token_hash,session_id,provider_id,generation,expires_at) VALUES(?1,'session-a','openai',1,?2)",
+                    params![&expired_hash[..], now - 1],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO provider_bootstrap_capabilities(token_hash,session_id,provider_id,generation,expires_at) VALUES(?1,'session-a','openai',2,?2)",
+                    params![&live_hash[..], now + 3600],
+                )
+                .unwrap();
+        }
+
+        // A future expiry here distinguishes cleanup using the current time from cleanup
+        // accidentally based on the new capability's expiry.
+        store
+            .insert_provider_bootstrap(&new_hash, "session-b", "anthropic", 3, now + 7200)
+            .unwrap();
+
+        let connection = store.connection.lock().unwrap();
+        let expired_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM provider_bootstrap_capabilities WHERE token_hash=?1",
+                [&expired_hash[..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let live_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM provider_bootstrap_capabilities WHERE token_hash=?1",
+                [&live_hash[..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(expired_count, 0);
+        assert_eq!(live_count, 1);
+    }
+
+    #[test]
+    fn provider_keys_are_encrypted_rotatable_and_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller.sqlite3");
+        let sealer = test_sealer();
+        let first_key = "provider-secret-first";
+        let first_store = ControllerStore::open(&path).unwrap();
+        let first = first_store
+            .upsert_provider_key("openai", first_key, &sealer)
+            .unwrap();
+        assert_eq!(first.generation, 1);
+        let second = first_store
+            .upsert_provider_key("openai", "provider-secret-second", &sealer)
+            .unwrap();
+        assert_eq!(second.generation, 2);
+        assert_eq!(
+            first_store
+                .get_provider_key("openai", 1, &sealer)
+                .unwrap()
+                .as_deref(),
+            Some(first_key)
+        );
+        assert_eq!(
+            first_store
+                .get_provider_key("openai", 0, &sealer)
+                .unwrap()
+                .as_deref(),
+            Some("provider-secret-second")
+        );
+        let metadata = first_store.list_provider_keys().unwrap();
+        assert_eq!(metadata, vec![first, second]);
+        let serialized = serde_json::to_string(&metadata).unwrap();
+        assert!(!serialized.contains(first_key));
+        assert!(!serialized.contains("ciphertext"));
+
+        {
+            let connection = first_store.connection.lock().unwrap();
+            let (ciphertext, nonce): (Vec<u8>, Vec<u8>) = connection
+                .query_row(
+                    "SELECT ciphertext,nonce FROM provider_credentials WHERE provider_id='openai' AND generation=1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_ne!(ciphertext, first_key.as_bytes());
+            assert_eq!(nonce.len(), 12);
+            assert!(!ciphertext
+                .windows(first_key.len())
+                .any(|window| window == first_key.as_bytes()));
+        }
+        drop(first_store);
+
+        let restarted = ControllerStore::open(&path).unwrap();
+        assert_eq!(
+            restarted
+                .get_provider_key("openai", 1, &sealer)
+                .unwrap()
+                .as_deref(),
+            Some(first_key)
+        );
+        let wrong_key = ProviderSealer::from_hex(
+            "10112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )
+        .unwrap();
+        assert!(matches!(
+            restarted.get_provider_key("openai", 1, &wrong_key),
+            Err(StoreError::ProviderCredentialCrypto)
+        ));
+    }
+
+    #[test]
+    fn provider_key_schema_migrates_from_version_sixteen() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_until(&connection, 16).unwrap();
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 16);
+        migrate(&connection).unwrap();
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 18);
+        let columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('provider_credentials')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 5);
+    }
+
+    #[test]
+    fn provider_credentials_validate_inputs_without_exposing_them() {
+        let (_dir, store) = store();
+        let sealer = test_sealer();
+        assert!(matches!(
+            store.upsert_provider_key("OpenAI", "secret-value", &sealer),
+            Err(StoreError::InvalidProviderCredential)
+        ));
+        assert!(matches!(
+            store.upsert_provider_key("openai", "", &sealer),
+            Err(StoreError::InvalidProviderCredential)
+        ));
+        assert!(matches!(
+            ProviderSealer::from_hex("bad"),
+            Err(ProviderSealerError::InvalidKey)
+        ));
     }
 
     #[test]
@@ -5251,7 +5690,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 18);
     }
 
     #[test]
@@ -5415,7 +5854,7 @@ mod tests {
                     row.get(0)
                 })
                 .unwrap();
-            assert_eq!(latest, 16, "restored schema version {target}");
+            assert_eq!(latest, 18, "restored schema version {target}");
         }
     }
 
@@ -5947,7 +6386,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(latest, 16);
+        assert_eq!(latest, 18);
         let index: i64=connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='orchestration_by_attempt'",[],|row|row.get(0)).unwrap();
         assert_eq!(index, 1);
         let state_mappings: i64 = connection

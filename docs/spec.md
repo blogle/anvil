@@ -85,6 +85,15 @@ budgets or permit simultaneous writers. Autonomous context retention is experime
 retain healthy Sessions as the baseline and compare fresh-per-prompt Sessions using
 the same durable packet, measuring convergence, latency, cost and context size.
 
+An optional model selection belongs to a **new Attempt**, not to its Commission.
+`POST /v1/tasks/{id}/attempts` accepts `{"model":"provider/model"}`; the value
+must be a qualified provider/model string. If omitted, the attempt uses the task's
+configured model or policy model. This records the strategy's selected model, but
+does not by itself provision another worker or provide a model-switch retry: the
+current scheduler does not permit a second Commission Workspace after the prior
+Session has been bound. In particular, selecting Sol for a new Attempt after a Luna
+Session has bound is **not** yet an implemented Luna-to-Sol execution retry.
+
 ## Interactive development
 
 A human takes interactive control of a Commission, steers its Session through

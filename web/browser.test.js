@@ -8,10 +8,23 @@ import { chromium } from '@playwright/test'
 
 test('static workspace routes render and campaign contract validation is usable', async t => {
   const root = join(import.meta.dirname, 'out')
-  let campaignSubmissions = 0, inboxCalls = 0, decisionCalls = 0
+  let campaignSubmissions = 0, inboxCalls = 0, decisionCalls = 0, credentialWrites = 0
+  const credentialAuth = []
   const decisionCursors = []
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost'), path = url.pathname
+    if (path === '/v1/provider-credentials') {
+      credentialAuth.push(req.headers.authorization)
+      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify([{ provider_id: 'openai', generation: 1, created_at: '2026-01-01T00:00:00Z' }])); return
+    }
+    if (req.method === 'PUT' && path === '/v1/provider-credentials/openai') {
+      credentialAuth.push(req.headers.authorization)
+      let body = ''
+      for await (const chunk of req) body += chunk
+      assert.deepEqual(JSON.parse(body), { key: 'fixture-api-key' })
+      credentialWrites++
+      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ provider_id: 'openai', generation: 2, created_at: '2026-01-02T00:00:00Z' })); return
+    }
     if (path === '/v1/inbox') {
       inboxCalls++
       const item = (commission_id, local_key, overrides = {}) => ({ campaign_id: 'campaign/1', commission_id, local_key, objective: `Work ${local_key}`, commission: { state: 'active', version: 2, start_authorized: true }, task: { state: 'running', controller_mode: 'automatic', operator_hold: false, hold_reason: null, retry_due_ms: null }, start_after: [], integration_after: [], attempt: { attempt_id: 'attempt-1', ordinal: 1, state: 'running', failure_reason: null, session_id: 'session/1' }, ...overrides })
@@ -61,6 +74,7 @@ test('static workspace routes render and campaign contract validation is usable'
     const page = await browser.newPage({ viewport: { width: 1360, height: 900 } })
     await page.goto(`http://127.0.0.1:${server.address().port}/`)
     await page.getByRole('heading', { name: 'Inbox' }).waitFor()
+    assert.doesNotMatch(await page.locator('body').innerText(), /Connected to local Anvil API|LOCAL API/, 'workspace makes no unconditional API connection claim')
     assert.match(await page.locator('.crumb').textContent(), /Workspace\s*\/\s*Inbox/, 'home breadcrumb matches the Inbox navigation label')
     await page.getByText('Operator hold: Review requested').waitFor()
     assert.match(await page.locator('.inbox-note').textContent(), /not an assessment of scheduler readiness/)
@@ -74,8 +88,9 @@ test('static workspace routes render and campaign contract validation is usable'
     await page.getByText('Commission v1 · Start not authorized').waitFor()
     assert.match(await page.locator('.inbox-panel').textContent(), /Start not authorized/)
     assert.equal(await page.locator('.inbox-links a').count(), 5, 'campaign, commission, and latest-attempt session links are present')
-    await page.getByRole('heading', { name: /Make work legible/ }).waitFor()
-    await page.getByRole('link', { name: /Create a Campaign/ }).click()
+    await page.getByRole('heading', { name: 'Sessions' }).waitFor()
+    await page.getByText('Fixture session').waitFor()
+    await page.getByRole('link', { name: 'Campaigns' }).click()
     await page.getByRole('heading', { name: /Create a Campaign/ }).waitFor()
     await page.locator('#submission').fill('{"campaign":{"purpose":""},"commissions":[]}')
     await page.getByRole('button', { name: /Submit Campaign/ }).click()
@@ -133,6 +148,28 @@ test('static workspace routes render and campaign contract validation is usable'
     }
     const routeWithoutSlash = await page.request.get(`http://127.0.0.1:${server.address().port}/sessions`)
     assert.equal(routeWithoutSlash.status(), 200, 'non-slash static route resolves to its exported index')
+    await page.goto(`http://127.0.0.1:${server.address().port}/`)
+    await page.getByRole('heading', { name: 'Inbox' }).waitFor()
+    await page.getByRole('link', { name: 'Settings' }).click()
+    await page.getByRole('heading', { name: 'Provider settings.' }).waitFor()
+    await page.locator('#operator-token').fill('fixture-operator-token')
+    await page.getByRole('button', { name: 'Load credentials' }).click()
+    await page.getByText('Generation 1 · 2026-01-01T00:00:00Z').waitFor()
+    await page.locator('#provider-id').fill('openai')
+    await page.locator('#provider-key').fill('fixture-api-key')
+    await page.getByRole('button', { name: 'Save key' }).click()
+    assert.equal(await page.locator('#provider-key').inputValue(), '', 'API key input clears as soon as save is submitted')
+    await page.getByText('Generation 2 · 2026-01-02T00:00:00Z').waitFor()
+    assert.deepEqual(credentialAuth, ['Bearer fixture-operator-token', 'Bearer fixture-operator-token'])
+    assert.equal(credentialWrites, 1)
+    assert.doesNotMatch(await page.locator('body').innerText(), /fixture-api-key|fixture-operator-token/)
+    assert.deepEqual(await page.evaluate(() => [localStorage.length, sessionStorage.length]), [0, 0])
+    assert.equal(new URL(page.url()).search, '?view=settings', 'operator token is absent from the URL')
+    await page.getByRole('link', { name: 'Inbox' }).click()
+    await page.getByRole('heading', { name: 'Inbox' }).waitFor()
+    await page.getByRole('link', { name: 'Settings' }).click()
+    await page.getByRole('heading', { name: 'Provider settings.' }).waitFor()
+    assert.equal(await page.locator('#operator-token').inputValue(), '', 'operator token is cleared when leaving Settings')
   } finally {
     await browser?.close()
     await new Promise(resolve => server.close(resolve))

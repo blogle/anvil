@@ -77,6 +77,41 @@ the profile/runtime; operator authentication and any provider credentials requir
 by the agreed integration. Never document secret values. Exact Secret names/keys,
 mounts and adapters should follow the actual implementation of each slice.
 
+### Provider API-key credentials
+
+Provider API keys are operator-managed through `GET /v1/provider-credentials` and
+`PUT /v1/provider-credentials/{provider}` (JSON body `{"key":"…"}`). Both
+require `Authorization: Bearer <operator-token>`. The API returns credential
+metadata, not key material. The same operator boundary is exposed by `anvilctl`
+provider-credentials list/set and the web Settings page; the CLI reads
+`ANVIL_PROVIDER_OPERATOR_TOKEN` and prompts for the key, while Settings takes the
+token and key in password fields and keeps them in page memory only. This is
+operator access, not worker access.
+
+Enable the API only by provisioning both daemon secrets:
+`ANVIL_PROVIDER_OPERATOR_TOKEN` (at least 32 characters) and
+`ANVIL_PROVIDER_ENCRYPTION_KEY` (64 hexadecimal characters, 32 random bytes).
+They must be provided together; the encryption key seals keys with AES-256-GCM
+before controller-store persistence and must remain secret and stable to decrypt
+existing records. Provision and rotate these through dotfiles' Secret workflow;
+never commit or put secret values in manifests, docs, URLs or logs. A new
+generation is stored on key update.
+
+During worker provisioning, Anvil issues a session/provider/generation-bound,
+one-use bootstrap capability. `GET /v1/sessions/{id}/credentials/provider` is a
+private init-only endpoint: the capability is removed from the Sandbox's regular
+container environment and passed only to the Workspace init container, which
+imports the API key into that Workspace's private OpenCode SQLite database. It
+does not grant the worker general operator API access. Bootstrap is not fully
+restart-safe: redemption consumes the token before the import completes, so if
+import fails after redemption, an operator must issue a new capability; automatic
+recovery is not available yet.
+
+The `ANVIL_OPENCODE_GO_SECRET` / `go-key` injection below is a legacy, explicit
+opt-in path, not the primary provider-key integration. Worker OAuth credential
+handoff is not supported; do not treat profile OAuth state or successful worker
+readiness as evidence of worker provider authentication.
+
 An isolated OpenCode Go worker may opt into `ANVIL_OPENCODE_GO_SECRET`, naming a
 namespace-local Secret with key `go-key`. Only its workspace init container
 mounts the key; it imports the credential into OpenCode's private SQLite database
