@@ -77,52 +77,74 @@ the profile/runtime; operator authentication and any provider credentials requir
 by the agreed integration. Never document secret values. Exact Secret names/keys,
 mounts and adapters should follow the actual implementation of each slice.
 
-### Provider API-key credentials
+### Provider credentials and profile OAuth
 
-Provider API keys are operator-managed through `GET /v1/provider-credentials` and
-`PUT /v1/provider-credentials/{provider}` (JSON body `{"key":"…"}`). Both
-require `Authorization: Bearer <operator-token>`. The API returns credential
-metadata, not key material. The same operator boundary is exposed by `anvilctl`
-provider-credentials list/set and the web Settings page; the CLI reads
-`ANVIL_PROVIDER_OPERATOR_TOKEN` and prompts for the key, while Settings takes the
-token and key in password fields and keeps them in page memory only. This is
-operator access, not worker access.
+Provider credential management is operator-gated: every route below requires
+`Authorization: Bearer <operator-token>`. The supported management surface is
+`GET /v1/provider-credentials` (metadata only),
+`PUT /v1/provider-credentials/{provider}` (API-key JSON body `{"key":"…"}`),
+`GET /v1/provider-credentials/catalog`, and
+`GET /v1/provider-credentials/{provider}/methods`. OAuth uses
+`POST /v1/provider-credentials/{provider}/oauth` to start a selected method,
+`GET /v1/provider-credentials/{provider}/oauth/{login_id}` to poll its status,
+and `POST /v1/provider-credentials/{provider}/oauth/{login_id}/complete` with
+`{"code":"…"}` when that method requires code completion. The catalog exposes
+only the `key` and `oauth` credential kinds; it is not a promise that all
+OpenCode providers or authentication methods are available or usable.
 
-Enable the API only by provisioning both daemon secrets:
+OpenCode v2 profile OAuth is performed against the authenticated profile service:
+Anvil starts and observes the OAuth attempt through `/api/integration`, then
+exports credentials through `/api/credential`. The secret credential payload is
+stored as a new generation in the controller database, sealed with AES-256-GCM;
+it is not returned to or stored in the browser. Browser Settings may initiate or
+display the operator flow, but must not handle the exported secret payload.
+The operator CLI also supports these management operations. The OpenCode profile
+must keep `XDG_DATA_HOME` on storage anchored to the profile PVC, so its SQLite
+database (including profile credential state) survives profile Pod restarts.
+
+Enable provider credential management only by provisioning both daemon secrets:
 `ANVIL_PROVIDER_OPERATOR_TOKEN` (at least 32 characters) and
 `ANVIL_PROVIDER_ENCRYPTION_KEY` (64 hexadecimal characters, 32 random bytes).
-They must be provided together; the encryption key seals keys with AES-256-GCM
-before controller-store persistence and must remain secret and stable to decrypt
-existing records. Provision and rotate these through dotfiles' Secret workflow;
-never commit or put secret values in manifests, docs, URLs or logs. A new
-generation is stored on key update.
+They must be provided together. The encryption key must remain secret and stable
+to decrypt existing records. Provision and rotate these through dotfiles' Secret
+workflow; never commit or put secret values in manifests, docs, URLs or logs.
+Key or OAuth credential updates create a new generation. These are operator
+credentials, not worker access.
 
-During worker provisioning, Anvil issues a session/provider/generation-bound,
-one-use bootstrap capability. `GET /v1/sessions/{id}/credentials/provider` is a
-private init-only endpoint: the capability is removed from the Sandbox's regular
-container environment and passed only to the Workspace init container, which
-imports the API key into that Workspace's private OpenCode SQLite database. It
-does not grant the worker general operator API access. Bootstrap is not fully
-restart-safe: redemption consumes the token before the import completes, so if
-import fails after redemption, an operator must issue a new capability; automatic
-recovery is not available yet.
+During worker provisioning, Anvil selects one provider credential generation and
+issues a session/provider/generation-bound, one-use bootstrap capability.
+`GET /v1/sessions/{id}/credentials/provider` is a private init-only endpoint: the
+capability is removed from the Sandbox's regular container environment and passed
+only to the Workspace init container. Init imports that selected key or OAuth
+credential into the worker's private OpenCode SQLite database. It does not grant
+the worker general operator API access. Bootstrap is not fully restart-safe:
+redemption consumes the token before the import completes, so if import fails
+after redemption, an operator must issue a new capability; automatic recovery is
+not available yet.
 
-The `ANVIL_OPENCODE_GO_SECRET` / `go-key` injection below is a legacy, explicit
-opt-in path, not the primary provider-key integration. Worker OAuth credential
-handoff is not supported; do not treat profile OAuth state or successful worker
-readiness as evidence of worker provider authentication.
+OpenAI's `chatgpt-headless` device-code method is the supported headless OAuth
+flow. Browser callback-based modes may not work when the profile is remote or
+otherwise cannot receive the callback. This is an implementation contract, not
+evidence that real OpenAI consent succeeds, refresh tokens remain valid for any
+particular duration, or a worker can execute billed requests. Tests are synthetic
+and APIs have been source-probed only; no real provider credentials have been
+supplied, and no billed worker execution has been established. Do not interpret
+profile OAuth completion or a worker readiness probe as proof of working worker
+provider authentication.
 
-An isolated OpenCode Go worker may opt into `ANVIL_OPENCODE_GO_SECRET`, naming a
-namespace-local Secret with key `go-key`. Only its workspace init container
-mounts the key; it imports the credential into OpenCode's private SQLite database
-on that worker's persistent Workspace before starting the server. The serving
-container does not mount either that Secret or the shared profile claim. Without
-the opt-in, existing profile-based sandbox behavior is unchanged. This contract
-declares a required Secret **reference**, not its provisioning or its contents.
-The pinned OpenCode V2 runtime stores live credentials in SQLite rather than the
-legacy `auth.json`; ChatGPT OAuth/profile-to-worker credential continuity is not
-established by the Go-key path. Do not interpret an OpenCode readiness probe as
-proof that provider authentication works.
+An OpenCode Go key can coexist as a distinct `opencode-go` provider credential;
+it is not a substitute or alias for OpenAI OAuth. If explicitly configured via
+`ANVIL_OPENCODE_GO_SECRET`, naming a namespace-local Secret with key `go-key`,
+only the Workspace init container mounts it and imports it into that worker's
+private SQLite database. The serving container does not mount either that Secret
+or the shared profile claim. This contract declares a required Secret
+**reference**, not its provisioning or contents.
+
+Each Attempt selects one model provider; provider selection is Attempt-scoped,
+not a Commission-wide mechanism for switching providers. The existing retry
+fence remains: the scheduler does not permit a second Commission Workspace after
+the prior Session has been bound, so selecting another provider in a later
+Attempt is not yet an implemented provider-switch execution retry.
 
 Environment namespaces, addrspace manifests, ingress domains/certificates, storage
 classes, secret provisioning, rollout/cleanup and production protection belong in

@@ -43,7 +43,43 @@ pub struct ProviderCredentialsCommand {
 #[derive(Debug, Subcommand)]
 pub enum ProviderCredentialsSubcommand {
     List,
-    Set { provider: String },
+    Set {
+        provider: String,
+    },
+    Oauth {
+        provider: String,
+        method_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct OperatorAuthMethods {
+    methods: Vec<OperatorAuthMethod>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct OperatorAuthMethod {
+    id: String,
+    label: String,
+    #[serde(default)]
+    form: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct OperatorOAuthStart {
+    login_id: String,
+    mode: String,
+    url: Option<String>,
+    instructions: Option<String>,
+    #[serde(default)]
+    time: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct OperatorOAuthStatus {
+    status: String,
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -191,6 +227,71 @@ impl ApiClient {
             &path,
             token,
             Some(serde_json::json!({"key": key})),
+        )
+        .await
+    }
+
+    async fn operator_auth_methods(
+        &self,
+        provider: &str,
+        token: &str,
+    ) -> Result<OperatorAuthMethods> {
+        self.provider_credentials_request(
+            Method::GET,
+            &format!("v1/provider-credentials/{provider}/methods"),
+            token,
+            None,
+        )
+        .await
+    }
+
+    async fn operator_oauth_start(
+        &self,
+        provider: &str,
+        method_id: &str,
+        answer: Option<Value>,
+        token: &str,
+    ) -> Result<OperatorOAuthStart> {
+        let mut body = serde_json::json!({"method_id":method_id});
+        if let Some(answer) = answer {
+            body["answer"] = answer;
+        }
+        self.provider_credentials_request(
+            Method::POST,
+            &format!("v1/provider-credentials/{provider}/oauth"),
+            token,
+            Some(body),
+        )
+        .await
+    }
+
+    async fn operator_oauth_status(
+        &self,
+        provider: &str,
+        login_id: &str,
+        token: &str,
+    ) -> Result<OperatorOAuthStatus> {
+        self.provider_credentials_request(
+            Method::GET,
+            &format!("v1/provider-credentials/{provider}/oauth/{login_id}"),
+            token,
+            None,
+        )
+        .await
+    }
+
+    async fn operator_oauth_complete(
+        &self,
+        provider: &str,
+        login_id: &str,
+        code: &str,
+        token: &str,
+    ) -> Result<OperatorOAuthStatus> {
+        self.provider_credentials_request(
+            Method::POST,
+            &format!("v1/provider-credentials/{provider}/oauth/{login_id}/complete"),
+            token,
+            Some(serde_json::json!({"code":code})),
         )
         .await
     }
@@ -432,6 +533,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                         );
                     }
                 }
+                ProviderCredentialsSubcommand::Oauth {
+                    provider,
+                    method_id,
+                } => {
+                    validate_provider_id(&provider)?;
+                    run_operator_oauth(&client, &provider, method_id.as_deref(), &token).await?;
+                }
             }
         }
         CommandGroup::Sessions(args) => run_sessions(client, args.command, cli.json).await?,
@@ -439,14 +547,125 @@ pub async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+async fn run_operator_oauth(
+    client: &ApiClient,
+    provider: &str,
+    requested_method: Option<&str>,
+    token: &str,
+) -> Result<()> {
+    let methods = client.operator_auth_methods(provider, token).await?.methods;
+    let selected = if let Some(id) = requested_method {
+        methods.iter().find(|method| method.id == id)
+    } else if provider == "openai" {
+        methods
+            .iter()
+            .find(|method| method.id == "chatgpt-headless")
+            .or_else(|| (methods.len() == 1).then(|| &methods[0]))
+    } else {
+        (methods.len() == 1).then(|| &methods[0])
+    };
+    let Some(method) = selected else {
+        let mut ids: Vec<_> = methods.iter().map(|method| method.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        return Err(anyhow!(
+            "select an OAuth METHOD_ID explicitly; available method IDs: {}",
+            if ids.is_empty() {
+                "(none)".into()
+            } else {
+                ids.join(", ")
+            }
+        ));
+    };
+    let answer = method
+        .form
+        .as_ref()
+        .and_then(Value::as_array)
+        .map(|prompts| {
+            collect_prompt_inputs(Some(prompts))
+                .and_then(|inputs| serde_json::to_value(inputs).context("encoding OAuth answer"))
+        })
+        .transpose()?;
+    let start = client
+        .operator_oauth_start(provider, &method.id, answer, token)
+        .await?;
+    println!("{} OAuth", provider_name(provider));
+    if let Some(url) = &start.url {
+        println!("\nOpen this URL in your browser:\n\n{url}");
+    }
+    if let Some(instructions) = &start.instructions {
+        println!("\n{instructions}");
+    }
+
+    let deadline = tokio::time::Instant::now() + oauth_timeout(&start.time);
+    if start.mode == "code" {
+        let code = rpassword::prompt_password("\nPaste authorization code: ")?;
+        if code.trim().is_empty() {
+            return Err(anyhow!("authorization code cannot be empty"));
+        }
+        let status = client
+            .operator_oauth_complete(provider, &start.login_id, code.trim(), token)
+            .await?;
+        validate_oauth_status(&status)?;
+        if status.status == "complete" {
+            println!("Authenticated successfully.");
+            return Ok(());
+        }
+    } else if start.mode != "auto" {
+        return Err(anyhow!("unsupported OAuth mode"));
+    }
+
+    println!("\nWaiting for authorization...");
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!("OAuth authorization timed out"));
+        }
+        sleep(Duration::from_secs(1)).await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!("OAuth authorization timed out"));
+        }
+        let status = client
+            .operator_oauth_status(provider, &start.login_id, token)
+            .await?;
+        validate_oauth_status(&status)?;
+        if status.status == "complete" {
+            println!("Authenticated successfully.");
+            return Ok(());
+        }
+    }
+}
+
+fn oauth_timeout(time: &Option<Value>) -> Duration {
+    Duration::from_secs(
+        time.as_ref()
+            .and_then(Value::as_u64)
+            .unwrap_or(600)
+            .clamp(1, 600),
+    )
+}
+
+fn validate_oauth_status(status: &OperatorOAuthStatus) -> Result<()> {
+    match status.status.as_str() {
+        "pending" => Ok(()),
+        "complete" if status.kind.as_deref().is_none_or(|kind| kind == "oauth") => Ok(()),
+        "complete" => Err(anyhow!(
+            "OAuth completed with an unexpected credential kind"
+        )),
+        "failed" | "expired" => Err(anyhow!("OAuth authorization {}", status.status)),
+        _ => Err(anyhow!("unexpected OAuth authorization status")),
+    }
+}
+
 fn validate_provider_id(provider: &str) -> Result<()> {
-    if provider.is_empty()
-        || provider.len() > 63
-        || !provider
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    let bytes = provider.as_bytes();
+    if !(1..=63).contains(&bytes.len())
+        || !(bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        || !bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+        || matches!(provider, "." | "..")
     {
-        return Err(anyhow!("provider must match [a-z0-9-]{{1,63}}"));
+        return Err(anyhow!("provider must match [a-z0-9][a-z0-9._-]{{0,62}}"));
     }
     Ok(())
 }
@@ -763,6 +982,27 @@ mod tests {
         assert!(!error.contains("private response detail"));
     }
 
+    #[tokio::test]
+    async fn dotted_provider_id_is_preserved_as_a_single_api_path_segment() {
+        let server = MockServer::start_async().await;
+        let request = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/v1/provider-credentials/wafer.ai")
+                .header("authorization", "Bearer operator-secret")
+                .json_body(serde_json::json!({"key":"private-key"}));
+            then.status(200).json_body(serde_json::json!({
+                "provider_id":"wafer.ai","generation":1,"created_at":"2026-10-03T00:00:00Z"
+            }));
+        });
+        validate_provider_id("wafer.ai").unwrap();
+        ApiClient::new(&server.base_url())
+            .unwrap()
+            .set_provider_credential("wafer.ai", "private-key".into(), "operator-secret")
+            .await
+            .unwrap();
+        request.assert_async().await;
+    }
+
     #[test]
     fn parses_provider_credential_commands_and_validates_provider_id() {
         let cli = Cli::try_parse_from(["anvilctl", "provider-credentials", "list"]).unwrap();
@@ -780,13 +1020,134 @@ mod tests {
                 command: ProviderCredentialsSubcommand::Set { .. }
             })
         ));
-        for valid in ["a", "openai", "provider-1"] {
+        let cli = Cli::try_parse_from([
+            "anvilctl",
+            "provider-credentials",
+            "oauth",
+            "openai",
+            "chatgpt-headless",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            CommandGroup::ProviderCredentials(ProviderCredentialsCommand {
+                command: ProviderCredentialsSubcommand::Oauth { .. }
+            })
+        ));
+        for valid in [
+            "a",
+            "openai",
+            "provider-1",
+            "wafer.ai",
+            "opencode-go",
+            "a_b.c-1",
+            &"a".repeat(63),
+        ] {
             assert!(validate_provider_id(valid).is_ok());
         }
-        for invalid in ["", "Upper", "foo/bar", "a_b"] {
+        for invalid in [
+            "", ".", "..", "../", "Upper", "foo/bar", "a?b", "a%b", "a:b", "a b", "_a", ".a", "a\n",
+        ] {
             assert!(validate_provider_id(invalid).is_err());
         }
         assert!(validate_provider_id(&"a".repeat(64)).is_err());
+    }
+
+    #[tokio::test]
+    async fn operator_oauth_methods_start_and_status_use_operator_bearer_and_get_polling() {
+        let server = MockServer::start_async().await;
+        let methods = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/provider-credentials/openai/methods")
+                .header("authorization", "Bearer operator-secret");
+            then.status(200).json_body(serde_json::json!({"methods":[
+                {"id":"chatgpt-headless","label":"ChatGPT Headless"},
+                {"id":"browser-callback","label":"Browser callback","form":[]}
+            ]}));
+        });
+        let start = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/provider-credentials/openai/oauth")
+                .header("authorization", "Bearer operator-secret")
+                .json_body(serde_json::json!({"method_id":"chatgpt-headless"}));
+            then.status(200).json_body(serde_json::json!({
+                "login_id":"login-1","mode":"auto","url":"https://auth.example.test",
+                "instructions":"Finish login","time":30
+            }));
+        });
+        let status = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/provider-credentials/openai/oauth/login-1")
+                .header("authorization", "Bearer operator-secret");
+            then.status(200)
+                .json_body(serde_json::json!({"status":"complete","kind":"oauth"}));
+        });
+        let complete = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/provider-credentials/openai/oauth/login-1/complete");
+            then.status(500);
+        });
+        let client = ApiClient::new(&server.base_url()).unwrap();
+        let methods_response = client
+            .operator_auth_methods("openai", "operator-secret")
+            .await
+            .unwrap();
+        assert_eq!(methods_response.methods[0].id, "chatgpt-headless");
+        let flow = client
+            .operator_oauth_start("openai", "chatgpt-headless", None, "operator-secret")
+            .await
+            .unwrap();
+        assert_eq!(flow.mode, "auto");
+        let result = client
+            .operator_oauth_status("openai", &flow.login_id, "operator-secret")
+            .await
+            .unwrap();
+        validate_oauth_status(&result).unwrap();
+        methods.assert_async().await;
+        start.assert_async().await;
+        status.assert_async().await;
+        assert_eq!(complete.hits_async().await, 0);
+    }
+
+    #[tokio::test]
+    async fn operator_oauth_code_completion_posts_code_with_operator_bearer() {
+        let server = MockServer::start_async().await;
+        let complete = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/provider-credentials/example/oauth/login-2/complete")
+                .header("authorization", "Bearer operator-secret")
+                .json_body(serde_json::json!({"code":"private-code"}));
+            then.status(200)
+                .json_body(serde_json::json!({"status":"complete","kind":"oauth"}));
+        });
+        let result = ApiClient::new(&server.base_url())
+            .unwrap()
+            .operator_oauth_complete("example", "login-2", "private-code", "operator-secret")
+            .await
+            .unwrap();
+        complete.assert_async().await;
+        validate_oauth_status(&result).unwrap();
+    }
+
+    #[tokio::test]
+    async fn operator_oauth_failures_discard_sensitive_response_body() {
+        let server = MockServer::start_async().await;
+        let failure = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/provider-credentials/example/methods")
+                .header("authorization", "Bearer operator-secret");
+            then.status(500)
+                .body("raw OAuth access token must not be shown");
+        });
+        let error = ApiClient::new(&server.base_url())
+            .unwrap()
+            .operator_auth_methods("example", "operator-secret")
+            .await
+            .unwrap_err()
+            .to_string();
+        failure.assert_async().await;
+        assert!(error.contains("500"));
+        assert!(!error.contains("raw OAuth access token"));
     }
 
     #[tokio::test]
