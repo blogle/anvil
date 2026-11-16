@@ -74,6 +74,11 @@ export default function CommissionInspector({ item, onClose, expanded, onToggleE
   const [starting, setStarting] = useState(false)
   const [startKey, setStartKey] = useState('')
   const [startRejectedKey, setStartRejectedKey] = useState('')
+  const [model, setModel] = useState('')
+  const [preparingAttempt, setPreparingAttempt] = useState(false)
+  const [attemptRejectedKey, setAttemptRejectedKey] = useState('')
+  const [attemptError, setAttemptError] = useState('')
+  const [startWithoutModel, setStartWithoutModel] = useState(false)
   const [attemptsError, setAttemptsError] = useState('')
   const [tab, setTab] = useState('overview')
   const [selectedAttemptKey, setSelectedAttemptKey] = useState(null)
@@ -91,6 +96,11 @@ export default function CommissionInspector({ item, onClose, expanded, onToggleE
     setAttemptsError('')
     setSessionData({})
     setSelectedAttemptKey(null)
+    setModel('')
+    setPreparingAttempt(false)
+    setAttemptRejectedKey('')
+    setAttemptError('')
+    setStartWithoutModel(false)
     setTab('overview')
     if (!commissionId) return () => { active = false }
     setLoading(true)
@@ -126,6 +136,10 @@ export default function CommissionInspector({ item, onClose, expanded, onToggleE
   const selectedSessionId = sessionFor(selectedAttempt)
   const campaignId = detail?.campaign_id ?? item?.campaign_id
   const title = detail?.objective ?? item?.objective ?? item?.title ?? `Commission ${text(commissionId)}`
+  const startAuthorized = detail?.task?.start_authorized ?? detail?.start_authorized
+  const hasAnyAttempt = sortedAttempts.length > 0 || Boolean(detail?.latest_attempt)
+  const attemptWithModel = sortedAttempts.find(attempt => typeof attempt?.model === 'string' && attempt.model.trim())
+    || (typeof detail?.latest_attempt?.model === 'string' && detail.latest_attempt.model.trim() ? detail.latest_attempt : null)
 
   useEffect(() => {
     if (!selectedSessionId || !['activity', 'diff'].includes(tab)) return undefined
@@ -188,6 +202,47 @@ export default function CommissionInspector({ item, onClose, expanded, onToggleE
     catch (e) { setError(`Commission start was accepted, but refreshing its contract failed: ${e.message}`) }
   }
 
+  async function prepareAttempt(event) {
+    event.preventDefault()
+    setAttemptError('')
+    const selectedModel = model.trim()
+    if (!/^[^/\s]+\/[^\s]+$/.test(selectedModel) || selectedModel.length > 256) {
+      setAttemptError('Enter a qualified provider/model value (maximum 256 characters).')
+      return
+    }
+    const storageKey = `anvil-attempt-key-${commissionId}`
+    const body = JSON.stringify({ model: selectedModel })
+    const { record, conflict } = getIdempotencyRecord(localStorage, storageKey, body)
+    if (conflict) {
+      setAttemptError('The uncertain preparation request is retained for its original model. Retry that model or inspect the Attempt receipt.')
+      return
+    }
+    setPreparingAttempt(true)
+    setAttemptRejectedKey('')
+    try {
+      await request(`/tasks/${encodeURIComponent(commissionId)}/attempts`, { method: 'POST', headers: { 'Idempotency-Key': record.key }, body })
+    } catch (e) {
+      const rejected = isDefinitiveRejection(e)
+      setAttemptRejectedKey(rejected ? storageKey : '')
+      setAttemptError(rejected
+        ? `${e.message} The server rejected this preparation; reset its key before trying again.`
+        : `${e.message} The outcome is uncertain. Keep the original model and key, retry, or inspect the Attempt receipt.`)
+      setPreparingAttempt(false)
+      return
+    }
+    resetIdempotencyRecord(localStorage, storageKey)
+    setAttemptRejectedKey('')
+    setModel('')
+    try {
+      const page = await request(`/tasks/${encodeURIComponent(commissionId)}/attempts`)
+      setAttempts(getAttempts(page))
+      setAttemptCursor(page?.next_cursor ?? page?.next_page_cursor ?? null)
+      setAttemptsMore((page?.next_cursor ?? page?.next_page_cursor ?? null) != null)
+      setTab('attempts')
+    } catch (e) { setAttemptError(`Attempt preparation was accepted, but refreshing attempts failed: ${e.message}`) }
+    finally { setPreparingAttempt(false) }
+  }
+
   const identityStatus = detail?.state ?? item?.state ?? item?.status
   const attemptOrdinal = item?.attempt?.ordinal ?? item?.attempt?.attempt_number ?? latestAttempt?.ordinal ?? latestAttempt?.attempt_number
   const itemAttempt = typeof attemptOrdinal === 'string' || typeof attemptOrdinal === 'number' ? attemptOrdinal : null
@@ -219,13 +274,18 @@ export default function CommissionInspector({ item, onClose, expanded, onToggleE
       {error && <p className="notice" role="alert">Could not load Commission: {error}</p>}
       {tab === 'overview' && <>
         <Panel title="Recorded next action" className="decision-panel">
-          {detail?.start_authorized === false ? <>
-            <p>Start not authorized in current Commission record; authorization is not scheduler readiness</p>
-            {typeof detail.version === 'number' && Number.isFinite(detail.version) && <form className="mock-actions" onSubmit={startCommission}>
-              <p className="muted">Start this Commission using the currently recorded contract version.</p>
-              {error && <p className="notice" role="alert">{error}</p>}
-              <div className="toolbar">
-                <button type="submit" className="btn primary" disabled={starting}>{starting ? 'Starting…' : 'Start Commission'}</button>
+          {startAuthorized === false ? <>
+              <p>Start not authorized in current Commission record; authorization is not scheduler readiness</p>
+              {attemptWithModel && <p className="muted">Prepared model recorded: <strong>{text(attemptWithModel.model)}</strong>. Start remains a separate explicit action.</p>}
+              {typeof detail.version === 'number' && Number.isFinite(detail.version) && <form className="mock-actions" onSubmit={startCommission}>
+                <p className="muted">Start this Commission using the currently recorded contract version.</p>
+                {!attemptWithModel && <>
+                  <p className="notice">No prepared model is recorded. OpenCode's default may differ; explicitly opt in to starting without a prepared model.</p>
+                  <label className="checkline"><input type="checkbox" checked={startWithoutModel} onChange={event => setStartWithoutModel(event.target.checked)}/> Start without a prepared model</label>
+                </>}
+                {error && <p className="notice" role="alert">{error}</p>}
+                <div className="toolbar">
+                <button type="submit" className="btn primary" disabled={starting || (!attemptWithModel && !startWithoutModel)}>{starting ? 'Starting…' : 'Start Commission'}</button>
                 {startRejectedKey && <button type="button" className="btn" disabled={starting} onClick={() => { resetIdempotencyRecord(localStorage, startRejectedKey); setStartKey(''); setStartRejectedKey(''); setError('Rejected start request reset. Starting again will use a new key.') }}>Reset rejected request</button>}
                 {startKey && <span className="dim">Idempotency key retained for retry</span>}
               </div>
@@ -233,17 +293,20 @@ export default function CommissionInspector({ item, onClose, expanded, onToggleE
           </> : null}
           {latestAttemptFailed && <p className="notice">{latestAttemptFailure ? `Recorded failure: ${text(latestAttemptFailure)}` : 'Latest attempt is recorded as failed.'}</p>}
           {operatorHold && <p className="notice">{item.task.hold_reason ? `Recorded operator hold: ${text(item.task.hold_reason)}` : 'An operator hold is recorded.'}</p>}
-          {detail?.start_authorized !== false && !latestAttemptFailed && !operatorHold && <p className="muted">No current operator action is established by this view.</p>}
+          {startAuthorized !== false && !latestAttemptFailed && !operatorHold && <p className="muted">No current operator action is established by this view.</p>}
         </Panel>
         <Panel title="Commission contract">
           {detail ? <>
             <p>{text(detail.objective)}</p>
             <div className="context-grid">
               <ContextCell label="Version" value={detail.version}/>
-              <ContextCell label="Start authorized" value={detail.start_authorized == null ? 'Not reported' : detail.start_authorized ? 'Yes' : 'No'}/>
+              <ContextCell label="Start authorized" value={typeof startAuthorized === 'boolean' ? startAuthorized ? 'Yes' : 'No' : 'Not reported'}/>
               <ContextCell label="Start after" value={detail.start_after?.length ? detail.start_after.join(', ') : 'None'}/>
               <ContextCell label="Integration after" value={detail.integration_after?.length ? detail.integration_after.join(', ') : 'None'}/>
-              <ContextCell label="Execution target" value={detail.execution_target}/>
+              <ContextCell label="Repository" value={detail.execution_target?.repository}/>
+              <ContextCell label="Base ref" value={detail.execution_target?.base_ref}/>
+              <ContextCell label="Delivery" value={detail.execution_target?.delivery}/>
+              <ContextCell label="Kind" value={detail.execution_target?.kind}/>
             </div>
             <div className="link-list">
               {campaignId && <a className="example-link" href={`/campaign?id=${encodeURIComponent(campaignId)}`}>Campaign · {text(campaignId)}</a>}
@@ -275,6 +338,17 @@ export default function CommissionInspector({ item, onClose, expanded, onToggleE
       </Panel>}
 
       {tab === 'attempts' && <Panel title="Recorded attempts">
+        {detail?.task?.start_authorized === false && !attemptsLoading && !hasAnyAttempt && <form className="mock-form attempt-prepare" onSubmit={prepareAttempt}>
+          <h3>Prepare Attempt</h3>
+          <label htmlFor="attempt-model">Qualified model</label>
+          <input id="attempt-model" name="model" type="text" maxLength={256} required value={model} placeholder="openai/gpt-5.6-luna" onChange={event => setModel(event.target.value)} />
+          <p className="muted">Use provider/model (maximum 256 characters); preparing does not start a worker.</p>
+          {attemptError && <p className="notice" role="alert">{attemptError}</p>}
+          <div className="toolbar">
+            <button type="submit" className="btn primary" disabled={preparingAttempt}>{preparingAttempt ? 'Preparing…' : 'Prepare Attempt'}</button>
+            {attemptRejectedKey && <button type="button" className="btn" disabled={preparingAttempt} onClick={() => { resetIdempotencyRecord(localStorage, attemptRejectedKey); setAttemptRejectedKey(''); setAttemptError('Rejected preparation reset. Submit again to use a new key.') }}>Reset rejected request</button>}
+          </div>
+        </form>}
         {attemptsLoading && attempts.length === 0 && <p className="muted" role="status">Loading attempts…</p>}
         {attemptsError && <p className="notice" role="alert">Could not load attempts: {attemptsError}</p>}
         {sortedAttempts.map((attempt, index) => {
@@ -282,6 +356,7 @@ export default function CommissionInspector({ item, onClose, expanded, onToggleE
           const sessionId = sessionFor(attempt)
           return <article className="mini-row" key={key}>
             <strong>Attempt {text(attempt.ordinal ?? attempt.attempt ?? attempt.attempt_number ?? index + 1)} · {text(attempt.lifecycle?.state ?? attempt.lifecycle ?? attempt.state ?? attempt.status)}</strong>
+            {attempt.model && <p>Model · {text(attempt.model)}</p>}
             <p>{text(attempt.started_at)}{(attempt.ended_at ?? attempt.finished_at) ? ` — ${text(attempt.ended_at ?? attempt.finished_at)}` : ''}</p>
             {(attempt.failure || attempt.failure_reason || attempt.error) && <p>Recorded failure: {text(attempt.failure?.summary ?? attempt.failure ?? attempt.failure_reason ?? attempt.error)}</p>}
             {sessionId && <a className="example-link" href={`/sessions?id=${encodeURIComponent(sessionId)}`}>Open bound session · {sessionId}</a>}

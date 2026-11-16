@@ -130,21 +130,30 @@ export function CampaignInspector({ campaignId, onSelectCommission, onClose }) {
     setLoading(true); setError('')
     try {
       const page = await request(`/campaigns/${encodeURIComponent(campaignId)}?limit=50&after=${encodeURIComponent(cursor)}`)
-      setDetail(current => ({ ...page, campaign: page?.campaign || current?.campaign, commissions: [...(current?.commissions || []), ...(page?.commissions || [])] }))
+      setDetail(current => ({
+        ...current,
+        ...page,
+        campaign: page?.campaign || current?.campaign,
+        purpose: page?.purpose ?? current?.purpose,
+        shared_contracts: page?.shared_contracts ?? current?.shared_contracts,
+        commissions: [...(current?.commissions || []), ...(page?.commissions || [])],
+      }))
       setCursor(page?.next_page_cursor || null)
     } catch (e) { setError(e.message) } finally { setLoading(false) }
   }
 
   const campaign = detail?.campaign || {}
   const commissions = Array.isArray(detail?.commissions) ? detail.commissions : []
-  const contracts = Array.isArray(campaign.shared_contracts) ? campaign.shared_contracts : []
+  const purpose = detail?.purpose ?? campaign.purpose
+  const sharedContracts = detail?.shared_contracts ?? campaign.shared_contracts
+  const contracts = Array.isArray(sharedContracts) ? sharedContracts : []
   return <section className="panel campaign-inspector" aria-label="Campaign inspector">
     <div className="inspector-tools"><span className="eyebrow">CAMPAIGN INSPECTOR</span>{onClose && <button type="button" className="btn" onClick={onClose}>Close</button>}</div>
     <h2 className="inspector-title">{campaignId}</h2>
     {loading && !detail && <p className="muted" role="status">Loading Campaign…</p>}
     {error && <div className="notice error" role="alert">{error} <button type="button" className="text-link" onClick={() => { setCursor(null); setDetail(null); setError(''); setRetry(value => value + 1) }}>Retry</button></div>}
     {detail && <>
-      <div className="panel"><h3>Campaign purpose</h3><p>{display(campaign.purpose)}</p><p className="muted">Campaign purpose and shared contracts are returned by the Campaign API.</p></div>
+      <div className="panel"><h3>Campaign purpose</h3><p>{display(purpose)}</p><p className="muted">Campaign purpose and shared contracts are returned by the Campaign API.</p></div>
       <div className="panel"><h3>Shared contracts</h3>{contracts.length ? contracts.map((contract, index) => <pre className="diff" key={contract?.id || contract?.name || index}>{stringify(contract)}</pre>) : <p className="muted">No shared contracts returned.</p>}</div>
       <div className="panel"><h3>Commissions · flat list</h3>{commissions.length ? commissions.map((commission, index) => <div className="data-row" key={commission.commission_id || commission.id || commission.local_key || index}>
         {onSelectCommission ? <button type="button" className="text-link" onClick={() => onSelectCommission(commission.commission_id || commission.id)}>{commission.objective || commission.local_key || commission.commission_id || commission.id || 'Commission'}</button> : <strong>{commission.objective || commission.local_key || commission.commission_id || commission.id || 'Commission'}</strong>}
