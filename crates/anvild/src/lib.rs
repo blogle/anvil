@@ -5461,6 +5461,9 @@ async fn create_attempt(
             store::StoreError::Conflict => ServiceError::Conflict(
                 "attempt idempotency key is bound to a different task or model".into(),
             ),
+            store::StoreError::InvalidState(_) => {
+                ServiceError::Conflict("Attempt budget exhausted".into())
+            }
             other => ServiceError::Store(other.to_string()),
         })?;
     let status = if acceptance.created {
@@ -10371,6 +10374,81 @@ mod tests {
             parse_create_attempt_model(b"{"),
             Err(ServiceError::Invalid(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn create_attempt_http_reports_exhausted_budget_as_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app_config = config("http://127.0.0.1:4097".into());
+        app_config.store_path = directory.path().join("controller.sqlite3");
+        let task_id = "attempt-budget-task";
+        store::ControllerStore::open(app_config.store_path.clone())
+            .unwrap()
+            .accept_task(
+                "attempt-budget-task-key",
+                "create-attempt-budget-test",
+                &json!({"task_id":task_id}),
+                task_id,
+                &json!({"outcome":"bounded work","budget":{"max_attempts":1,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600,"max_model_cost":null}}),
+            )
+            .unwrap();
+        let app = router(AppState::new(app_config.clone(), FakeSandbox));
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/tasks/{task_id}/attempts"))
+                    .header("idempotency-key", "attempt-budget-first")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"model":"openai/gpt-5"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(first.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first_body["model"], "openai/gpt-5");
+
+        let second = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/tasks/{task_id}/attempts"))
+                    .header("idempotency-key", "attempt-budget-second")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"model":"openai/gpt-5"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        let second_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(second.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            second_body["error"]["message"],
+            "conflict: Attempt budget exhausted"
+        );
+        assert!(!second_body.to_string().contains("SQL"));
+        assert_eq!(
+            store::ControllerStore::open(app_config.store_path)
+                .unwrap()
+                .attempts_for_task(task_id)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
