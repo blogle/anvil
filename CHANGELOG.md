@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.3] - 2026-11-16
+
+- **fix**: Match workbench inspectors to live Commission and Campaign response contracts
+
 ## [0.2.2] - 2026-11-15
 
 - **fix**: Wait briefly for OpenCode's model catalog to warm up when creating sessions
