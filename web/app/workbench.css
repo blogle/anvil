@@ -98,6 +98,10 @@
 .anvil-app .mock-form textarea { min-height:66px; resize:vertical; }
 .anvil-app .mock-form input,.anvil-app .mock-form select,.anvil-app .mock-form textarea { width:100%; padding:.48rem; border:1px solid #574b3c; border-radius:4px; background:#211d19; color:#e0d4c2; }
 .anvil-app .mock-actions { margin-top:.6rem; padding-top:.6rem; border-top:1px solid #4a3f34; }
+.anvil-app .attempt-prepare { margin:.55rem 0 .8rem; padding:.6rem; border:1px solid #514638; border-radius:4px; background:#28231e; }
+.anvil-app .attempt-prepare input[type="text"] { width:100%; padding:.48rem; border:1px solid #574b3c; border-radius:4px; background:#211d19; color:#e0d4c2; }
+.anvil-app .attempt-prepare input::placeholder { color:#897f72; }
+.anvil-app .attempt-prepare .muted { margin:0; }
 .anvil-app .notice { margin-top:.55rem; padding:.48rem; border-left:2px solid #b69b64; background:#332b21; color:#e0c98f; font-size:.68rem; }
 .anvil-app.workbench-expanded .content-layout { grid-template-columns:minmax(0,1fr); }
 .anvil-app.workbench-expanded .primary-view { display:none; }

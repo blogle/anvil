@@ -15,12 +15,14 @@ test('live-matched workbench shell uses returned records and exposes unavailable
   const campaignKeys = [], credentialAuth = [], oauthAuth = []
   let createAttempts = 0, startAttempts = 0, oauthPolls = 0
   const startKeys = [], startVersions = []
+  const attemptKeys = [], attemptBodies = [], preparedAttempts = []
   let startAuthorized = false
   const inbox = {
     schema_version: 1,
     items: [
       { campaign_id: 'campaign-fixture-1', commission_id: 'commission-focus-1', local_key: 'first-focused', objective: 'First recorded focus item', execution_target: { kind: 'git_repository', repository: 'https://example.invalid/repo', base_ref: 'main', delivery: 'pull_request' }, obligation_count: 1, created_at: '2026-10-01T00:00:00Z', commission: { state: 'active', version: 3, start_authorized: false }, task: { state: 'paused', controller_mode: 'operator', operator_hold: true, hold_reason: 'Operator review', repository: 'task-repository-not-used' }, start_after: [], integration_after: [], attempt: { attempt_id: 'attempt-fixture-1', ordinal: 1, state: 'failed', session_id: 'session-fixture-1', failure_reason: 'fixture failure' } },
       { campaign_id: 'campaign-fixture-1', commission_id: 'commission-second', local_key: 'second', objective: 'Second Commission', execution_target: { kind: 'git_repository', repository: 'https://example.invalid/other-repo', base_ref: 'develop', delivery: 'local_branch' }, obligation_count: 0, commission: { state: 'draft', version: 1, start_authorized: false }, task: { state: 'queued', controller_mode: 'automatic', operator_hold: false }, start_after: [], integration_after: [], attempt: null },
+      { campaign_id: 'campaign-fixture-1', commission_id: 'commission-prepare', local_key: 'prepare', objective: 'Prepare model fixture', execution_target: { kind: 'git_repository', repository: 'https://example.invalid/prepare', base_ref: 'main', delivery: 'local_branch' }, obligation_count: 0, created_at: '2026-10-01T00:00:00Z', commission: { state: 'draft', version: 1, start_authorized: false }, task: { state: 'queued', controller_mode: 'automatic', operator_hold: false }, start_after: [], integration_after: [], attempt: null },
     ],
     next_cursor: null,
   }
@@ -35,15 +37,26 @@ test('live-matched workbench shell uses returned records and exposes unavailable
     if (path === '/v1/sessions') return json(200, [{ id: 'session-fixture-1', project: 'Fixture session', environment_state: 'ready', execution_state: 'idle' }])
     if (path === '/v1/capacity') return json(200, { running: 2, provisioning: 1, global_limit: 8, available_slots: 5, queued_runnable: 3 })
     if (path === '/v1/commissions/commission-focus-1') return json(200, { campaign_id: 'campaign-fixture-1', commission_id: 'commission-focus-1', objective: 'First recorded focus item', state: 'active', version: 3, task: { start_authorized: startAuthorized }, obligations: [{ id: 'required', version: 1, requirement: 'Retain the work contract', acceptance_expectations: ['Contract remains visible'] }], execution_target: { kind: 'git_repository', repository: 'https://example.invalid/repo', base_ref: 'main', delivery: 'pull_request' } })
-    if (path === '/v1/commissions/commission-focus-1/start' && req.method === 'POST') {
+    if (path === '/v1/commissions/commission-prepare') return json(200, { campaign_id: 'campaign-fixture-1', commission_id: 'commission-prepare', objective: 'Prepare model fixture', state: 'draft', version: 1, task: { start_authorized: false }, execution_target: { kind: 'git_repository', repository: 'https://example.invalid/prepare', base_ref: 'main', delivery: 'local_branch' } })
+    if (/^\/v1\/commissions\/[^/]+\/start$/.test(path) && req.method === 'POST') {
       startAttempts++; startKeys.push(req.headers['idempotency-key'])
       const body = JSON.parse(rawBody); startVersions.push(body.expected_version)
-      assert.equal(body.expected_version, 3)
+      assert.ok(Number.isInteger(body.expected_version))
       assert.ok(req.headers['idempotency-key'], 'Commission start requires an idempotency key')
-      startAuthorized = true
-      return json(202, { commission_id: 'commission-focus-1', state: 'accepted', expected_version: 3 })
+      if (path === '/v1/commissions/commission-focus-1/start') startAuthorized = true
+      return json(202, { commission_id: path.split('/')[3], state: 'accepted', expected_version: body.expected_version })
     }
     if (path === '/v1/tasks/commission-focus-1/attempts') return json(200, { attempts: [{ attempt_id: 'attempt-fixture-1', ordinal: 1, state: 'failed', session_id: 'session-fixture-1' }] })
+    if (path === '/v1/tasks/commission-prepare/attempts' && req.method === 'POST') {
+      const body = JSON.parse(rawBody)
+      assert.deepEqual(body, { model: 'openai/gpt-5.6-luna' })
+      attemptKeys.push(req.headers['idempotency-key'])
+      attemptBodies.push(rawBody)
+      if (attemptKeys.length === 1) return json(503, { message: 'temporary preparation outage' })
+      preparedAttempts.push({ attempt_id: 'attempt-prepared', ordinal: 1, state: 'queued', model: body.model })
+      return json(202, preparedAttempts[0])
+    }
+    if (path === '/v1/tasks/commission-prepare/attempts') return json(200, { attempts: preparedAttempts })
     if (path === '/v1/sessions/session-fixture-1/activity' || path === '/v1/sessions/session-fixture-1/diff') { res.writeHead(503, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ message: 'Unavailable in fixture' })) }
     if (path === '/v1/campaigns/campaign-fixture-1' && req.method === 'GET') return json(200, { purpose: 'Top-level fixture campaign purpose', shared_contracts: [{ id: 'shared-fixture', requirement: 'Returned at top level' }], commissions: [{ commission_id: 'commission-focus-1', objective: 'First recorded focus item', start_after: [], integration_after: [] }], next_page_cursor: null })
     if (path === '/v1/campaigns' && req.method === 'POST') {
@@ -148,6 +161,8 @@ test('live-matched workbench shell uses returned records and exposes unavailable
     await tabs.nth(0).click()
     assert.match(await page.locator('.decision-panel').innerText(), /Start Commission/, 'first Overview action contains Start Commission')
     assert.equal(startAttempts, 0, 'no Commission start is sent before an explicit click')
+    assert.equal(await page.getByRole('button', { name: 'Start Commission' }).isDisabled(), true, 'start without a prepared model requires explicit opt-in')
+    await page.getByLabel('Start without a prepared model').check()
     await page.getByRole('button', { name: 'Start Commission' }).click()
     await page.getByText('Yes', { exact: true }).waitFor()
     assert.equal(await page.getByRole('button', { name: 'Start Commission' }).count(), 0, 'accepted start refetch removes the Start Commission button')
@@ -156,6 +171,30 @@ test('live-matched workbench shell uses returned records and exposes unavailable
     assert.ok(startKeys[0], 'Commission start requires an idempotency key')
     assert.deepEqual(startVersions, [3])
     assert.equal(calls.filter(call => call.method === 'POST' && call.path === '/v1/commissions/commission-focus-1/start').length, 1, 'there are no unsolicited Commission starts')
+    await page.getByRole('button', { name: 'Everything' }).click()
+    await page.locator('.filter-details summary').click()
+    await page.getByLabel('https://example.invalid/repo', { exact: false }).uncheck()
+    await page.locator('.filter-details summary').click()
+    await page.getByRole('button', { name: /Prepare model fixture/ }).click()
+    await tabs.nth(4).click()
+    await page.getByRole('heading', { name: 'Prepare Attempt' }).waitFor()
+    assert.equal(startAttempts, 1, 'preparation does not start the Commission')
+    await page.getByLabel('Qualified model').fill('openai/gpt-5.6-luna')
+    await page.getByRole('button', { name: 'Prepare Attempt' }).click()
+    await page.getByRole('alert').filter({ hasText: 'outcome is uncertain' }).waitFor()
+    assert.equal(startAttempts, 1, 'an uncertain preparation still does not start a worker')
+    await page.getByRole('button', { name: 'Prepare Attempt' }).click()
+    await page.getByText('Model · openai/gpt-5.6-luna').waitFor()
+    assert.ok(attemptKeys[0], 'Attempt preparation includes an idempotency key')
+    assert.equal(attemptKeys[0], attemptKeys[1], 'uncertain preparation retry retains the same idempotency key')
+    assert.deepEqual(attemptBodies, ['{"model":"openai/gpt-5.6-luna"}', '{"model":"openai/gpt-5.6-luna"}'], 'uncertain preparation retry retains the exact model body')
+    assert.equal(calls.filter(call => call.method === 'POST' && call.path === '/v1/commissions/commission-prepare/start').length, 0, 'prepared Attempt does not implicitly start a worker')
+    await tabs.nth(0).click()
+    assert.match(await page.locator('.decision-panel').innerText(), /Prepared model recorded: openai\/gpt-5\.6-luna/)
+    assert.equal(await page.getByRole('button', { name: 'Start Commission' }).isEnabled(), true, 'a recorded model permits explicit Start without the opt-in checkbox')
+    await page.getByRole('button', { name: 'Start Commission' }).click()
+    assert.equal(startAttempts, 2, 'Start is only sent after its separate explicit click')
+    await page.getByRole('button', { name: /First recorded focus item/ }).click()
     await tabs.nth(2).click()
     await page.getByRole('alert').filter({ hasText: 'Could not load diff' }).waitFor()
     assert.match(await page.locator('[role="tabpanel"]').innerText(), /Could not load diff/)

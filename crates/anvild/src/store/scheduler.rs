@@ -176,6 +176,9 @@ impl ControllerStore {
                     .is_some_and(|attempt| attempt["state"] == "queued")
             {
                 let (ordinal, raw, _) = previous.as_ref().unwrap();
+                if *ordinal as u32 > attempt_limit {
+                    continue;
+                }
                 let mut attempt: Value = serde_json::from_str(raw)?;
                 attempt["state"] = Value::String("provisioning".into());
                 let attempt_id = attempt["attempt_id"].as_str().unwrap_or_default();
@@ -713,9 +716,11 @@ fn task_is_runnable(
     now_ms: i64,
     max_attempts: u32,
 ) -> bool {
-    if latest_attempt
-        .is_some_and(|attempt| attempt["ordinal"].as_u64().unwrap_or(0) >= u64::from(max_attempts))
-    {
+    if latest_attempt.is_some_and(|attempt| {
+        let ordinal = attempt["ordinal"].as_u64().unwrap_or(0);
+        ordinal > u64::from(max_attempts)
+            || (task_state != "queued" && ordinal >= u64::from(max_attempts))
+    }) {
         return false;
     }
     match task_state {
@@ -1031,6 +1036,46 @@ mod tests {
                 .unwrap()
                 .queued_runnable,
             0
+        );
+    }
+
+    #[test]
+    fn queued_attempt_beyond_persisted_budget_is_not_adopted() {
+        let (_dir, store) = setup(&[("budgeted", 1, vec![("task", vec![])])]);
+        store
+            .create_attempt("task", "old-attempt-1", "old-key-1")
+            .unwrap();
+        store.set_attempt_state("old-attempt-1", "failed").unwrap();
+        store
+            .create_attempt("task", "old-attempt-2", "old-key-2")
+            .unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            let raw: String = connection
+                .query_row(
+                    "SELECT payload_json FROM tasks WHERE task_id='task'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut task: Value = serde_json::from_str(&raw).unwrap();
+            task["budget"] = serde_json::json!({"max_attempts": 1});
+            connection
+                .execute(
+                    "UPDATE tasks SET payload_json=?1 WHERE task_id='task'",
+                    [task.to_string()],
+                )
+                .unwrap();
+        }
+
+        assert!(store.claim_runnable(1, 0, 5, 0).unwrap().is_empty());
+        let attempts = store.attempts_for_task("task").unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[1]["ordinal"], 2);
+        assert_eq!(attempts[1]["state"], "queued");
+        assert_eq!(
+            store.get_resource("task", "task").unwrap().unwrap()["state"],
+            "queued"
         );
     }
 

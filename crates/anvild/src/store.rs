@@ -3768,6 +3768,13 @@ pub(super) fn create_attempt_tx(
         [task_id],
         |row| row.get(0),
     )?;
+    let mut task: Value = serde_json::from_str(&task)?;
+    if task["budget"]["max_attempts"]
+        .as_u64()
+        .is_some_and(|limit| limit > 0 && ordinal as u64 > limit)
+    {
+        return Err(StoreError::InvalidState("Attempt budget exhausted".into()));
+    }
     let now = chrono::Utc::now().to_rfc3339();
     let mut attempt = serde_json::json!({"attempt_id":attempt_id,"task_id":task_id,"ordinal":ordinal,"version":1,"role":"implementation","session_id":null,"state":"queued","lifecycle":"queued","exit_reason":null,"created_at":now});
     if let Some(model) = model {
@@ -3780,7 +3787,6 @@ pub(super) fn create_attempt_tx(
     )?;
     tx.execute("INSERT INTO orchestration_resources(resource_type,resource_id,batch_id,task_id,attempt_id,payload_json,created_at,updated_at) SELECT 'attempt',?1,batch_id,?2,?1,?3,?4,?4 FROM orchestration_resources WHERE resource_type='task' AND resource_id=?2", params![attempt_id,task_id,serde_json::to_string(&attempt)?,now])?;
     append_resource_change(tx, "attempt", attempt_id, &attempt)?;
-    let mut task: Value = serde_json::from_str(&task)?;
     let task_version:i64=tx.query_row("UPDATE task_durable_state SET version=version+1,updated_at=?2 WHERE task_id=?1 RETURNING version",params![task_id,now],|row|row.get(0))?;
     task["version"] = serde_json::json!(task_version);
     let task_payload = serde_json::to_string(&task)?;
@@ -5424,6 +5430,133 @@ mod tests {
         assert!(
             anvil_core::validate_campaign_submission(serde_json::from_value(cyclic).unwrap())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn prepared_commission_attempt_preserves_start_version_and_is_claimed_after_authorization() {
+        let request = json!({"campaign":{"purpose":"prepared attempt","shared_contracts":[]},"commissions":[
+            {"local_key":"only","objective":"deliver","obligations":[{"id":"o1","version":1,"requirement":"done","acceptance_expectations":["test"]}],"execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},"budget":{"max_attempts":1,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},"start_after":[],"integration_after":[]}
+        ]});
+        let validated = anvil_core::validate_campaign_submission(
+            serde_json::from_value(request.clone()).unwrap(),
+        )
+        .unwrap();
+        let (dir, store) = store();
+        let accepted = store
+            .accept_campaign("prepared-campaign-key", "test", &request, &validated)
+            .unwrap();
+        let commission_id = accepted.task["commissions"][0]["commission_id"]
+            .as_str()
+            .unwrap();
+
+        let prepared = store
+            .create_attempt_with_model(
+                commission_id,
+                "prepared-attempt-1",
+                "prepared-attempt-key",
+                Some("openai/gpt-5"),
+            )
+            .unwrap();
+        assert!(prepared.created);
+        assert_eq!(prepared.attempt["model"], "openai/gpt-5");
+        assert_eq!(
+            store.get_commission(commission_id).unwrap().unwrap()["version"],
+            1
+        );
+
+        let started = store
+            .start_commission("prepared-start-key", commission_id, 1)
+            .unwrap();
+        assert_eq!(started["commission"]["version"], 2);
+        let claimed = store.claim_runnable(1, 0, 3, 0).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].attempt["attempt_id"], "prepared-attempt-1");
+        assert_eq!(claimed[0].attempt["model"], "openai/gpt-5");
+
+        drop(store);
+        let reopened = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
+        let replayed_attempt = reopened
+            .create_attempt_with_model(
+                commission_id,
+                "ignored-attempt-id",
+                "prepared-attempt-key",
+                Some("openai/gpt-5"),
+            )
+            .unwrap();
+        assert!(!replayed_attempt.created);
+        assert_eq!(replayed_attempt.attempt["attempt_id"], "prepared-attempt-1");
+        let replayed_start = reopened
+            .start_commission("prepared-start-key", commission_id, 1)
+            .unwrap();
+        assert_eq!(replayed_start["commission"]["version"], 2);
+        assert_eq!(reopened.attempts_for_task(commission_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn creating_attempt_past_commission_budget_is_rejected_without_changes() {
+        let request = json!({"campaign":{"purpose":"attempt budget","shared_contracts":[]},"commissions":[
+            {"local_key":"only","objective":"deliver","obligations":[{"id":"o1","version":1,"requirement":"done","acceptance_expectations":["test"]}],"execution_target":{"kind":"git_repository","repository":"https://example.test/repo","base_ref":"main","delivery":"pull_request"},"budget":{"max_attempts":1,"max_continuations_per_reason":0,"max_verifier_cycles":0,"max_ci_retries":0,"max_execution_seconds":3600},"start_after":[],"integration_after":[]}
+        ]});
+        let validated = anvil_core::validate_campaign_submission(
+            serde_json::from_value(request.clone()).unwrap(),
+        )
+        .unwrap();
+        let (_dir, store) = store();
+        let accepted = store
+            .accept_campaign("budget-campaign-key", "test", &request, &validated)
+            .unwrap();
+        let commission_id = accepted.task["commissions"][0]["commission_id"]
+            .as_str()
+            .unwrap();
+        store
+            .create_attempt(commission_id, "budget-attempt-1", "budget-attempt-key-1")
+            .unwrap();
+        let before_task = store.get_resource("task", commission_id).unwrap().unwrap();
+        let before_changes: i64 = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM orchestration_changes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        assert!(matches!(
+            store.create_attempt(
+                commission_id,
+                "budget-attempt-2",
+                "budget-attempt-key-2"
+            ),
+            Err(StoreError::InvalidState(message)) if message == "Attempt budget exhausted"
+        ));
+
+        assert_eq!(store.attempts_for_task(commission_id).unwrap().len(), 1);
+        assert_eq!(
+            store.get_resource("task", commission_id).unwrap().unwrap(),
+            before_task
+        );
+        let connection = store.connection.lock().unwrap();
+        let submissions: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM attempt_submissions WHERE task_id=?1",
+                [commission_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let after_changes: i64 = connection
+            .query_row("SELECT COUNT(*) FROM orchestration_changes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(submissions, 1);
+        assert_eq!(after_changes, before_changes);
+        assert!(
+            !connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attempt_submissions WHERE idempotency_key='budget-attempt-key-2')",
+                [],
+                |row| row.get::<_, bool>(0),
+            ).unwrap(),
         );
     }
 
