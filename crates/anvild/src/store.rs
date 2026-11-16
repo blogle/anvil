@@ -1597,6 +1597,18 @@ impl ControllerStore {
         {
             let commission: Value = serde_json::from_str(&commission_json)?;
             let task: Value = serde_json::from_str(&task_json)?;
+            let execution_target = &commission["execution_target"];
+            let execution_target = if execution_target.is_object() {
+                json!({
+                    "kind":execution_target["kind"],
+                    "repository":execution_target["repository"],
+                    "base_ref":execution_target["base_ref"],
+                    "delivery":execution_target["delivery"],
+                })
+            } else {
+                Value::Null
+            };
+            let obligation_count = commission["obligations"].as_array().map_or(0, Vec::len);
             let attempt = match (attempt_id, ordinal, attempt_json) {
                 (Some(attempt_id), Some(ordinal), Some(payload)) => {
                     let payload: Value = serde_json::from_str(&payload)?;
@@ -1615,6 +1627,9 @@ impl ControllerStore {
                 "commission_id":commission_id,
                 "local_key":local_key,
                 "objective":commission["objective"],
+                "execution_target":execution_target,
+                "obligation_count":obligation_count,
+                "created_at":commission["created_at"],
                 "commission":{
                     "state":commission["state"],
                     "version":commission["version"],
@@ -5073,7 +5088,7 @@ mod tests {
 
     #[test]
     fn inbox_keyset_pages_cross_campaign_boundary_and_project_latest_state() {
-        let (_dir, store) = store();
+        let (dir, store) = store();
         let commission = |key: &str| {
             json!({
                 "local_key":key,"objective":format!("Objective {key}"),"obligations":[{"id":"deliver","version":1,"requirement":"Deliver the objective","acceptance_expectations":["verified"]}],
@@ -5107,6 +5122,27 @@ mod tests {
         assert_eq!(first_items[0]["campaign_id"], campaign_ids[0]);
         assert_eq!(first_items[0]["local_key"], "alpha");
         assert_eq!(first_items[0]["commission"]["start_authorized"], false);
+        assert_eq!(
+            first_items[0]["execution_target"],
+            json!({
+                "kind":"git_repository",
+                "repository":"https://example.test/repo",
+                "base_ref":"main",
+                "delivery":"pull_request"
+            })
+        );
+        assert_eq!(first_items[0]["obligation_count"], 1);
+        let stored_created_at: String = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT json_extract(payload_json,'$.created_at') FROM commissions WHERE commission_id=?1",
+                [first_items[0]["commission_id"].as_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_items[0]["created_at"], stored_created_at);
         assert!(first_items[0]["attempt"].is_null());
         let cursor = first["next_cursor"].as_str().unwrap();
         let second = store.inbox(Some(cursor), 1).unwrap();
@@ -5171,6 +5207,50 @@ mod tests {
             store.inbox(None, 101),
             Err(StoreError::InvalidState(_))
         ));
+
+        // Prove the safe target projection remains narrow even if persisted records carry
+        // additional target metadata, and that all projected context survives a restart.
+        {
+            let connection = store.connection.lock().unwrap();
+            let mut record: Value = serde_json::from_str(
+                &connection
+                    .query_row(
+                        "SELECT payload_json FROM commissions WHERE commission_id=?1",
+                        [commission_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+            record["execution_target"]["private_token"] = json!("never-project-this-secret");
+            connection
+                .execute(
+                    "UPDATE commissions SET payload_json=?1 WHERE commission_id=?2",
+                    params![record.to_string(), commission_id],
+                )
+                .unwrap();
+        }
+        drop(store);
+        let restarted = ControllerStore::open(dir.path().join("controller.sqlite3")).unwrap();
+        let persisted = restarted.inbox(None, 4).unwrap();
+        let persisted_item = persisted["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["commission_id"] == commission_id)
+            .unwrap();
+        assert_eq!(
+            persisted_item["execution_target"]["repository"],
+            "https://example.test/repo"
+        );
+        assert_eq!(persisted_item["obligation_count"], 1);
+        assert_eq!(persisted_item["created_at"], changed["created_at"]);
+        assert!(persisted_item["execution_target"]
+            .get("private_token")
+            .is_none());
+        assert!(!persisted_item
+            .to_string()
+            .contains("never-project-this-secret"));
     }
 
     #[test]

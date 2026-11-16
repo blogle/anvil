@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "Match workbench inspectors to live Commission and Campaign response contracts"
+}

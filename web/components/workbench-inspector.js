@@ -126,6 +126,7 @@ export default function CommissionInspector({ item, onClose, expanded, onToggleE
   const selectedSessionId = sessionFor(selectedAttempt)
   const campaignId = detail?.campaign_id ?? item?.campaign_id
   const title = detail?.objective ?? item?.objective ?? item?.title ?? `Commission ${text(commissionId)}`
+  const startAuthorized = detail?.task?.start_authorized ?? detail?.start_authorized
 
   useEffect(() => {
     if (!selectedSessionId || !['activity', 'diff'].includes(tab)) return undefined
@@ -219,7 +220,7 @@ export default function CommissionInspector({ item, onClose, expanded, onToggleE
       {error && <p className="notice" role="alert">Could not load Commission: {error}</p>}
       {tab === 'overview' && <>
         <Panel title="Recorded next action" className="decision-panel">
-          {detail?.start_authorized === false ? <>
+          {startAuthorized === false ? <>
             <p>Start not authorized in current Commission record; authorization is not scheduler readiness</p>
             {typeof detail.version === 'number' && Number.isFinite(detail.version) && <form className="mock-actions" onSubmit={startCommission}>
               <p className="muted">Start this Commission using the currently recorded contract version.</p>
@@ -233,17 +234,20 @@ export default function CommissionInspector({ item, onClose, expanded, onToggleE
           </> : null}
           {latestAttemptFailed && <p className="notice">{latestAttemptFailure ? `Recorded failure: ${text(latestAttemptFailure)}` : 'Latest attempt is recorded as failed.'}</p>}
           {operatorHold && <p className="notice">{item.task.hold_reason ? `Recorded operator hold: ${text(item.task.hold_reason)}` : 'An operator hold is recorded.'}</p>}
-          {detail?.start_authorized !== false && !latestAttemptFailed && !operatorHold && <p className="muted">No current operator action is established by this view.</p>}
+          {startAuthorized !== false && !latestAttemptFailed && !operatorHold && <p className="muted">No current operator action is established by this view.</p>}
         </Panel>
         <Panel title="Commission contract">
           {detail ? <>
             <p>{text(detail.objective)}</p>
             <div className="context-grid">
               <ContextCell label="Version" value={detail.version}/>
-              <ContextCell label="Start authorized" value={detail.start_authorized == null ? 'Not reported' : detail.start_authorized ? 'Yes' : 'No'}/>
+              <ContextCell label="Start authorized" value={typeof startAuthorized === 'boolean' ? startAuthorized ? 'Yes' : 'No' : 'Not reported'}/>
               <ContextCell label="Start after" value={detail.start_after?.length ? detail.start_after.join(', ') : 'None'}/>
               <ContextCell label="Integration after" value={detail.integration_after?.length ? detail.integration_after.join(', ') : 'None'}/>
-              <ContextCell label="Execution target" value={detail.execution_target}/>
+              <ContextCell label="Repository" value={detail.execution_target?.repository}/>
+              <ContextCell label="Base ref" value={detail.execution_target?.base_ref}/>
+              <ContextCell label="Delivery" value={detail.execution_target?.delivery}/>
+              <ContextCell label="Kind" value={detail.execution_target?.kind}/>
             </div>
             <div className="link-list">
               {campaignId && <a className="example-link" href={`/campaign?id=${encodeURIComponent(campaignId)}`}>Campaign · {text(campaignId)}</a>}
