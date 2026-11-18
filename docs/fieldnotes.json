@@ -1,0 +1,13 @@
+{
+  "title": "Anvil",
+  "entry": "index.md",
+  "navigation": [
+    { "label": "Overview", "href": "index.md" },
+    { "label": "Specification", "href": "spec.md" },
+    { "label": "Architecture", "href": "architecture.md" },
+    { "label": "Mockup — Inbox", "href": "mockups/inbox.html" },
+    { "label": "Mockup — Campaign", "href": "mockups/campaign.html" },
+    { "label": "Mockup — Commission", "href": "mockups/commission.html" },
+    { "label": "Research", "href": "research.md" }
+  ]
+}

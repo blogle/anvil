@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Anvil — Inbox (mockup)</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+         background: #14161a; color: #d7dae0; margin: 0; padding: 2rem; }
+  h1 { font-size: 1.1rem; font-weight: 600; letter-spacing: .05em; }
+  .sub { color: #7a828e; margin: .25rem 0 1.5rem; }
+  table { border-collapse: collapse; width: 100%; max-width: 960px; }
+  th { text-align: left; color: #7a828e; font-weight: 500; padding: .4rem .75rem;
+       border-bottom: 1px solid #2a2e35; }
+  td { padding: .6rem .75rem; border-bottom: 1px solid #21252b; vertical-align: top; }
+  tr:hover td { background: #191c21; }
+  .kind { display: inline-block; padding: .1rem .5rem; border-radius: 3px;
+          font-size: .75rem; border: 1px solid #3a3f47; white-space: nowrap; }
+  .k-review { color: #7ee787; border-color: #2ea04340; }
+  .k-budget { color: #f0883e; border-color: #f0883e40; }
+  .k-attention { color: #79c0ff; border-color: #79c0ff40; }
+  .k-env { color: #ff7b72; border-color: #ff7b7240; }
+  .k-conflict { color: #d2a8ff; border-color: #d2a8ff40; }
+  .k-invite { color: #e3b341; border-color: #e3b34140; }
+  .actions a { color: #79c0ff; text-decoration: none; margin-right: .75rem; }
+  .actions a:hover { text-decoration: underline; }
+  .age { color: #7a828e; white-space: nowrap; }
+  .topbar { display: flex; gap: 1rem; max-width: 960px; margin-bottom: 1rem; }
+  .topbar a { color: #7a828e; text-decoration: none; }
+  .topbar a.here { color: #d7dae0; border-bottom: 1px solid #d7dae0; }
+</style>
+</head>
+<body>
+  <h1>ANVIL / inbox</h1>
+  <div class="sub">deterministic attention items only — 6 open, 42 dismissed today</div>
+  <div class="topbar">
+    <a class="here" href="#">inbox (6)</a><a href="campaign.html">campaigns</a><a href="commission.html">commissions</a>
+  </div>
+  <table>
+    <tr><th>kind</th><th>commission</th><th>summary</th><th>age</th><th>suggested actions</th></tr>
+    <tr><td><span class="kind k-review">review-ready</span></td>
+        <td>payments-refactor / invoice-split</td>
+        <td>PR #481 green on all checks; ready for review</td>
+        <td class="age">12m</td>
+        <td class="actions"><a href="#">open PR</a><a href="#">takeover</a><a href="#">cancel</a></td></tr>
+    <tr><td><span class="kind k-budget">budget-exhausted</span></td>
+        <td>payments-refactor / ledger-migration</td>
+        <td>8 attempts; obligation o3 unchanged for 4 attempts</td>
+        <td class="age">1h</td>
+        <td class="actions"><a href="#">retry</a><a href="#">revise</a><a href="#">takeover</a><a href="#">cancel</a></td></tr>
+    <tr><td><span class="kind k-attention">agent-attention</span></td>
+        <td>web-refresh / virtual-table</td>
+        <td>"need decision: cursor pagination vs infinite scroll per o2"</td>
+        <td class="age">2h</td>
+        <td class="actions"><a href="#">chat</a><a href="#">revise</a><a href="#">resume</a></td></tr>
+    <tr><td><span class="kind k-env">env-failure</span></td>
+        <td>web-refresh / asset-pipeline</td>
+        <td>nix develop failed: flake output `devShell` missing (exit 1)</td>
+        <td class="age">3h</td>
+        <td class="actions"><a href="#">retry</a><a href="#">takeover</a><a href="#">cancel</a></td></tr>
+    <tr><td><span class="kind k-conflict">unmergeable</span></td>
+        <td>payments-refactor / webhook-retry</td>
+        <td>target head moved; agent rebase attempt failed twice</td>
+        <td class="age">5h</td>
+        <td class="actions"><a href="#">retry</a><a href="#">chat</a><a href="#">cancel</a></td></tr>
+    <tr><td><span class="kind k-invite">interactive-invite</span></td>
+        <td>web-refresh / settings-page</td>
+        <td>converged & configured auto-interactive: iterate before merge?</td>
+        <td class="age">6h</td>
+        <td class="actions"><a href="#">takeover</a><a href="#">chat</a><a href="#">resume</a></td></tr>
+  </table>
+</body>
+</html>

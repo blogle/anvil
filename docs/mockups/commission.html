@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Anvil — Commission (mockup)</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+         background: #14161a; color: #d7dae0; margin: 0; padding: 2rem; }
+  h1 { font-size: 1.1rem; font-weight: 600; letter-spacing: .05em; }
+  .sub { color: #7a828e; margin: .25rem 0 1.25rem; }
+  .sub a { color: #79c0ff; text-decoration: none; }
+  .cols { display: grid; grid-template-columns: 1.4fr 1fr; gap: 2rem; max-width: 1080px; }
+  h2 { font-size: .8rem; color: #7a828e; font-weight: 500; letter-spacing: .08em;
+       border-bottom: 1px solid #2a2e35; padding-bottom: .35rem; }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: .5rem .6rem; border-bottom: 1px solid #21252b; vertical-align: top; }
+  .ob { display: inline-block; padding: .05rem .45rem; border-radius: 3px;
+        font-size: .72rem; border: 1px solid #3a3f47; margin-right: .5rem; }
+  .ok { color: #7ee787; border-color: #2ea04340; }
+  .gap { color: #f0883e; border-color: #f0883e40; }
+  .ev { color: #7a828e; font-size: .78rem; }
+  .state { display: inline-block; padding: .1rem .5rem; border-radius: 3px;
+           font-size: .75rem; border: 1px solid #79c0ff40; color: #79c0ff; }
+  .checks span { margin-right: .75rem; }
+  .pass { color: #7ee787; } .fail { color: #ff7b72; } .pend { color: #e3b341; }
+  .atm { color: #7a828e; }
+  .preview a { color: #d2a8ff; text-decoration: none; }
+  .tool { color: #8b949e; font-size: .78rem; }
+</style>
+</head>
+<body>
+  <h1>COMMISSION / payments-refactor / invoice-split</h1>
+  <div class="sub">
+    <span class="state">needs-review</span> &nbsp;
+    repo <a href="#">acme/payments</a> · branch anvil/payments-refactor/invoice-split ·
+    PR <a href="#">#481</a> (ready-for-review) · target main @ a41f2c (unchanged)
+  </div>
+
+  <div class="cols">
+    <div>
+      <h2>OBLIGATIONS (4/4 evidenced — checks green)</h2>
+      <table>
+        <tr><td><span class="ob ok">o1 ✓</span>extract invoice routes into services/invoice/
+            <div class="ev">evidence: services/invoice/** (+14 files); CI `route-map` green</div></td></tr>
+        <tr><td><span class="ob ok">o2 ✓</span>public API contract unchanged
+            <div class="ev">evidence: openapi-diff empty; contract tests green</div></td></tr>
+        <tr><td><span class="ob ok">o3 ✓</span>integration tests stay green
+            <div class="ev">evidence: PR checks — integration (12m 04s) passed</div></td></tr>
+        <tr><td><span class="ob ok">o4 ✓</span>no new direct DB access from routes
+            <div class="ev">evidence: grep clean; lint rule `no-direct-sql` green</div></td></tr>
+      </table>
+
+      <h2 style="margin-top:1.5rem">ATTEMPT 5 (current)</h2>
+      <table>
+        <tr><td><span class="atm">turn 12</span> reprompt — gap: o3 check failure `test_invoice_sync` <span class="tool">(tokens 41k · glm-5.3 · high)</span></td></tr>
+        <tr><td><span class="atm">turn 13</span> session 4f2a1c — fix timezone in sync test <span class="tool">(tokens 38k)</span></td></tr>
+        <tr><td><span class="atm">turn 14</span> anvilctl done — evaluation: PR checks green → needs-review <span class="tool">(tokens 2k)</span></td></tr>
+      </table>
+
+      <h2 style="margin-top:1.5rem">PR CHECKS</h2>
+      <div class="checks">
+        <span class="pass">● build (3m 12s)</span>
+        <span class="pass">● unit (1m 48s)</span>
+        <span class="pass">● integration (12m 04s)</span>
+        <span class="pass">● lint (42s)</span>
+      </div>
+    </div>
+
+    <div>
+      <h2>LIVE SESSION</h2>
+      <table>
+        <tr><td><span class="atm">assistant</span> the sync test used a naive local timestamp…</td></tr>
+        <tr><td><span class="tool">tool: edit services/invoice/sync.test.ts</span></td></tr>
+        <tr><td><span class="tool">tool: bash nix develop -c pytest -k invoice_sync</span></td></tr>
+        <tr><td><span class="atm">assistant</span> green locally — pushing and claiming done</td></tr>
+        <tr><td><span class="tool">tool: bash git push origin anvil/payments-refactor/invoice-split</span></tr>
+        <tr><td><span class="tool">tool: bash anvilctl done --notes "o3 fixed"</span></td></tr>
+      </table>
+
+      <h2 style="margin-top:1.5rem">PREVIEW ROUTES</h2>
+      <div class="preview">
+        <a href="#">3000.invoice-split.payments-refactor.preview.anvil.dev</a><br>
+        <a href="#">5432.invoice-split.payments-refactor.preview.anvil.dev</a>
+      </div>
+
+      <h2 style="margin-top:1.5rem">USAGE</h2>
+      <table>
+        <tr><td>attempt tokens</td><td style="text-align:right">81k</td></tr>
+        <tr><td>commission total</td><td style="text-align:right">1.2M</td></tr>
+        <tr><td>turns / attempts</td><td style="text-align:right">14 / 5</td></tr>
+        <tr><td>wall clock</td><td style="text-align:right">3h 41m</td></tr>
+      </table>
+    </div>
+  </div>
+</body>
+</html>

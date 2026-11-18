@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Anvil — Campaign (mockup)</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+         background: #14161a; color: #d7dae0; margin: 0; padding: 2rem; }
+  h1 { font-size: 1.1rem; font-weight: 600; letter-spacing: .05em; }
+  .sub { color: #7a828e; margin: .25rem 0 1.5rem; }
+  .wave { max-width: 960px; margin-bottom: 1.75rem; }
+  .wave h2 { font-size: .85rem; color: #7a828e; font-weight: 500;
+             border-bottom: 1px solid #2a2e35; padding-bottom: .35rem; }
+  .wave h2 .hint { float: right; font-size: .75rem; }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: .6rem .75rem; border-bottom: 1px solid #21252b; }
+  tr:hover td { background: #191c21; }
+  .state { display: inline-block; padding: .1rem .5rem; border-radius: 3px;
+           font-size: .75rem; border: 1px solid #3a3f47; white-space: nowrap; }
+  .s-active { color: #79c0ff; border-color: #79c0ff40; }
+  .s-review { color: #7ee787; border-color: #2ea04340; }
+  .s-merged { color: #8b949e; border-color: #8b949e40; }
+  .s-escalated { color: #f0883e; border-color: #f0883e40; }
+  .s-interactive { color: #e3b341; border-color: #e3b34140; }
+  .s-pending { color: #7a828e; }
+  a { color: #79c0ff; text-decoration: none; } a:hover { text-decoration: underline; }
+  .usage { color: #7a828e; white-space: nowrap; }
+</style>
+</head>
+<body>
+  <h1>CAMPAIGN / payments-refactor</h1>
+  <div class="sub">strategy: glm-5.3 · thinking high · wave 1 complete, wave 2 running · tokens this campaign: 4.1M</div>
+
+  <div class="wave">
+    <h2>WAVE 1 <span class="hint">admitted → terminal (skip-gate passed: 1 escalated, not blocking)</span></h2>
+    <table>
+      <tr><td><span class="state s-merged">merged</span></td><td><a href="commission.html">invoice-split</a></td><td>acme/payments</td><td>PR #481</td><td class="usage">5 attempts · 1.2M tok</td></tr>
+      <tr><td><span class="state s-escalated">escalated</span></td><td><a href="commission.html">ledger-migration</a></td><td>acme/payments</td><td>PR #487</td><td class="usage">8 attempts · 2.0M tok</td></tr>
+    </table>
+  </div>
+
+  <div class="wave">
+    <h2>WAVE 2 <span class="hint">running</span></h2>
+    <table>
+      <tr><td><span class="state s-active">active</span></td><td><a href="commission.html">webhook-retry</a></td><td>acme/payments</td><td>PR #493 (draft)</td><td class="usage">3 attempts · 610k tok</td></tr>
+      <tr><td><span class="state s-interactive">interactive</span></td><td><a href="commission.html">settings-page</a></td><td>acme/web</td><td>PR #494 (draft)</td><td class="usage">2 attempts · 240k tok</td></tr>
+      <tr><td><span class="state s-review">needs-review</span></td><td><a href="commission.html">invoice-ui</a></td><td>acme/web</td><td>PR #496</td><td class="usage">4 attempts · 940k tok</td></tr>
+    </table>
+  </div>
+
+  <div class="wave">
+    <h2>WAVE 3 <span class="hint">pending — admits when wave 2 is terminal</span></h2>
+    <table>
+      <tr><td><span class="state s-pending">pending</span></td><td>reporting-export</td><td>acme/payments</td><td>—</td><td class="usage">—</td></tr>
+    </table>
+  </div>
+</body>
+</html>
