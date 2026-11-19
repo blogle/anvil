@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "Signal channel (N20): the daemon serves POST /v1/signals/done and /v1/signals/attention behind per-commission bearer tokens — tokens are minted by the store, kept only as hashes, and claim done on the running attempt idempotently with a done-claimed event; agent attention becomes an open attention item plus event in one transaction. anvilctl is the preinstalled sandbox CLI reading ANVILCTL_URL/ANVILCTL_TOKEN with explicit exit codes. The anvild daemon itself now boots: store bootstrap, engine tick loop, optional GitHub client from stored credentials, signal endpoints on a bindable listener — exiting only on bootstrap failure (N18)."
+}

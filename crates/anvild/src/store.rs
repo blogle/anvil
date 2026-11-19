@@ -7,7 +7,7 @@ use anvil_api::{
     CampaignId, Commission, CommissionId, CommissionState, Event, EventKind, NewAttention,
     NewCampaign, NewCommission, NewEvent, Obligation, ObligationId, Turn, TurnId,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteQueryResult,
     SqliteSynchronous,
@@ -348,7 +348,8 @@ impl Store {
 
     pub async fn attempts(&self, commission: CommissionId) -> Result<Vec<Attempt>, StoreError> {
         let rows = sqlx::query_as::<_, AttemptRow>(
-            "SELECT id, commission_id, n, strategy, started_at, ended_at, heartbeat_at, tokens, outcome
+            "SELECT id, commission_id, n, strategy, started_at, ended_at, done_claimed_at,
+                    heartbeat_at, tokens, outcome
              FROM attempts WHERE commission_id = ? ORDER BY n",
         )
         .bind(commission.to_string())
@@ -523,6 +524,112 @@ impl Store {
         Ok(row.map(|r| r.get::<String, _>("secret")))
     }
 
+    pub async fn issue_commission_token(
+        &self,
+        commission: CommissionId,
+    ) -> Result<String, StoreError> {
+        let token = Uuid::new_v4().to_string();
+        let hash = token_hash(&token);
+        sqlx::query("INSERT INTO tokens (token_hash, commission_id, created_at) VALUES (?, ?, ?)")
+            .bind(hash)
+            .bind(commission.to_string())
+            .bind(now_millis())
+            .execute(&self.pool)
+            .await?;
+        Ok(token)
+    }
+
+    pub async fn commission_by_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<CommissionId>, StoreError> {
+        let row = sqlx::query("SELECT commission_id FROM tokens WHERE token_hash = ?")
+            .bind(token_hash(token))
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| {
+            decode_uuid("commission id", &r.get::<String, _>("commission_id")).map(CommissionId)
+        })
+        .transpose()
+    }
+
+    pub async fn claim_done(
+        &self,
+        commission: CommissionId,
+        notes: Option<&str>,
+    ) -> Result<AttemptId, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let running = sqlx::query(
+            "SELECT id, done_claimed_at FROM attempts
+             WHERE commission_id = ? AND ended_at IS NULL
+             ORDER BY n DESC LIMIT 1",
+        )
+        .bind(commission.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(running) = running else {
+            return Err(StoreError::Missing {
+                what: "running attempt for done claim",
+                id: commission.to_string(),
+            });
+        };
+        let attempt_id = AttemptId(decode_uuid("attempt id", &running.get::<String, _>("id"))?);
+        if running.get::<Option<i64>, _>("done_claimed_at").is_none() {
+            sqlx::query("UPDATE attempts SET done_claimed_at = ? WHERE id = ?")
+                .bind(now_millis())
+                .bind(attempt_id.to_string())
+                .execute(&mut *tx)
+                .await?;
+            let mut payload = json!({"attempt": attempt_id.to_string()});
+            if let Some(notes) = notes {
+                payload["notes"] = json!(notes);
+            }
+            insert_event(
+                &mut tx,
+                &NewEvent {
+                    kind: EventKind::DoneClaimed,
+                    campaign_id: None,
+                    commission_id: Some(commission),
+                    payload,
+                },
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(attempt_id)
+    }
+
+    pub async fn agent_attention(
+        &self,
+        commission: CommissionId,
+        message: &str,
+    ) -> Result<AttentionId, StoreError> {
+        let id = AttentionId::new();
+        let mut tx = self.pool.begin().await?;
+        insert_attention(
+            &mut tx,
+            id,
+            &NewAttention {
+                commission_id: commission,
+                kind: AttentionKind::AgentAttention,
+                payload: json!({"message": message}),
+            },
+        )
+        .await?;
+        insert_event(
+            &mut tx,
+            &NewEvent {
+                kind: EventKind::AttentionRaised,
+                campaign_id: None,
+                commission_id: Some(commission),
+                payload: json!({"message": message}),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
     fn require_row(
         result: SqliteQueryResult,
         what: &'static str,
@@ -595,6 +702,17 @@ fn decode_uuid(field: &'static str, raw: &str) -> Result<Uuid, StoreError> {
 
 fn encode_json(value: &Value) -> String {
     value.to_string()
+}
+
+fn token_hash(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(token.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 fn decode_json(field: &'static str, raw: &str) -> Result<Value, StoreError> {
@@ -699,6 +817,7 @@ struct AttemptRow {
     strategy: String,
     started_at: i64,
     ended_at: Option<i64>,
+    done_claimed_at: Option<i64>,
     heartbeat_at: i64,
     tokens: Option<i64>,
     outcome: Option<String>,
@@ -713,6 +832,7 @@ impl AttemptRow {
             strategy: decode_json("attempt strategy", &self.strategy)?,
             started_at: from_millis(self.started_at)?,
             ended_at: self.ended_at.map(from_millis).transpose()?,
+            done_claimed_at: self.done_claimed_at.map(from_millis).transpose()?,
             heartbeat_at: from_millis(self.heartbeat_at)?,
             tokens: self.tokens,
             outcome: self

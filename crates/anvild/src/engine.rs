@@ -347,24 +347,19 @@ impl Engine {
             .await?;
         Ok(())
     }
-}
 
-pub async fn run(
-    store: Store,
-    config: EngineConfig,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<(), EngineError> {
-    let engine = Engine::new(store, config);
-    let mut interval = tokio::time::interval(engine.config.tick_interval);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                engine.tick().await?;
-            }
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    return Ok(());
+    pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<(), EngineError> {
+        let mut interval = tokio::time::interval(self.config.tick_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    self.tick().await?;
+                }
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        return Ok(());
+                    }
                 }
             }
         }
