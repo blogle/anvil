@@ -47,6 +47,14 @@ impl SandboxProvider {
         }
     }
 
+    pub async fn handle(&self, name: &str) -> Result<Option<SandboxHandle>, SandboxError> {
+        validate_name(name)?;
+        match self {
+            Self::Podman(provider) => provider.handle(name).await,
+            Self::Memory(provider) => provider.handle(name).await,
+        }
+    }
+
     pub async fn destroy(&self, name: &str) -> Result<(), SandboxError> {
         match self {
             Self::Podman(provider) => provider.destroy(name).await,
@@ -118,6 +126,17 @@ impl PodmanProvider {
                 cause,
             })?;
         Ok(SandboxHandle { name, serve_url })
+    }
+
+    pub async fn handle(&self, name: &str) -> Result<Option<SandboxHandle>, SandboxError> {
+        if !self.is_running(name).await? {
+            return Ok(None);
+        }
+        let port = self.published_port(name).await?;
+        Ok(Some(SandboxHandle {
+            name: name.to_owned(),
+            serve_url: format!("http://127.0.0.1:{port}"),
+        }))
     }
 
     pub async fn destroy(&self, name: &str) -> Result<(), SandboxError> {
@@ -217,6 +236,18 @@ pub struct MemoryProvider {
 }
 
 impl MemoryProvider {
+    pub async fn handle(&self, name: &str) -> Result<Option<SandboxHandle>, SandboxError> {
+        Ok(self
+            .sandboxes
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|_| SandboxHandle {
+                name: name.to_owned(),
+                serve_url: format!("http://{name}/"),
+            }))
+    }
+
     pub async fn start(&self, spec: &SandboxSpec) -> Result<SandboxHandle, SandboxError> {
         tokio::fs::create_dir_all(&spec.workspace).await?;
         for (path, content) in &spec.files {
