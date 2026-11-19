@@ -2,3 +2,8 @@
 name = "anvil-api"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+time.workspace = true
+uuid.workspace = true
