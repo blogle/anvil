@@ -2,8 +2,8 @@
   description = "Anvil — control plane and operator loop for opencode agent campaigns";
 
   inputs = {
-    # Pinned SDLC release; reusable workflow refs pin the same release.
-    sdlc.url = "github:blogle/sdlc/v2.1.5";
+    # SDLC compatible update channel; flake.lock records the exact revision.
+    sdlc.url = "github:blogle/sdlc/v2";
 
     # Documentation workbench (no release tags yet; pinned by revision).
     fieldnotes.url = "github:blogle/fieldnotes/60f863bc41820fffda1ad8e950438a19b1dbdc2b";

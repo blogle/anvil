@@ -1,0 +1,64 @@
+merge_protections_settings:
+  reporting_method: check-runs
+  post_comment: false
+  auto_merge_conditions:
+    - base ~= ^(main|master)$
+    - head != sdlc/release-next
+    - label != release
+    - check-success = @github-actions/sdlc / check
+    - check-success = @github-actions/sdlc / policy
+    - or:
+        - and:
+            - label = integration:auto
+            - label != integration:review
+        - and:
+            - label = integration:review
+            - label != integration:auto
+            - "#approved-reviews-by >= 1"
+
+queue_rules:
+  - name: validated candidates
+    queue_conditions:
+      - base ~= ^(main|master)$
+      - head != sdlc/release-next
+      - label != release
+      - check-success = @github-actions/sdlc / check
+      - check-success = @github-actions/sdlc / policy
+      - or:
+          - and:
+              - label = integration:auto
+              - label != integration:review
+          - and:
+              - label = integration:review
+              - label != integration:auto
+              - "#approved-reviews-by >= 1"
+    merge_conditions:
+      - check-success = @github-actions/sdlc / verify
+    batch_size: 5
+    batch_max_wait_time: 2 minutes
+    merge_method: squash
+    update_method: merge
+
+merge_protections:
+  - name: Feature PR admission
+    if:
+      - base ~= ^(main|master)$
+      - head != sdlc/release-next
+    success_conditions:
+      - check-success = @github-actions/sdlc / check
+      - check-success = @github-actions/sdlc / policy
+      - or:
+          - and:
+              - label = integration:auto
+              - label != integration:review
+          - and:
+              - label = integration:review
+              - label != integration:auto
+              - "#approved-reviews-by >= 1"
+  - name: Release candidate needs trusted SDLC gate
+    if:
+      - base ~= ^(main|master)$
+      - head = sdlc/release-next
+    success_conditions:
+      - check-success = @sdlc-release/sdlc / release-gate
+      - "#commits-behind = 0"

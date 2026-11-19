@@ -185,12 +185,14 @@ docs.attic.rs; cachix.org.
 ## blogle tooling
 
 - **blogle/sdlc** (<https://github.com/blogle/sdlc>): pinned nix library + shared
-  GitHub workflows; consumer owns checks, `ci.nix` (`check`/`verify`), and the
-  `publish` app; `sdlc.lib.mkConsumer` validates and returns the consumer's
-  `ci.<system>` output, which the pinned reusable stage workflows consume as
-  `.#ci.<system>.<stage>` (newer unreleased sdlc additionally aliases these into
-  `hydraJobs.ci-check/ci-verify`). Changelog via `.changes/*.json` stubs, caller
-  workflows (`sdlc / check`, `sdlc / verify`), release via
+  GitHub workflows, consumed via the compatible `github:blogle/sdlc/v2` channel
+  (flake.lock records the exact revision; workflows pin the full locked SHA).
+  Consumer owns checks, `ci.nix` (`check`/`verify`), and the `publish` app;
+  `sdlc.lib.mkConsumer` validates and returns the consumer's `ci.<system>`
+  output. `sdlc install` generates the pinned caller workflows
+  (CI emitting `sdlc / check|verify|policy`, release, cache GC) and the canonical
+  `.mergify.yml`; `sdlc ruleset plan/apply/check` manages the canonical
+  default-branch ruleset. Changelog via `.changes/*.json` stubs; release via
   `just release-publish <version>` promoting the same artifact identity.
   Skill format: `skills/<name>/SKILL.md` with YAML frontmatter
   (`name`, `description`), installed under `.agents/skills/`.
