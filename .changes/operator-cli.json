@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "Operator CLI (N23): anvil drives the M1 loop from the terminal — campaign submit and commission add take YAML files and submit idempotently by content hash, ps and status render the commission table and detail, logs tails or follows the typed events stream, inbox triages attention, revise adds or drops obligations, retry/resume/takeover/cancel map onto transitions with 409s surfaced as exit 1, and auth add/list onboards credentials without ever echoing secrets. The daemon gains the matching credentials endpoints and JSON-negotiated event reads."
+}

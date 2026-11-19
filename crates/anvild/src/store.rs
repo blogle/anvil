@@ -574,6 +574,21 @@ impl Store {
         Ok(row.map(|r| r.get::<String, _>("secret")))
     }
 
+    pub async fn credential_names(&self) -> Result<Vec<(String, i64)>, StoreError> {
+        let rows = sqlx::query("SELECT name, updated_at FROM credentials ORDER BY name")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("name"),
+                    row.get::<i64, _>("updated_at"),
+                )
+            })
+            .collect())
+    }
+
     pub async fn issue_commission_token(
         &self,
         commission: CommissionId,
