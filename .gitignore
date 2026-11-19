@@ -1,4 +1,5 @@
 /result
+/target
 /.direnv
 .env
 node_modules/

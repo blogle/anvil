@@ -20,8 +20,15 @@
       forSystem = system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          lib = pkgs.lib;
           craneLib = crane.mkLib pkgs;
-          src = craneLib.cleanCargoSource ./.;
+          src = lib.fileset.toSource {
+            root = ./.;
+            fileset = lib.fileset.unions [
+              (craneLib.fileset.commonCargoSources ./.)
+              ./crates/anvild/migrations
+            ];
+          };
           commonArgs = {
             inherit src;
             strictDeps = true;
