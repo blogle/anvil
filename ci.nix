@@ -10,5 +10,6 @@
     anvild = self.packages.${system}.anvild;
     anvilctl = self.packages.${system}.anvilctl;
     anvil-router = self.packages.${system}.anvil-router;
+    anvil-sandbox-image = self.packages.${system}.anvil-sandbox-image;
   };
 }
