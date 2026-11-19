@@ -17,5 +17,5 @@ serde_json = "1"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
 thiserror = "2"
 time = "0.3"
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
 uuid = { version = "1", features = ["v4"] }
