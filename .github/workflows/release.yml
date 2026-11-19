@@ -1,0 +1,18 @@
+name: Release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish_version:
+        description: Existing release tag version to republish after a failed publication
+        type: string
+        required: false
+permissions:
+  contents: write
+jobs:
+  publish:
+    uses: blogle/sdlc/.github/workflows/release.yml@v2.1.5
+    with:
+      publish_version: ${{ inputs.publish_version || '' }}
+    secrets: inherit

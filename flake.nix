@@ -2,51 +2,96 @@
   description = "Anvil — control plane and operator loop for opencode agent campaigns";
 
   inputs = {
-    # Pinned SDLC release; reusable workflows should pin the same revision.
+    # Pinned SDLC release; reusable workflow refs pin the same release.
     sdlc.url = "github:blogle/sdlc/v2.1.5";
 
     # Documentation workbench (no release tags yet; pinned by revision).
     fieldnotes.url = "github:blogle/fieldnotes/60f863bc41820fffda1ad8e950438a19b1dbdc2b";
 
-    # Rust build caching; follows SDLC's nixpkgs per the consumer contract.
-    crane = {
-      url = "github:ipetkov/crane";
-      inputs.nixpkgs.follows = "sdlc/nixpkgs-latest";
-    };
+    # Rust build caching, instantiated against SDLC's nixpkgs.
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs = { self, sdlc, fieldnotes, crane }:
     let
       systems = [ "x86_64-linux" ];
       nixpkgs = sdlc.nixpkgs-latest;
-    in
-    {
-      apps = nixpkgs.lib.genAttrs systems (system: {
-        docs = {
-          type = "app";
-          program = "${fieldnotes.packages.${system}.default}/bin/fieldnotes";
-        };
-        sdlc = {
-          type = "app";
-          program = "${sdlc.packages.${system}.sdlc}/bin/sdlc";
-        };
-      });
+      version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+      forSystem = system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          craneLib = crane.mkLib pkgs;
+          src = craneLib.cleanCargoSource ./.;
+          commonArgs = {
+            inherit src;
+            strictDeps = true;
+            pname = "anvil-workspace";
+            inherit version;
+          };
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          member = pname:
+            craneLib.buildPackage (commonArgs // {
+              inherit pname version cargoArtifacts;
+              cargoExtraArgs = "-p ${pname}";
+              doCheck = false;
+            });
+        in
+        {
+          checks = {
+            fmt = craneLib.cargoFmt commonArgs;
+            clippy = craneLib.cargoClippy (commonArgs // {
+              inherit cargoArtifacts;
+              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+            });
+            test = craneLib.mkCargoDerivation (commonArgs // {
+              inherit cargoArtifacts;
+              buildPhaseCargoCommand = "cargo test --offline --workspace";
+            });
+          };
 
-      packages = nixpkgs.lib.genAttrs systems (system:
-        let pkgs = nixpkgs.legacyPackages.${system};
-        in {
-          nix-eval-jobs = pkgs.nix-eval-jobs;
-        });
+          packages = {
+            anvil = member "anvil";
+            anvild = member "anvild";
+            anvilctl = member "anvilctl";
+            anvil-router = member "anvil-router";
+          };
 
-      devShells = nixpkgs.lib.genAttrs systems (system:
-        let pkgs = nixpkgs.legacyPackages.${system};
-        in {
-          default = pkgs.mkShell {
+          apps = {
+            docs = {
+              type = "app";
+              program = "${fieldnotes.packages.${system}.default}/bin/fieldnotes";
+            };
+            sdlc = {
+              type = "app";
+              program = "${sdlc.packages.${system}.sdlc}/bin/sdlc";
+            };
+          };
+
+          devShells.default = pkgs.mkShell {
             packages = sdlc.lib.devTools {
               inherit pkgs;
               sdlcCli = sdlc.packages.${system}.sdlc;
-            } ++ [ pkgs.just pkgs.gh ];
+            } ++ [
+              pkgs.cargo
+              pkgs.rustc
+              pkgs.rustfmt
+              pkgs.clippy
+              pkgs.rust-analyzer
+              pkgs.just
+              pkgs.gh
+            ];
           };
+        };
+      ci = system:
+        sdlc.lib.mkConsumer ((import ./ci.nix { inherit self system; }) // {
+          publish = sdlc.ci.${system}.publish;
         });
+    in
+    {
+      checks = nixpkgs.lib.genAttrs systems (system: (forSystem system).checks);
+      packages = nixpkgs.lib.genAttrs systems (system: (forSystem system).packages);
+      apps = nixpkgs.lib.genAttrs systems (system: (forSystem system).apps);
+      devShells = nixpkgs.lib.genAttrs systems (system: (forSystem system).devShells);
+      ci = nixpkgs.lib.genAttrs systems ci;
     };
 }

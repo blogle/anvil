@@ -1,0 +1,22 @@
+name: CI
+on: [pull_request, merge_group]
+jobs:
+  check:
+    uses: blogle/sdlc/.github/workflows/check.yml@v2.1.5
+  verify:
+    if: github.event_name == 'merge_group' || startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/')
+    uses: blogle/sdlc/.github/workflows/verify.yml@v2.1.5
+  sdlc-check:
+    name: sdlc / check
+    needs: check
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.check.result }}" = success
+  sdlc-verify:
+    name: sdlc / verify
+    needs: verify
+    if: always() && (github.event_name == 'merge_group' || startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/'))
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.verify.result }}" = success

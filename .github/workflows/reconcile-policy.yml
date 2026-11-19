@@ -1,0 +1,15 @@
+name: Repository policy
+on:
+  pull_request:
+    paths:
+      - .github/repository-policy.json
+  push:
+    paths:
+      - .github/repository-policy.json
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  policy:
+    uses: blogle/sdlc/.github/workflows/reconcile-policy.yml@v2.1.5
+    secrets: inherit

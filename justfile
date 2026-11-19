@@ -1,3 +1,5 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
 default:
     @just --list
 
@@ -5,14 +7,22 @@ default:
 docs:
     nix run .#docs -- --root docs --project .
 
-# Cheap admission checks (full ci.nix machinery arrives with M1)
+# Cheap admission checks: format, lint, unit tests
 ci-check:
-    nix flake check
+    nix build --no-link .#checks.x86_64-linux.fmt .#checks.x86_64-linux.clippy .#checks.x86_64-linux.test
 
-# Merge-candidate verification (deferred to M1 ci.nix machinery)
+# Merge-candidate verification: distributable packages build
 ci-verify:
-    @echo "ci-verify: arrives with M1 ci.nix check/verify machinery"
+    nix build --no-link .#anvil .#anvild .#anvilctl .#anvil-router
 
 # Validate changelog stubs
 changelog-check:
     nix run .#sdlc -- changelog check
+
+# Preview the next release from .changes stubs
+release-plan:
+    nix run .#sdlc -- changelog plan
+
+# Consumer-owned promotion hook; replace with artifact promotion once images exist
+release-publish version:
+    gh release view "v{{version}}" >/dev/null 2>&1 || gh release create "v{{version}}" --title "v{{version}}" --generate-notes

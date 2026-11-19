@@ -185,11 +185,13 @@ docs.attic.rs; cachix.org.
 ## blogle tooling
 
 - **blogle/sdlc** (<https://github.com/blogle/sdlc>): pinned nix library + shared
-  GitHub workflows; consumer owns checks, `ci.nix` (`check`/`verify`), the
-  `publish` app (`sdlc.lib.mkConsumer` → `hydraJobs.ci-check/ci-verify`),
-  `packages.nix-eval-jobs`, `apps.sdlc`, justfile recipes, `.changes/*.json`
-  changelog stubs, caller workflows (`sdlc / check`, `sdlc / verify`), release
-  via `just release-publish <version>` promoting the same artifact identity.
+  GitHub workflows; consumer owns checks, `ci.nix` (`check`/`verify`), and the
+  `publish` app; `sdlc.lib.mkConsumer` validates and returns the consumer's
+  `ci.<system>` output, which the pinned reusable stage workflows consume as
+  `.#ci.<system>.<stage>` (newer unreleased sdlc additionally aliases these into
+  `hydraJobs.ci-check/ci-verify`). Changelog via `.changes/*.json` stubs, caller
+  workflows (`sdlc / check`, `sdlc / verify`), release via
+  `just release-publish <version>` promoting the same artifact identity.
   Skill format: `skills/<name>/SKILL.md` with YAML frontmatter
   (`name`, `description`), installed under `.agents/skills/`.
 - **blogle/fieldnotes** (<https://github.com/blogle/fieldnotes>): build-free

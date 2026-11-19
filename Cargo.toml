@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/anvil",
+    "crates/anvil-api",
+    "crates/anvilctl",
+    "crates/anvil-router",
+    "crates/anvild",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"

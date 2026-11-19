@@ -1,0 +1,6 @@
+[package]
+name = "anvil-router"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

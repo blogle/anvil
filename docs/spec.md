@@ -201,13 +201,14 @@ not inform this specification.
   `.changes/` stubs only; never edit `CHANGELOG.md` directly; no major version
   before consolidation.
 - **N31 — CI/CD per the blogle/sdlc contract.** `ci.nix` returning nonempty
-  `check` (cheap PR admission) and `verify` (merge-candidate) attrsets; a
-  `publish` app through `sdlc.lib.mkConsumer` → `hydraJobs.ci-check/ci-verify`;
-  `packages.x86_64-linux.nix-eval-jobs`; `apps.x86_64-linux.sdlc`; justfile
-  recipes `ci-check`/`ci-verify`/`release-publish <version>`; caller workflows
-  with `sdlc / check` and `sdlc / verify` required-check contexts. Candidate
-  artifacts publish an immutable identity (OCI digest); promotion re-tags the
-  same identity without rebuilding.
+  `check` (cheap PR admission) and `verify` (merge-candidate) attrsets; exposed
+  as a validated `ci.<system>` output (`sdlc.lib.mkConsumer` over check/verify
+  plus the `publish` app) that the pinned reusable workflows consume as
+  `.#ci.<system>.<stage>`; `apps.<system>.sdlc`; justfile recipes
+  `ci-check`/`ci-verify`/`release-publish <version>`. Caller workflows run with
+  `sdlc / check` and `sdlc / verify` contexts. Candidate artifacts publish an
+  immutable identity (OCI digest); promotion re-tags the same identity without
+  rebuilding.
 
 ### 3.5 Process
 

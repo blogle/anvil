@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "Scaffold the five-crate Cargo workspace and wire the SDLC CI contract: crane check/verify stages, per-member packages, caller workflows, and repository policy."
+}
