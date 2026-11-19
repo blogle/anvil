@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod github;
 pub mod harness;
 pub mod sandbox;
 pub mod store;

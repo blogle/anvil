@@ -6,6 +6,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use tokio::sync::watch;
 
+use crate::github::{pr_body, GithubClient, GithubError};
 use crate::store::{Store, StoreError};
 
 #[derive(Debug, thiserror::Error)]
@@ -104,11 +105,21 @@ pub enum EngineError {
 pub struct Engine {
     store: Store,
     config: EngineConfig,
+    github: Option<GithubClient>,
 }
 
 impl Engine {
     pub fn new(store: Store, config: EngineConfig) -> Self {
-        Self { store, config }
+        Self {
+            store,
+            config,
+            github: None,
+        }
+    }
+
+    pub fn with_github(mut self, github: GithubClient) -> Self {
+        self.github = Some(github);
+        self
     }
 
     pub async fn tick(&self) -> Result<TickReport, EngineError> {
@@ -141,14 +152,90 @@ impl Engine {
                 .iter()
                 .filter(|c| c.state == CommissionState::Pending && c.wave == pending_wave)
             {
-                let to = apply(&commission.state, Transition::Admit)?;
-                let event = state_changed(commission, &to, Value::Null);
-                self.store
-                    .transition_commission(commission.id, to, &[event], None)
-                    .await?;
+                self.admit_commission(&campaign, commission).await?;
                 report.admitted += 1;
             }
         }
+        Ok(())
+    }
+
+    async fn admit_commission(
+        &self,
+        campaign: &anvil_api::Campaign,
+        commission: &Commission,
+    ) -> Result<(), EngineError> {
+        let Some(github) = &self.github else {
+            let to = apply(&commission.state, Transition::Admit)?;
+            let event = state_changed(commission, &to, Value::Null);
+            self.store
+                .transition_commission(commission.id, to, &[event], None)
+                .await?;
+            return Ok(());
+        };
+        let obligations = self.store.obligations(commission.id).await?;
+        let texts: Vec<String> = obligations.iter().map(|o| o.text.clone()).collect();
+        let body = pr_body(&commission.spec, &texts);
+        let provisioned = github
+            .provision(
+                &commission.repo,
+                &campaign.slug,
+                &commission.slug,
+                &commission.target_ref,
+                &commission.title,
+                &body,
+            )
+            .await;
+        match provisioned {
+            Ok(provisioned) => {
+                let to = apply(&commission.state, Transition::Admit)?;
+                let mut events = vec![NewEvent {
+                    kind: EventKind::CommissionAdmitted,
+                    campaign_id: Some(commission.campaign_id),
+                    commission_id: Some(commission.id),
+                    payload: json!({
+                        "target_sha": provisioned.target_sha,
+                        "branch": provisioned.branch,
+                        "pr_number": provisioned.pr_number,
+                    }),
+                }];
+                events.push(state_changed(commission, &to, Value::Null));
+                self.store
+                    .provision_and_transition(
+                        commission.id,
+                        to,
+                        &provisioned.target_sha,
+                        &provisioned.branch,
+                        provisioned.pr_number,
+                        &events,
+                    )
+                    .await?;
+            }
+            Err(error) => self.fail_provisioning(commission, &error).await?,
+        }
+        Ok(())
+    }
+
+    async fn fail_provisioning(
+        &self,
+        commission: &Commission,
+        error: &GithubError,
+    ) -> Result<(), EngineError> {
+        let cause = format!("provisioning failed: {error}");
+        let to = apply(
+            &commission.state,
+            Transition::Fail {
+                cause: cause.clone(),
+            },
+        )?;
+        let event = state_changed(commission, &to, json!({"cause": cause}));
+        let attention = NewAttention {
+            commission_id: commission.id,
+            kind: AttentionKind::EnvFailure,
+            payload: json!({"stage": "provisioning"}),
+        };
+        self.store
+            .transition_commission(commission.id, to, &[event], Some(attention))
+            .await?;
         Ok(())
     }
 

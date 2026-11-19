@@ -230,6 +230,39 @@ impl Store {
         Ok(())
     }
 
+    pub async fn provision_and_transition(
+        &self,
+        id: CommissionId,
+        to: CommissionState,
+        target_sha: &str,
+        branch: &str,
+        pr_number: i64,
+        events: &[NewEvent],
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "UPDATE commissions
+             SET state = ?, state_detail = ?, target_sha = ?, branch = ?, pr_number = ?,
+                 updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(to.kind())
+        .bind(to.detail())
+        .bind(target_sha)
+        .bind(branch)
+        .bind(pr_number)
+        .bind(now_millis())
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        Self::require_row(result, "commission", &id.to_string())?;
+        for event in events {
+            insert_event(&mut tx, event).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn set_commission_pr(
         &self,
         id: CommissionId,
