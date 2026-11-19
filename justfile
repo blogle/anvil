@@ -13,7 +13,7 @@ ci-check:
 
 # Merge-candidate verification: distributable packages build
 ci-verify:
-    nix build --no-link .#anvil .#anvild .#anvilctl .#anvil-router
+    nix build --no-link .#anvil .#anvild .#anvilctl .#anvil-router .#anvil-sandbox-image
 
 # Validate changelog stubs
 changelog-check:
