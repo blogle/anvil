@@ -37,6 +37,7 @@ impl StoreError {
     }
 }
 
+#[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
 }
@@ -200,6 +201,34 @@ impl Store {
         Self::require_row(result, "commission", &id.to_string())
     }
 
+    pub async fn transition_commission(
+        &self,
+        id: CommissionId,
+        to: CommissionState,
+        events: &[NewEvent],
+        attention: Option<NewAttention>,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "UPDATE commissions SET state = ?, state_detail = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(to.kind())
+        .bind(to.detail())
+        .bind(now_millis())
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        Self::require_row(result, "commission", &id.to_string())?;
+        for event in events {
+            insert_event(&mut tx, event).await?;
+        }
+        if let Some(new) = attention {
+            insert_attention(&mut tx, AttentionId::new(), &new).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn set_commission_pr(
         &self,
         id: CommissionId,
@@ -354,7 +383,7 @@ impl Store {
     pub async fn turns(&self, attempt: AttemptId) -> Result<Vec<Turn>, StoreError> {
         let rows = sqlx::query_as::<_, TurnRow>(
             "SELECT id, attempt_id, prompt_hash, started_at, ended_at, tokens, result
-             FROM turns WHERE attempt_id = ? ORDER BY started_at, id",
+             FROM turns WHERE attempt_id = ? ORDER BY rowid",
         )
         .bind(attempt.to_string())
         .fetch_all(&self.pool)
@@ -368,17 +397,7 @@ impl Store {
         }
         let mut tx = self.pool.begin().await?;
         for event in events {
-            sqlx::query(
-                "INSERT INTO events (at, kind, campaign_id, commission_id, payload)
-                 VALUES (?, ?, ?, ?, ?)",
-            )
-            .bind(now_millis())
-            .bind(event.kind.as_str())
-            .bind(event.campaign_id.map(|id| id.to_string()))
-            .bind(event.commission_id.map(|id| id.to_string()))
-            .bind(encode_json(&event.payload))
-            .execute(&mut *tx)
-            .await?;
+            insert_event(&mut tx, event).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -398,17 +417,9 @@ impl Store {
 
     pub async fn raise_attention(&self, new: NewAttention) -> Result<AttentionId, StoreError> {
         let id = AttentionId::new();
-        sqlx::query(
-            "INSERT INTO attention (id, commission_id, kind, payload, state, created_at)
-             VALUES (?, ?, ?, ?, 'open', ?)",
-        )
-        .bind(id.to_string())
-        .bind(new.commission_id.to_string())
-        .bind(new.kind.as_str())
-        .bind(encode_json(&new.payload))
-        .bind(now_millis())
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        insert_attention(&mut tx, id, &new).await?;
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -491,6 +502,43 @@ impl Store {
 
 fn now_millis() -> i64 {
     to_millis(OffsetDateTime::now_utc())
+}
+
+async fn insert_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    event: &NewEvent,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO events (at, kind, campaign_id, commission_id, payload)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(now_millis())
+    .bind(event.kind.as_str())
+    .bind(event.campaign_id.map(|id| id.to_string()))
+    .bind(event.commission_id.map(|id| id.to_string()))
+    .bind(encode_json(&event.payload))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn insert_attention(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: AttentionId,
+    new: &NewAttention,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO attention (id, commission_id, kind, payload, state, created_at)
+         VALUES (?, ?, ?, ?, 'open', ?)",
+    )
+    .bind(id.to_string())
+    .bind(new.commission_id.to_string())
+    .bind(new.kind.as_str())
+    .bind(encode_json(&new.payload))
+    .bind(now_millis())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 fn to_millis(at: OffsetDateTime) -> i64 {
