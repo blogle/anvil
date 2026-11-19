@@ -4,17 +4,16 @@
   anvilctl,
 }:
 let
-  opencode-src = pkgs.fetchurl {
-    url = "https://github.com/anomalyco/opencode/releases/download/v1.18.35/opencode-linux-x64-musl.tar.gz";
-    hash = "sha256-o2R+0fux1S+8R8AsMbZBf+DW8OY54nsJX0fCabYL/tU=";
+  opencode-release = pkgs.fetchurl {
+    url = "https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-linux-x64.tar.gz";
+    hash = "sha256-VjtdZjY3ImtuO7S7aAMoG8ObDSzYjbBtZ0tkIKqwCbA=";
   };
 
   opencode = pkgs.runCommand "opencode" { } ''
     mkdir -p $out/bin
-    tar -xf ${opencode-src} -C $out/bin
+    tar -xf ${opencode-release} -C $out/bin
     chmod +x $out/bin/opencode
   '';
-
   entrypoint = pkgs.writeShellScriptBin "anvil-entrypoint" ''
     set -euo pipefail
     export PATH=/bin
@@ -55,11 +54,12 @@ let
       pkgs.procps
       pkgs.which
       pkgs.nix
-      pkgs.musl
+      pkgs.glibc.out
+      pkgs.gcc.cc.lib
       pkgs.cacert
       opencode
     ];
-    pathsToLink = [ "/bin" "/lib" "/etc" ];
+    pathsToLink = [ "/bin" "/lib" "/lib64" "/etc" ];
   };
 
   anvil-side = pkgs.buildEnv {

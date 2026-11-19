@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "The sandbox image ships opencode v2.3.2 (the current v2 release with the documented API) instead of the v1.18.35 musl tarball, with glibc and libstdc++ relocated into the image root so the release binary runs unmodified. The v2 server password contract is honored end to end: the engine mints a per-commission password into OPENCODE_SERVER_PASSWORD, every harness call authenticates as HTTP Basic user opencode, and readiness accepts 401 as proof of serving. Podman joins the dev shell and the gated podman contract test now drives a real container through clone, serve, authenticated session create/wait, and destroy."
+}

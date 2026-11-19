@@ -144,7 +144,11 @@ impl PodmanProvider {
         let result = podman(&args).await?;
         match result {
             Ok(_) => Ok(()),
-            Err(stderr) if stderr.contains("no such container") => Ok(()),
+            Err(stderr)
+                if stderr.contains("no such container") || stderr.contains("no such object") =>
+            {
+                Ok(())
+            }
             Err(stderr) => Err(SandboxError::Podman { stderr }),
         }
     }
@@ -153,7 +157,11 @@ impl PodmanProvider {
         let args = ["inspect", "-f", "{{.State.Running}}", name].map(str::to_owned);
         match podman(&args).await? {
             Ok(output) => Ok(String::from_utf8_lossy(&output.stdout).trim() == "true"),
-            Err(stderr) if stderr.contains("no such container") => Ok(false),
+            Err(stderr)
+                if stderr.contains("no such container") || stderr.contains("no such object") =>
+            {
+                Ok(false)
+            }
             Err(stderr) => Err(SandboxError::Podman { stderr }),
         }
     }
@@ -178,7 +186,8 @@ impl PodmanProvider {
         let client = reqwest::Client::new();
         loop {
             if let Ok(response) = client.get(format!("{serve_url}/api/info")).send().await {
-                if response.status().is_success() {
+                let status = response.status().as_u16();
+                if status == 200 || status == 401 {
                     return Ok(());
                 }
             }

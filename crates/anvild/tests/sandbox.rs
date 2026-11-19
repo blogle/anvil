@@ -107,6 +107,20 @@ async fn podman_contract_test() {
     context
         .env
         .insert("ANVIL_TARGET_REF".to_owned(), "main".to_owned());
+    context.env.insert(
+        "ANVIL_REPO_URL".to_owned(),
+        "https://github.com/blogle/fieldnotes.git".to_owned(),
+    );
+    context
+        .env
+        .insert("ANVIL_REPO_BRANCH".to_owned(), "main".to_owned());
+    context
+        .env
+        .insert("ANVIL_GITHUB_TOKEN".to_owned(), String::new());
+    context.env.insert(
+        "OPENCODE_SERVER_PASSWORD".to_owned(),
+        "contract-test-password".to_owned(),
+    );
     context.image = std::env::var("ANVIL_TEST_SANDBOX_IMAGE")
         .unwrap_or_else(|_| "anvil-sandbox:latest".to_owned());
 
@@ -114,10 +128,49 @@ async fn podman_contract_test() {
     assert!(handle.serve_url.starts_with("http://127.0.0.1:"));
     assert!(provider.is_running(&handle.name).await.unwrap());
 
-    let info = reqwest::get(format!("{}/api/info", handle.serve_url))
+    let client = reqwest::Client::new();
+    let info = client
+        .get(format!("{}/api/info", handle.serve_url))
+        .basic_auth("opencode", Some("contract-test-password"))
+        .send()
         .await
         .expect("serve answers");
     assert!(info.status().is_success());
+
+    let session = client
+        .post(format!("{}/api/session", handle.serve_url))
+        .basic_auth("opencode", Some("contract-test-password"))
+        .json(&serde_json::json!({"title": "anvil contract probe"}))
+        .send()
+        .await
+        .expect("session create answers")
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let session_id = session["data"]["id"].as_str().expect("session id");
+
+    let wait = client
+        .post(format!(
+            "{}/api/experimental/session/{session_id}/wait",
+            handle.serve_url
+        ))
+        .basic_auth("opencode", Some("contract-test-password"))
+        .send()
+        .await
+        .expect("session wait answers");
+    assert!(wait.status().is_success());
+
+    let unauthorized = client
+        .get(format!("{}/api/info", handle.serve_url))
+        .send()
+        .await
+        .expect("serve answers without auth too");
+    assert_eq!(
+        unauthorized.status().as_u16(),
+        401,
+        "got {}",
+        unauthorized.status()
+    );
 
     provider.destroy(&handle.name).await.unwrap();
     assert!(!provider.is_running(&handle.name).await.unwrap());

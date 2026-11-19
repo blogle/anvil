@@ -370,6 +370,24 @@ impl Engine {
             Err(error) => return Err(error.into()),
         }
         env.insert("ANVILCTL_URL".to_owned(), self.config.daemon_url.clone());
+        let serve_password = match self
+            .store
+            .credential(&serve_password_key(commission.id))
+            .await?
+        {
+            Some(existing) => existing,
+            None => {
+                let password = uuid::Uuid::new_v4().simple().to_string();
+                self.store
+                    .put_credential(&serve_password_key(commission.id), &password)
+                    .await?;
+                password
+            }
+        };
+        env.insert(
+            "OPENCODE_SERVER_PASSWORD".to_owned(),
+            serve_password.clone(),
+        );
 
         let obligations: Vec<String> = self
             .store
@@ -458,7 +476,12 @@ impl Engine {
                 }
             };
             let receipt = harness
-                .run_turn(&handle.serve_url, session.as_deref(), &prompt)
+                .run_turn(
+                    &handle.serve_url,
+                    Some(&serve_password),
+                    session.as_deref(),
+                    &prompt,
+                )
                 .await;
             match receipt {
                 Ok(receipt) => {
@@ -772,6 +795,10 @@ impl Engine {
             }
         }
     }
+}
+
+fn serve_password_key(commission: anvil_api::CommissionId) -> String {
+    format!("serve-password:{}", commission)
 }
 
 fn is_terminal(state: &CommissionState) -> bool {
