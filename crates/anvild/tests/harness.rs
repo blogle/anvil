@@ -60,12 +60,15 @@ async fn scripted_harness_replays_the_script_and_records_prompts() {
         receipt("s-1", 2_000),
     ]));
 
-    let first = harness.run_turn(None, "solve the invoices").await.unwrap();
+    let first = harness
+        .run_turn("http://memory", None, "solve the invoices")
+        .await
+        .unwrap();
     assert_eq!(first.session, "s-1");
     assert_eq!(first.tokens, Some(1_000));
 
     let second = harness
-        .run_turn(Some("s-1"), "fix the failing check")
+        .run_turn("http://memory", Some("s-1"), "fix the failing check")
         .await
         .unwrap();
     assert_eq!(second.session, "s-1");
@@ -84,14 +87,19 @@ async fn scripted_harness_replays_the_script_and_records_prompts() {
         (Some("s-1".to_owned()), "fix the failing check".to_owned())
     );
 
-    let exhausted = harness.run_turn(Some("s-1"), "one more").await;
+    let exhausted = harness
+        .run_turn("http://memory", Some("s-1"), "one more")
+        .await;
     assert!(matches!(exhausted, Err(HarnessError::ScriptExhausted)));
 }
 
 #[tokio::test]
 async fn scripted_harness_can_fail_a_turn_on_cue() {
     let harness = ScriptedHarness::new(vec![Err(HarnessError::ScriptExhausted)]);
-    assert!(harness.run_turn(None, "any").await.is_err());
+    assert!(harness
+        .run_turn("http://memory", None, "any")
+        .await
+        .is_err());
 }
 
 #[test]
@@ -129,15 +137,18 @@ async fn opencode_contract_test() {
         eprintln!("skipping: ANVIL_TEST_OPENCODE_URL is not set");
         return;
     };
-    let harness = anvild::harness::OpencodeHarness::new(base);
+    let harness = anvild::harness::OpencodeHarness::new();
 
     let receipt = harness
-        .run_turn(None, "Reply with the single word: pong")
+        .run_turn(&base, None, "Reply with the single word: pong")
         .await
         .expect("live opencode turn");
     assert!(!receipt.session.is_empty());
 
-    let events = harness.subscribe(&["session.usage.updated"]).await.unwrap();
+    let events = harness
+        .subscribe(&base, &["session.usage.updated"])
+        .await
+        .unwrap();
     let mut events = events;
     assert!(events.next_event().await.is_some());
 }

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
@@ -73,54 +73,61 @@ pub enum Harness {
 impl Harness {
     pub async fn run_turn(
         &self,
+        base_url: &str,
         session: Option<&str>,
         prompt: &str,
     ) -> Result<TurnReceipt, HarnessError> {
         match self {
-            Self::Opencode(harness) => harness.run_turn(session, prompt).await,
-            Self::Scripted(harness) => harness.run_turn(session, prompt).await,
+            Self::Opencode(harness) => harness.run_turn(base_url, session, prompt).await,
+            Self::Scripted(harness) => harness.run_turn(base_url, session, prompt).await,
         }
     }
 }
 
 pub struct OpencodeHarness {
-    base: String,
     client: reqwest::Client,
 }
 
+impl Default for OpencodeHarness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OpencodeHarness {
-    pub fn new(base: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         Self {
-            base: base.into(),
             client: reqwest::Client::new(),
         }
     }
 
     pub async fn run_turn(
         &self,
+        base_url: &str,
         session: Option<&str>,
         prompt: &str,
     ) -> Result<TurnReceipt, HarnessError> {
+        let base = base_url.trim_end_matches('/');
         let (id, before) = match session {
             Some(id) => {
-                let info = self.session_info(id).await?;
+                let info = self.session_info(base, id).await?;
                 (id.to_owned(), tokens_total(&info))
             }
             None => {
                 let info = self
-                    .post_json("/api/session", &json!({"title": "anvil"}))
+                    .post_json(&format!("{base}/api/session"), &json!({"title": "anvil"}))
                     .await?;
                 let data = field(&info, "data")?;
                 (field_str(data, "id")?.to_owned(), tokens_total(data))
             }
         };
         self.post_json(
-            &format!("/api/session/{id}/prompt"),
+            &format!("{base}/api/session/{id}/prompt"),
             &json!({"text": prompt}),
         )
         .await?;
-        self.wait(&id).await?;
-        let info = self.session_info(&id).await?;
+        self.wait(base, &id).await?;
+        let info = self.session_info(base, &id).await?;
         let spent = tokens_total(field(&info, "data")?).saturating_sub(before);
         Ok(TurnReceipt {
             session: id,
@@ -128,10 +135,14 @@ impl OpencodeHarness {
         })
     }
 
-    pub async fn subscribe(&self, types: &[&str]) -> Result<EventStream, HarnessError> {
+    pub async fn subscribe(
+        &self,
+        base_url: &str,
+        types: &[&str],
+    ) -> Result<EventStream, HarnessError> {
         let response = self
             .client
-            .get(format!("{}/api/event", self.base))
+            .get(format!("{}/api/event", base_url.trim_end_matches('/')))
             .query(&[("types", types.join(","))])
             .send()
             .await?;
@@ -148,10 +159,10 @@ impl OpencodeHarness {
         })
     }
 
-    async fn session_info(&self, id: &str) -> Result<Value, HarnessError> {
+    async fn session_info(&self, base: &str, id: &str) -> Result<Value, HarnessError> {
         let response = self
             .client
-            .get(format!("{}/api/session/{id}", self.base))
+            .get(format!("{base}/api/session/{id}"))
             .send()
             .await?;
         let status = response.status();
@@ -164,10 +175,10 @@ impl OpencodeHarness {
         Ok(response.json().await?)
     }
 
-    async fn wait(&self, id: &str) -> Result<(), HarnessError> {
+    async fn wait(&self, base: &str, id: &str) -> Result<(), HarnessError> {
         let response = self
             .client
-            .post(format!("{}/api/experimental/session/{id}/wait", self.base))
+            .post(format!("{base}/api/experimental/session/{id}/wait"))
             .send()
             .await?;
         if !response.status().is_success() {
@@ -179,13 +190,8 @@ impl OpencodeHarness {
         Ok(())
     }
 
-    async fn post_json(&self, path: &str, body: &Value) -> Result<Value, HarnessError> {
-        let response = self
-            .client
-            .post(format!("{}{path}", self.base))
-            .json(body)
-            .send()
-            .await?;
+    async fn post_json(&self, url: &str, body: &Value) -> Result<Value, HarnessError> {
+        let response = self.client.post(url).json(body).send().await?;
         let status = response.status();
         if !status.is_success() {
             return Err(HarnessError::BadStatus {
@@ -313,21 +319,25 @@ impl SseParser {
     }
 }
 
+pub type RecordedTurn = (Option<String>, String);
+
+#[derive(Clone)]
 pub struct ScriptedHarness {
-    script: Mutex<VecDeque<Result<TurnReceipt, HarnessError>>>,
-    pub received: Mutex<Vec<(Option<String>, String)>>,
+    script: Arc<Mutex<VecDeque<Result<TurnReceipt, HarnessError>>>>,
+    pub received: Arc<Mutex<Vec<RecordedTurn>>>,
 }
 
 impl ScriptedHarness {
     pub fn new(script: Vec<Result<TurnReceipt, HarnessError>>) -> Self {
         Self {
-            script: Mutex::new(script.into_iter().collect()),
-            received: Mutex::new(Vec::new()),
+            script: Arc::new(Mutex::new(script.into_iter().collect())),
+            received: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub async fn run_turn(
         &self,
+        _base_url: &str,
         session: Option<&str>,
         prompt: &str,
     ) -> Result<TurnReceipt, HarnessError> {

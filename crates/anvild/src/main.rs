@@ -1,9 +1,12 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anvild::engine::{Engine, EngineConfig};
 use anvild::github::GithubClient;
+use anvild::harness::{Harness, OpencodeHarness};
 use anvild::http;
+use anvild::sandbox::{MemoryProvider, PodmanProvider, SandboxProvider};
 use anvild::store::Store;
 use tokio::sync::watch;
 
@@ -51,10 +54,22 @@ async fn daemon() -> ExitCode {
         .or_else(|| std::env::var("ANVIL_BIND").ok())
         .unwrap_or_else(|| "127.0.0.1:8788".to_owned());
 
-    let mut engine = Engine::new(store.clone(), EngineConfig::default());
+    let config = EngineConfig {
+        daemon_url: format!("http://{bind}"),
+        ..EngineConfig::default()
+    };
+
+    let mut engine = Engine::new(store.clone(), config);
     if let Some(github) = github_from_credentials(&store).await {
         engine = engine.with_github(github);
     }
+    let sandbox = match std::env::var("ANVIL_SANDBOX").as_deref() {
+        Ok("memory") => SandboxProvider::Memory(MemoryProvider::default()),
+        _ => SandboxProvider::Podman(PodmanProvider::default()),
+    };
+    engine = engine
+        .with_sandbox(Arc::new(sandbox))
+        .with_harness(Arc::new(Harness::Opencode(OpencodeHarness::new())));
     let (shutdown, shutdown_rx) = watch::channel(false);
     tokio::spawn(engine.run(shutdown_rx));
 

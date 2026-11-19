@@ -599,6 +599,15 @@ impl Store {
         Ok(attempt_id)
     }
 
+    pub async fn clear_done_claim(&self, id: AttemptId) -> Result<(), StoreError> {
+        let result =
+            sqlx::query("UPDATE attempts SET done_claimed_at = NULL WHERE id = ? AND done_claimed_at IS NOT NULL")
+                .bind(id.to_string())
+                .execute(&self.pool)
+                .await?;
+        Self::require_row(result, "claimed attempt", &id.to_string())
+    }
+
     pub async fn agent_attention(
         &self,
         commission: CommissionId,

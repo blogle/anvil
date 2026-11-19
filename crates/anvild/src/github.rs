@@ -62,6 +62,10 @@ impl GithubClient {
         })
     }
 
+    pub async fn installation_token(&self) -> Result<String, GithubError> {
+        self.token().await
+    }
+
     async fn token(&self) -> Result<String, GithubError> {
         if let Some((token, minted)) = self.token.lock().unwrap().clone() {
             if minted.elapsed() < TOKEN_CACHE_TTL {

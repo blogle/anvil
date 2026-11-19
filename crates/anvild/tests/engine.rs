@@ -44,6 +44,7 @@ fn engine(store: &Store, heartbeat_timeout: Duration, turn_timeout: Duration) ->
             tick_interval: Duration::from_secs(10),
             heartbeat_timeout,
             turn_timeout,
+            ..EngineConfig::default()
         },
     )
 }
