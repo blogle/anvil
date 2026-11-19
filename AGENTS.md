@@ -21,6 +21,10 @@ rewrite that supersedes the incumbent; it develops on `origin/main` of
    (`type`, `semver`, `summary`). Never edit `CHANGELOG.md` directly.
 6. **Verify.** `just ci-check` before declaring work done; never claim a check
    passed that was not run.
+7. **Landing & releases.** Work lands via PR with the `integration:auto` label
+   through the Mergify queue; `main` receives only checked squash merges.
+   Releases wait for milestone completion — the first release (v0.3.0,
+   numbering from the incumbent's surviving tags) ships a working M1 loop.
 
 ## Commands
 

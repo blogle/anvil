@@ -259,6 +259,7 @@ pub enum AttentionKind {
     EnvFailure,
     Unmergeable,
     InteractiveInvite,
+    AttemptStalled,
 }
 
 impl AttentionKind {
@@ -270,6 +271,7 @@ impl AttentionKind {
             Self::EnvFailure => "env-failure",
             Self::Unmergeable => "unmergeable",
             Self::InteractiveInvite => "interactive-invite",
+            Self::AttemptStalled => "attempt-stalled",
         }
     }
 
@@ -281,6 +283,7 @@ impl AttentionKind {
             "env-failure" => Self::EnvFailure,
             "unmergeable" => Self::Unmergeable,
             "interactive-invite" => Self::InteractiveInvite,
+            "attempt-stalled" => Self::AttemptStalled,
             _ => return None,
         })
     }

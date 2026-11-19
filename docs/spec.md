@@ -78,8 +78,10 @@ not inform this specification.
   1. review-ready (green PR), 2. budget/attempt exhaustion, 3. agent-requested
   attention (`anvilctl attention`), 4. environment/onboarding failure (broken
   flake, GitHub App permission denied), 5. unmergeable after agent rebase
-  attempts, 6. interactive invitation. Each item carries commission context and
-  suggested actions (retry / revise / chat / takeover / cancel).
+  attempts, 6. interactive invitation, 7. attempt stalled (heartbeat or turn
+  timeout exceeded — distinct from exhaustion: the attempt died rather than
+  spent). Each item carries commission context and suggested actions
+  (retry / revise / chat / takeover / cancel).
 - **N9 — Waves.** Cross-commission dependencies are waves/epochs. Wave N+1 admits
   only when every wave-N commission is terminal: `merged`, `needs-review`,
   `escalated`, `failed`, or `cancelled`. One escalated commission MUST NOT deadlock

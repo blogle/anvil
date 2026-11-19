@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "Engine: cadence tick loop with the commission state machine (exhaustive transition table), wave admission with the escalated skip-gate, and MVP detectors (heartbeat/turn timeouts, attempt budget exhaustion) — transitions write state, events, and attention atomically."
+}
