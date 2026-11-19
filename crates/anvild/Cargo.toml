@@ -4,3 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anvil-api = { path = "../anvil-api" }
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio.workspace = true
