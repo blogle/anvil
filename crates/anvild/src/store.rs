@@ -116,14 +116,15 @@ impl Store {
         let now = now_millis();
         sqlx::query(
             "INSERT INTO commissions
-             (id, campaign_id, title, slug, repo, target_ref, target_sha, wave,
+             (id, campaign_id, title, slug, spec, repo, target_ref, target_sha, wave,
               state, state_detail, budget, strategy, branch, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, '', ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, '', ?, ?)",
         )
         .bind(id.to_string())
         .bind(new.campaign_id.to_string())
         .bind(&new.title)
         .bind(&new.slug)
+        .bind(&new.spec)
         .bind(&new.repo)
         .bind(&new.target_ref)
         .bind(&new.target_sha)
@@ -139,7 +140,7 @@ impl Store {
 
     pub async fn commission(&self, id: CommissionId) -> Result<Option<Commission>, StoreError> {
         let row = sqlx::query_as::<_, CommissionRow>(
-            "SELECT id, campaign_id, title, slug, repo, target_ref, target_sha, wave,
+            "SELECT id, campaign_id, title, slug, spec, repo, target_ref, target_sha, wave,
                     state, state_detail, budget, strategy, branch, pr_number, created_at, updated_at
              FROM commissions WHERE id = ?",
         )
@@ -154,7 +155,7 @@ impl Store {
         campaign: CampaignId,
     ) -> Result<Vec<Commission>, StoreError> {
         let rows = sqlx::query_as::<_, CommissionRow>(
-            "SELECT id, campaign_id, title, slug, repo, target_ref, target_sha, wave,
+            "SELECT id, campaign_id, title, slug, spec, repo, target_ref, target_sha, wave,
                     state, state_detail, budget, strategy, branch, pr_number, created_at, updated_at
              FROM commissions WHERE campaign_id = ? ORDER BY wave, slug",
         )
@@ -171,7 +172,7 @@ impl Store {
         state: &CommissionState,
     ) -> Result<Vec<Commission>, StoreError> {
         let rows = sqlx::query_as::<_, CommissionRow>(
-            "SELECT id, campaign_id, title, slug, repo, target_ref, target_sha, wave,
+            "SELECT id, campaign_id, title, slug, spec, repo, target_ref, target_sha, wave,
                     state, state_detail, budget, strategy, branch, pr_number, created_at, updated_at
              FROM commissions WHERE state = ? ORDER BY wave, slug",
         )
@@ -289,17 +290,22 @@ impl Store {
         Self::require_row(result, "obligation", &id.to_string())
     }
 
-    pub async fn insert_attempt(&self, commission: CommissionId) -> Result<AttemptId, StoreError> {
+    pub async fn insert_attempt(
+        &self,
+        commission: CommissionId,
+        strategy: &Value,
+    ) -> Result<AttemptId, StoreError> {
         let id = AttemptId::new();
         let now = now_millis();
         sqlx::query(
-            "INSERT INTO attempts (id, commission_id, n, started_at, heartbeat_at)
+            "INSERT INTO attempts (id, commission_id, n, strategy, started_at, heartbeat_at)
              VALUES (?, ?, (SELECT COALESCE(MAX(n), 0) + 1
-                            FROM attempts WHERE commission_id = ?), ?, ?)",
+                            FROM attempts WHERE commission_id = ?), ?, ?, ?)",
         )
         .bind(id.to_string())
         .bind(commission.to_string())
         .bind(commission.to_string())
+        .bind(encode_json(strategy))
         .bind(now)
         .bind(now)
         .execute(&self.pool)
@@ -309,7 +315,7 @@ impl Store {
 
     pub async fn attempts(&self, commission: CommissionId) -> Result<Vec<Attempt>, StoreError> {
         let rows = sqlx::query_as::<_, AttemptRow>(
-            "SELECT id, commission_id, n, started_at, ended_at, heartbeat_at, tokens, outcome
+            "SELECT id, commission_id, n, strategy, started_at, ended_at, heartbeat_at, tokens, outcome
              FROM attempts WHERE commission_id = ? ORDER BY n",
         )
         .bind(commission.to_string())
@@ -591,6 +597,7 @@ struct CommissionRow {
     campaign_id: String,
     title: String,
     slug: String,
+    spec: String,
     repo: String,
     target_ref: String,
     target_sha: String,
@@ -613,6 +620,7 @@ impl CommissionRow {
             campaign_id: CampaignId(decode_uuid("campaign id", &self.campaign_id)?),
             title: self.title,
             slug: self.slug,
+            spec: self.spec,
             repo: self.repo,
             target_ref: self.target_ref,
             target_sha: self.target_sha,
@@ -655,6 +663,7 @@ struct AttemptRow {
     id: String,
     commission_id: String,
     n: i64,
+    strategy: String,
     started_at: i64,
     ended_at: Option<i64>,
     heartbeat_at: i64,
@@ -668,6 +677,7 @@ impl AttemptRow {
             id: AttemptId(decode_uuid("attempt id", &self.id)?),
             commission_id: CommissionId(decode_uuid("commission id", &self.commission_id)?),
             n: self.n,
+            strategy: decode_json("attempt strategy", &self.strategy)?,
             started_at: from_millis(self.started_at)?,
             ended_at: self.ended_at.map(from_millis).transpose()?,
             heartbeat_at: from_millis(self.heartbeat_at)?,

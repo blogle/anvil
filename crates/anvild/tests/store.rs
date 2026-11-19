@@ -26,6 +26,7 @@ fn commission(campaign_id: anvil_api::CampaignId, wave: i64) -> NewCommission {
         campaign_id,
         title: "split invoice service".to_owned(),
         slug: "invoice-split".to_owned(),
+        spec: "Extract the invoice line rendering into its own service.".to_owned(),
         repo: "acme/payments".to_owned(),
         target_ref: "main".to_owned(),
         target_sha: "a41f2c".to_owned(),
@@ -66,6 +67,10 @@ async fn commission_starts_pending_and_preserves_state_detail() {
     assert_eq!(loaded.state, CommissionState::Pending);
     assert_eq!(loaded.target_ref, "main");
     assert_eq!(loaded.target_sha, "a41f2c");
+    assert_eq!(
+        loaded.spec,
+        "Extract the invoice line rendering into its own service."
+    );
 
     store
         .set_commission_state(
@@ -137,8 +142,17 @@ async fn attempts_number_sequentially_and_end() {
         .await
         .unwrap();
 
-    let first = store.insert_attempt(commission_id).await.unwrap();
-    let second = store.insert_attempt(commission_id).await.unwrap();
+    let first = store
+        .insert_attempt(commission_id, &json!({"name":"default"}))
+        .await
+        .unwrap();
+    let second = store
+        .insert_attempt(
+            commission_id,
+            &json!({"name":"default","session":"continuous"}),
+        )
+        .await
+        .unwrap();
     store.touch_attempt(second).await.unwrap();
     store
         .end_attempt(second, Some(41_000), json!({"outcome": "converged"}))
@@ -149,8 +163,13 @@ async fn attempts_number_sequentially_and_end() {
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].id, first);
     assert_eq!(attempts[0].n, 1);
+    assert_eq!(attempts[0].strategy, json!({"name":"default"}));
     assert!(attempts[0].ended_at.is_none());
     assert_eq!(attempts[1].n, 2);
+    assert_eq!(
+        attempts[1].strategy,
+        json!({"name":"default","session":"continuous"})
+    );
     assert!(attempts[1].ended_at.is_some());
     assert!(attempts[1].heartbeat_at >= attempts[0].heartbeat_at);
     assert_eq!(attempts[1].tokens, Some(41_000));
@@ -165,7 +184,10 @@ async fn turns_record_within_attempt() {
         .insert_commission(commission(campaign_id, 1))
         .await
         .unwrap();
-    let attempt_id = store.insert_attempt(commission_id).await.unwrap();
+    let attempt_id = store
+        .insert_attempt(commission_id, &json!({"name":"default"}))
+        .await
+        .unwrap();
 
     let turn_id = store.insert_turn(attempt_id, "sha256:abc").await.unwrap();
     store.insert_turn(attempt_id, "sha256:def").await.unwrap();

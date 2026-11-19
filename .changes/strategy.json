@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "Strategy: the default single-agent obligations loop — compose_turn renders the hierarchical prompt (campaign context, commission spec, obligations, gaps, live PR state, operating instructions), evaluate gates convergence on PR checks with failed checks becoming gap reprompts. Commissions gain a spec column; attempts snapshot the strategy selection (N19). Session continuity and verify_cmd knobs parsed from config, verify_cmd default off."
+}
