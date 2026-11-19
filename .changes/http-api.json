@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "Operator HTTP API (N21): campaigns and commissions submit over REST with embedded batch commissions, Idempotency-Key replay on all POSTs, cursor-based commission GETs, commission detail with obligations and attempts, obligation add/drop, the attention inbox with dismissal, operator transition actions (retry/resume/takeover/converge/merge/reopen) with explicit 409s on illegal paths, DELETE to cancel, and a typed SSE stream of the events log for logs --follow. Duplicate slugs are 409 conflicts, not crashes."
+}

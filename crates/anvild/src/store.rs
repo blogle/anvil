@@ -138,6 +138,56 @@ impl Store {
         Ok(id)
     }
 
+    pub async fn commissions(&self) -> Result<Vec<Commission>, StoreError> {
+        let rows = sqlx::query_as::<_, CommissionRow>(
+            "SELECT id, campaign_id, title, slug, spec, repo, target_ref, target_sha, wave,
+                    state, state_detail, budget, strategy, branch, pr_number, created_at, updated_at
+             FROM commissions ORDER BY wave, slug",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(CommissionRow::into_commission)
+            .collect()
+    }
+
+    pub async fn commissions_updated_since(
+        &self,
+        since_millis: i64,
+    ) -> Result<Vec<Commission>, StoreError> {
+        let rows = sqlx::query_as::<_, CommissionRow>(
+            "SELECT id, campaign_id, title, slug, spec, repo, target_ref, target_sha, wave,
+                    state, state_detail, budget, strategy, branch, pr_number, created_at, updated_at
+             FROM commissions WHERE updated_at > ? ORDER BY updated_at, slug",
+        )
+        .bind(since_millis)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(CommissionRow::into_commission)
+            .collect()
+    }
+
+    pub async fn idempotency_remember(&self, key: &str, response: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO idempotency (key, response, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(key)
+        .bind(response)
+        .bind(now_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn idempotency_lookup(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let row = sqlx::query("SELECT response FROM idempotency WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>("response")))
+    }
+
     pub async fn commission(&self, id: CommissionId) -> Result<Option<Commission>, StoreError> {
         let row = sqlx::query_as::<_, CommissionRow>(
             "SELECT id, campaign_id, title, slug, spec, repo, target_ref, target_sha, wave,
