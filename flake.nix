@@ -95,6 +95,8 @@
               pkgs.rust-analyzer
               pkgs.just
               pkgs.gh
+              pkgs.podman
+              pkgs.skopeo
             ];
           };
         };
