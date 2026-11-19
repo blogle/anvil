@@ -74,12 +74,13 @@ impl Harness {
     pub async fn run_turn(
         &self,
         base_url: &str,
+        password: Option<&str>,
         session: Option<&str>,
         prompt: &str,
     ) -> Result<TurnReceipt, HarnessError> {
         match self {
-            Self::Opencode(harness) => harness.run_turn(base_url, session, prompt).await,
-            Self::Scripted(harness) => harness.run_turn(base_url, session, prompt).await,
+            Self::Opencode(harness) => harness.run_turn(base_url, password, session, prompt).await,
+            Self::Scripted(harness) => harness.run_turn(base_url, password, session, prompt).await,
         }
     }
 }
@@ -104,18 +105,23 @@ impl OpencodeHarness {
     pub async fn run_turn(
         &self,
         base_url: &str,
+        password: Option<&str>,
         session: Option<&str>,
         prompt: &str,
     ) -> Result<TurnReceipt, HarnessError> {
         let base = base_url.trim_end_matches('/');
         let (id, before) = match session {
             Some(id) => {
-                let info = self.session_info(base, id).await?;
+                let info = self.session_info(base, password, id).await?;
                 (id.to_owned(), tokens_total(&info))
             }
             None => {
                 let info = self
-                    .post_json(&format!("{base}/api/session"), &json!({"title": "anvil"}))
+                    .post_json(
+                        &format!("{base}/api/session"),
+                        password,
+                        &json!({"title": "anvil"}),
+                    )
                     .await?;
                 let data = field(&info, "data")?;
                 (field_str(data, "id")?.to_owned(), tokens_total(data))
@@ -123,11 +129,12 @@ impl OpencodeHarness {
         };
         self.post_json(
             &format!("{base}/api/session/{id}/prompt"),
+            password,
             &json!({"text": prompt}),
         )
         .await?;
-        self.wait(base, &id).await?;
-        let info = self.session_info(base, &id).await?;
+        self.wait(base, password, &id).await?;
+        let info = self.session_info(base, password, &id).await?;
         let spent = tokens_total(field(&info, "data")?).saturating_sub(before);
         Ok(TurnReceipt {
             session: id,
@@ -138,14 +145,17 @@ impl OpencodeHarness {
     pub async fn subscribe(
         &self,
         base_url: &str,
+        password: Option<&str>,
         types: &[&str],
     ) -> Result<EventStream, HarnessError> {
-        let response = self
+        let mut request = self
             .client
             .get(format!("{}/api/event", base_url.trim_end_matches('/')))
-            .query(&[("types", types.join(","))])
-            .send()
-            .await?;
+            .query(&[("types", types.join(","))]);
+        if let Some(password) = password {
+            request = request.basic_auth("opencode", Some(password));
+        }
+        let response = request.send().await?;
         let status = response.status();
         if !status.is_success() {
             return Err(HarnessError::BadStatus {
@@ -159,12 +169,17 @@ impl OpencodeHarness {
         })
     }
 
-    async fn session_info(&self, base: &str, id: &str) -> Result<Value, HarnessError> {
-        let response = self
-            .client
-            .get(format!("{base}/api/session/{id}"))
-            .send()
-            .await?;
+    async fn session_info(
+        &self,
+        base: &str,
+        password: Option<&str>,
+        id: &str,
+    ) -> Result<Value, HarnessError> {
+        let mut request = self.client.get(format!("{base}/api/session/{id}"));
+        if let Some(password) = password {
+            request = request.basic_auth("opencode", Some(password));
+        }
+        let response = request.send().await?;
         let status = response.status();
         if !status.is_success() {
             return Err(HarnessError::BadStatus {
@@ -175,12 +190,14 @@ impl OpencodeHarness {
         Ok(response.json().await?)
     }
 
-    async fn wait(&self, base: &str, id: &str) -> Result<(), HarnessError> {
-        let response = self
+    async fn wait(&self, base: &str, password: Option<&str>, id: &str) -> Result<(), HarnessError> {
+        let mut request = self
             .client
-            .post(format!("{base}/api/experimental/session/{id}/wait"))
-            .send()
-            .await?;
+            .post(format!("{base}/api/experimental/session/{id}/wait"));
+        if let Some(password) = password {
+            request = request.basic_auth("opencode", Some(password));
+        }
+        let response = request.send().await?;
         if !response.status().is_success() {
             return Err(HarnessError::BadStatus {
                 status: response.status().as_u16(),
@@ -190,8 +207,17 @@ impl OpencodeHarness {
         Ok(())
     }
 
-    async fn post_json(&self, url: &str, body: &Value) -> Result<Value, HarnessError> {
-        let response = self.client.post(url).json(body).send().await?;
+    async fn post_json(
+        &self,
+        url: &str,
+        password: Option<&str>,
+        body: &Value,
+    ) -> Result<Value, HarnessError> {
+        let mut request = self.client.post(url).json(body);
+        if let Some(password) = password {
+            request = request.basic_auth("opencode", Some(password));
+        }
+        let response = request.send().await?;
         let status = response.status();
         if !status.is_success() {
             return Err(HarnessError::BadStatus {
@@ -338,6 +364,7 @@ impl ScriptedHarness {
     pub async fn run_turn(
         &self,
         _base_url: &str,
+        _password: Option<&str>,
         session: Option<&str>,
         prompt: &str,
     ) -> Result<TurnReceipt, HarnessError> {
