@@ -11,6 +11,9 @@ use anvild::store::Store;
 use tokio::sync::watch;
 
 fn main() -> ExitCode {
+    if let Ok(path) = dotenvy::dotenv() {
+        eprintln!("anvild: loaded {}", path.display());
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

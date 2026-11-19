@@ -120,6 +120,7 @@ dependencies = [
  "anvil-api",
  "axum",
  "chacha20poly1305",
+ "dotenvy",
  "getrandom 0.3.4",
  "jsonwebtoken",
  "reqwest",

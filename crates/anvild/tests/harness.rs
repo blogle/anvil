@@ -13,6 +13,31 @@ fn receipt(session: &str, tokens: i64) -> Result<TurnReceipt, HarnessError> {
 }
 
 #[test]
+fn provider_config_writes_opencode_oauth_auth_json_when_named() {
+    let strategy = json!({"model": "chatgpt/gpt-5", "opencode_auth": "chatgpt"});
+    let mut credentials = BTreeMap::new();
+    credentials.insert(
+        "opencode-auth:chatgpt".to_owned(),
+        "{\"chatgpt\":{\"type\":\"oauth\"}}".to_owned(),
+    );
+
+    let config = materialize_provider_config(&strategy, &credentials).unwrap();
+    let auth_json = config.files.get(anvild::harness::AUTH_JSON_FILE).unwrap();
+    assert!(auth_json.contains("oauth"));
+    assert_eq!(config.env.len(), 0);
+}
+
+#[test]
+fn provider_config_fails_when_named_oauth_auth_is_missing() {
+    let strategy = json!({"opencode_auth": "chatgpt"});
+    let error = materialize_provider_config(&strategy, &BTreeMap::new()).unwrap_err();
+    assert!(matches!(
+        error,
+        HarnessError::CredentialMissing { name } if name == "opencode-auth:chatgpt"
+    ));
+}
+
+#[test]
 fn provider_config_writes_model_and_mcp_without_secrets() {
     let strategy = json!({
         "model": "glm-5.3",

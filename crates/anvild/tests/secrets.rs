@@ -50,6 +50,7 @@ fn legacy_plaintext_rows_read_as_themselves() {
 #[tokio::test]
 async fn the_store_file_holds_no_plaintext_and_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("secret.key"), hex_key(1)).unwrap();
     let db = dir.path().join("anvil.db");
     let store = anvild::store::Store::open(&db).await.unwrap();
     store
@@ -74,14 +75,24 @@ async fn the_store_file_holds_no_plaintext_and_survives_reopen() {
         .unwrap()
         .expect("credential exists");
     assert!(secret.starts_with("-----BEGIN RSA PRIVATE KEY-----"));
+}
 
-    let key_file = dir.path().join("secret.key");
-    assert!(key_file.exists());
-    let metadata = std::fs::metadata(&key_file).unwrap();
-    #[cfg(unix)]
-    let perms = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions());
-    #[cfg(unix)]
-    assert_eq!(perms & 0o777, 0o600);
+fn hex_key(n: u8) -> String {
+    (0..32u32)
+        .map(|i| format!("{:02x}", (i + n as u32) % 256))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_missing_master_key_fails_the_store_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("anvil.db");
+    let outcome = anvild::store::Store::open(&db).await;
+    let error = match outcome {
+        Ok(_) => panic!("the store must not open without a master key"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("no master key"), "{error}");
 }
 
 #[tokio::test]
