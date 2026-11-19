@@ -27,6 +27,7 @@ fn commission(campaign_id: anvil_api::CampaignId, wave: i64) -> NewCommission {
         campaign_id,
         title: "invoice split".to_owned(),
         slug: format!("invoice-{wave}"),
+        spec: "Extract the invoice line rendering into its own service.".to_owned(),
         repo: "acme/payments".to_owned(),
         target_ref: "main".to_owned(),
         target_sha: "a41f2c".to_owned(),
@@ -216,7 +217,10 @@ async fn stale_attempt_heartbeat_escalates_with_events_and_attention() {
 
     let engine = engine(&store, Duration::from_millis(40), hrs(2));
     engine.tick().await.unwrap();
-    store.insert_attempt(commission_id).await.unwrap();
+    store
+        .insert_attempt(commission_id, &json!({"name":"default"}))
+        .await
+        .unwrap();
 
     tokio::time::sleep(Duration::from_millis(80)).await;
     let report = engine.tick().await.unwrap();
@@ -249,7 +253,10 @@ async fn fresh_attempt_heartbeats_do_not_escalate() {
 
     let engine = engine(&store, mins(30), hrs(2));
     engine.tick().await.unwrap();
-    store.insert_attempt(commission_id).await.unwrap();
+    store
+        .insert_attempt(commission_id, &json!({"name":"default"}))
+        .await
+        .unwrap();
 
     let report = engine.tick().await.unwrap();
     assert_eq!(report.escalated, 0);
@@ -275,7 +282,10 @@ async fn stale_unfinished_turn_escalates() {
 
     let engine = engine(&store, mins(30), Duration::from_millis(40));
     engine.tick().await.unwrap();
-    let attempt_id = store.insert_attempt(commission_id).await.unwrap();
+    let attempt_id = store
+        .insert_attempt(commission_id, &json!({"name":"default"}))
+        .await
+        .unwrap();
     store.insert_turn(attempt_id, "sha256:abc").await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -302,7 +312,10 @@ async fn completed_turns_do_not_escalate() {
 
     let engine = engine(&store, mins(30), Duration::from_millis(40));
     engine.tick().await.unwrap();
-    let attempt_id = store.insert_attempt(commission_id).await.unwrap();
+    let attempt_id = store
+        .insert_attempt(commission_id, &json!({"name":"default"}))
+        .await
+        .unwrap();
     let turn_id = store.insert_turn(attempt_id, "sha256:abc").await.unwrap();
     store
         .end_turn(turn_id, None, json!({"result": "reprompt"}))
@@ -325,7 +338,10 @@ async fn exhausted_attempt_budget_escalates() {
     engine.tick().await.unwrap();
 
     for _ in 0..2 {
-        let attempt = store.insert_attempt(commission_id).await.unwrap();
+        let attempt = store
+            .insert_attempt(commission_id, &json!({"name":"default"}))
+            .await
+            .unwrap();
         store
             .end_attempt(attempt, None, json!({"outcome": "reprompt"}))
             .await
@@ -353,12 +369,18 @@ async fn running_attempt_keeps_budget_unescalated() {
     let engine = engine(&store, mins(30), hrs(2));
     engine.tick().await.unwrap();
 
-    let first = store.insert_attempt(commission_id).await.unwrap();
+    let first = store
+        .insert_attempt(commission_id, &json!({"name":"default"}))
+        .await
+        .unwrap();
     store
         .end_attempt(first, None, json!({"outcome": "reprompt"}))
         .await
         .unwrap();
-    store.insert_attempt(commission_id).await.unwrap();
+    store
+        .insert_attempt(commission_id, &json!({"name":"default"}))
+        .await
+        .unwrap();
 
     let report = engine.tick().await.unwrap();
     assert_eq!(report.escalated, 0);
