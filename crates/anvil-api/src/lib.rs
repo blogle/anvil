@@ -45,6 +45,45 @@ id!(AttemptId);
 id!(TurnId);
 id!(AttentionId);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckConclusion {
+    Pass,
+    Fail,
+    Pending,
+    Inconclusive,
+}
+
+impl CheckConclusion {
+    pub fn classify(raw: &str) -> Self {
+        match raw {
+            "success" => Self::Pass,
+            "failure" | "timed_out" | "action_required" => Self::Fail,
+            "pending" | "queued" | "in_progress" | "" => Self::Pending,
+            _ => Self::Inconclusive,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckStatus {
+    pub name: String,
+    pub conclusion: CheckConclusion,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalState {
+    pub checks: Vec<CheckStatus>,
+    pub mergeable: bool,
+    pub head_moved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Converge,
+    Continue { gaps: Vec<String> },
+    Pending,
+}
+
 pub struct Campaign {
     pub id: CampaignId,
     pub name: String,
@@ -122,6 +161,7 @@ pub struct Commission {
     pub campaign_id: CampaignId,
     pub title: String,
     pub slug: String,
+    pub spec: String,
     pub repo: String,
     pub target_ref: String,
     pub target_sha: String,
@@ -139,6 +179,7 @@ pub struct NewCommission {
     pub campaign_id: CampaignId,
     pub title: String,
     pub slug: String,
+    pub spec: String,
     pub repo: String,
     pub target_ref: String,
     pub target_sha: String,
@@ -159,6 +200,7 @@ pub struct Attempt {
     pub id: AttemptId,
     pub commission_id: CommissionId,
     pub n: i64,
+    pub strategy: Value,
     pub started_at: OffsetDateTime,
     pub ended_at: Option<OffsetDateTime>,
     pub heartbeat_at: OffsetDateTime,
@@ -331,4 +373,21 @@ pub struct NewAttention {
     pub commission_id: CommissionId,
     pub kind: AttentionKind,
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnContext {
+    pub campaign_name: String,
+    pub campaign_context: String,
+    pub commission_title: String,
+    pub commission_spec: String,
+    pub repo: String,
+    pub target_ref: String,
+    pub target_sha: String,
+    pub branch: String,
+    pub wave: i64,
+    pub attempt_n: i64,
+    pub obligations: Vec<String>,
+    pub gaps: Vec<String>,
+    pub external: ExternalState,
 }
