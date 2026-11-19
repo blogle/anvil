@@ -1,5 +1,0 @@
-{
-  "type": "feature",
-  "semver": "minor",
-  "summary": "SQLite persistence layer: domain vocabulary in anvil-api and the store module in anvild (WAL-tuned, append-only event log with cursor semantics, deterministic attention items, explicit failures on missing rows)."
-}
