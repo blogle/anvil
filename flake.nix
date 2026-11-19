@@ -10,9 +10,12 @@
 
     # Rust build caching, instantiated against SDLC's nixpkgs.
     crane.url = "github:ipetkov/crane";
+
+    # OCI image builds for agent sandboxes (archive-less, layered).
+    nix2container.url = "github:nlewo/nix2container";
   };
 
-  outputs = { self, sdlc, fieldnotes, crane }:
+  outputs = { self, sdlc, fieldnotes, crane, nix2container }:
     let
       systems = [ "x86_64-linux" ];
       nixpkgs = sdlc.nixpkgs-latest;
@@ -61,6 +64,11 @@
             anvild = member "anvild";
             anvilctl = member "anvilctl";
             anvil-router = member "anvil-router";
+            anvil-sandbox-image = import ./images/sandbox-image.nix {
+              inherit pkgs;
+              nix2container = nix2container.packages.${system}.nix2container;
+              anvilctl = member "anvilctl";
+            };
           };
 
           apps = {

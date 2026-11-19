@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "Sandbox: SandboxProvider port with the podman provider — one sandbox per commission, host nix store bind-mounted read-only with the daemon socket (NIX_REMOTE=daemon), workspace mounted so it persists across attempts, provider-config files materialized before start, serve port published on loopback with readiness polling. The generic nix2container image ships opencode (musl), git, the nix client, anvilctl, and basics; its entrypoint clones the commissioned repo onto the work branch and execs opencode serve. A memory provider backs the stub engine-test lane."
+}
