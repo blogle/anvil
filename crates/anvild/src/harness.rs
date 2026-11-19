@@ -29,6 +29,8 @@ pub struct ProviderConfig {
     pub env: BTreeMap<String, String>,
 }
 
+pub const AUTH_JSON_FILE: &str = "home/.local/share/opencode/auth.json";
+
 pub fn materialize_provider_config(
     strategy: &Value,
     credentials: &BTreeMap<String, String>,
@@ -42,6 +44,14 @@ pub fn materialize_provider_config(
     }
     let mut files = BTreeMap::new();
     files.insert("opencode.json".to_owned(), config.to_string());
+
+    if let Some(auth) = strategy.get("opencode_auth").and_then(Value::as_str) {
+        let name = format!("opencode-auth:{auth}");
+        let Some(auth_json) = credentials.get(&name) else {
+            return Err(HarnessError::CredentialMissing { name });
+        };
+        files.insert(AUTH_JSON_FILE.to_owned(), auth_json.clone());
+    }
 
     let mut env = BTreeMap::new();
     for name in strategy

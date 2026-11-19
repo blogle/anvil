@@ -7,6 +7,11 @@ use serde_json::json;
 
 async fn temp_store() -> (Store, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        dir.path().join("secret.key"),
+        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+    )
+    .expect("write key");
     let store = Store::open(&dir.path().join("store.db"))
         .await
         .expect("open store");

@@ -134,6 +134,44 @@ async fn the_cli_onboards_credentials_without_echoing_them() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn auth_add_reads_multiline_pem_from_stdin() {
+    let (store, base) = daemon().await;
+    let binary = env!("CARGO_BIN_EXE_anvil");
+    let mut child = Command::new(binary)
+        .env("ANVIL_URL", &base)
+        .args(["auth", "add", "github-app-private-key"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write as _;
+    let pem =
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\nmore lines\n-----END RSA PRIVATE KEY-----\n";
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(pem.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stored = store
+        .credential("github-app-private-key")
+        .await
+        .unwrap()
+        .expect("credential exists");
+    assert!(stored.starts_with("-----BEGIN RSA PRIVATE KEY-----"));
+    assert!(stored.ends_with("-----END RSA PRIVATE KEY-----"));
+    assert_eq!(stored.lines().count(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn bad_urls_and_missing_files_exit_explicitly() {
     let (_store, base) = daemon().await;
     let unreachable = Command::new(env!("CARGO_BIN_EXE_anvil"))

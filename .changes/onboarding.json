@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "Onboarding is explicit and scripted. The daemon refuses to boot without a master key — ANVIL_SECRET_KEY env (from .env, which the daemon now loads, or a k8s Secret) or a pre-placed secret.key file — with the how-to in the error; nothing generates keys silently, so a lost volume surfaces at startup instead of bricking secrets. The runbook becomes just recipes: sandbox-load, keygen (explicit .env provisioning), auth-onboard (GitHub App trio and provider keys from .env, PEM from a file path), and daemon. The CLI's stdin secret read accepts multiline PEM, and the OAuth model path lands: a strategy's opencode_auth knob materializes a stored auth.json into the sandbox's opencode data dir, so a ChatGPT Plus login captured once on the host drives sandbox agents; plain API keys keep riding env."
+}

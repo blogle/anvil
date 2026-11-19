@@ -141,6 +141,35 @@ async fn a_commission_runs_a_turn_and_converges_on_done() {
 }
 
 #[tokio::test]
+async fn a_commission_with_oauth_strategy_materializes_auth_json_into_the_workspace() {
+    let harness = loop_with(
+        json!({"model": "chatgpt/gpt-5", "opencode_auth": "chatgpt"}),
+        vec![receipt("s-1", 1_000)],
+    )
+    .await;
+    harness
+        .store
+        .put_credential(
+            "opencode-auth:chatgpt",
+            "{\"chatgpt\":{\"type\":\"oauth\",\"access_token\":\"tok\"}}",
+        )
+        .await
+        .unwrap();
+
+    harness.engine.tick().await.unwrap();
+    settle().await;
+
+    let auth_json = std::fs::read_to_string(
+        harness
+            .workspace
+            .join("home/.local/share/opencode/auth.json"),
+    )
+    .unwrap();
+    assert!(auth_json.contains("oauth"));
+    assert!(auth_json.contains("chatgpt"));
+}
+
+#[tokio::test]
 async fn a_turn_ending_without_done_reprompts_with_a_gap() {
     let harness = loop_with(
         json!({}),

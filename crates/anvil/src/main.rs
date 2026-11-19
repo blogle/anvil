@@ -192,13 +192,15 @@ async fn run(anvil: Anvil, command: Command) -> Result<(), AnvilError> {
                 let secret = match secret {
                     Some(secret) => secret,
                     None => {
-                        let mut line = String::new();
-                        if std::io::stdin().read_line(&mut line).is_err() || line.trim().is_empty()
+                        let mut buffer = String::new();
+                        if std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
+                            .is_err()
+                            || buffer.trim().is_empty()
                         {
                             eprintln!("anvil: provide the secret via --secret or stdin");
                             return Ok(());
                         }
-                        line.trim().to_owned()
+                        buffer.trim_end_matches('\n').to_owned()
                     }
                 };
                 anvil.auth_add(&name, &secret).await?;
