@@ -30,6 +30,7 @@
             fileset = lib.fileset.unions [
               (craneLib.fileset.commonCargoSources ./.)
               ./crates/anvild/migrations
+              ./crates/anvild/tests/test-github-app.pem
             ];
           };
           commonArgs = {

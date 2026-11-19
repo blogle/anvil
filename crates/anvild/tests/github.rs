@@ -1,0 +1,354 @@
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::mpsc;
+use std::thread;
+
+use anvil_api::{CheckConclusion, CommissionState};
+use anvild::engine::{Engine, EngineConfig};
+use anvild::github::{branch_name, parse_check_runs, parse_pull, parse_ref, pr_body, GithubClient};
+use anvild::store::Store;
+use serde_json::{json, Value};
+
+const TEST_PEM: &str = include_str!("test-github-app.pem");
+
+type Handler = Box<dyn Fn(&str, &str, &Value) -> (u16, String) + Send>;
+
+struct MockGithub {
+    addr: std::net::SocketAddr,
+    requests: mpsc::Receiver<String>,
+    _handle: thread::JoinHandle<()>,
+}
+
+impl MockGithub {
+    fn spawn(handler: Handler) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, requests) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = String::new();
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    buffer.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if let Some(head_end) = buffer.find("\r\n\r\n") {
+                        let length = buffer[head_end..].len().saturating_sub(4);
+                        let content_length = buffer
+                            .split("\r\n")
+                            .find_map(|line| {
+                                line.strip_prefix("Content-Length: ")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if length >= content_length {
+                            break;
+                        }
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let head = buffer.split("\r\n\r\n").next().unwrap_or_default();
+                let mut lines = head.splitn(2, ' ');
+                let method = lines.next().unwrap_or_default().to_owned();
+                let rest = lines.next().unwrap_or_default();
+                let path = rest.split(' ').next().unwrap_or_default().to_owned();
+                let body_text = buffer
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| body.to_owned())
+                    .unwrap_or_default();
+                let body: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+                tx.send(format!("{method} {path}")).unwrap();
+                let (status, body) = handler(&method, &path, &body);
+                let reason = if status < 300 { "OK" } else { "Error" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        Self {
+            addr,
+            requests,
+            _handle: handle,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn next_request(&self) -> String {
+        self.requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+    }
+}
+
+fn client(url: &str) -> GithubClient {
+    GithubClient::new(url, "test-app", 1, TEST_PEM).unwrap()
+}
+
+#[tokio::test]
+async fn provision_resolves_creates_branch_and_opens_pr() {
+    let mock = MockGithub::spawn(Box::new(|method, path, _| match (method, path) {
+        ("POST", "/app/installations/1/access_tokens") => {
+            (200, json!({"token": "inst-token"}).to_string())
+        }
+        ("GET", "/repos/acme/payments/git/ref/heads/main") => {
+            (200, json!({"object": {"sha": "a41f2c9"}}).to_string())
+        }
+        ("POST", "/repos/acme/payments/git/refs") => (201, "{}".to_owned()),
+        ("GET", p) if p.starts_with("/repos/acme/payments/pulls?head=") => (200, "[]".to_owned()),
+        ("POST", "/repos/acme/payments/pulls") => (201, json!({"number": 7}).to_string()),
+        _ => (404, "{}".to_owned()),
+    }));
+
+    let provisioned = client(&mock.url())
+        .provision(
+            "acme/payments",
+            "payments-refactor",
+            "invoice-split",
+            "main",
+            "split invoice service",
+            "spec text",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(provisioned.target_sha, "a41f2c9");
+    assert_eq!(provisioned.branch, "anvil/payments-refactor/invoice-split");
+    assert_eq!(provisioned.pr_number, 7);
+}
+
+#[tokio::test]
+async fn provision_is_idempotent_when_branch_and_pr_exist() {
+    let mock = MockGithub::spawn(Box::new(|method, path, _| match (method, path) {
+        ("POST", "/app/installations/1/access_tokens") => {
+            (200, json!({"token": "inst-token"}).to_string())
+        }
+        ("GET", "/repos/acme/payments/git/ref/heads/main") => {
+            (200, json!({"object": {"sha": "a41f2c9"}}).to_string())
+        }
+        ("POST", "/repos/acme/payments/git/refs") => (
+            422,
+            json!({"message": "Reference already exists"}).to_string(),
+        ),
+        ("GET", p) if p.starts_with("/repos/acme/payments/pulls?head=") => {
+            (200, json!([{"number": 7, "state": "open"}]).to_string())
+        }
+        _ => (404, "{}".to_owned()),
+    }));
+
+    let provisioned = client(&mock.url())
+        .provision(
+            "acme/payments",
+            "payments-refactor",
+            "invoice-split",
+            "main",
+            "split invoice service",
+            "spec",
+        )
+        .await
+        .unwrap();
+    assert_eq!(provisioned.pr_number, 7);
+    assert_eq!(provisioned.branch, "anvil/payments-refactor/invoice-split");
+}
+
+#[tokio::test]
+async fn external_state_maps_checks_mergeability_and_head_movement() {
+    let mock = MockGithub::spawn(Box::new(|method, path, _| match (method, path) {
+        ("POST", "/app/installations/1/access_tokens") => {
+            (200, json!({"token": "inst-token"}).to_string())
+        }
+        ("GET", "/repos/acme/payments/pulls/7") => (
+            200,
+            json!({"number": 7, "state": "open", "mergeable": true,
+                       "head": {"sha": "head123"}})
+            .to_string(),
+        ),
+        ("GET", "/repos/acme/payments/commits/head123/check-runs") => (
+            200,
+            json!({"check_runs": [
+                {"name": "go test", "conclusion": "failure"},
+                {"name": "lint", "conclusion": "success"},
+                {"name": "race", "conclusion": null}
+            ]})
+            .to_string(),
+        ),
+        ("GET", "/repos/acme/payments/git/ref/heads/main") => {
+            (200, json!({"object": {"sha": "moved999"}}).to_string())
+        }
+        _ => (404, "{}".to_owned()),
+    }));
+
+    let state = client(&mock.url())
+        .external_state("acme/payments", 7, "main", "a41f2c9")
+        .await
+        .unwrap();
+    assert!(state.mergeable);
+    assert!(state.head_moved);
+    assert_eq!(state.checks.len(), 3);
+    assert_eq!(state.checks[0].conclusion, CheckConclusion::Fail);
+    assert_eq!(state.checks[1].conclusion, CheckConclusion::Pass);
+    assert_eq!(state.checks[2].conclusion, CheckConclusion::Pending);
+}
+
+#[tokio::test]
+async fn engine_admission_provisions_branch_pr_and_target_sha() {
+    let mock = MockGithub::spawn(Box::new(|method, path, body| match (method, path) {
+        ("POST", "/app/installations/1/access_tokens") => {
+            (200, json!({"token": "inst-token"}).to_string())
+        }
+        ("GET", "/repos/acme/payments/git/ref/heads/main") => {
+            (200, json!({"object": {"sha": "a41f2c9"}}).to_string())
+        }
+        ("POST", "/repos/acme/payments/git/refs") => (201, "{}".to_owned()),
+        ("GET", p) if p.starts_with("/repos/acme/payments/pulls?head=") => (200, "[]".to_owned()),
+        ("POST", "/repos/acme/payments/pulls") => {
+            assert_eq!(body["title"], "invoice split");
+            assert_eq!(body["draft"], true);
+            assert!(body["body"].as_str().unwrap().contains("extract invoices"));
+            (201, json!({"number": 7}).to_string())
+        }
+        _ => (404, "{}".to_owned()),
+    }));
+
+    let store = Store::open_memory().await.unwrap();
+    let campaign_id = store
+        .insert_campaign(anvil_api::NewCampaign {
+            name: "payments refactor".to_owned(),
+            slug: "payments-refactor".to_owned(),
+            context: "split the monolith".to_owned(),
+            strategy: json!({}),
+        })
+        .await
+        .unwrap();
+    let commission_id = store
+        .insert_commission(anvil_api::NewCommission {
+            campaign_id,
+            title: "invoice split".to_owned(),
+            slug: "invoice-split".to_owned(),
+            spec: "extract invoices".to_owned(),
+            repo: "acme/payments".to_owned(),
+            target_ref: "main".to_owned(),
+            target_sha: String::new(),
+            wave: 1,
+            budget: json!({}),
+            strategy: json!({}),
+        })
+        .await
+        .unwrap();
+    store
+        .insert_obligation(commission_id, "the payments suite stays green")
+        .await
+        .unwrap();
+
+    let engine =
+        Engine::new(store.clone(), EngineConfig::default()).with_github(client(&mock.url()));
+    let report = engine.tick().await.unwrap();
+    assert_eq!(report.admitted, 1);
+
+    let commission = store.commission(commission_id).await.unwrap().unwrap();
+    assert_eq!(commission.state, CommissionState::Active);
+    assert_eq!(commission.target_sha, "a41f2c9");
+    assert_eq!(commission.branch, "anvil/payments-refactor/invoice-split");
+    assert_eq!(commission.pr_number, Some(7));
+
+    assert_eq!(
+        mock.next_request(),
+        "POST /app/installations/1/access_tokens"
+    );
+}
+
+#[tokio::test]
+async fn engine_admission_failure_fails_the_commission_with_attention() {
+    let mock = MockGithub::spawn(Box::new(|method, path, _| match (method, path) {
+        ("POST", "/app/installations/1/access_tokens") => {
+            (200, json!({"token": "inst-token"}).to_string())
+        }
+        ("GET", "/repos/acme/payments/git/ref/heads/main") => {
+            (500, json!({"message": "boom"}).to_string())
+        }
+        _ => (404, "{}".to_owned()),
+    }));
+
+    let store = Store::open_memory().await.unwrap();
+    let campaign_id = store
+        .insert_campaign(anvil_api::NewCampaign {
+            name: "payments refactor".to_owned(),
+            slug: "payments-refactor".to_owned(),
+            context: String::new(),
+            strategy: json!({}),
+        })
+        .await
+        .unwrap();
+    let commission_id = store
+        .insert_commission(anvil_api::NewCommission {
+            campaign_id,
+            title: "invoice split".to_owned(),
+            slug: "invoice-split".to_owned(),
+            spec: String::new(),
+            repo: "acme/payments".to_owned(),
+            target_ref: "main".to_owned(),
+            target_sha: String::new(),
+            wave: 1,
+            budget: json!({}),
+            strategy: json!({}),
+        })
+        .await
+        .unwrap();
+
+    let engine =
+        Engine::new(store.clone(), EngineConfig::default()).with_github(client(&mock.url()));
+    engine.tick().await.unwrap();
+
+    let commission = store.commission(commission_id).await.unwrap().unwrap();
+    assert!(matches!(
+        commission.state,
+        CommissionState::Failed { ref cause } if cause.contains("provisioning failed")
+    ));
+    let attention = store.open_attention().await.unwrap();
+    assert_eq!(attention.len(), 1);
+    assert_eq!(attention[0].kind, anvil_api::AttentionKind::EnvFailure);
+}
+
+#[test]
+fn branch_names_and_slugs_validate() {
+    assert_eq!(
+        branch_name("payments-refactor", "invoice-split").unwrap(),
+        "anvil/payments-refactor/invoice-split"
+    );
+    assert!(branch_name("UPPER", "ok").is_err());
+    assert!(branch_name("ok", "with space").is_err());
+    assert!(branch_name("ok", "").is_err());
+}
+
+#[test]
+fn parsers_map_github_payloads() {
+    assert_eq!(
+        parse_ref(&json!({"object": {"sha": "abc"}})),
+        Some("abc".to_owned())
+    );
+    assert_eq!(parse_ref(&json!({})), None);
+
+    let checks = parse_check_runs(&json!({"check_runs": [
+        {"name": "go test", "conclusion": "timed_out"},
+        {"name": "lint", "conclusion": "neutral"}
+    ]}));
+    assert_eq!(checks.len(), 2);
+    assert_eq!(checks[0].conclusion, CheckConclusion::Fail);
+    assert_eq!(checks[1].conclusion, CheckConclusion::Inconclusive);
+
+    let pull = parse_pull(&json!({"number": 7, "state": "open", "mergeable": null,
+                                  "head": {"sha": "x"}}))
+    .unwrap();
+    assert!(!pull.mergeable);
+    assert!(pull.open);
+
+    let body = pr_body("extract invoices", &["suite stays green".to_owned()]);
+    assert!(body.contains("extract invoices"));
+    assert!(body.contains("- suite stays green"));
+}

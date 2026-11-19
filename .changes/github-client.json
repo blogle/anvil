@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "GitHub client: App installation tokens (RS256 JWT, cached under TTL) minted per commission and passed through sandbox env only — long-lived credentials never at rest. Admission provisions the work branch anvil/<campaign>/<commission> at the resolved target SHA and opens a draft PR with the obligations rendered into its body, idempotently when branch or PR already exist. Check-run polling maps PR state into the strategy's external state (checks, mergeability, target-head movement). Provisioning failures fail the commission with env-failure attention; the tick keeps going."
+}
