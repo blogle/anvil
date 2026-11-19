@@ -1,0 +1,26 @@
+{
+  "changelog_sha256": "71c9c3032791f613f1d41df23d2296e9cecac0f901d2ff3fdc197ebe83e47e10",
+  "fragments": [
+    {
+      "blob_sha": "4d3bb213ddf3c3eca42e2c4942b694e4ccabdba3",
+      "path": ".changes/engine-loop.json"
+    },
+    {
+      "blob_sha": "954f58f503206b135b270406f95ddc7876b30be3",
+      "path": ".changes/store-layer.json"
+    },
+    {
+      "blob_sha": "34d7a315decde32bcd7d1160fc6dc0528ab44fbb",
+      "path": ".changes/workspace-scaffold.json"
+    }
+  ],
+  "generated_tree": "025dd1ebdfc73056766e078a94e016195030dd8a8ed666b0d08f62ba4c394aaa",
+  "prior_released_boundary": null,
+  "publication": {
+    "source_main_sha": "e7800b33fb83a213dafd1b061acb15c4d8a8a7ba",
+    "version": "0.1.0"
+  },
+  "schema": 1,
+  "source_main_sha": "e7800b33fb83a213dafd1b061acb15c4d8a8a7ba",
+  "version": "0.1.0"
+}
