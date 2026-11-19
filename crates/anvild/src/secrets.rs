@@ -11,11 +11,12 @@ pub const KEY_FILE: &str = "secret.key";
 pub enum SecretError {
     #[error("the master key in {location} is not 64 hex characters")]
     BadKey { location: String },
-    #[error("cannot {action} the master key file: {message}")]
-    KeyFile {
-        action: &'static str,
-        message: String,
-    },
+    #[error(
+        "no master key: set {KEY_ENV} to 64 hex characters (e.g. `openssl rand -hex 32` in your .env, or a k8s Secret) or provide {KEY_FILE} beside the store"
+    )]
+    MissingKey,
+    #[error("cannot read the master key file: {message}")]
+    KeyFile { message: String },
     #[error(
         "the stored secret could not be decrypted — was it written under a different master key?"
     )]
@@ -41,25 +42,13 @@ impl SecretBox {
             return Self::from_hex(&hex, KEY_ENV);
         }
         let path = dir.join(KEY_FILE);
-        if path.exists() {
-            let hex = std::fs::read_to_string(&path).map_err(|error| SecretError::KeyFile {
-                action: "read",
-                message: error.to_string(),
-            })?;
-            return Self::from_hex(hex.trim(), &path.display().to_string());
+        if !path.exists() {
+            return Err(SecretError::MissingKey);
         }
-        let key = random_key()?;
-        std::fs::write(&path, hex_encode(&key)).map_err(|error| SecretError::KeyFile {
-            action: "write",
+        let hex = std::fs::read_to_string(&path).map_err(|error| SecretError::KeyFile {
             message: error.to_string(),
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-        eprintln!("anvild: generated the master key at {}", path.display());
-        Ok(Self::from_key(key))
+        Self::from_hex(hex.trim(), &path.display().to_string())
     }
 
     fn from_hex(hex: &str, source: &str) -> Result<Self, SecretError> {
@@ -106,12 +95,6 @@ impl SecretBox {
             .map(Some)
             .map_err(|_| SecretError::WrongKey)
     }
-}
-
-fn random_key() -> Result<[u8; 32], SecretError> {
-    let mut key = [0u8; 32];
-    fill_random(&mut key)?;
-    Ok(key)
 }
 
 fn fill_random(bytes: &mut [u8]) -> Result<(), SecretError> {

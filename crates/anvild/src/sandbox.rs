@@ -260,7 +260,11 @@ impl MemoryProvider {
     pub async fn start(&self, spec: &SandboxSpec) -> Result<SandboxHandle, SandboxError> {
         tokio::fs::create_dir_all(&spec.workspace).await?;
         for (path, content) in &spec.files {
-            tokio::fs::write(spec.workspace.join(path), content).await?;
+            let target = spec.workspace.join(path);
+            if let Some(parent) = target.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(target, content).await?;
         }
         self.sandboxes
             .lock()

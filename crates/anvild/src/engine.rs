@@ -331,6 +331,12 @@ impl Engine {
                 credentials.insert(name.to_owned(), secret);
             }
         }
+        if let Some(auth) = strategy_value.get("opencode_auth").and_then(Value::as_str) {
+            let name = format!("opencode-auth:{auth}");
+            if let Ok(Some(secret)) = self.store.credential(&name).await {
+                credentials.insert(name, secret);
+            }
+        }
         let provider_config = match materialize_provider_config(&strategy_value, &credentials) {
             Ok(config) => config,
             Err(error) => {
