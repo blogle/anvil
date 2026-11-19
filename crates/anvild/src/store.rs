@@ -16,12 +16,16 @@ use sqlx::{FromRow, Row, SqlitePool};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::secrets::SecretBox;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error("database migration failed: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error("secrets: {0}")]
+    Secrets(#[from] crate::secrets::SecretError),
     #[error("no {what} with id {id}")]
     Missing { what: &'static str, id: String },
     #[error("corrupt {field}: {value}")]
@@ -40,10 +44,13 @@ impl StoreError {
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
+    secrets: SecretBox,
 }
 
 impl Store {
     pub async fn open(path: &Path) -> Result<Self, StoreError> {
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let secrets = SecretBox::bootstrap(dir)?;
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
@@ -51,10 +58,11 @@ impl Store {
             .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(5));
-        Self::connect(options).await
+        Self::connect(options, secrets).await
     }
 
     pub async fn open_memory() -> Result<Self, StoreError> {
+        let secrets = SecretBox::from_key([0u8; 32]);
         let options = SqliteConnectOptions::new()
             .in_memory(true)
             .synchronous(SqliteSynchronous::Normal)
@@ -64,13 +72,16 @@ impl Store {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self { pool, secrets })
     }
 
-    async fn connect(options: SqliteConnectOptions) -> Result<Self, StoreError> {
+    async fn connect(
+        options: SqliteConnectOptions,
+        secrets: SecretBox,
+    ) -> Result<Self, StoreError> {
         let pool = SqlitePool::connect_with(options).await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self { pool, secrets })
     }
 
     pub async fn insert_campaign(&self, new: NewCampaign) -> Result<CampaignId, StoreError> {
@@ -553,13 +564,14 @@ impl Store {
     }
 
     pub async fn put_credential(&self, name: &str, secret: &str) -> Result<(), StoreError> {
+        let sealed = self.secrets.seal(secret)?;
         sqlx::query(
             "INSERT INTO credentials (name, secret, updated_at) VALUES (?, ?, ?)
              ON CONFLICT(name) DO UPDATE SET secret = excluded.secret,
                                             updated_at = excluded.updated_at",
         )
         .bind(name)
-        .bind(secret)
+        .bind(sealed)
         .bind(now_millis())
         .execute(&self.pool)
         .await?;
@@ -571,7 +583,13 @@ impl Store {
             .bind(name)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|r| r.get::<String, _>("secret")))
+        match row {
+            None => Ok(None),
+            Some(row) => {
+                let raw = row.get::<String, _>("secret");
+                Ok(self.secrets.open(&raw)?)
+            }
+        }
     }
 
     pub async fn credential_names(&self) -> Result<Vec<(String, i64)>, StoreError> {

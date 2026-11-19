@@ -3,5 +3,6 @@ pub mod github;
 pub mod harness;
 pub mod http;
 pub mod sandbox;
+pub mod secrets;
 pub mod store;
 pub mod strategy;
