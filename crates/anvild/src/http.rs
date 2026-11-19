@@ -44,6 +44,10 @@ pub fn router(store: Store) -> Router {
         .route("/v1/attempts", get(list_attempts))
         .route("/v1/inbox", get(list_inbox))
         .route("/v1/inbox/{id}/dismiss", post(dismiss_attention))
+        .route(
+            "/v1/credentials",
+            post(add_credential).get(list_credentials),
+        )
         .route("/v1/events", get(events))
         .with_state(store)
 }
@@ -556,41 +560,101 @@ async fn cancel_commission(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize)]
+struct AddCredentialRequest {
+    name: String,
+    secret: String,
+}
+
+async fn add_credential(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Json(request): Json<AddCredentialRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if let Some(replayed) = replayed(&store, &headers).await {
+        return Ok(replayed);
+    }
+    let name = request.name.clone();
+    store.put_credential(&request.name, &request.secret).await?;
+    let view = json!({"name": name});
+    remember(&store, &headers, &view).await;
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+async fn list_credentials(State(store): State<Store>) -> Result<Json<Value>, ApiError> {
+    let names: Vec<Value> = store
+        .credential_names()
+        .await?
+        .into_iter()
+        .map(|(name, updated_at)| json!({"name": name, "updated_at": updated_at}))
+        .collect();
+    Ok(Json(json!({"credentials": names})))
+}
+
 async fn events(
     State(store): State<Store>,
     Query(query): Query<ListQuery>,
-) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
-    let mut cursor = query.since.unwrap_or(0);
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let cursor = query.since.unwrap_or(0);
+    let wants_json = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| accept.contains("application/json"));
+    if wants_json {
+        let events = store.events_since(cursor, 500).await?;
+        let views: Vec<Value> = events
+            .iter()
+            .map(|event| {
+                json!({
+                    "seq": event.seq,
+                    "at": millis(event.at),
+                    "kind": event.kind.as_str(),
+                    "campaign_id": event.campaign_id.map(|id| id.to_string()),
+                    "commission_id": event.commission_id.map(|id| id.to_string()),
+                    "payload": event.payload,
+                })
+            })
+            .collect();
+        return Ok(Json(json!({
+            "events": views,
+            "cursor": events.last().map(|event| event.seq).unwrap_or(cursor),
+        }))
+        .into_response());
+    }
     let (tx, rx) = tokio::sync::mpsc::channel(64);
-    tokio::spawn(async move {
-        loop {
-            match store.events_since(cursor, 100).await {
-                Ok(events) if events.is_empty() => {}
-                Ok(events) => {
-                    for event in events {
-                        cursor = event.seq;
-                        let frame = Event::default().event(event.kind.as_str()).data(
-                            json!({
-                                "seq": event.seq,
-                                "at": millis(event.at),
-                                "kind": event.kind.as_str(),
-                                "campaign_id": event.campaign_id.map(|id| id.to_string()),
-                                "commission_id": event.commission_id.map(|id| id.to_string()),
-                                "payload": event.payload,
-                            })
-                            .to_string(),
-                        );
-                        if tx.send(Ok(frame)).await.is_err() {
-                            return;
-                        }
-                    }
+    tokio::spawn(sse_pump(store, tx, cursor));
+    Ok(Sse::new(ReceiverStream::new(rx)).into_response())
+}
+
+async fn sse_pump(
+    store: Store,
+    tx: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+    start: i64,
+) {
+    let mut cursor = start;
+    loop {
+        if let Ok(events) = store.events_since(cursor, 100).await {
+            for event in events {
+                cursor = event.seq;
+                let frame = Event::default().event(event.kind.as_str()).data(
+                    json!({
+                        "seq": event.seq,
+                        "at": millis(event.at),
+                        "kind": event.kind.as_str(),
+                        "campaign_id": event.campaign_id.map(|id| id.to_string()),
+                        "commission_id": event.commission_id.map(|id| id.to_string()),
+                        "payload": event.payload,
+                    })
+                    .to_string(),
+                );
+                if tx.send(Ok(frame)).await.is_err() {
+                    return;
                 }
-                Err(_) => {}
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-    });
-    Ok(Sse::new(ReceiverStream::new(rx)))
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 enum SignalError {
