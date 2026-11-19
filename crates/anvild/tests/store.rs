@@ -51,6 +51,44 @@ async fn campaign_round_trips() {
 }
 
 #[tokio::test]
+async fn provision_and_transition_admits_with_branch_pr_and_resolved_sha() {
+    let (store, _dir) = temp_store().await;
+    let campaign_id = store.insert_campaign(campaign("payments")).await.unwrap();
+    let id = store
+        .insert_commission(commission(campaign_id, 1))
+        .await
+        .unwrap();
+
+    store
+        .provision_and_transition(
+            id,
+            CommissionState::Active,
+            "resolved999",
+            "anvil/payments/invoice-split",
+            7,
+            &[NewEvent {
+                kind: EventKind::CommissionAdmitted,
+                campaign_id: Some(campaign_id),
+                commission_id: Some(id),
+                payload: json!({"branch": "anvil/payments/invoice-split"}),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let loaded = store.commission(id).await.unwrap().unwrap();
+    assert_eq!(loaded.state, CommissionState::Active);
+    assert_eq!(loaded.target_sha, "resolved999");
+    assert_eq!(loaded.branch, "anvil/payments/invoice-split");
+    assert_eq!(loaded.pr_number, Some(7));
+
+    let events = store.events_since(0, 100).await.unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.kind == EventKind::CommissionAdmitted));
+}
+
+#[tokio::test]
 async fn commission_starts_pending_and_preserves_state_detail() {
     let (store, _dir) = temp_store().await;
     let campaign_id = store.insert_campaign(campaign("payments")).await.unwrap();
