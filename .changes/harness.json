@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "Harness: InnerHarness port behind enum dispatch — opencode serve adapter (session.create, session.prompt, experimental.session.wait, token accounting as before/after deltas, SSE event.subscribe stream with an incremental frame parser) plus the scripted stub harness as the engine-test instrument. Provider config materializes opencode.json and env once at sandbox start; credentials are named by their env var and never written into files."
+}
