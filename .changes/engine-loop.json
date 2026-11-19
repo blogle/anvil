@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "The loop runs: the engine's due-work scan drives active commissions end to end — a fresh attempt snapshots the resolved strategy, materializes provider config into the per-commission workspace, mints the anvilctl token, and runs the composed turn through the sandbox's harness as a spawned I/O task so the tick never blocks. A done claim evaluates PR checks: converge to needs-review with a review-ready attention item, failed checks reprompt with named gaps, pending keeps polling. Turns that end without done reprompt as not-done; harness failures are evidence and the loop continues; sandbox failures end the attempt and fail the commission with env-failure. Stalled escalations end their attempts so retry starts fresh. The daemon boots podman+opencode by default with a memory sandbox for smoke runs."
+}
