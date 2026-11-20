@@ -53,12 +53,31 @@ async fn daemon() -> ExitCode {
         }
     };
 
+    match store.close_in_flight_turns().await {
+        Ok(0) => {}
+        Ok(count) => {
+            eprintln!("anvild: closed {count} turn(s) left in flight by a previous boot")
+        }
+        Err(error) => {
+            eprintln!("anvild: cannot close in-flight turns: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     let bind = value_of("bind")
         .or_else(|| std::env::var("ANVIL_BIND").ok())
         .unwrap_or_else(|| "127.0.0.1:8788".to_owned());
 
+    let advertise_port = bind
+        .rsplit(':')
+        .next()
+        .filter(|port| port.parse::<u16>().is_ok())
+        .unwrap_or("8788");
+    let daemon_url = std::env::var("ANVIL_ADVERTISE_URL")
+        .unwrap_or_else(|_| format!("http://10.0.2.2:{advertise_port}"));
+
     let config = EngineConfig {
-        daemon_url: format!("http://{bind}"),
+        daemon_url,
         ..EngineConfig::default()
     };
 

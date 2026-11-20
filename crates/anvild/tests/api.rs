@@ -301,3 +301,80 @@ async fn cursor_gets_return_only_newer_commissions() {
         .unwrap();
     assert_eq!(none["commissions"].as_array().unwrap().len(), 0);
 }
+
+#[tokio::test]
+async fn retry_requeues_unprovisioned_commissions_and_resumes_provisioned_ones() {
+    let (store, base) = daemon().await;
+    let campaign: Value = post(&base, "/v1/campaigns", campaign_body())
+        .await
+        .json()
+        .await
+        .unwrap();
+    let campaign_id = campaign["id"].as_str().unwrap().to_owned();
+    let commissions: Value = get(&base, "/v1/commissions").await.json().await.unwrap();
+    let commission_id: anvil_api::CommissionId = commissions["commissions"][0]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let state_changed = || anvil_api::NewEvent {
+        kind: anvil_api::EventKind::StateChanged,
+        campaign_id: Some(campaign_id.parse().unwrap()),
+        commission_id: Some(commission_id),
+        payload: json!({"to": "failed"}),
+    };
+
+    store
+        .transition_commission(
+            commission_id,
+            anvil_api::CommissionState::Failed {
+                cause: "sandbox: boom".to_owned(),
+            },
+            &[state_changed()],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let requeue = post(
+        &base,
+        &format!("/v1/commissions/{commission_id}"),
+        json!({"action": "retry"}),
+    )
+    .await;
+    assert_eq!(requeue.status(), 204);
+    let detail: Value = get(&base, &format!("/v1/commissions/{commission_id}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["commission"]["state"]["kind"], json!("pending"));
+
+    store
+        .provision_and_transition(
+            commission_id,
+            anvil_api::CommissionState::Failed {
+                cause: "harness: boom".to_owned(),
+            },
+            "resolved999",
+            "anvil/payments/invoice-split",
+            7,
+            &[state_changed()],
+        )
+        .await
+        .unwrap();
+
+    let resume = post(
+        &base,
+        &format!("/v1/commissions/{commission_id}"),
+        json!({"action": "retry"}),
+    )
+    .await;
+    assert_eq!(resume.status(), 204);
+    let detail: Value = get(&base, &format!("/v1/commissions/{commission_id}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["commission"]["state"]["kind"], json!("active"));
+}

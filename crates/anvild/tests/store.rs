@@ -250,6 +250,40 @@ async fn turns_record_within_attempt() {
 }
 
 #[tokio::test]
+async fn closing_in_flight_turns_ends_only_the_undead() {
+    let (store, _dir) = temp_store().await;
+    let campaign_id = store.insert_campaign(campaign("payments")).await.unwrap();
+    let commission_id = store
+        .insert_commission(commission(campaign_id, 1))
+        .await
+        .unwrap();
+    let attempt_id = store
+        .insert_attempt(commission_id, &json!({"name":"default"}))
+        .await
+        .unwrap();
+    let first = store.insert_turn(attempt_id, "sha256:abc").await.unwrap();
+    store.insert_turn(attempt_id, "sha256:def").await.unwrap();
+    store
+        .end_turn(first, Some(1_000), json!({"status": "ok"}))
+        .await
+        .unwrap();
+
+    let closed = store.close_in_flight_turns().await.unwrap();
+    assert_eq!(closed, 1);
+
+    let turns = store.turns(attempt_id).await.unwrap();
+    assert_eq!(turns[0].tokens, Some(1_000));
+    assert!(turns[1].ended_at.is_some());
+    assert_eq!(
+        turns[1].result.as_ref().unwrap()["error"],
+        json!("daemon restarted while the turn was in flight")
+    );
+
+    let again = store.close_in_flight_turns().await.unwrap();
+    assert_eq!(again, 0);
+}
+
+#[tokio::test]
 async fn events_append_in_batches_with_monotonic_cursor() {
     let (store, _dir) = temp_store().await;
     let campaign_id = store.insert_campaign(campaign("payments")).await.unwrap();
