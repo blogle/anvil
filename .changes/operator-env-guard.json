@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "Operator-local files are now protected by an explicit rule (AGENTS.md rule 8): .env, the daemon's state directory, and any key or PEM on the host are never deleted, overwritten, or reset without an explicit instruction — smokes isolate into their own scratch state instead of clearing the operator's. A committed .env.example is the canonical template, and auth-onboard's missing-value errors point straight at it."
+}
