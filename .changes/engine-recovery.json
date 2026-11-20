@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "The engine recovers instead of wedging. retry on a never-provisioned commission requeues it through provisioning instead of landing in an active state with no PR to run against; retry after a failed attempt starts a fresh attempt because an error older than the last state change is history, not news; an attempt left running without a single turn (crash or silent skip) is discarded so a new one starts; a turn left in flight by a dead daemon is closed at boot; and a failed engine tick is logged and the loop continues instead of silently dying."
+}

@@ -208,6 +208,7 @@ pub fn run_args(spec: &SandboxSpec, nix_store: &Path, nix_socket_dir: &Path) -> 
         "-d".to_owned(),
         "--name".to_owned(),
         spec.name.clone(),
+        "--network=pasta:--map-host-loopback=10.0.2.2".to_owned(),
         "-v".to_owned(),
         format!("{}:/nix/store:ro", nix_store.display()),
         "-v".to_owned(),

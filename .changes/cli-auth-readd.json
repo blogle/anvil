@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "Re-adding a credential updates its value. The CLI was stamping auth add with a name-only idempotency key, so correcting a stored secret replayed the first response — 'stored' — without ever storing the new value; the key is gone and the upsert lands."
+}

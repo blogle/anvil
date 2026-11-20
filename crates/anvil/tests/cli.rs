@@ -134,6 +134,30 @@ async fn the_cli_onboards_credentials_without_echoing_them() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn re_adding_a_credential_updates_its_value() {
+    let (store, base) = daemon().await;
+    let first = run_anvil(
+        &base,
+        &["auth", "add", "github-installation-id", "--secret", "first"],
+    );
+    assert!(first.status.success());
+    let second = run_anvil(
+        &base,
+        &[
+            "auth",
+            "add",
+            "github-installation-id",
+            "--secret",
+            "second",
+        ],
+    );
+    assert!(second.status.success());
+
+    let stored = store.credential("github-installation-id").await.unwrap();
+    assert_eq!(stored.as_deref(), Some("second"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn auth_add_reads_multiline_pem_from_stdin() {
     let (store, base) = daemon().await;
     let binary = env!("CARGO_BIN_EXE_anvil");

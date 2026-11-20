@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "GitHub provisioning works against the real API. The client sends a User-Agent (GitHub 403s requests without one), and a fresh branch is seeded with an empty 'anvil: begin' commit before the draft PR opens — GitHub refuses PRs with zero commits, so provision previously died with 'No commits between main and the branch' on every first attempt."
+}

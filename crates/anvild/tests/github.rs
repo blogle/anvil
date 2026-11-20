@@ -16,7 +16,17 @@ async fn provision_resolves_creates_branch_and_opens_pr() {
         ("GET", "/repos/acme/payments/git/ref/heads/main") => {
             (200, json!({"object": {"sha": "a41f2c9"}}).to_string())
         }
+        ("GET", "/repos/acme/payments/git/ref/heads/anvil/payments-refactor/invoice-split") => {
+            (200, json!({"object": {"sha": "a41f2c9"}}).to_string())
+        }
         ("POST", "/repos/acme/payments/git/refs") => (201, "{}".to_owned()),
+        ("GET", "/repos/acme/payments/git/commits/a41f2c9") => {
+            (200, json!({"tree": {"sha": "tree-1"}}).to_string())
+        }
+        ("POST", "/repos/acme/payments/git/commits") => (201, json!({"sha": "seed-1"}).to_string()),
+        ("PATCH", "/repos/acme/payments/git/refs/heads/anvil/payments-refactor/invoice-split") => {
+            (200, json!({"object": {"sha": "seed-1"}}).to_string())
+        }
         ("GET", p) if p.starts_with("/repos/acme/payments/pulls?head=") => (200, "[]".to_owned()),
         ("POST", "/repos/acme/payments/pulls") => (201, json!({"number": 7}).to_string()),
         _ => (404, "{}".to_owned()),
@@ -48,6 +58,10 @@ async fn provision_is_idempotent_when_branch_and_pr_exist() {
         ("GET", "/repos/acme/payments/git/ref/heads/main") => {
             (200, json!({"object": {"sha": "a41f2c9"}}).to_string())
         }
+        ("GET", "/repos/acme/payments/git/ref/heads/anvil/payments-refactor/invoice-split") => (
+            200,
+            json!({"object": {"sha": "agent-pushed-1"}}).to_string(),
+        ),
         ("POST", "/repos/acme/payments/git/refs") => (
             422,
             json!({"message": "Reference already exists"}).to_string(),
@@ -122,6 +136,16 @@ async fn engine_admission_provisions_branch_pr_and_target_sha() {
             (200, json!({"object": {"sha": "a41f2c9"}}).to_string())
         }
         ("POST", "/repos/acme/payments/git/refs") => (201, "{}".to_owned()),
+        ("GET", "/repos/acme/payments/git/ref/heads/anvil/payments-refactor/invoice-split") => {
+            (200, json!({"object": {"sha": "a41f2c9"}}).to_string())
+        }
+        ("GET", "/repos/acme/payments/git/commits/a41f2c9") => {
+            (200, json!({"tree": {"sha": "tree-1"}}).to_string())
+        }
+        ("POST", "/repos/acme/payments/git/commits") => (201, json!({"sha": "seed-1"}).to_string()),
+        ("PATCH", "/repos/acme/payments/git/refs/heads/anvil/payments-refactor/invoice-split") => {
+            (200, json!({"object": {"sha": "seed-1"}}).to_string())
+        }
         ("GET", p) if p.starts_with("/repos/acme/payments/pulls?head=") => (200, "[]".to_owned()),
         ("POST", "/repos/acme/payments/pulls") => {
             assert_eq!(body["title"], "invoice split");

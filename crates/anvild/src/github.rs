@@ -54,6 +54,7 @@ impl GithubClient {
             .map_err(|error| GithubError::Auth(error.to_string()))?;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .user_agent(concat!("anvil/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("static reqwest client options are valid");
         Ok(Self {
@@ -180,6 +181,54 @@ impl GithubClient {
         }
     }
 
+    pub async fn seed_commit(
+        &self,
+        repo: &str,
+        branch: &str,
+        base_sha: &str,
+    ) -> Result<(), GithubError> {
+        let commit = self
+            .call(
+                "GET",
+                &format!("/repos/{repo}/git/commits/{base_sha}"),
+                None,
+            )
+            .await?;
+        let tree = commit
+            .get("tree")
+            .and_then(Value::as_object)
+            .and_then(|tree| tree.get("sha"))
+            .and_then(Value::as_str)
+            .ok_or(GithubError::Malformed {
+                field: "commit tree sha",
+            })?;
+        let created = self
+            .call(
+                "POST",
+                &format!("/repos/{repo}/git/commits"),
+                Some(json!({
+                    "message": "anvil: begin",
+                    "tree": tree,
+                    "parents": [base_sha],
+                })),
+            )
+            .await?;
+        let sha = created
+            .get("sha")
+            .and_then(Value::as_str)
+            .ok_or(GithubError::Malformed {
+                field: "created commit sha",
+            })?
+            .to_owned();
+        self.call(
+            "PATCH",
+            &format!("/repos/{repo}/git/refs/heads/{branch}"),
+            Some(json!({"sha": sha})),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn pull(&self, repo: &str, pr_number: i64) -> Result<PullInfo, GithubError> {
         let body = self
             .call("GET", &format!("/repos/{repo}/pulls/{pr_number}"), None)
@@ -251,6 +300,9 @@ impl GithubClient {
         let target_sha = self.resolve_ref(repo, target_ref).await?;
         let branch = branch_name(campaign_slug, commission_slug)?;
         self.create_branch(repo, &branch, &target_sha).await?;
+        if self.resolve_ref(repo, &branch).await? == target_sha {
+            self.seed_commit(repo, &branch, &target_sha).await?;
+        }
         let pr_number = self.open_pr(repo, title, &branch, target_ref, body).await?;
         Ok(Provisioned {
             target_sha,

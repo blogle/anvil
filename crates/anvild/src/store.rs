@@ -481,6 +481,18 @@ impl Store {
         Self::require_row(rows, "turn", &id.to_string())
     }
 
+    pub async fn close_in_flight_turns(&self) -> Result<u64, StoreError> {
+        let rows = sqlx::query("UPDATE turns SET ended_at = ?, result = ? WHERE ended_at IS NULL")
+            .bind(now_millis())
+            .bind(encode_json(&json!({
+                "status": "error",
+                "error": "daemon restarted while the turn was in flight",
+            })))
+            .execute(&self.pool)
+            .await?;
+        Ok(rows.rows_affected())
+    }
+
     pub async fn turns(&self, attempt: AttemptId) -> Result<Vec<Turn>, StoreError> {
         let rows = sqlx::query_as::<_, TurnRow>(
             "SELECT id, attempt_id, prompt_hash, started_at, ended_at, tokens, result
