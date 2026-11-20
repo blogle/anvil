@@ -32,20 +32,26 @@ keygen:
 
 # Onboard the GitHub App and provider credentials from .env into the daemon (daemon must be running)
 auth-onboard:
-    @test -n "${GITHUB_APP_ID:-}"     || { echo "GITHUB_APP_ID missing from .env"; exit 1; }
-    @test -n "${GITHUB_INSTALLATION_ID:-}" || { echo "GITHUB_INSTALLATION_ID missing from .env"; exit 1; }
-    @test -n "${GITHUB_APP_PRIVATE_KEY_FILE:-}" || { echo "GITHUB_APP_PRIVATE_KEY_FILE missing from .env"; exit 1; }
-    @test -f "${GITHUB_APP_PRIVATE_KEY_FILE}"  || { echo "GITHUB_APP_PRIVATE_KEY_FILE does not exist: ${GITHUB_APP_PRIVATE_KEY_FILE}"; exit 1; }
+    #!/usr/bin/env bash
+    set -euo pipefail
+    nix run .#anvil -- inbox >/dev/null 2>&1 || { echo "the daemon is unreachable (start it with: just daemon)"; exit 1; }
+    test -n "${GITHUB_APP_ID:-}" || { echo "GITHUB_APP_ID missing from .env"; exit 1; }
+    test -n "${GITHUB_INSTALLATION_ID:-}" || { echo "GITHUB_INSTALLATION_ID missing from .env"; exit 1; }
+    test -n "${GITHUB_APP_PRIVATE_KEY_FILE:-}" || { echo "GITHUB_APP_PRIVATE_KEY_FILE missing from .env"; exit 1; }
+    key_file="${GITHUB_APP_PRIVATE_KEY_FILE/#"~"/$HOME}"
+    test -f "$key_file" || { echo "GITHUB_APP_PRIVATE_KEY_FILE does not exist: $key_file"; exit 1; }
     nix run .#anvil -- auth add github-app-id --secret "${GITHUB_APP_ID}"
     nix run .#anvil -- auth add github-installation-id --secret "${GITHUB_INSTALLATION_ID}"
-    nix run .#anvil -- auth add github-app-private-key < "${GITHUB_APP_PRIVATE_KEY_FILE}"
-    @for pair in ${PROVIDER_KEYS:-}; do \
-        name="${pair%%=*}"; value="${pair#*=}"; \
-        echo "onboarding ${name}"; \
-        nix run .#anvil -- auth add "${name}" --secret "${value}"; \
+    nix run .#anvil -- auth add github-app-private-key < "$key_file"
+    for pair in ${PROVIDER_KEYS:-}; do
+        name="${pair%%=*}"; value="${pair#*=}"
+        echo "onboarding ${name}"
+        nix run .#anvil -- auth add "$name" --secret "$value"
     done
-    @if test -n "${OPENCODE_AUTH_JSON_FILE:-}"; then \
-        nix run .#anvil -- auth add "opencode-auth:chatgpt" < "${OPENCODE_AUTH_JSON_FILE}"; \
+    if test -n "${OPENCODE_AUTH_JSON_FILE:-}"; then
+        auth_json="${OPENCODE_AUTH_JSON_FILE/#"~"/$HOME}"
+        test -f "$auth_json" || { echo "OPENCODE_AUTH_JSON_FILE does not exist: $auth_json"; exit 1; }
+        nix run .#anvil -- auth add "opencode-auth:chatgpt" < "$auth_json"
     fi
     nix run .#anvil -- auth list
 
