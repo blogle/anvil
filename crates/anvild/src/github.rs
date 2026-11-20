@@ -52,12 +52,16 @@ impl GithubClient {
     ) -> Result<Self, GithubError> {
         let key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
             .map_err(|error| GithubError::Auth(error.to_string()))?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("static reqwest client options are valid");
         Ok(Self {
             api_base: api_base.into(),
             app_id: app_id.into(),
             installation_id,
             key,
-            client: reqwest::Client::new(),
+            client,
             token: Mutex::new(None),
         })
     }
