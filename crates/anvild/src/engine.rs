@@ -508,7 +508,13 @@ impl Engine {
                             json!({"status": "error", "error": error.to_string()}),
                         )
                         .await;
-                    let _ = store.touch_attempt(attempt_id).await;
+                    let _ = store
+                        .end_attempt(
+                            attempt_id,
+                            None,
+                            json!({"error": format!("harness: {error}")}),
+                        )
+                        .await;
                 }
             }
         });
