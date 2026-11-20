@@ -19,6 +19,7 @@ struct Loop {
     engine: Engine,
     scripted: ScriptedHarness,
     workspace: std::path::PathBuf,
+    campaign_id: anvil_api::CampaignId,
     commission_id: anvil_api::CommissionId,
 }
 
@@ -72,6 +73,7 @@ async fn loop_with(
         engine,
         scripted,
         workspace: workspace.join("workspaces").join("invoice-split"),
+        campaign_id,
         commission_id,
     }
 }
@@ -260,6 +262,81 @@ async fn an_env_failed_attempt_halts_the_commission() {
     ));
     let attention = harness.store.open_attention().await.unwrap();
     assert_eq!(attention[0].kind, anvil_api::AttentionKind::EnvFailure);
+}
+
+#[tokio::test]
+async fn a_stale_attempt_without_turns_is_discarded_and_a_fresh_one_starts() {
+    let harness = loop_with(
+        json!({}),
+        vec![receipt("s-1", 1_000), receipt("s-2", 2_000)],
+    )
+    .await;
+    harness
+        .store
+        .insert_attempt(harness.commission_id, &json!({}))
+        .await
+        .unwrap();
+
+    harness.engine.tick().await.unwrap();
+    settle().await;
+    harness.engine.tick().await.unwrap();
+    settle().await;
+
+    let attempts = harness.store.attempts(harness.commission_id).await.unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].outcome.as_ref().unwrap()["stale"], json!(true));
+    assert!(attempts[0].ended_at.is_some());
+    assert!(attempts[1].ended_at.is_none());
+    let received = harness.scripted.received.lock().unwrap().clone();
+    assert_eq!(received.len(), 1);
+}
+
+#[tokio::test]
+async fn a_retry_after_a_harness_failure_starts_a_fresh_attempt() {
+    let harness = loop_with(
+        json!({}),
+        vec![Err(HarnessError::ScriptExhausted), receipt("s-9", 5_000)],
+    )
+    .await;
+    harness.engine.tick().await.unwrap();
+    settle().await;
+    harness.engine.tick().await.unwrap();
+
+    let commission = harness
+        .store
+        .commission(harness.commission_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(commission.state, CommissionState::Failed { .. }));
+
+    let to = anvil_api::CommissionState::Active;
+    let event = anvil_api::NewEvent {
+        kind: anvil_api::EventKind::StateChanged,
+        campaign_id: Some(harness.campaign_id),
+        commission_id: Some(harness.commission_id),
+        payload: json!({"via": "retry"}),
+    };
+    harness
+        .store
+        .transition_commission(harness.commission_id, to, &[event], None)
+        .await
+        .unwrap();
+    harness.engine.tick().await.unwrap();
+    settle().await;
+
+    let attempts = harness.store.attempts(harness.commission_id).await.unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts[1].ended_at.is_none());
+    let received = harness.scripted.received.lock().unwrap().clone();
+    assert_eq!(received.len(), 2);
+    let commission = harness
+        .store
+        .commission(harness.commission_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(commission.state, CommissionState::Active);
 }
 
 #[tokio::test]

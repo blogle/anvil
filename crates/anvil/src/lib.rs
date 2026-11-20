@@ -207,7 +207,7 @@ impl Anvil {
             "POST",
             "/v1/credentials",
             Some(json!({"name": name, "secret": secret})),
-            Some(name),
+            None,
             None,
         )
         .await?;

@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "The sandbox can signal the daemon. Containers run with pasta's host-loopback mapping (10.0.2.2) and the advertised control-plane URL defaults to it — before, anvilctl inside the sandbox pointed at the container's own 127.0.0.1 and every done claim died at the network boundary, reprompting forever. ANVIL_ADVERTISE_URL overrides the default for non-podman setups."
+}

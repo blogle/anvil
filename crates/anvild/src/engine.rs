@@ -33,6 +33,7 @@ pub enum Transition {
     Reopen,
     Merge,
     Retry,
+    Requeue,
     Escalate { reason: String },
     Fail { cause: String },
     Cancel,
@@ -62,6 +63,7 @@ pub fn apply(
         (S::Escalated { .. }, T::Retry) => S::Active,
         (S::Escalated { .. }, T::Cancel) => S::Cancelled,
         (S::Failed { .. }, T::Retry) => S::Active,
+        (S::Failed { .. }, T::Requeue) => S::Pending,
         (S::Failed { .. }, T::Cancel) => S::Cancelled,
         (S::Merged, t) | (S::Cancelled, t) => {
             return Err(IllegalTransition {
@@ -177,12 +179,18 @@ impl Engine {
             let running = attempts.iter().rev().find(|a| a.ended_at.is_none());
             match running {
                 None => {
-                    if attempts
-                        .last()
-                        .and_then(|a| a.outcome.as_ref())
-                        .and_then(|o| o.get("error"))
-                        .is_some()
-                    {
+                    let fresh_error = attempts.last().is_some_and(|attempt| {
+                        let errored = attempt
+                            .outcome
+                            .as_ref()
+                            .and_then(|outcome| outcome.get("error"))
+                            .is_some();
+                        let newer_than_last_change = attempt
+                            .ended_at
+                            .is_some_and(|ended| ended > commission.updated_at);
+                        errored && newer_than_last_change
+                    });
+                    if fresh_error {
                         self.fail_commission(
                             &commission,
                             "environment failure on the last attempt",
@@ -196,7 +204,14 @@ impl Engine {
                 Some(attempt) => {
                     let turns = self.store.turns(attempt.id).await?;
                     let in_flight = turns.last().is_some_and(|t| t.ended_at.is_none());
-                    if in_flight || turns.is_empty() {
+                    if in_flight {
+                        continue;
+                    }
+                    if turns.is_empty() {
+                        let _ = self
+                            .store
+                            .end_attempt(attempt.id, None, json!({"stale": true}))
+                            .await;
                         continue;
                     }
                     if attempt.done_claimed_at.is_some() {
@@ -352,10 +367,15 @@ impl Engine {
 
         let mut env = provider_config.env;
         if let Some(github) = &self.github {
-            let Some(pr_number) = commission.pr_number else {
+            let Some(_pr_number) = commission.pr_number else {
+                self.fail_commission(
+                    commission,
+                    "not provisioned: the commission has no pull request; retry re-provisions",
+                    AttentionKind::EnvFailure,
+                )
+                .await?;
                 return Ok(());
             };
-            let _ = pr_number;
             match github.installation_token().await {
                 Ok(token) => {
                     env.insert("ANVIL_GITHUB_TOKEN".to_owned(), token);
@@ -797,7 +817,9 @@ impl Engine {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    self.tick().await?;
+                    if let Err(error) = self.tick().await {
+                        eprintln!("anvild: engine tick failed: {error}");
+                    }
                 }
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {

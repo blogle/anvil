@@ -502,7 +502,13 @@ async fn commission_action(
     };
     use crate::engine::Transition as T;
     let transition = match request.action.as_str() {
-        "retry" => T::Retry,
+        "retry" => {
+            if commission.pr_number.is_none() {
+                T::Requeue
+            } else {
+                T::Retry
+            }
+        }
         "resume" => T::Resume,
         "takeover" => T::Pause,
         "converge" => T::Converge,
