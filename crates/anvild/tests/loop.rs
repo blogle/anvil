@@ -5,7 +5,7 @@ use anvild::engine::{Engine, EngineConfig};
 use anvild::harness::{Harness, HarnessError, ScriptedHarness, TurnReceipt};
 use anvild::sandbox::SandboxProvider;
 use anvild::store::Store;
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn receipt(session: &str, tokens: i64) -> Result<TurnReceipt, HarnessError> {
     Ok(TurnReceipt {
@@ -195,7 +195,7 @@ async fn a_turn_ending_without_done_reprompts_with_a_gap() {
 }
 
 #[tokio::test]
-async fn a_failed_turn_is_evidence_and_the_loop_continues() {
+async fn a_failed_turn_is_an_env_failure_and_halts_the_commission() {
     let harness = loop_with(
         json!({}),
         vec![Err(HarnessError::ScriptExhausted), receipt("s-2", 3_000)],
@@ -205,22 +205,33 @@ async fn a_failed_turn_is_evidence_and_the_loop_continues() {
     harness.engine.tick().await.unwrap();
     settle().await;
     harness.engine.tick().await.unwrap();
-    settle().await;
 
     let received = harness.scripted.received.lock().unwrap().clone();
-    assert_eq!(received.len(), 2);
+    assert_eq!(received.len(), 1);
     let commission = harness
         .store
         .commission(harness.commission_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(commission.state, CommissionState::Active);
+    assert!(matches!(
+        commission.state,
+        CommissionState::Failed { ref cause } if cause.contains("environment failure")
+    ));
 
     let attempts = harness.store.attempts(harness.commission_id).await.unwrap();
     let turns = harness.store.turns(attempts[0].id).await.unwrap();
-    assert_eq!(turns.len(), 2);
+    assert_eq!(turns.len(), 1);
     assert_eq!(turns[0].result.as_ref().unwrap()["status"], json!("error"));
+    assert!(attempts[0]
+        .outcome
+        .as_ref()
+        .and_then(|o| o.get("error"))
+        .and_then(Value::as_str)
+        .unwrap()
+        .contains("harness:"));
+    let attention = harness.store.open_attention().await.unwrap();
+    assert_eq!(attention[0].kind, anvil_api::AttentionKind::EnvFailure);
 }
 
 #[tokio::test]

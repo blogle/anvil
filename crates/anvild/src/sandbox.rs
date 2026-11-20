@@ -183,7 +183,10 @@ impl PodmanProvider {
 
     async fn await_ready(&self, serve_url: &str) -> Result<(), String> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("static reqwest client options are valid");
         loop {
             if let Ok(response) = client.get(format!("{serve_url}/api/info")).send().await {
                 let status = response.status().as_u16();

@@ -107,9 +107,11 @@ impl Default for OpencodeHarness {
 
 impl OpencodeHarness {
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("static reqwest client options are valid");
+        Self { client }
     }
 
     pub async fn run_turn(

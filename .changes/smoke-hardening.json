@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "The first live daemon smoke wedged a turn forever against an unreachable sandbox. Every HTTP client is now bounded — the harness gets a 30-second connect timeout (no request timeout: long agent turns are streaming and legitimate), the GitHub client a 30-second total timeout, the sandbox readiness probe a 5-second connect timeout. And a harness transport error is now the environment failure it always was: the attempt ends with the error, the commission halts Failed with an EnvFailure attention in the inbox, and anvil retry restarts it — where before the engine reprompted a dead sandbox forever, mistaking infrastructure for evidence."
+}
