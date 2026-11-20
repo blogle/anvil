@@ -25,6 +25,12 @@ rewrite that supersedes the incumbent; it develops on `origin/main` of
    through the Mergify queue; `main` receives only checked squash merges.
    Releases wait for milestone completion — the first release (v0.3.0,
    numbering from the incumbent's surviving tags) ships a working M1 loop.
+8. **Operator-local files are sacred.** `.env`, `~/.local/state/anvil/`,
+   credentials, and any key or PEM file on the host belong to the operator.
+   Never delete, overwrite, or reset them without an explicit instruction to
+   do so. Tests and smokes use their own scratch state — when a run needs
+   isolation, point it at a fresh directory (own `--db`, own `.env`) instead
+   of clearing the operator's.
 
 ## Commands
 

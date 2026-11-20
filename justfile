@@ -35,9 +35,9 @@ auth-onboard:
     #!/usr/bin/env bash
     set -euo pipefail
     nix run .#anvil -- inbox >/dev/null 2>&1 || { echo "the daemon is unreachable (start it with: just daemon)"; exit 1; }
-    test -n "${GITHUB_APP_ID:-}" || { echo "GITHUB_APP_ID missing from .env"; exit 1; }
-    test -n "${GITHUB_INSTALLATION_ID:-}" || { echo "GITHUB_INSTALLATION_ID missing from .env"; exit 1; }
-    test -n "${GITHUB_APP_PRIVATE_KEY_FILE:-}" || { echo "GITHUB_APP_PRIVATE_KEY_FILE missing from .env"; exit 1; }
+    test -n "${GITHUB_APP_ID:-}" || { echo "GITHUB_APP_ID missing from .env (cp .env.example .env and fill it in)"; exit 1; }
+    test -n "${GITHUB_INSTALLATION_ID:-}" || { echo "GITHUB_INSTALLATION_ID missing from .env (cp .env.example .env and fill it in)"; exit 1; }
+    test -n "${GITHUB_APP_PRIVATE_KEY_FILE:-}" || { echo "GITHUB_APP_PRIVATE_KEY_FILE missing from .env (cp .env.example .env and fill it in)"; exit 1; }
     key_file="${GITHUB_APP_PRIVATE_KEY_FILE/#"~"/$HOME}"
     test -f "$key_file" || { echo "GITHUB_APP_PRIVATE_KEY_FILE does not exist: $key_file"; exit 1; }
     nix run .#anvil -- auth add github-app-id --secret "${GITHUB_APP_ID}"
