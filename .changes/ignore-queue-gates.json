@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "Queue-gate checks are no longer agent gaps. A repo's merge-queue policy (Mergify protections requiring the operator's merge label) fails every agent PR by design; the loop kept reprompting the agent to fix a check it must not touch, and the new gap tripwire correctly escalated — but convergence should hinge on the real CI, not the queue gate. The strategy gained ignore_checks: excluded names count for neither gaps nor the pending hold; they still render in live state for the operator's eye. Pair with verify_cmd set to the repo's admission command so agents run the real gate before claiming done."
+}

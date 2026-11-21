@@ -16,6 +16,7 @@ pub struct DefaultStrategy {
     pub verify_cmd: Option<String>,
     pub turn_timeout_secs: Option<u64>,
     pub session_tokens: i64,
+    pub ignore_checks: Vec<String>,
 }
 
 pub const DEFAULT_SESSION_TOKENS: i64 = 400_000;
@@ -27,6 +28,7 @@ impl Default for DefaultStrategy {
             verify_cmd: None,
             turn_timeout_secs: None,
             session_tokens: DEFAULT_SESSION_TOKENS,
+            ignore_checks: Vec::new(),
         }
     }
 }
@@ -101,11 +103,26 @@ pub fn parse(config: &Value) -> Result<DefaultStrategy, StrategyError> {
             })
         }
     };
+    let ignore_checks = match fields.get("ignore_checks") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(raw)) => raw
+            .iter()
+            .map(|entry| entry.as_str().unwrap_or_default().to_owned())
+            .filter(|entry| !entry.is_empty())
+            .collect(),
+        Some(other) => {
+            return Err(StrategyError::Invalid {
+                field: "ignore_checks",
+                value: other.to_string(),
+            })
+        }
+    };
     Ok(DefaultStrategy {
         session,
         verify_cmd,
         turn_timeout_secs,
         session_tokens,
+        ignore_checks,
     })
 }
 
@@ -221,8 +238,12 @@ impl DefaultStrategy {
     }
 
     pub fn evaluate(&self, external: &ExternalState) -> Verdict {
-        let gaps: Vec<String> = external
+        let checks: Vec<&anvil_api::CheckStatus> = external
             .checks
+            .iter()
+            .filter(|check| !self.ignore_checks.iter().any(|name| name == &check.name))
+            .collect();
+        let gaps: Vec<String> = checks
             .iter()
             .filter(|check| check.conclusion == CheckConclusion::Fail)
             .map(|check| format!("check failed: {}", check.name))
@@ -230,8 +251,7 @@ impl DefaultStrategy {
         if !gaps.is_empty() {
             return Verdict::Continue { gaps };
         }
-        if external
-            .checks
+        if checks
             .iter()
             .any(|check| check.conclusion == CheckConclusion::Pending)
         {
