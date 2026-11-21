@@ -74,22 +74,22 @@ fn parse_reads_budget_watchdog_and_session_knobs() {
 
     assert!(matches!(
         parse(&json!({"turn_timeout_secs": 0})).unwrap_err(),
-        StrategyError::Invalid { field: "turn_timeout_secs", .. }
-    ));
-    assert!(matches!(
-        parse(&json!({"session_tokens": "much"})).unwrap_err(),
-        StrategyError::Invalid { field: "session_tokens", .. }
-    ));
-    assert!(matches!(
-        parse(&json!({"ignore_checks": "nope"})).unwrap_err(),
-        StrategyError::Invalid { field: "ignore_checks", .. }
-    ));
-}
+        StrategyError::Invalid {
+            field: "turn_timeout_secs",
+            ..
+        }
     ));
     assert!(matches!(
         parse(&json!({"session_tokens": "much"})).unwrap_err(),
         StrategyError::Invalid {
             field: "session_tokens",
+            ..
+        }
+    ));
+    assert!(matches!(
+        parse(&json!({"ignore_checks": "nope"})).unwrap_err(),
+        StrategyError::Invalid {
+            field: "ignore_checks",
             ..
         }
     ));
