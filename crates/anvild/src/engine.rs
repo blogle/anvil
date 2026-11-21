@@ -527,8 +527,15 @@ impl Engine {
 
         let turn_id = self.store.insert_turn(attempt.id, &prompt_hash).await?;
 
+        let sandbox_name = format!("anvil-{}-{}-a{}", campaign.slug, commission.slug, attempt.n);
+        let previous_name = format!(
+            "anvil-{}-{}-a{}",
+            campaign.slug,
+            commission.slug,
+            attempt.n.saturating_sub(1)
+        );
         let spec = SandboxSpec {
-            name: format!("anvil-{}-{}", campaign.slug, commission.slug),
+            name: sandbox_name.clone(),
             image: self.config.sandbox_image.clone(),
             workspace: self
                 .config
@@ -543,7 +550,11 @@ impl Engine {
         let sandbox = Arc::clone(self.sandbox.as_ref().expect("checked in drive"));
         let harness = Arc::clone(self.harness.as_ref().expect("checked in drive"));
         let attempt_id = attempt.id;
+        let attempt_n = attempt.n;
         tokio::spawn(async move {
+            if attempt_n > 1 {
+                let _ = sandbox.destroy(&previous_name).await;
+            }
             let handle = match sandbox.handle(&spec.name).await {
                 Ok(Some(handle)) => handle,
                 Ok(None) => match sandbox.start(&spec).await {
