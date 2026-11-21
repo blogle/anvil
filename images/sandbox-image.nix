@@ -27,6 +27,7 @@ let
         clone "''${ANVIL_REPO_URL}" /workspace/repo
     fi
     cd /workspace/repo
+    git fetch origin "''${ANVIL_TARGET_REF}" 2>/dev/null || true
     git fetch origin "''${ANVIL_REPO_BRANCH}" 2>/dev/null || true
     if ! git checkout "$ANVIL_REPO_BRANCH" 2>/dev/null; then
       if git rev-parse --verify -q "origin/$ANVIL_REPO_BRANCH" >/dev/null; then
