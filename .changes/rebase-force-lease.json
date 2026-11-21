@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "The rebase instruction now says how to push it. The prompt told the agent to push to its work branch and never rewrite the target - but a rebased work branch needs a force-push to its own remote, and an agent reading 'never rewrite' conservatively pushes plain, gets rejected against its own earlier commits, and repeats the rebase gap until the tripwire stops it. The instructions now scope the rule: the work branch is yours to rewrite (--force-with-lease), the target ref is not."
+}

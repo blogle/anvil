@@ -216,6 +216,10 @@ impl DefaultStrategy {
         );
         let _ = writeln!(
             out,
+            "- after rebasing, push the work branch with --force-with-lease; the work branch is yours to rewrite, the target ref is not"
+        );
+        let _ = writeln!(
+            out,
             "- when the obligations are met: `anvilctl done --notes <summary>`"
         );
         let _ = writeln!(
