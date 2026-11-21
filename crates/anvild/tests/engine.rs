@@ -78,7 +78,7 @@ async fn terminal_commission_sandbox_is_destroyed_once_and_logged() {
     let sandbox = Arc::new(SandboxProvider::Memory(Default::default()));
     sandbox
         .start(&SandboxSpec {
-            name: "anvil-payments-invoice-1-a1".to_owned(),
+            name: "anvil-payments-invoice-1".to_owned(),
             image: "anvil-sandbox:latest".to_owned(),
             workspace: _dir.path().join(PathBuf::from("workspace")),
             files: BTreeMap::new(),
@@ -90,7 +90,7 @@ async fn terminal_commission_sandbox_is_destroyed_once_and_logged() {
 
     engine.tick().await.unwrap();
     assert!(!sandbox
-        .is_running("anvil-payments-invoice-1-a1")
+        .is_running("anvil-payments-invoice-1")
         .await
         .unwrap());
     let events = store.events_since(0, 100).await.unwrap();

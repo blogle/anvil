@@ -176,14 +176,8 @@ impl Engine {
             let Some(campaign) = self.store.campaign(commission.campaign_id).await? else {
                 continue;
             };
-            let base_name = format!("anvil-{}-{}", campaign.slug, commission.slug);
-            let mut names = vec![base_name.clone()];
-            for attempt in self.store.attempts(commission.id).await? {
-                names.push(format!("{base_name}-a{}", attempt.n));
-            }
-            for name in &names {
-                sandbox.destroy(name).await?;
-            }
+            let name = format!("anvil-{}-{}", campaign.slug, commission.slug);
+            sandbox.destroy(&name).await?;
             self.store
                 .mark_sandbox_destroyed(
                     commission.id,
@@ -191,7 +185,7 @@ impl Engine {
                         kind: EventKind::SandboxDestroyed,
                         campaign_id: Some(commission.campaign_id),
                         commission_id: Some(commission.id),
-                        payload: json!({"names": names}),
+                        payload: json!({"name": name}),
                     },
                 )
                 .await?;
@@ -563,13 +557,7 @@ impl Engine {
 
         let turn_id = self.store.insert_turn(attempt.id, &prompt_hash).await?;
 
-        let sandbox_name = format!("anvil-{}-{}-a{}", campaign.slug, commission.slug, attempt.n);
-        let previous_name = format!(
-            "anvil-{}-{}-a{}",
-            campaign.slug,
-            commission.slug,
-            attempt.n.saturating_sub(1)
-        );
+        let sandbox_name = format!("anvil-{}-{}", campaign.slug, commission.slug);
         let spec = SandboxSpec {
             name: sandbox_name.clone(),
             image: self.config.sandbox_image.clone(),
@@ -586,11 +574,7 @@ impl Engine {
         let sandbox = Arc::clone(self.sandbox.as_ref().expect("checked in drive"));
         let harness = Arc::clone(self.harness.as_ref().expect("checked in drive"));
         let attempt_id = attempt.id;
-        let attempt_n = attempt.n;
         tokio::spawn(async move {
-            if attempt_n > 1 {
-                let _ = sandbox.destroy(&previous_name).await;
-            }
             let handle = match sandbox.handle(&spec.name).await {
                 Ok(Some(handle)) => handle,
                 Ok(None) => match sandbox.start(&spec).await {
