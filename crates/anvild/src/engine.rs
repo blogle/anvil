@@ -919,6 +919,13 @@ impl Engine {
         reason: &str,
         payload: Value,
     ) -> Result<(), EngineError> {
+        let attempts = self.store.attempts(commission.id).await?;
+        if let Some(running) = attempts.iter().rev().find(|a| a.ended_at.is_none()) {
+            let _ = self
+                .store
+                .end_attempt(running.id, None, json!({"escalated": reason}))
+                .await;
+        }
         let to = apply(
             &commission.state,
             Transition::Escalate {
