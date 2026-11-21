@@ -1,7 +1,11 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anvil_api::{AttentionKind, CommissionState, EventKind, NewCampaign, NewCommission};
 use anvild::engine::{apply, Engine, EngineConfig, Transition};
+use anvild::sandbox::{SandboxProvider, SandboxSpec};
 use anvild::store::Store;
 use serde_json::json;
 
@@ -52,6 +56,147 @@ fn engine(store: &Store, heartbeat_timeout: Duration, turn_timeout: Duration) ->
             ..EngineConfig::default()
         },
     )
+}
+
+#[tokio::test]
+async fn terminal_commission_sandbox_is_destroyed_once_and_logged() {
+    let (store, _dir) = temp_store().await;
+    let campaign_id = store.insert_campaign(campaign("payments")).await.unwrap();
+    let commission_id = store
+        .insert_commission(commission(campaign_id, 1))
+        .await
+        .unwrap();
+    store
+        .set_commission_state(commission_id, CommissionState::Cancelled)
+        .await
+        .unwrap();
+
+    let sandbox = Arc::new(SandboxProvider::Memory(Default::default()));
+    sandbox
+        .start(&SandboxSpec {
+            name: "anvil-payments-invoice-1".to_owned(),
+            image: "anvil-sandbox:latest".to_owned(),
+            workspace: _dir.path().join(PathBuf::from("workspace")),
+            files: BTreeMap::new(),
+            env: BTreeMap::new(),
+        })
+        .await
+        .unwrap();
+    let engine = engine(&store, mins(30), hrs(2)).with_sandbox(sandbox.clone());
+
+    engine.tick().await.unwrap();
+    assert!(!sandbox
+        .is_running("anvil-payments-invoice-1")
+        .await
+        .unwrap());
+    let events = store.events_since(0, 100).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == EventKind::SandboxDestroyed)
+            .count(),
+        1
+    );
+
+    engine.tick().await.unwrap();
+    let events = store.events_since(0, 100).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == EventKind::SandboxDestroyed)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn only_cancelled_and_merged_commissions_are_torn_down() {
+    let (store, dir) = temp_store().await;
+    let campaign_id = store.insert_campaign(campaign("payments")).await.unwrap();
+    let cancelled = store
+        .insert_commission(commission(campaign_id, 1))
+        .await
+        .unwrap();
+    let merged = store
+        .insert_commission(commission(campaign_id, 2))
+        .await
+        .unwrap();
+    let failed = store
+        .insert_commission(commission(campaign_id, 3))
+        .await
+        .unwrap();
+    let escalated = store
+        .insert_commission(commission(campaign_id, 4))
+        .await
+        .unwrap();
+    store
+        .set_commission_state(cancelled, CommissionState::Cancelled)
+        .await
+        .unwrap();
+    store
+        .set_commission_state(merged, CommissionState::Merged)
+        .await
+        .unwrap();
+    store
+        .set_commission_state(
+            failed,
+            CommissionState::Failed {
+                cause: "test".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .set_commission_state(
+            escalated,
+            CommissionState::Escalated {
+                reason: "test".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let sandbox = Arc::new(SandboxProvider::Memory(Default::default()));
+    for (name, index) in [
+        ("anvil-payments-invoice-1", 1),
+        ("anvil-payments-invoice-2", 2),
+        ("anvil-payments-invoice-3", 3),
+        ("anvil-payments-invoice-4", 4),
+    ] {
+        sandbox
+            .start(&SandboxSpec {
+                name: name.to_owned(),
+                image: "anvil-sandbox:latest".to_owned(),
+                workspace: dir.path().join(format!("workspace-{index}")),
+                files: BTreeMap::new(),
+                env: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    engine(&store, mins(30), hrs(2))
+        .with_sandbox(sandbox.clone())
+        .tick()
+        .await
+        .unwrap();
+
+    assert!(!sandbox
+        .is_running("anvil-payments-invoice-1")
+        .await
+        .unwrap());
+    assert!(!sandbox
+        .is_running("anvil-payments-invoice-2")
+        .await
+        .unwrap());
+    assert!(sandbox
+        .is_running("anvil-payments-invoice-3")
+        .await
+        .unwrap());
+    assert!(sandbox
+        .is_running("anvil-payments-invoice-4")
+        .await
+        .unwrap());
 }
 
 #[test]

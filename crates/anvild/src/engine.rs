@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use tokio::sync::watch;
 
 use crate::github::{pr_body, GithubClient, GithubError};
 use crate::harness::{materialize_provider_config, Harness};
-use crate::sandbox::{SandboxProvider, SandboxSpec};
+use crate::sandbox::{SandboxError, SandboxProvider, SandboxSpec};
 use crate::store::{Store, StoreError};
 use crate::strategy::{self, SessionContinuity};
 
@@ -117,6 +118,8 @@ pub enum EngineError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Illegal(#[from] IllegalTransition),
+    #[error(transparent)]
+    Sandbox(#[from] SandboxError),
 }
 
 pub struct Engine {
@@ -125,6 +128,7 @@ pub struct Engine {
     github: Option<GithubClient>,
     sandbox: Option<Arc<SandboxProvider>>,
     harness: Option<Arc<Harness>>,
+    terminal_sweep_at: AtomicI64,
 }
 
 impl Engine {
@@ -135,6 +139,7 @@ impl Engine {
             github: None,
             sandbox: None,
             harness: None,
+            terminal_sweep_at: AtomicI64::new(0),
         }
     }
 
@@ -159,8 +164,37 @@ impl Engine {
         self.escalate_stalled_attempts(&mut report).await?;
         self.escalate_stalled_turns(&mut report).await?;
         self.escalate_exhausted_commissions(&mut report).await?;
+        self.teardown_terminal_sandboxes().await?;
         self.drive_active_commissions(&mut report).await?;
         Ok(report)
+    }
+
+    async fn teardown_terminal_sandboxes(&self) -> Result<(), EngineError> {
+        let Some(sandbox) = &self.sandbox else {
+            return Ok(());
+        };
+
+        let since = self.terminal_sweep_at.load(Ordering::Acquire);
+        let sweep_started = now_millis();
+        let commissions = self.store.terminal_commissions_updated_since(since).await?;
+        for commission in commissions {
+            let Some(campaign) = self.store.campaign(commission.campaign_id).await? else {
+                continue;
+            };
+            let name = format!("anvil-{}-{}", campaign.slug, commission.slug);
+            sandbox.destroy(&name).await?;
+            self.store
+                .append_events(&[NewEvent {
+                    kind: EventKind::SandboxDestroyed,
+                    campaign_id: Some(commission.campaign_id),
+                    commission_id: Some(commission.id),
+                    payload: json!({"name": name}),
+                }])
+                .await?;
+        }
+        self.terminal_sweep_at
+            .store(sweep_started, Ordering::Release);
+        Ok(())
     }
 
     async fn drive_active_commissions(&self, report: &mut TickReport) -> Result<(), EngineError> {
@@ -982,6 +1016,10 @@ fn is_terminal(state: &CommissionState) -> bool {
 fn is_stale(at: OffsetDateTime, timeout: Duration) -> bool {
     let now = OffsetDateTime::now_utc();
     now - at >= time::Duration::try_from(timeout).unwrap_or(time::Duration::MAX)
+}
+
+fn now_millis() -> i64 {
+    OffsetDateTime::now_utc().unix_timestamp_nanos() as i64 / 1_000_000
 }
 
 fn budget_attempts(budget: &Value) -> Option<i64> {

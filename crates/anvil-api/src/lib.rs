@@ -235,6 +235,7 @@ pub enum EventKind {
     AttentionRaised,
     AttentionDismissed,
     ObligationMutated,
+    SandboxDestroyed,
 }
 
 impl EventKind {
@@ -253,6 +254,7 @@ impl EventKind {
             Self::AttentionRaised => "attention-raised",
             Self::AttentionDismissed => "attention-dismissed",
             Self::ObligationMutated => "obligation-mutated",
+            Self::SandboxDestroyed => "sandbox-destroyed",
         }
     }
 
@@ -271,6 +273,7 @@ impl EventKind {
             "attention-raised" => Self::AttentionRaised,
             "attention-dismissed" => Self::AttentionDismissed,
             "obligation-mutated" => Self::ObligationMutated,
+            "sandbox-destroyed" => Self::SandboxDestroyed,
             _ => return None,
         })
     }

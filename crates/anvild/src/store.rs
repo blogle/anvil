@@ -168,8 +168,27 @@ impl Store {
     ) -> Result<Vec<Commission>, StoreError> {
         let rows = sqlx::query_as::<_, CommissionRow>(
             "SELECT id, campaign_id, title, slug, spec, repo, target_ref, target_sha, wave,
-                    state, state_detail, budget, strategy, branch, pr_number, created_at, updated_at
+                     state, state_detail, budget, strategy, branch, pr_number, created_at, updated_at
              FROM commissions WHERE updated_at > ? ORDER BY updated_at, slug",
+        )
+        .bind(since_millis)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(CommissionRow::into_commission)
+            .collect()
+    }
+
+    pub async fn terminal_commissions_updated_since(
+        &self,
+        since_millis: i64,
+    ) -> Result<Vec<Commission>, StoreError> {
+        let rows = sqlx::query_as::<_, CommissionRow>(
+            "SELECT id, campaign_id, title, slug, spec, repo, target_ref, target_sha, wave,
+                    state, state_detail, budget, strategy, branch, pr_number, created_at, updated_at
+             FROM commissions
+             WHERE updated_at > ? AND state IN ('cancelled', 'merged')
+             ORDER BY updated_at, slug",
         )
         .bind(since_millis)
         .fetch_all(&self.pool)

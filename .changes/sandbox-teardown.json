@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "Destroy commission sandboxes when commissions are cancelled or merged."
+}
