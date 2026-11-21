@@ -456,6 +456,7 @@ impl SseLines {
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::status_view;
