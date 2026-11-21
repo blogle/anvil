@@ -27,9 +27,15 @@ let
         clone "''${ANVIL_REPO_URL}" /workspace/repo
     fi
     cd /workspace/repo
+    git fetch origin "''${ANVIL_REPO_BRANCH}" 2>/dev/null || true
     if ! git checkout "$ANVIL_REPO_BRANCH" 2>/dev/null; then
-      git checkout -b "$ANVIL_REPO_BRANCH" "origin/$ANVIL_TARGET_REF"
+      if git rev-parse --verify -q "origin/$ANVIL_REPO_BRANCH" >/dev/null; then
+        git checkout -b "$ANVIL_REPO_BRANCH" "origin/$ANVIL_REPO_BRANCH"
+      else
+        git checkout -b "$ANVIL_REPO_BRANCH" "origin/$ANVIL_TARGET_REF"
+      fi
     fi
+    git branch --set-upstream-to="origin/$ANVIL_REPO_BRANCH" "$ANVIL_REPO_BRANCH" 2>/dev/null || true
     exec /bin/opencode serve --hostname 0.0.0.0 --port "''${ANVIL_SERVE_PORT:-4096}"
   '';
 

@@ -616,6 +616,7 @@ impl Engine {
                 checks: Vec::new(),
                 mergeable: true,
                 head_moved: false,
+                work_present: true,
             }),
             Some(github) => {
                 let pr_number = commission.pr_number?;

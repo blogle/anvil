@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "The work must actually land. The sandbox entrypoint now points the work branch's upstream at its own remote branch - it was tracking the target, so the agent's natural git push targeted protected main, failed, and the commission claimed done with its work stranded locally while the PR showed an empty diff running green CI on the seed commit alone. And convergence now requires the PR to contain work: evaluation reads the PR's commits and refuses to converge - with an explicit push gap - until something beyond the anvil: begin seed has been pushed. A workless PR can no longer ride its seed's green checks into needs-review."
+}
