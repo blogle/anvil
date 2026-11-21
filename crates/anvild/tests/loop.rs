@@ -525,6 +525,64 @@ async fn an_attempt_with_an_in_flight_turn_is_not_heartbeat_stalled() {
 }
 
 #[tokio::test]
+async fn an_operator_retry_resets_the_gap_tripwire() {
+    let harness = loop_with(
+        json!({}),
+        vec![
+            receipt("s-1", 1_000),
+            receipt("s-2", 1_000),
+            receipt("s-3", 1_000),
+            receipt("s-4", 1_000),
+        ],
+    )
+    .await;
+    for _ in 0..5 {
+        harness.engine.tick().await.unwrap();
+        settle().await;
+    }
+    let commission = harness
+        .store
+        .commission(harness.commission_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        commission.state,
+        CommissionState::Escalated { .. }
+    ));
+
+    let event = anvil_api::NewEvent {
+        kind: anvil_api::EventKind::StateChanged,
+        campaign_id: Some(harness.campaign_id),
+        commission_id: Some(harness.commission_id),
+        payload: json!({"via": "retry"}),
+    };
+    harness
+        .store
+        .transition_commission(
+            harness.commission_id,
+            anvil_api::CommissionState::Active,
+            &[event],
+            None,
+        )
+        .await
+        .unwrap();
+
+    harness.engine.tick().await.unwrap();
+    settle().await;
+
+    let received = harness.scripted.received.lock().unwrap().clone();
+    assert_eq!(received.len(), 4, "the retried attempt earns fresh gaps");
+    let commission = harness
+        .store
+        .commission(harness.commission_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(commission.state, CommissionState::Active);
+}
+
+#[tokio::test]
 async fn continuous_sessions_reuse_the_last_turn_session() {
     let harness = loop_with(
         json!({"session": "continuous"}),

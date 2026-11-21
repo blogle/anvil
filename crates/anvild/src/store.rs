@@ -532,15 +532,17 @@ impl Store {
         &self,
         commission: CommissionId,
         kind: &str,
+        since: i64,
         limit: i64,
     ) -> Result<Vec<Value>, StoreError> {
         let rows = sqlx::query_scalar::<_, Option<String>>(
             "SELECT payload FROM events
-             WHERE commission_id = ? AND kind = ?
+             WHERE commission_id = ? AND kind = ? AND at > ?
              ORDER BY seq DESC LIMIT ?",
         )
         .bind(commission.to_string())
         .bind(kind)
+        .bind(since)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
