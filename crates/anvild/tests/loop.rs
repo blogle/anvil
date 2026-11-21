@@ -583,6 +583,68 @@ async fn an_operator_retry_resets_the_gap_tripwire() {
 }
 
 #[tokio::test]
+async fn escalation_ends_the_running_attempt_so_retry_starts_a_fresh_one() {
+    let harness = loop_with(
+        json!({}),
+        vec![
+            receipt("s-1", 1_000),
+            receipt("s-2", 1_000),
+            receipt("s-3", 1_000),
+            receipt("s-4", 1_000),
+        ],
+    )
+    .await;
+    harness
+        .store
+        .set_commission_budget(harness.commission_id, &json!({"turns": 1}))
+        .await
+        .unwrap();
+
+    harness.engine.tick().await.unwrap();
+    settle().await;
+    harness.engine.tick().await.unwrap();
+
+    let attempts = harness.store.attempts(harness.commission_id).await.unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].outcome.as_ref().unwrap()["escalated"],
+        json!("turn budget exhausted")
+    );
+    assert!(attempts[0].ended_at.is_some());
+
+    let event = anvil_api::NewEvent {
+        kind: anvil_api::EventKind::StateChanged,
+        campaign_id: Some(harness.campaign_id),
+        commission_id: Some(harness.commission_id),
+        payload: json!({"via": "retry"}),
+    };
+    harness
+        .store
+        .transition_commission(
+            harness.commission_id,
+            anvil_api::CommissionState::Active,
+            &[event],
+            None,
+        )
+        .await
+        .unwrap();
+
+    harness.engine.tick().await.unwrap();
+    settle().await;
+
+    let attempts = harness.store.attempts(harness.commission_id).await.unwrap();
+    assert_eq!(attempts.len(), 2, "the retry runs a fresh attempt");
+    assert!(attempts[1].ended_at.is_none());
+    let commission = harness
+        .store
+        .commission(harness.commission_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(commission.state, CommissionState::Active);
+}
+
+#[tokio::test]
 async fn continuous_sessions_reuse_the_last_turn_session() {
     let harness = loop_with(
         json!({"session": "continuous"}),
