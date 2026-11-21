@@ -1,6 +1,7 @@
 use anvil_api::{CheckConclusion, CheckStatus, ExternalState, TurnContext, Verdict};
 use anvild::strategy::{
     parse, prompt_hash, resolve, DefaultStrategy, SessionContinuity, StrategyError,
+    DEFAULT_SESSION_TOKENS,
 };
 use serde_json::json;
 
@@ -43,8 +44,10 @@ fn parse_defaults_when_config_is_empty() {
     assert_eq!(
         parse(&json!(null)).unwrap(),
         DefaultStrategy {
-            session: SessionContinuity::Fresh,
+            session: SessionContinuity::Continuous,
             verify_cmd: None,
+            turn_timeout_secs: None,
+            session_tokens: DEFAULT_SESSION_TOKENS,
         }
     );
     assert_eq!(parse(&json!({})).unwrap(), DefaultStrategy::default());
@@ -52,6 +55,34 @@ fn parse_defaults_when_config_is_empty() {
         parse(&json!({"name": "default"})).unwrap(),
         DefaultStrategy::default()
     );
+}
+
+#[test]
+fn parse_reads_budget_watchdog_and_session_knobs() {
+    let strategy = parse(&json!({
+        "session": "fresh",
+        "turn_timeout_secs": 300,
+        "session_tokens": 50_000,
+    }))
+    .unwrap();
+    assert_eq!(strategy.session, SessionContinuity::Fresh);
+    assert_eq!(strategy.turn_timeout_secs, Some(300));
+    assert_eq!(strategy.session_tokens, 50_000);
+
+    assert!(matches!(
+        parse(&json!({"turn_timeout_secs": 0})).unwrap_err(),
+        StrategyError::Invalid {
+            field: "turn_timeout_secs",
+            ..
+        }
+    ));
+    assert!(matches!(
+        parse(&json!({"session_tokens": "much"})).unwrap_err(),
+        StrategyError::Invalid {
+            field: "session_tokens",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -150,6 +181,8 @@ fn compose_turn_renders_head_movement_and_verify_cmd() {
     let strategy = DefaultStrategy {
         session: SessionContinuity::Fresh,
         verify_cmd: Some("just ci-check".to_owned()),
+        turn_timeout_secs: None,
+        session_tokens: DEFAULT_SESSION_TOKENS,
     };
     let prompt = strategy.compose_turn(&context);
     assert!(prompt.contains("- target head moved since admission: rebase onto the new head"));

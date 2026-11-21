@@ -154,11 +154,20 @@ impl Anvil {
         Ok(response.json().await?)
     }
 
-    pub async fn action(&self, commission: &str, action: &str) -> Result<(), AnvilError> {
+    pub async fn action(
+        &self,
+        commission: &str,
+        action: &str,
+        model: Option<&str>,
+    ) -> Result<(), AnvilError> {
+        let mut body = json!({"action": action});
+        if let Some(model) = model {
+            body["model"] = json!(model);
+        }
         self.send(
             "POST",
             &format!("/v1/commissions/{commission}"),
-            Some(json!({"action": action})),
+            Some(body),
             None,
             None,
         )

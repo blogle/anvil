@@ -97,7 +97,7 @@ impl Default for EngineConfig {
         Self {
             tick_interval: Duration::from_secs(10),
             heartbeat_timeout: Duration::from_secs(30 * 60),
-            turn_timeout: Duration::from_secs(2 * 60 * 60),
+            turn_timeout: Duration::from_secs(15 * 60),
             state_dir: PathBuf::from(format!("{home}/.local/state/anvil")),
             daemon_url: "http://127.0.0.1:8788".to_owned(),
             sandbox_image: "anvil-sandbox:latest".to_owned(),
@@ -159,11 +159,11 @@ impl Engine {
         self.escalate_stalled_attempts(&mut report).await?;
         self.escalate_stalled_turns(&mut report).await?;
         self.escalate_exhausted_commissions(&mut report).await?;
-        self.drive_active_commissions().await?;
+        self.drive_active_commissions(&mut report).await?;
         Ok(report)
     }
 
-    async fn drive_active_commissions(&self) -> Result<(), EngineError> {
+    async fn drive_active_commissions(&self, report: &mut TickReport) -> Result<(), EngineError> {
         if self.harness.is_none() || self.sandbox.is_none() {
             return Ok(());
         }
@@ -175,6 +175,20 @@ impl Engine {
             let Some(campaign) = self.store.campaign(commission.campaign_id).await? else {
                 continue;
             };
+            if let Some(max_tokens) = budget_tokens(&commission.budget, &campaign.strategy) {
+                let spent = self.store.commission_tokens_spent(commission.id).await?;
+                if spent >= max_tokens {
+                    self.escalate(
+                        &commission,
+                        AttentionKind::BudgetExhausted,
+                        "token budget exhausted",
+                        json!({"tokens": spent, "max_tokens": max_tokens}),
+                    )
+                    .await?;
+                    report.escalated += 1;
+                    continue;
+                }
+            }
             let attempts = self.store.attempts(commission.id).await?;
             let running = attempts.iter().rev().find(|a| a.ended_at.is_none());
             match running {
@@ -214,10 +228,36 @@ impl Engine {
                             .await;
                         continue;
                     }
+                    if let Some(max_turns) = budget_turns(&commission.budget) {
+                        if turns.len() as i64 >= max_turns {
+                            self.escalate(
+                                &commission,
+                                AttentionKind::BudgetExhausted,
+                                "turn budget exhausted",
+                                json!({"turns": turns.len(), "max_turns": max_turns}),
+                            )
+                            .await?;
+                            report.escalated += 1;
+                            continue;
+                        }
+                    }
                     if attempt.done_claimed_at.is_some() {
                         self.evaluate_claim(&campaign, &commission, attempt).await?;
                     } else {
                         let gaps = vec!["the previous turn ended without claiming done".to_owned()];
+                        self.store
+                            .append_events(&[NewEvent {
+                                kind: EventKind::GapDetected,
+                                campaign_id: Some(campaign.id),
+                                commission_id: Some(commission.id),
+                                payload: json!({"gaps": gaps, "via": "not-done reprompt"}),
+                            }])
+                            .await?;
+                        if self.gap_loop_burned(&commission, &gaps).await? {
+                            self.escalate_gap_loop(&commission, &gaps).await?;
+                            report.escalated += 1;
+                            continue;
+                        }
                         self.spawn_turn(&campaign, &commission, attempt, gaps)
                             .await?;
                     }
@@ -306,9 +346,13 @@ impl Engine {
                         kind: EventKind::GapDetected,
                         campaign_id: Some(campaign.id),
                         commission_id: Some(commission.id),
-                        payload: json!({"gaps": gaps}),
+                        payload: json!({"gaps": gaps, "via": "evaluation"}),
                     }])
                     .await?;
+                if self.gap_loop_burned(commission, &gaps).await? {
+                    self.escalate_gap_loop(commission, &gaps).await?;
+                    return Ok(());
+                }
                 self.spawn_turn(campaign, commission, attempt, gaps).await?;
             }
             Verdict::Pending => {}
@@ -423,6 +467,43 @@ impl Engine {
             .map(|o| o.text)
             .collect();
 
+        let turns = self.store.turns(attempt.id).await?;
+        let session = match parsed.session {
+            SessionContinuity::Fresh => None,
+            SessionContinuity::Continuous => turns
+                .iter()
+                .rev()
+                .find_map(|t| t.result.as_ref())
+                .and_then(|result| result.get("session"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .filter(|session| {
+                    let spent: i64 = turns
+                        .iter()
+                        .filter(|t| {
+                            t.result
+                                .as_ref()
+                                .and_then(|result| result.get("session"))
+                                .and_then(Value::as_str)
+                                == Some(session.as_str())
+                        })
+                        .map(|t| t.tokens.unwrap_or(0))
+                        .sum();
+                    spent < parsed.session_tokens
+                }),
+        };
+        let gaps = match (parsed.session, session.as_ref(), turns.is_empty()) {
+            (SessionContinuity::Continuous, None, false) => {
+                let mut rolled = gaps;
+                rolled.push(format!(
+                    "the prior session crossed its {}-token budget: a fresh session was started",
+                    parsed.session_tokens
+                ));
+                rolled
+            }
+            _ => gaps,
+        };
+
         let Some(external) = self.external_state(commission).await else {
             return Ok(());
         };
@@ -443,18 +524,6 @@ impl Engine {
         };
         let prompt = parsed.compose_turn(&context);
         let prompt_hash = strategy::prompt_hash(&prompt);
-
-        let turns = self.store.turns(attempt.id).await?;
-        let session = match parsed.session {
-            SessionContinuity::Fresh => None,
-            SessionContinuity::Continuous => turns
-                .iter()
-                .rev()
-                .find_map(|t| t.result.as_ref())
-                .and_then(|result| result.get("session"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        };
 
         let turn_id = self.store.insert_turn(attempt.id, &prompt_hash).await?;
 
@@ -561,6 +630,39 @@ impl Engine {
                     .ok()
             }
         }
+    }
+
+    async fn gap_loop_burned(
+        &self,
+        commission: &Commission,
+        gaps: &[String],
+    ) -> Result<bool, EngineError> {
+        let trail = self
+            .store
+            .recent_commission_events(commission.id, "gap-detected", GAP_LOOP_LIMIT as i64)
+            .await?;
+        if trail.len() < GAP_LOOP_LIMIT {
+            return Ok(false);
+        }
+        let expected: Vec<Value> = gaps.iter().map(|gap| Value::String(gap.clone())).collect();
+        let same = trail
+            .iter()
+            .all(|payload| payload.get("gaps").and_then(Value::as_array) == Some(&expected));
+        Ok(same)
+    }
+
+    async fn escalate_gap_loop(
+        &self,
+        commission: &Commission,
+        gaps: &[String],
+    ) -> Result<(), EngineError> {
+        self.escalate(
+            commission,
+            AttentionKind::AttemptStalled,
+            "the same gap keeps coming back: the loop cannot make progress",
+            json!({"consecutive": GAP_LOOP_LIMIT, "gaps": gaps}),
+        )
+        .await
     }
 
     async fn fail_commission(
@@ -693,6 +795,10 @@ impl Engine {
             let attempts = self.store.attempts(commission.id).await?;
             let mut stalled = false;
             for attempt in attempts.iter().filter(|a| a.ended_at.is_none()) {
+                let turns = self.store.turns(attempt.id).await?;
+                if turns.last().is_some_and(|t| t.ended_at.is_none()) {
+                    continue;
+                }
                 if is_stale(attempt.heartbeat_at, self.config.heartbeat_timeout) {
                     stalled = true;
                     self.store
@@ -728,9 +834,12 @@ impl Engine {
             let mut stalled = Vec::new();
             for attempt in attempts.iter().filter(|a| a.ended_at.is_none()) {
                 let turns = self.store.turns(attempt.id).await?;
-                if turns.iter().any(|t| {
-                    t.ended_at.is_none() && is_stale(t.started_at, self.config.turn_timeout)
-                }) {
+                let timeout =
+                    strategy_turn_timeout(&attempt.strategy).unwrap_or(self.config.turn_timeout);
+                if turns
+                    .iter()
+                    .any(|t| t.ended_at.is_none() && is_stale(t.started_at, timeout))
+                {
                     stalled.push(attempt.id);
                 }
             }
@@ -856,6 +965,42 @@ fn budget_attempts(budget: &Value) -> Option<i64> {
         .get("attempts")
         .and_then(Value::as_i64)
         .filter(|n| *n > 0)
+}
+
+fn budget_turns(budget: &Value) -> Option<i64> {
+    budget
+        .get("turns")
+        .and_then(Value::as_i64)
+        .filter(|n| *n > 0)
+}
+
+fn budget_tokens(budget: &Value, campaign_strategy: &Value) -> Option<i64> {
+    if let Some(tokens) = budget
+        .get("tokens")
+        .and_then(Value::as_i64)
+        .filter(|n| *n > 0)
+    {
+        return Some(tokens);
+    }
+    let quota = campaign_strategy
+        .get("quota_tokens")
+        .and_then(Value::as_i64)
+        .filter(|n| *n > 0)?;
+    let pct = budget
+        .get("quota_pct")
+        .and_then(Value::as_i64)
+        .filter(|n| *n > 0)?;
+    Some(quota.saturating_mul(pct) / 100)
+}
+
+const GAP_LOOP_LIMIT: usize = 3;
+
+fn strategy_turn_timeout(strategy: &Value) -> Option<Duration> {
+    strategy
+        .get("turn_timeout_secs")
+        .and_then(Value::as_u64)
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
 }
 
 fn state_changed(commission: &Commission, to: &CommissionState, detail: Value) -> NewEvent {

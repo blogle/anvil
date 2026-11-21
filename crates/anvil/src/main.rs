@@ -45,6 +45,8 @@ enum Command {
     },
     Retry {
         id: String,
+        #[arg(long)]
+        model: Option<String>,
     },
     Resume {
         id: String,
@@ -171,9 +173,9 @@ async fn run(anvil: Anvil, command: Command) -> Result<(), AnvilError> {
                 print!("{}", anvil::inbox_view(&inbox));
             }
         }
-        Command::Retry { id } => anvil.action(&id, "retry").await?,
-        Command::Resume { id } => anvil.action(&id, "resume").await?,
-        Command::Takeover { id } => anvil.action(&id, "takeover").await?,
+        Command::Retry { id, model } => anvil.action(&id, "retry", model.as_deref()).await?,
+        Command::Resume { id } => anvil.action(&id, "resume", None).await?,
+        Command::Takeover { id } => anvil.action(&id, "takeover", None).await?,
         Command::Cancel { id } => anvil.cancel(&id).await?,
         Command::Revise {
             id,

@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "Commissions are now spend-bounded and wedge-detected, per the give-up policy the spec always demanded. Commission budgets (attempts, turns per attempt, tokens) and a campaign quota with per-commission percent caps escalate to the operator with spend stats before another token burns. The same gap three reprompts in a row escalates instead of looping. Continuous sessions are the default, rolling to a fresh session once a session's usage crosses its token budget. Model and thinking level are strategy knobs — provider/model#variant, materialized as a named agent config because the root model field drops variants — and `anvil retry --model` picks the tier for the next attempt. Turn timeout is a per-attempt knob with a 15-minute default, and a live turn is no longer mistaken for a dead heartbeat."
+}

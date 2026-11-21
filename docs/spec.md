@@ -270,6 +270,17 @@ During interactive mode: none of this — relayed messages only.
 Optional per-commission `verify_cmd` knob (shell command run in-sandbox on
 `done`), **default off** — PR checks are the default gate.
 
+Strategy knobs (per N7/N19): `model` (`provider/model#variant`, thinking
+level via variant; materialized as a named agent config because the root
+`model` field drops variants), `session` (`continuous` by default, `fresh`
+opt-in; continuous sessions roll over to a fresh session once cumulative
+session usage crosses `session_tokens`), `turn_timeout_secs` (per-attempt
+wedge bound), `session_tokens`. Budgets live on the commission
+(`{"attempts", "turns", "tokens"}`) plus campaign `quota_tokens` with
+per-commission `quota_pct` for the account-wide ceiling; every breach
+escalates with the spend stats. A gap identical for three consecutive
+reprompts escalates instead of looping.
+
 ### 4.4 Operator CLI verbs
 
 | Verb | Effect |
