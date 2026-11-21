@@ -321,11 +321,31 @@ impl GithubClient {
     ) -> Result<ExternalState, GithubError> {
         let pull = self.pull(repo, pr_number).await?;
         let checks = self.check_runs(repo, &pull.head_sha).await?;
+        let commits = self
+            .call(
+                "GET",
+                &format!("/repos/{repo}/pulls/{pr_number}/commits"),
+                None,
+            )
+            .await?;
+        let work_present = commits
+            .as_array()
+            .map(|commits| {
+                commits.iter().any(|commit| {
+                    commit
+                        .get("commit")
+                        .and_then(|inner| inner.get("message"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|message| !message.starts_with("anvil: begin"))
+                })
+            })
+            .unwrap_or(false);
         let current_target = self.resolve_ref(repo, target_ref).await?;
         Ok(ExternalState {
             checks,
             mergeable: pull.open && pull.mergeable,
             head_moved: pull.base_sha != current_target,
+            work_present,
         })
     }
 }

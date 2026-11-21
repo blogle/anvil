@@ -35,6 +35,7 @@ fn ctx() -> TurnContext {
             ],
             mergeable: false,
             head_moved: false,
+            work_present: true,
         },
     }
 }
@@ -216,6 +217,7 @@ fn evaluate_converges_when_checks_pass_and_mergeable() {
         ],
         mergeable: true,
         head_moved: false,
+        work_present: true,
     };
     assert_eq!(
         DefaultStrategy::default().evaluate(&external),
@@ -229,6 +231,7 @@ fn evaluate_converges_with_no_checks_at_all() {
         checks: vec![],
         mergeable: true,
         head_moved: false,
+        work_present: true,
     };
     assert_eq!(
         DefaultStrategy::default().evaluate(&external),
@@ -251,6 +254,7 @@ fn evaluate_collects_failed_checks_as_gaps() {
         ],
         mergeable: true,
         head_moved: true,
+        work_present: true,
     };
     assert_eq!(
         DefaultStrategy::default().evaluate(&external),
@@ -258,6 +262,28 @@ fn evaluate_collects_failed_checks_as_gaps() {
             gaps: vec![
                 "check failed: go test".to_owned(),
                 "check failed: race".to_owned(),
+            ]
+        }
+    );
+}
+
+#[test]
+fn a_workless_pr_never_converges_no_matter_how_green_its_seed_checks() {
+    let external = ExternalState {
+        checks: vec![CheckStatus {
+            name: "sdlc / pr-fast".to_owned(),
+            conclusion: CheckConclusion::Pass,
+        }],
+        mergeable: true,
+        head_moved: false,
+        work_present: false,
+    };
+    assert_eq!(
+        DefaultStrategy::default().evaluate(&external),
+        Verdict::Continue {
+            gaps: vec![
+                "nothing has been committed to the work branch yet: implement the commission, commit, and push"
+                    .to_owned(),
             ]
         }
     );
@@ -282,6 +308,7 @@ fn evaluate_ignores_checks_the_operator_excluded() {
         ],
         mergeable: true,
         head_moved: false,
+        work_present: true,
     };
     assert_eq!(strategy.evaluate(&external), Verdict::Converge);
 
@@ -292,6 +319,7 @@ fn evaluate_ignores_checks_the_operator_excluded() {
         }],
         mergeable: true,
         head_moved: false,
+        work_present: true,
     };
     assert_eq!(
         strategy.evaluate(&external),
@@ -310,6 +338,7 @@ fn evaluate_waits_on_pending_checks() {
         }],
         mergeable: true,
         head_moved: false,
+        work_present: true,
     };
     assert_eq!(
         DefaultStrategy::default().evaluate(&external),
@@ -323,6 +352,7 @@ fn evaluate_reprompts_on_head_movement_and_conflicts() {
         checks: vec![],
         mergeable: true,
         head_moved: true,
+        work_present: true,
     };
     assert!(matches!(
         DefaultStrategy::default().evaluate(&moved),
@@ -333,6 +363,7 @@ fn evaluate_reprompts_on_head_movement_and_conflicts() {
         checks: vec![],
         mergeable: false,
         head_moved: false,
+        work_present: true,
     };
     assert!(matches!(
         DefaultStrategy::default().evaluate(&conflicted),

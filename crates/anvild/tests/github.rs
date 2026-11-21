@@ -99,6 +99,12 @@ async fn external_state_maps_checks_mergeability_and_head_movement() {
                        "head": {"sha": "head123"}, "base": {"sha": "target-1"}})
             .to_string(),
         ),
+        ("GET", "/repos/acme/payments/pulls/7/commits") => (
+            200,
+            json!([{"commit": {"message": "anvil: begin"}},
+                   {"commit": {"message": "feat: teardown terminal sandboxes"}}])
+            .to_string(),
+        ),
         ("GET", "/repos/acme/payments/commits/head123/check-runs") => (
             200,
             json!({"check_runs": [
@@ -136,6 +142,12 @@ async fn a_rebased_pr_clears_head_movement_even_after_the_target_moves() {
             200,
             json!({"number": 7, "state": "open", "mergeable": true,
                        "head": {"sha": "rebased-1"}, "base": {"sha": "moved-999"}})
+            .to_string(),
+        ),
+        ("GET", "/repos/acme/payments/pulls/7/commits") => (
+            200,
+            json!([{"commit": {"message": "anvil: begin"}},
+                   {"commit": {"message": "make sandbox teardown durable"}}])
             .to_string(),
         ),
         ("GET", "/repos/acme/payments/commits/rebased-1/check-runs") => {
