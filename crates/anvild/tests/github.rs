@@ -96,7 +96,7 @@ async fn external_state_maps_checks_mergeability_and_head_movement() {
         ("GET", "/repos/acme/payments/pulls/7") => (
             200,
             json!({"number": 7, "state": "open", "mergeable": true,
-                       "head": {"sha": "head123"}})
+                       "head": {"sha": "head123"}, "base": {"sha": "target-1"}})
             .to_string(),
         ),
         ("GET", "/repos/acme/payments/commits/head123/check-runs") => (
@@ -124,6 +124,37 @@ async fn external_state_maps_checks_mergeability_and_head_movement() {
     assert_eq!(state.checks[0].conclusion, CheckConclusion::Fail);
     assert_eq!(state.checks[1].conclusion, CheckConclusion::Pass);
     assert_eq!(state.checks[2].conclusion, CheckConclusion::Pending);
+}
+
+#[tokio::test]
+async fn a_rebased_pr_clears_head_movement_even_after_the_target_moves() {
+    let mock = MockGithub::spawn(Box::new(|method, path, _| match (method, path) {
+        ("POST", "/app/installations/1/access_tokens") => {
+            (200, json!({"token": "inst-token"}).to_string())
+        }
+        ("GET", "/repos/acme/payments/pulls/7") => (
+            200,
+            json!({"number": 7, "state": "open", "mergeable": true,
+                       "head": {"sha": "rebased-1"}, "base": {"sha": "moved-999"}})
+            .to_string(),
+        ),
+        ("GET", "/repos/acme/payments/commits/rebased-1/check-runs") => {
+            (200, json!({"total_count": 0, "check_runs": []}).to_string())
+        }
+        ("GET", "/repos/acme/payments/git/ref/heads/main") => {
+            (200, json!({"object": {"sha": "moved-999"}}).to_string())
+        }
+        _ => (404, "{}".to_owned()),
+    }));
+
+    let state = client(&mock.url())
+        .external_state("acme/payments", 7, "main", "stale-admission-sha")
+        .await
+        .unwrap();
+    assert!(
+        !state.head_moved,
+        "the PR base tracks the moved target: the agent already rebased"
+    );
 }
 
 #[tokio::test]
@@ -283,10 +314,11 @@ fn parsers_map_github_payloads() {
     assert_eq!(checks[1].conclusion, CheckConclusion::Inconclusive);
 
     let pull = parse_pull(&json!({"number": 7, "state": "open", "mergeable": null,
-                                  "head": {"sha": "x"}}))
+                                  "head": {"sha": "x"}, "base": {"sha": "y"}}))
     .unwrap();
     assert!(!pull.mergeable);
     assert!(pull.open);
+    assert_eq!(pull.base_sha, "y");
 
     let body = pr_body("extract invoices", &["suite stays green".to_owned()]);
     assert!(body.contains("extract invoices"));

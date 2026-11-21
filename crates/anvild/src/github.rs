@@ -20,6 +20,7 @@ pub struct PullInfo {
     pub open: bool,
     pub mergeable: bool,
     pub head_sha: String,
+    pub base_sha: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -316,7 +317,7 @@ impl GithubClient {
         repo: &str,
         pr_number: i64,
         target_ref: &str,
-        admitted_target_sha: &str,
+        _admitted_target_sha: &str,
     ) -> Result<ExternalState, GithubError> {
         let pull = self.pull(repo, pr_number).await?;
         let checks = self.check_runs(repo, &pull.head_sha).await?;
@@ -324,7 +325,7 @@ impl GithubClient {
         Ok(ExternalState {
             checks,
             mergeable: pull.open && pull.mergeable,
-            head_moved: current_target != admitted_target_sha,
+            head_moved: pull.base_sha != current_target,
         })
     }
 }
@@ -408,6 +409,7 @@ pub fn parse_pull(body: &Value) -> Option<PullInfo> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         head_sha: body.get("head")?.get("sha")?.as_str()?.to_owned(),
+        base_sha: body.get("base")?.get("sha")?.as_str()?.to_owned(),
     })
 }
 
