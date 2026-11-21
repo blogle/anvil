@@ -309,13 +309,15 @@ pub fn status_view(detail: &Value) -> String {
         "state:    {}",
         commission["state"]["kind"].as_str().unwrap_or("")
     );
-    let cause = match commission["state"]["kind"].as_str() {
-        Some("failed") => commission["state"]["cause"].as_str(),
-        Some("escalated") => commission["state"]["reason"].as_str(),
-        _ => None,
-    };
-    if let Some(cause) = cause {
-        let _ = writeln!(out, "cause:    {cause}");
+    match commission["state"]["kind"].as_str() {
+        Some("failed") | Some("escalated") => {
+            let cause = commission["state"]["cause"]
+                .as_str()
+                .or_else(|| commission["state"]["reason"].as_str())
+                .unwrap_or("");
+            let _ = writeln!(out, "cause:    {cause}");
+        }
+        _ => {}
     }
     let _ = writeln!(
         out,

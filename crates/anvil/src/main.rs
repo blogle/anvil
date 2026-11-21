@@ -85,8 +85,9 @@ enum CommissionVerb {
 #[derive(Subcommand)]
 enum InboxVerb {
     Dismiss {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
         id: Option<String>,
-        #[arg(long, conflicts_with = "id")]
+        #[arg(long)]
         all: bool,
     },
 }
@@ -195,11 +196,6 @@ async fn run(anvil: Anvil, command: Command) -> Result<(), AnvilError> {
                     }
                 } else if let Some(id) = id {
                     anvil.dismiss_attention(&id).await?;
-                } else {
-                    return Err(AnvilError::Api {
-                        status: 2,
-                        body: "inbox dismiss requires an id or --all".to_owned(),
-                    });
                 }
             }
         },
