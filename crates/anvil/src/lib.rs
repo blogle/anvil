@@ -432,6 +432,30 @@ struct SseLines {
     buffer: String,
 }
 
+impl SseLines {
+    fn feed(&mut self, bytes: &[u8]) {
+        self.buffer
+            .push_str(&String::from_utf8_lossy(bytes).replace("\r\n", "\n"));
+    }
+
+    fn next_line(&mut self) -> Option<String> {
+        loop {
+            let line_end = self.buffer.find('\n')?;
+            let line: String = self.buffer.drain(..=line_end).collect();
+            let line = line.trim_end().to_owned();
+            if let Some(data) = line.strip_prefix("data: ") {
+                if let Ok(value) = serde_json::from_str::<Value>(data) {
+                    return Some(format!(
+                        "#{:<5} {} {}",
+                        value["seq"].as_i64().unwrap_or(0),
+                        value["kind"].as_str().unwrap_or(""),
+                        value["commission_id"].as_str().unwrap_or("")
+                    ));
+                }
+            }
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::status_view;
@@ -465,30 +489,5 @@ mod tests {
             }
         }));
         assert!(!active.contains("cause:"));
-    }
-}
-
-impl SseLines {
-    fn feed(&mut self, bytes: &[u8]) {
-        self.buffer
-            .push_str(&String::from_utf8_lossy(bytes).replace("\r\n", "\n"));
-    }
-
-    fn next_line(&mut self) -> Option<String> {
-        loop {
-            let line_end = self.buffer.find('\n')?;
-            let line: String = self.buffer.drain(..=line_end).collect();
-            let line = line.trim_end().to_owned();
-            if let Some(data) = line.strip_prefix("data: ") {
-                if let Ok(value) = serde_json::from_str::<Value>(data) {
-                    return Some(format!(
-                        "#{:<5} {} {}",
-                        value["seq"].as_i64().unwrap_or(0),
-                        value["kind"].as_str().unwrap_or(""),
-                        value["commission_id"].as_str().unwrap_or("")
-                    ));
-                }
-            }
-        }
     }
 }
