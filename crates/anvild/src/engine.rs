@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -128,7 +127,6 @@ pub struct Engine {
     github: Option<GithubClient>,
     sandbox: Option<Arc<SandboxProvider>>,
     harness: Option<Arc<Harness>>,
-    terminal_sweep_at: AtomicI64,
 }
 
 impl Engine {
@@ -139,7 +137,6 @@ impl Engine {
             github: None,
             sandbox: None,
             harness: None,
-            terminal_sweep_at: AtomicI64::new(0),
         }
     }
 
@@ -174,9 +171,7 @@ impl Engine {
             return Ok(());
         };
 
-        let since = self.terminal_sweep_at.load(Ordering::Acquire);
-        let sweep_started = now_millis();
-        let commissions = self.store.terminal_commissions_updated_since(since).await?;
+        let commissions = self.store.terminal_commissions_pending_teardown().await?;
         for commission in commissions {
             let Some(campaign) = self.store.campaign(commission.campaign_id).await? else {
                 continue;
@@ -184,16 +179,17 @@ impl Engine {
             let name = format!("anvil-{}-{}", campaign.slug, commission.slug);
             sandbox.destroy(&name).await?;
             self.store
-                .append_events(&[NewEvent {
-                    kind: EventKind::SandboxDestroyed,
-                    campaign_id: Some(commission.campaign_id),
-                    commission_id: Some(commission.id),
-                    payload: json!({"name": name}),
-                }])
+                .mark_sandbox_destroyed(
+                    commission.id,
+                    NewEvent {
+                        kind: EventKind::SandboxDestroyed,
+                        campaign_id: Some(commission.campaign_id),
+                        commission_id: Some(commission.id),
+                        payload: json!({"name": name}),
+                    },
+                )
                 .await?;
         }
-        self.terminal_sweep_at
-            .store(sweep_started, Ordering::Release);
         Ok(())
     }
 
@@ -1016,10 +1012,6 @@ fn is_terminal(state: &CommissionState) -> bool {
 fn is_stale(at: OffsetDateTime, timeout: Duration) -> bool {
     let now = OffsetDateTime::now_utc();
     now - at >= time::Duration::try_from(timeout).unwrap_or(time::Duration::MAX)
-}
-
-fn now_millis() -> i64 {
-    OffsetDateTime::now_utc().unix_timestamp_nanos() as i64 / 1_000_000
 }
 
 fn budget_attempts(budget: &Value) -> Option<i64> {

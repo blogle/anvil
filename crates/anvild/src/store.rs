@@ -179,23 +179,43 @@ impl Store {
             .collect()
     }
 
-    pub async fn terminal_commissions_updated_since(
+    pub async fn terminal_commissions_pending_teardown(
         &self,
-        since_millis: i64,
     ) -> Result<Vec<Commission>, StoreError> {
         let rows = sqlx::query_as::<_, CommissionRow>(
             "SELECT id, campaign_id, title, slug, spec, repo, target_ref, target_sha, wave,
                     state, state_detail, budget, strategy, branch, pr_number, created_at, updated_at
              FROM commissions
-             WHERE updated_at > ? AND state IN ('cancelled', 'merged')
+             WHERE state IN ('cancelled', 'merged') AND sandbox_destroyed_at IS NULL
              ORDER BY updated_at, slug",
         )
-        .bind(since_millis)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
             .map(CommissionRow::into_commission)
             .collect()
+    }
+
+    pub async fn mark_sandbox_destroyed(
+        &self,
+        id: CommissionId,
+        event: NewEvent,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "UPDATE commissions SET sandbox_destroyed_at = ?
+             WHERE id = ? AND state IN ('cancelled', 'merged')
+               AND sandbox_destroyed_at IS NULL",
+        )
+        .bind(now_millis())
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 1 {
+            insert_event(&mut tx, &event).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn idempotency_remember(&self, key: &str, response: &str) -> Result<(), StoreError> {
