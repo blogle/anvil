@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "A retry earns fresh gap chances. The repeated-gap tripwire counted the last three gap events for the commission regardless of who was on shift, so an operator retry - the very act of saying try again - inherited the previous attempt's gap history and re-escalated on the first identical gap, before the agent did anything at all. The trail is now scoped to gaps newer than the commission's last state change: three identical gaps within one run of the loop escalate, and a retry starts the count over."
+}
