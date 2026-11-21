@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "Escalation ends the running attempt, so a retry runs a fresh one. Escalations left the attempt un-ended, so an operator retry resumed the same exhausted attempt - inheriting its spent turn budget, its stale gap trail momentum, and its session lineage - and re-escalated on sight, before the agent did anything. Every escalation path (budgets, gap loops, stalls) now closes the running attempt with its reason as outcome; the commission's attempts read as a clean ledger of runs."
+}
