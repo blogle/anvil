@@ -54,6 +54,7 @@ fn provider_config_writes_model_and_mcp_without_secrets() {
     let opencode = config.files.get("opencode.json").unwrap();
     assert!(!opencode.contains("sk-ant-secret"));
     assert!(!opencode.contains("ghp-token"));
+    assert!(opencode.contains("\"default_agent\":\"anvil\""));
     assert!(opencode.contains("\"model\":\"glm-5.3\""));
     assert!(opencode.contains("{env.GITHUB_TOKEN}"));
     assert_eq!(config.env["ANTHROPIC_API_KEY"], "sk-ant-secret");
@@ -176,4 +177,15 @@ async fn opencode_contract_test() {
         .unwrap();
     let mut events = events;
     assert!(events.next_event().await.is_some());
+}
+
+#[test]
+fn provider_config_keeps_model_variants_for_thinking_levels() {
+    let strategy = json!({"model": "openai/gpt-6.1-luna#high"});
+    let config = materialize_provider_config(&strategy, &BTreeMap::new()).unwrap();
+    let opencode = config.files.get("opencode.json").unwrap();
+    assert!(opencode.contains("\"default_agent\":\"anvil\""));
+    assert!(opencode.contains(
+        "\"agents\":{\"anvil\":{\"mode\":\"primary\",\"model\":\"openai/gpt-6.1-luna#high\"}}"
+    ));
 }

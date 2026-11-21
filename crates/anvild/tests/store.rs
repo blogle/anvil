@@ -284,6 +284,49 @@ async fn closing_in_flight_turns_ends_only_the_undead() {
 }
 
 #[tokio::test]
+async fn commission_token_spend_sums_across_attempts() {
+    let (store, _dir) = temp_store().await;
+    let campaign_id = store.insert_campaign(campaign("payments")).await.unwrap();
+    let commission_id = store
+        .insert_commission(commission(campaign_id, 1))
+        .await
+        .unwrap();
+    let first = store
+        .insert_attempt(commission_id, &json!({}))
+        .await
+        .unwrap();
+    let second = store
+        .insert_attempt(commission_id, &json!({}))
+        .await
+        .unwrap();
+    let t1 = store.insert_turn(first, "sha256:one").await.unwrap();
+    let t2 = store.insert_turn(first, "sha256:two").await.unwrap();
+    let t3 = store.insert_turn(second, "sha256:three").await.unwrap();
+    store
+        .end_turn(t1, Some(1_000), json!({"status": "ok"}))
+        .await
+        .unwrap();
+    store
+        .end_turn(t2, Some(2_000), json!({"status": "ok"}))
+        .await
+        .unwrap();
+    store
+        .end_turn(t3, Some(4_000), json!({"status": "ok"}))
+        .await
+        .unwrap();
+
+    let spent = store.commission_tokens_spent(commission_id).await.unwrap();
+    assert_eq!(spent, 7_000);
+
+    store
+        .set_commission_budget(commission_id, &json!({"tokens": 10_000}))
+        .await
+        .unwrap();
+    let commission = store.commission(commission_id).await.unwrap().unwrap();
+    assert_eq!(commission.budget["tokens"], json!(10_000));
+}
+
+#[tokio::test]
 async fn events_append_in_batches_with_monotonic_cursor() {
     let (store, _dir) = temp_store().await;
     let campaign_id = store.insert_campaign(campaign("payments")).await.unwrap();

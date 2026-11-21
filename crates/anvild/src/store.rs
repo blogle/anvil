@@ -528,6 +528,72 @@ impl Store {
         rows.into_iter().map(EventRow::into_event).collect()
     }
 
+    pub async fn recent_commission_events(
+        &self,
+        commission: CommissionId,
+        kind: &str,
+        limit: i64,
+    ) -> Result<Vec<Value>, StoreError> {
+        let rows = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT payload FROM events
+             WHERE commission_id = ? AND kind = ?
+             ORDER BY seq DESC LIMIT ?",
+        )
+        .bind(commission.to_string())
+        .bind(kind)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .flatten()
+            .filter_map(|raw| serde_json::from_str(&raw).ok())
+            .collect())
+    }
+
+    pub async fn commission_tokens_spent(
+        &self,
+        commission: CommissionId,
+    ) -> Result<i64, StoreError> {
+        let spent: Option<i64> = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(t.tokens), 0) FROM turns t
+             JOIN attempts a ON t.attempt_id = a.id
+             WHERE a.commission_id = ?",
+        )
+        .bind(commission.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(spent.unwrap_or(0))
+    }
+
+    pub async fn set_commission_strategy(
+        &self,
+        commission: CommissionId,
+        strategy: &Value,
+    ) -> Result<(), StoreError> {
+        let rows = sqlx::query("UPDATE commissions SET strategy = ?, updated_at = ? WHERE id = ?")
+            .bind(encode_json(strategy))
+            .bind(now_millis())
+            .bind(commission.to_string())
+            .execute(&self.pool)
+            .await?;
+        Self::require_row(rows, "commission", &commission.to_string())
+    }
+
+    pub async fn set_commission_budget(
+        &self,
+        commission: CommissionId,
+        budget: &Value,
+    ) -> Result<(), StoreError> {
+        let rows = sqlx::query("UPDATE commissions SET budget = ?, updated_at = ? WHERE id = ?")
+            .bind(encode_json(budget))
+            .bind(now_millis())
+            .bind(commission.to_string())
+            .execute(&self.pool)
+            .await?;
+        Self::require_row(rows, "commission", &commission.to_string())
+    }
+
     pub async fn raise_attention(&self, new: NewAttention) -> Result<AttentionId, StoreError> {
         let id = AttentionId::new();
         let mut tx = self.pool.begin().await?;

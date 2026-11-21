@@ -14,13 +14,19 @@ pub enum SessionContinuity {
 pub struct DefaultStrategy {
     pub session: SessionContinuity,
     pub verify_cmd: Option<String>,
+    pub turn_timeout_secs: Option<u64>,
+    pub session_tokens: i64,
 }
+
+pub const DEFAULT_SESSION_TOKENS: i64 = 400_000;
 
 impl Default for DefaultStrategy {
     fn default() -> Self {
         Self {
-            session: SessionContinuity::Fresh,
+            session: SessionContinuity::Continuous,
             verify_cmd: None,
+            turn_timeout_secs: None,
+            session_tokens: DEFAULT_SESSION_TOKENS,
         }
     }
 }
@@ -54,8 +60,8 @@ pub fn parse(config: &Value) -> Result<DefaultStrategy, StrategyError> {
         });
     }
     let session = match fields.get("session").and_then(Value::as_str) {
-        None | Some("fresh") => SessionContinuity::Fresh,
-        Some("continuous") => SessionContinuity::Continuous,
+        None | Some("continuous") => SessionContinuity::Continuous,
+        Some("fresh") => SessionContinuity::Fresh,
         Some(other) => {
             return Err(StrategyError::Invalid {
                 field: "session",
@@ -73,9 +79,33 @@ pub fn parse(config: &Value) -> Result<DefaultStrategy, StrategyError> {
             })
         }
     };
+    let turn_timeout_secs = match fields.get("turn_timeout_secs") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(raw)) if raw.as_u64().is_some_and(|n| n > 0) => raw.as_u64(),
+        Some(other) => {
+            return Err(StrategyError::Invalid {
+                field: "turn_timeout_secs",
+                value: other.to_string(),
+            })
+        }
+    };
+    let session_tokens = match fields.get("session_tokens") {
+        None | Some(Value::Null) => DEFAULT_SESSION_TOKENS,
+        Some(Value::Number(raw)) if raw.as_i64().is_some_and(|n| n > 0) => {
+            raw.as_i64().unwrap_or(DEFAULT_SESSION_TOKENS)
+        }
+        Some(other) => {
+            return Err(StrategyError::Invalid {
+                field: "session_tokens",
+                value: other.to_string(),
+            })
+        }
+    };
     Ok(DefaultStrategy {
         session,
         verify_cmd,
+        turn_timeout_secs,
+        session_tokens,
     })
 }
 
