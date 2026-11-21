@@ -100,6 +100,7 @@ struct AddObligationRequest {
 #[derive(Deserialize)]
 struct CommissionActionRequest {
     action: String,
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -501,6 +502,18 @@ async fn commission_action(
         return Err(ApiError::NotFound { what: "commission" });
     };
     use crate::engine::Transition as T;
+    if request.action.as_str() == "retry" {
+        if let Some(model) = request.model.as_deref().filter(|m| !m.is_empty()) {
+            let mut strategy = commission.strategy.clone();
+            if !strategy.is_object() {
+                strategy = json!({});
+            }
+            strategy["model"] = json!(model);
+            store
+                .set_commission_strategy(commission_id, &strategy)
+                .await?;
+        }
+    }
     let transition = match request.action.as_str() {
         "retry" => {
             if commission.pr_number.is_none() {

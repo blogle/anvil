@@ -37,7 +37,8 @@ pub fn materialize_provider_config(
 ) -> Result<ProviderConfig, HarnessError> {
     let mut config = json!({});
     if let Some(model) = strategy.get("model").and_then(Value::as_str) {
-        config["model"] = json!(model);
+        config["default_agent"] = json!("anvil");
+        config["agents"] = json!({"anvil": {"mode": "primary", "model": model}});
     }
     if let Some(mcp) = strategy.get("mcp") {
         config["mcp"] = mcp.clone();

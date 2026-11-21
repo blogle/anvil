@@ -378,3 +378,51 @@ async fn retry_requeues_unprovisioned_commissions_and_resumes_provisioned_ones()
         .unwrap();
     assert_eq!(detail["commission"]["state"]["kind"], json!("active"));
 }
+
+#[tokio::test]
+async fn retry_with_a_model_sets_the_next_attempts_tier() {
+    let (store, base) = daemon().await;
+    let campaign: Value = post(&base, "/v1/campaigns", campaign_body())
+        .await
+        .json()
+        .await
+        .unwrap();
+    let _campaign_id = campaign["id"].as_str().unwrap().to_owned();
+    let commissions: Value = get(&base, "/v1/commissions").await.json().await.unwrap();
+    let commission_id: anvil_api::CommissionId = commissions["commissions"][0]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let event = anvil_api::NewEvent {
+        kind: anvil_api::EventKind::StateChanged,
+        campaign_id: Some(campaign["id"].as_str().unwrap().parse().unwrap()),
+        commission_id: Some(commission_id),
+        payload: json!({"to": "failed"}),
+    };
+    store
+        .transition_commission(
+            commission_id,
+            anvil_api::CommissionState::Failed {
+                cause: "harness: boom".to_owned(),
+            },
+            &[event],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let retry = post(
+        &base,
+        &format!("/v1/commissions/{commission_id}"),
+        json!({"action": "retry", "model": "openai/gpt-6.1-luna#high"}),
+    )
+    .await;
+    assert_eq!(retry.status(), 204);
+
+    let commission = store.commission(commission_id).await.unwrap().unwrap();
+    assert_eq!(
+        commission.strategy["model"],
+        json!("openai/gpt-6.1-luna#high")
+    );
+}
