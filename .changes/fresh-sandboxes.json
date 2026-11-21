@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "Sandboxes no longer outlive their credentials. The engine reused a commission's container by name across attempts, freezing its environment at first boot - so an installation token older than an hour sat in the git credential helper and every push of finished work was rejected while the agent told the operator exactly that through the attention channel. Each attempt now gets its own container, named per attempt, with freshly minted environment; the previous attempt's container is destroyed idempotently at spawn. The workspace - not the container - is the persistent thing."
+}
