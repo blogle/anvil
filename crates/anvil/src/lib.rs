@@ -154,6 +154,18 @@ impl Anvil {
         Ok(response.json().await?)
     }
 
+    pub async fn dismiss_attention(&self, attention: &str) -> Result<(), AnvilError> {
+        self.send(
+            "POST",
+            &format!("/v1/inbox/{attention}/dismiss"),
+            Some(json!({})),
+            None,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn action(
         &self,
         commission: &str,
@@ -297,6 +309,14 @@ pub fn status_view(detail: &Value) -> String {
         "state:    {}",
         commission["state"]["kind"].as_str().unwrap_or("")
     );
+    let cause = match commission["state"]["kind"].as_str() {
+        Some("failed") => commission["state"]["cause"].as_str(),
+        Some("escalated") => commission["state"]["reason"].as_str(),
+        _ => None,
+    };
+    if let Some(cause) = cause {
+        let _ = writeln!(out, "cause:    {cause}");
+    }
     let _ = writeln!(
         out,
         "repo:     {} @ {}",
@@ -410,6 +430,42 @@ pub async fn follow_stream(
 #[derive(Default)]
 struct SseLines {
     buffer: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_view;
+    use serde_json::json;
+
+    #[test]
+    fn status_view_shows_only_failure_and_escalation_causes() {
+        let failed = status_view(&json!({
+            "commission": {
+                "title": "broken",
+                "slug": "broken",
+                "state": {"kind": "failed", "cause": "sandbox did not start"}
+            }
+        }));
+        assert!(failed.contains("cause:    sandbox did not start"));
+
+        let escalated = status_view(&json!({
+            "commission": {
+                "title": "stuck",
+                "slug": "stuck",
+                "state": {"kind": "escalated", "reason": "turn budget exhausted"}
+            }
+        }));
+        assert!(escalated.contains("cause:    turn budget exhausted"));
+
+        let active = status_view(&json!({
+            "commission": {
+                "title": "running",
+                "slug": "running",
+                "state": {"kind": "active", "cause": "not displayed"}
+            }
+        }));
+        assert!(!active.contains("cause:"));
+    }
 }
 
 impl SseLines {
