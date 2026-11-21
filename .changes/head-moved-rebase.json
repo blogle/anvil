@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "A rebased PR now clears the head-moved gap. Head movement was judged against the target sha snapshot taken at admission, so after main moved once - even by the operator landing an unrelated PR mid-flight - every evaluation kept telling the agent to rebase onto the new head, forever, no matter how many times it already had; the gap tripwire then escalated a finished commission while its CI ran green. The judgment now compares the PR's live base against the current target: a rebased PR converges, a stale one keeps its gap."
+}
