@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "The operator CLI shows failed and escalated commission causes and can dismiss inbox attention items."
+}
