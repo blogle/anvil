@@ -48,6 +48,7 @@ fn parse_defaults_when_config_is_empty() {
             verify_cmd: None,
             turn_timeout_secs: None,
             session_tokens: DEFAULT_SESSION_TOKENS,
+            ignore_checks: Vec::new(),
         }
     );
     assert_eq!(parse(&json!({})).unwrap(), DefaultStrategy::default());
@@ -63,18 +64,27 @@ fn parse_reads_budget_watchdog_and_session_knobs() {
         "session": "fresh",
         "turn_timeout_secs": 300,
         "session_tokens": 50_000,
+        "ignore_checks": ["Mergify Merge Protections"],
     }))
     .unwrap();
     assert_eq!(strategy.session, SessionContinuity::Fresh);
     assert_eq!(strategy.turn_timeout_secs, Some(300));
     assert_eq!(strategy.session_tokens, 50_000);
+    assert_eq!(strategy.ignore_checks, vec!["Mergify Merge Protections"]);
 
     assert!(matches!(
         parse(&json!({"turn_timeout_secs": 0})).unwrap_err(),
-        StrategyError::Invalid {
-            field: "turn_timeout_secs",
-            ..
-        }
+        StrategyError::Invalid { field: "turn_timeout_secs", .. }
+    ));
+    assert!(matches!(
+        parse(&json!({"session_tokens": "much"})).unwrap_err(),
+        StrategyError::Invalid { field: "session_tokens", .. }
+    ));
+    assert!(matches!(
+        parse(&json!({"ignore_checks": "nope"})).unwrap_err(),
+        StrategyError::Invalid { field: "ignore_checks", .. }
+    ));
+}
     ));
     assert!(matches!(
         parse(&json!({"session_tokens": "much"})).unwrap_err(),
@@ -183,6 +193,7 @@ fn compose_turn_renders_head_movement_and_verify_cmd() {
         verify_cmd: Some("just ci-check".to_owned()),
         turn_timeout_secs: None,
         session_tokens: DEFAULT_SESSION_TOKENS,
+        ignore_checks: Vec::new(),
     };
     let prompt = strategy.compose_turn(&context);
     assert!(prompt.contains("- target head moved since admission: rebase onto the new head"));
@@ -248,6 +259,44 @@ fn evaluate_collects_failed_checks_as_gaps() {
                 "check failed: go test".to_owned(),
                 "check failed: race".to_owned(),
             ]
+        }
+    );
+}
+
+#[test]
+fn evaluate_ignores_checks_the_operator_excluded() {
+    let strategy = DefaultStrategy {
+        ignore_checks: vec!["Mergify Merge Protections".to_owned()],
+        ..DefaultStrategy::default()
+    };
+    let external = ExternalState {
+        checks: vec![
+            CheckStatus {
+                name: "Mergify Merge Protections".to_owned(),
+                conclusion: CheckConclusion::Fail,
+            },
+            CheckStatus {
+                name: "sdlc / check / clippy".to_owned(),
+                conclusion: CheckConclusion::Pass,
+            },
+        ],
+        mergeable: true,
+        head_moved: false,
+    };
+    assert_eq!(strategy.evaluate(&external), Verdict::Converge);
+
+    let external = ExternalState {
+        checks: vec![CheckStatus {
+            name: "sdlc / check / clippy".to_owned(),
+            conclusion: CheckConclusion::Fail,
+        }],
+        mergeable: true,
+        head_moved: false,
+    };
+    assert_eq!(
+        strategy.evaluate(&external),
+        Verdict::Continue {
+            gaps: vec!["check failed: sdlc / check / clippy".to_owned()]
         }
     );
 }
