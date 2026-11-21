@@ -238,6 +238,14 @@ impl DefaultStrategy {
     }
 
     pub fn evaluate(&self, external: &ExternalState) -> Verdict {
+        if !external.work_present {
+            return Verdict::Continue {
+                gaps: vec![
+                    "nothing has been committed to the work branch yet: implement the commission, commit, and push"
+                        .to_owned(),
+                ],
+            };
+        }
         let checks: Vec<&anvil_api::CheckStatus> = external
             .checks
             .iter()

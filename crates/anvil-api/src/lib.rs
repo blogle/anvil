@@ -75,6 +75,7 @@ pub struct ExternalState {
     pub checks: Vec<CheckStatus>,
     pub mergeable: bool,
     pub head_moved: bool,
+    pub work_present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
