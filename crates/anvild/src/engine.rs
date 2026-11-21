@@ -651,7 +651,12 @@ impl Engine {
     ) -> Result<bool, EngineError> {
         let trail = self
             .store
-            .recent_commission_events(commission.id, "gap-detected", GAP_LOOP_LIMIT as i64)
+            .recent_commission_events(
+                commission.id,
+                "gap-detected",
+                (commission.updated_at.unix_timestamp_nanos() / 1_000_000) as i64,
+                GAP_LOOP_LIMIT as i64,
+            )
             .await?;
         if trail.len() < GAP_LOOP_LIMIT {
             return Ok(false);
