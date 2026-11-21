@@ -291,10 +291,14 @@ impl Store {
     ) -> Result<(), StoreError> {
         let result = sqlx::query(
             "UPDATE commissions
-             SET state = ?, state_detail = ?, updated_at = ? WHERE id = ?",
+             SET state = ?, state_detail = ?,
+                 sandbox_destroyed_at = CASE WHEN ? IN ('cancelled', 'merged')
+                                             THEN sandbox_destroyed_at ELSE NULL END,
+                 updated_at = ? WHERE id = ?",
         )
         .bind(state.kind())
         .bind(state.detail())
+        .bind(state.kind())
         .bind(now_millis())
         .bind(id.to_string())
         .execute(&self.pool)
@@ -311,10 +315,15 @@ impl Store {
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
-            "UPDATE commissions SET state = ?, state_detail = ?, updated_at = ? WHERE id = ?",
+            "UPDATE commissions
+             SET state = ?, state_detail = ?,
+                 sandbox_destroyed_at = CASE WHEN ? IN ('cancelled', 'merged')
+                                             THEN sandbox_destroyed_at ELSE NULL END,
+                 updated_at = ? WHERE id = ?",
         )
         .bind(to.kind())
         .bind(to.detail())
+        .bind(to.kind())
         .bind(now_millis())
         .bind(id.to_string())
         .execute(&mut *tx)
@@ -342,12 +351,16 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE commissions
-             SET state = ?, state_detail = ?, target_sha = ?, branch = ?, pr_number = ?,
+             SET state = ?, state_detail = ?,
+                 sandbox_destroyed_at = CASE WHEN ? IN ('cancelled', 'merged')
+                                             THEN sandbox_destroyed_at ELSE NULL END,
+                 target_sha = ?, branch = ?, pr_number = ?,
                  updated_at = ?
              WHERE id = ?",
         )
         .bind(to.kind())
         .bind(to.detail())
+        .bind(to.kind())
         .bind(target_sha)
         .bind(branch)
         .bind(pr_number)

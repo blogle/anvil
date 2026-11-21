@@ -107,6 +107,34 @@ async fn terminal_commission_sandbox_is_destroyed_once_and_logged() {
             .count(),
         1
     );
+
+    store
+        .set_commission_state(commission_id, CommissionState::Active)
+        .await
+        .unwrap();
+    sandbox
+        .start(&SandboxSpec {
+            name: "anvil-payments-invoice-1".to_owned(),
+            image: "anvil-sandbox:latest".to_owned(),
+            workspace: _dir.path().join(PathBuf::from("workspace-retry")),
+            files: BTreeMap::new(),
+            env: BTreeMap::new(),
+        })
+        .await
+        .unwrap();
+    store
+        .set_commission_state(commission_id, CommissionState::Cancelled)
+        .await
+        .unwrap();
+    engine.tick().await.unwrap();
+    let events = store.events_since(0, 100).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == EventKind::SandboxDestroyed)
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]
