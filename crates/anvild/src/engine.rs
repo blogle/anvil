@@ -176,8 +176,14 @@ impl Engine {
             let Some(campaign) = self.store.campaign(commission.campaign_id).await? else {
                 continue;
             };
-            let name = format!("anvil-{}-{}", campaign.slug, commission.slug);
-            sandbox.destroy(&name).await?;
+            let base_name = format!("anvil-{}-{}", campaign.slug, commission.slug);
+            let mut names = vec![base_name.clone()];
+            for attempt in self.store.attempts(commission.id).await? {
+                names.push(format!("{base_name}-a{}", attempt.n));
+            }
+            for name in &names {
+                sandbox.destroy(name).await?;
+            }
             self.store
                 .mark_sandbox_destroyed(
                     commission.id,
@@ -185,7 +191,7 @@ impl Engine {
                         kind: EventKind::SandboxDestroyed,
                         campaign_id: Some(commission.campaign_id),
                         commission_id: Some(commission.id),
-                        payload: json!({"name": name}),
+                        payload: json!({"names": names}),
                     },
                 )
                 .await?;
