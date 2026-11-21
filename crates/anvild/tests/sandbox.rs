@@ -81,6 +81,7 @@ async fn memory_provider_lifecycle_records_and_destroys() {
     assert!(provider.is_running("anvil-invoice-split").await.unwrap());
     provider.destroy("anvil-invoice-split").await.unwrap();
     assert!(!provider.is_running("anvil-invoice-split").await.unwrap());
+    provider.destroy("anvil-invoice-split").await.unwrap();
     assert!(!provider.is_running("anvil-never-started").await.unwrap());
 }
 
