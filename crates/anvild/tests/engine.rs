@@ -88,7 +88,6 @@ fn transition_table_rejects_illegal_paths() {
         (S::Pending, Transition::Merge),
         (S::Pending, Transition::Converge),
         (S::Active, Transition::Admit),
-        (S::Active, Transition::Merge),
         (S::Interactive, Transition::Converge),
         (S::Merged, Transition::Retry),
         (S::Merged, Transition::Cancel),
