@@ -428,20 +428,18 @@ impl Store {
         Self::require_row(result, "attempt", &id.to_string())
     }
 
-    pub async fn end_attempt(
-        &self,
-        id: AttemptId,
-        tokens: Option<i64>,
-        outcome: Value,
-    ) -> Result<(), StoreError> {
-        let result =
-            sqlx::query("UPDATE attempts SET ended_at = ?, tokens = ?, outcome = ? WHERE id = ?")
-                .bind(now_millis())
-                .bind(tokens)
-                .bind(encode_json(&outcome))
-                .bind(id.to_string())
-                .execute(&self.pool)
-                .await?;
+    pub async fn end_attempt(&self, id: AttemptId, outcome: Value) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            "UPDATE attempts SET ended_at = ?,
+                    tokens = (SELECT COALESCE(SUM(tokens), 0) FROM turns WHERE attempt_id = ?),
+                    outcome = ? WHERE id = ?",
+        )
+        .bind(now_millis())
+        .bind(id.to_string())
+        .bind(encode_json(&outcome))
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
         Self::require_row(result, "attempt", &id.to_string())
     }
 

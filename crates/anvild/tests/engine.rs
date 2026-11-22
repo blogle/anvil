@@ -348,7 +348,7 @@ async fn exhausted_attempt_budget_escalates() {
             .await
             .unwrap();
         store
-            .end_attempt(attempt, None, json!({"outcome": "reprompt"}))
+            .end_attempt(attempt, json!({"outcome": "reprompt"}))
             .await
             .unwrap();
     }
@@ -379,7 +379,7 @@ async fn running_attempt_keeps_budget_unescalated() {
         .await
         .unwrap();
     store
-        .end_attempt(first, None, json!({"outcome": "reprompt"}))
+        .end_attempt(first, json!({"outcome": "reprompt"}))
         .await
         .unwrap();
     store

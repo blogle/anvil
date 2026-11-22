@@ -245,7 +245,7 @@ async fn an_env_failed_attempt_halts_the_commission() {
     let attempts = harness.store.attempts(harness.commission_id).await.unwrap();
     harness
         .store
-        .end_attempt(attempts[0].id, None, json!({"error": "sandbox: boom"}))
+        .end_attempt(attempts[0].id, json!({"error": "sandbox: boom"}))
         .await
         .unwrap();
 
