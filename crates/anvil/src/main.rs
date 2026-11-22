@@ -40,6 +40,8 @@ enum Command {
         since: i64,
     },
     Inbox {
+        #[command(subcommand)]
+        verb: Option<InboxVerb>,
         #[arg(long)]
         json: bool,
     },
@@ -78,6 +80,16 @@ enum CampaignVerb {
 #[derive(Subcommand)]
 enum CommissionVerb {
     Add { campaign: String, file: String },
+}
+
+#[derive(Subcommand)]
+enum InboxVerb {
+    Dismiss {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        id: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -165,14 +177,28 @@ async fn run(anvil: Anvil, command: Command) -> Result<(), AnvilError> {
                 print!("{}", anvil::events_view(&events));
             }
         }
-        Command::Inbox { json } => {
-            let inbox = anvil.inbox().await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&inbox).unwrap());
-            } else {
-                print!("{}", anvil::inbox_view(&inbox));
+        Command::Inbox { verb, json } => match verb {
+            None => {
+                let inbox = anvil.inbox().await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&inbox).unwrap());
+                } else {
+                    print!("{}", anvil::inbox_view(&inbox));
+                }
             }
-        }
+            Some(InboxVerb::Dismiss { id, all }) => {
+                if all {
+                    let inbox = anvil.inbox().await?;
+                    for item in inbox["attention"].as_array().into_iter().flatten() {
+                        if let Some(id) = item["id"].as_str() {
+                            anvil.dismiss_attention(id).await?;
+                        }
+                    }
+                } else if let Some(id) = id {
+                    anvil.dismiss_attention(&id).await?;
+                }
+            }
+        },
         Command::Retry { id, model } => anvil.action(&id, "retry", model.as_deref()).await?,
         Command::Resume { id } => anvil.action(&id, "resume", None).await?,
         Command::Takeover { id } => anvil.action(&id, "takeover", None).await?,
