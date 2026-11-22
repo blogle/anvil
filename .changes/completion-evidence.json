@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "Status shows the completion evidence. The agent's own signal - its anvilctl done notes - renders verbatim, the PR link is printed, and each attempt carries its outcome (converged, error, escalated, stale) and its token sum. Attempt tokens are now the store's single source of truth: ending an attempt always sums its turns, where before only the converge path recorded spend and failed attempts read tokens:-."
+}

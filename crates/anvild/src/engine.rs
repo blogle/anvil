@@ -230,7 +230,7 @@ impl Engine {
                     if turns.is_empty() {
                         let _ = self
                             .store
-                            .end_attempt(attempt.id, None, json!({"stale": true}))
+                            .end_attempt(attempt.id, json!({"stale": true}))
                             .await;
                         continue;
                     }
@@ -329,10 +329,8 @@ impl Engine {
         };
         match parsed.evaluate(&external) {
             Verdict::Converge => {
-                let turns = self.store.turns(attempt.id).await?;
-                let tokens: i64 = turns.iter().filter_map(|t| t.tokens).sum();
                 self.store
-                    .end_attempt(attempt.id, Some(tokens), json!({"converged": true}))
+                    .end_attempt(attempt.id, json!({"converged": true}))
                     .await?;
                 let to = apply(&commission.state, Transition::Converge)?;
                 let event = state_changed(commission, &to, json!({"via": "done claim"}));
@@ -567,22 +565,14 @@ impl Engine {
                     Ok(handle) => handle,
                     Err(error) => {
                         let _ = store
-                            .end_attempt(
-                                attempt_id,
-                                None,
-                                json!({"error": format!("sandbox: {error}")}),
-                            )
+                            .end_attempt(attempt_id, json!({"error": format!("sandbox: {error}")}))
                             .await;
                         return;
                     }
                 },
                 Err(error) => {
                     let _ = store
-                        .end_attempt(
-                            attempt_id,
-                            None,
-                            json!({"error": format!("sandbox: {error}")}),
-                        )
+                        .end_attempt(attempt_id, json!({"error": format!("sandbox: {error}")}))
                         .await;
                     return;
                 }
@@ -615,11 +605,7 @@ impl Engine {
                         )
                         .await;
                     let _ = store
-                        .end_attempt(
-                            attempt_id,
-                            None,
-                            json!({"error": format!("harness: {error}")}),
-                        )
+                        .end_attempt(attempt_id, json!({"error": format!("harness: {error}")}))
                         .await;
                 }
             }
@@ -873,7 +859,6 @@ impl Engine {
                     self.store
                         .end_attempt(
                             attempt.id,
-                            None,
                             json!({"escalated": "attempt stalled: no heartbeat within timeout"}),
                         )
                         .await?;
@@ -917,7 +902,6 @@ impl Engine {
                     self.store
                         .end_attempt(
                             attempt_id,
-                            None,
                             json!({"escalated": "turn stalled: no turn completion within timeout"}),
                         )
                         .await?;
@@ -975,7 +959,7 @@ impl Engine {
         if let Some(running) = attempts.iter().rev().find(|a| a.ended_at.is_none()) {
             let _ = self
                 .store
-                .end_attempt(running.id, None, json!({"escalated": reason}))
+                .end_attempt(running.id, json!({"escalated": reason}))
                 .await;
         }
         let to = apply(

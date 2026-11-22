@@ -407,10 +407,17 @@ async fn commission_detail(
     };
     let obligations = store.obligations(commission_id).await?;
     let attempts = store.attempts(commission_id).await?;
+    let last_claim = store
+        .recent_commission_events(commission_id, "done-claimed", 0, 1)
+        .await?
+        .into_iter()
+        .next()
+        .unwrap_or(Value::Null);
     Ok(Json(json!({
         "commission": commission_view(&commission),
         "obligations": obligations.iter().map(obligation_view).collect::<Vec<_>>(),
         "attempts": attempts.iter().map(attempt_view).collect::<Vec<_>>(),
+        "claim": last_claim,
     })))
 }
 
