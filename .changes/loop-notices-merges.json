@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "The loop notices merges. A commission whose PR merged now settles itself terminal: every tick asks GitHub whether the PR of any live commission - active, interactive, needs-review, escalated, or failed - has merged, and transitions it to merged with a pr-merged event. No operator cancel ceremony after merging, no manual merge action except when forced. A merged PR is a fact about the world that makes any in-flight state moot, including an escalation that fired while the operator was already merging the work."
+}

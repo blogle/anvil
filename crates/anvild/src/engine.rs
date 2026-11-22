@@ -50,20 +50,24 @@ pub fn apply(
         (S::Pending, T::Fail { cause }) => S::Failed { cause },
         (S::Pending, T::Cancel) => S::Cancelled,
         (S::Active, T::Converge) => S::NeedsReview,
+        (S::Active, T::Merge) => S::Merged,
         (S::Active, T::Pause) => S::Interactive,
         (S::Active, T::Escalate { reason }) => S::Escalated { reason },
         (S::Active, T::Fail { cause }) => S::Failed { cause },
         (S::Active, T::Cancel) => S::Cancelled,
         (S::Interactive, T::Resume) => S::Active,
+        (S::Interactive, T::Merge) => S::Merged,
         (S::Interactive, T::Cancel) => S::Cancelled,
         (S::NeedsReview, T::Reopen) => S::Active,
         (S::NeedsReview, T::Merge) => S::Merged,
         (S::NeedsReview, T::Escalate { reason }) => S::Escalated { reason },
         (S::NeedsReview, T::Cancel) => S::Cancelled,
         (S::Escalated { .. }, T::Retry) => S::Active,
+        (S::Escalated { .. }, T::Merge) => S::Merged,
         (S::Escalated { .. }, T::Cancel) => S::Cancelled,
         (S::Failed { .. }, T::Retry) => S::Active,
         (S::Failed { .. }, T::Requeue) => S::Pending,
+        (S::Failed { .. }, T::Merge) => S::Merged,
         (S::Failed { .. }, T::Cancel) => S::Cancelled,
         (S::Merged, t) | (S::Cancelled, t) => {
             return Err(IllegalTransition {
@@ -109,6 +113,7 @@ impl Default for EngineConfig {
 pub struct TickReport {
     pub admitted: usize,
     pub escalated: usize,
+    pub merged: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -159,6 +164,7 @@ impl Engine {
         self.escalate_stalled_attempts(&mut report).await?;
         self.escalate_stalled_turns(&mut report).await?;
         self.escalate_exhausted_commissions(&mut report).await?;
+        self.settle_merged_commissions(&mut report).await?;
         self.drive_active_commissions(&mut report).await?;
         Ok(report)
     }
@@ -801,6 +807,52 @@ impl Engine {
             AttentionKind::EnvFailure,
         )
         .await
+    }
+
+    async fn settle_merged_commissions(&self, report: &mut TickReport) -> Result<(), EngineError> {
+        let Some(github) = &self.github else {
+            return Ok(());
+        };
+        let candidates = self
+            .store
+            .commissions()
+            .await?
+            .into_iter()
+            .filter(|commission| {
+                commission.pr_number.is_some()
+                    && matches!(
+                        commission.state,
+                        CommissionState::Active
+                            | CommissionState::Interactive
+                            | CommissionState::NeedsReview
+                            | CommissionState::Escalated { .. }
+                            | CommissionState::Failed { .. }
+                    )
+            })
+            .collect::<Vec<_>>();
+        for commission in candidates {
+            let Some(pr_number) = commission.pr_number else {
+                continue;
+            };
+            let merged = github
+                .pull_merged(&commission.repo, pr_number)
+                .await
+                .unwrap_or(false);
+            if !merged {
+                continue;
+            }
+            let to = apply(&commission.state, Transition::Merge)?;
+            let event = state_changed(
+                &commission,
+                &to,
+                json!({"via": "pr merged", "pr": pr_number}),
+            );
+            self.store
+                .transition_commission(commission.id, to, &[event], None)
+                .await?;
+            report.merged += 1;
+        }
+        Ok(())
     }
 
     async fn escalate_stalled_attempts(&self, report: &mut TickReport) -> Result<(), EngineError> {

@@ -1,4 +1,4 @@
-use anvil_api::{CheckConclusion, CommissionState};
+use anvil_api::{CheckConclusion, CommissionState, EventKind, NewEvent};
 use anvild::engine::{Engine, EngineConfig};
 use anvild::github::{branch_name, parse_check_runs, parse_pull, parse_ref, pr_body};
 use anvild::store::Store;
@@ -335,4 +335,93 @@ fn parsers_map_github_payloads() {
     let body = pr_body("extract invoices", &["suite stays green".to_owned()]);
     assert!(body.contains("extract invoices"));
     assert!(body.contains("- suite stays green"));
+}
+
+#[tokio::test]
+async fn merged_prs_settle_their_commissions_terminal() {
+    let mock = MockGithub::spawn(Box::new(|method, path, _| match (method, path) {
+        ("POST", "/app/installations/1/access_tokens") => {
+            (200, json!({"token": "inst-token"}).to_string())
+        }
+        ("GET", "/repos/acme/payments/pulls/7") => (
+            200,
+            json!({"number": 7, "state": "closed", "merged": true,
+                       "head": {"sha": "head123"}, "base": {"sha": "target-1"}})
+            .to_string(),
+        ),
+        _ => (404, "{}".to_owned()),
+    }));
+
+    let store = Store::open_memory().await.unwrap();
+    let campaign_id = store
+        .insert_campaign(anvil_api::NewCampaign {
+            name: "payments refactor".to_owned(),
+            slug: "payments-refactor".to_owned(),
+            context: "split the monolith".to_owned(),
+            strategy: json!({}),
+        })
+        .await
+        .unwrap();
+    let commission_id = store
+        .insert_commission(anvil_api::NewCommission {
+            campaign_id,
+            title: "invoice split".to_owned(),
+            slug: "invoice-split".to_owned(),
+            spec: "extract invoices".to_owned(),
+            repo: "acme/payments".to_owned(),
+            target_ref: "main".to_owned(),
+            target_sha: "a41f2c9".to_owned(),
+            wave: 1,
+            budget: json!({}),
+            strategy: json!({}),
+        })
+        .await
+        .unwrap();
+
+    let event = |to: &str| NewEvent {
+        kind: EventKind::StateChanged,
+        campaign_id: Some(campaign_id),
+        commission_id: Some(commission_id),
+        payload: json!({"to": to}),
+    };
+    store
+        .provision_and_transition(
+            commission_id,
+            CommissionState::NeedsReview,
+            "a41f2c9",
+            "anvil/payments-refactor/invoice-split",
+            7,
+            &[event("needs-review")],
+        )
+        .await
+        .unwrap();
+
+    let engine =
+        Engine::new(store.clone(), EngineConfig::default()).with_github(client(&mock.url()));
+    let report = engine.tick().await.unwrap();
+
+    assert_eq!(report.merged, 1);
+    let commission = store.commission(commission_id).await.unwrap().unwrap();
+    assert_eq!(commission.state, CommissionState::Merged);
+
+    store
+        .transition_commission(
+            commission_id,
+            CommissionState::Escalated {
+                reason: "stalled while the operator merged it anyway".to_owned(),
+            },
+            &[event("escalated")],
+            None,
+        )
+        .await
+        .unwrap();
+    let report = engine.tick().await.unwrap();
+
+    assert_eq!(report.merged, 1);
+    let commission = store.commission(commission_id).await.unwrap().unwrap();
+    assert_eq!(
+        commission.state,
+        CommissionState::Merged,
+        "a merged PR makes even an escalation moot"
+    );
 }
