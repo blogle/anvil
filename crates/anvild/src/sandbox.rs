@@ -56,6 +56,7 @@ impl SandboxProvider {
     }
 
     pub async fn destroy(&self, name: &str) -> Result<(), SandboxError> {
+        validate_name(name)?;
         match self {
             Self::Podman(provider) => provider.destroy(name).await,
             Self::Memory(provider) => provider.destroy(name).await,

@@ -177,7 +177,18 @@ impl Engine {
                 continue;
             };
             let name = format!("anvil-{}-{}", campaign.slug, commission.slug);
-            sandbox.destroy(&name).await?;
+            if let Err(error) = sandbox.destroy(&name).await {
+                let _ = self
+                    .store
+                    .append_events(&[NewEvent {
+                        kind: EventKind::SandboxDestroyFailed,
+                        campaign_id: Some(commission.campaign_id),
+                        commission_id: Some(commission.id),
+                        payload: json!({"name": name, "error": error.to_string()}),
+                    }])
+                    .await;
+                continue;
+            }
             self.store
                 .mark_sandbox_destroyed(
                     commission.id,
@@ -558,6 +569,7 @@ impl Engine {
         let turn_id = self.store.insert_turn(attempt.id, &prompt_hash).await?;
 
         let sandbox_name = format!("anvil-{}-{}", campaign.slug, commission.slug);
+        let first_turn_of_attempt = turns.is_empty();
         let spec = SandboxSpec {
             name: sandbox_name.clone(),
             image: self.config.sandbox_image.clone(),
@@ -575,6 +587,9 @@ impl Engine {
         let harness = Arc::clone(self.harness.as_ref().expect("checked in drive"));
         let attempt_id = attempt.id;
         tokio::spawn(async move {
+            if first_turn_of_attempt {
+                let _ = sandbox.destroy(&spec.name).await;
+            }
             let handle = match sandbox.handle(&spec.name).await {
                 Ok(Some(handle)) => handle,
                 Ok(None) => match sandbox.start(&spec).await {
