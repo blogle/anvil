@@ -56,6 +56,7 @@ impl SandboxProvider {
     }
 
     pub async fn destroy(&self, name: &str) -> Result<(), SandboxError> {
+        validate_name(name)?;
         match self {
             Self::Podman(provider) => provider.destroy(name).await,
             Self::Memory(provider) => provider.destroy(name).await,
@@ -144,11 +145,7 @@ impl PodmanProvider {
         let result = podman(&args).await?;
         match result {
             Ok(_) => Ok(()),
-            Err(stderr)
-                if stderr.contains("no such container") || stderr.contains("no such object") =>
-            {
-                Ok(())
-            }
+            Err(stderr) if is_missing_container(&stderr) => Ok(()),
             Err(stderr) => Err(SandboxError::Podman { stderr }),
         }
     }
@@ -157,11 +154,7 @@ impl PodmanProvider {
         let args = ["inspect", "-f", "{{.State.Running}}", name].map(str::to_owned);
         match podman(&args).await? {
             Ok(output) => Ok(String::from_utf8_lossy(&output.stdout).trim() == "true"),
-            Err(stderr)
-                if stderr.contains("no such container") || stderr.contains("no such object") =>
-            {
-                Ok(false)
-            }
+            Err(stderr) if is_missing_container(&stderr) => Ok(false),
             Err(stderr) => Err(SandboxError::Podman { stderr }),
         }
     }
@@ -200,6 +193,12 @@ impl PodmanProvider {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
+}
+
+fn is_missing_container(stderr: &str) -> bool {
+    stderr.contains("no such container")
+        || stderr.contains("no such object")
+        || stderr.contains("no container with name or ID")
 }
 
 pub fn run_args(spec: &SandboxSpec, nix_store: &Path, nix_socket_dir: &Path) -> Vec<String> {

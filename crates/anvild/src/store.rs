@@ -168,7 +168,7 @@ impl Store {
     ) -> Result<Vec<Commission>, StoreError> {
         let rows = sqlx::query_as::<_, CommissionRow>(
             "SELECT id, campaign_id, title, slug, spec, repo, target_ref, target_sha, wave,
-                    state, state_detail, budget, strategy, branch, pr_number, created_at, updated_at
+                     state, state_detail, budget, strategy, branch, pr_number, created_at, updated_at
              FROM commissions WHERE updated_at > ? ORDER BY updated_at, slug",
         )
         .bind(since_millis)
@@ -177,6 +177,48 @@ impl Store {
         rows.into_iter()
             .map(CommissionRow::into_commission)
             .collect()
+    }
+
+    pub async fn terminal_commissions_pending_teardown(
+        &self,
+        terminal_before: OffsetDateTime,
+    ) -> Result<Vec<Commission>, StoreError> {
+        let rows = sqlx::query_as::<_, CommissionRow>(
+            "SELECT id, campaign_id, title, slug, spec, repo, target_ref, target_sha, wave,
+                    state, state_detail, budget, strategy, branch, pr_number, created_at, updated_at
+             FROM commissions
+             WHERE state IN ('cancelled', 'merged') AND sandbox_destroyed_at IS NULL
+               AND updated_at <= ?
+             ORDER BY updated_at, slug",
+        )
+        .bind(to_millis(terminal_before))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(CommissionRow::into_commission)
+            .collect()
+    }
+
+    pub async fn mark_sandbox_destroyed(
+        &self,
+        id: CommissionId,
+        event: NewEvent,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "UPDATE commissions SET sandbox_destroyed_at = ?
+             WHERE id = ? AND state IN ('cancelled', 'merged')
+               AND sandbox_destroyed_at IS NULL",
+        )
+        .bind(now_millis())
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 1 {
+            insert_event(&mut tx, &event).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn idempotency_remember(&self, key: &str, response: &str) -> Result<(), StoreError> {
@@ -252,10 +294,14 @@ impl Store {
     ) -> Result<(), StoreError> {
         let result = sqlx::query(
             "UPDATE commissions
-             SET state = ?, state_detail = ?, updated_at = ? WHERE id = ?",
+             SET state = ?, state_detail = ?,
+                 sandbox_destroyed_at = CASE WHEN ? IN ('cancelled', 'merged')
+                                             THEN sandbox_destroyed_at ELSE NULL END,
+                 updated_at = ? WHERE id = ?",
         )
         .bind(state.kind())
         .bind(state.detail())
+        .bind(state.kind())
         .bind(now_millis())
         .bind(id.to_string())
         .execute(&self.pool)
@@ -272,10 +318,15 @@ impl Store {
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
-            "UPDATE commissions SET state = ?, state_detail = ?, updated_at = ? WHERE id = ?",
+            "UPDATE commissions
+             SET state = ?, state_detail = ?,
+                 sandbox_destroyed_at = CASE WHEN ? IN ('cancelled', 'merged')
+                                             THEN sandbox_destroyed_at ELSE NULL END,
+                 updated_at = ? WHERE id = ?",
         )
         .bind(to.kind())
         .bind(to.detail())
+        .bind(to.kind())
         .bind(now_millis())
         .bind(id.to_string())
         .execute(&mut *tx)
@@ -303,12 +354,16 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE commissions
-             SET state = ?, state_detail = ?, target_sha = ?, branch = ?, pr_number = ?,
+             SET state = ?, state_detail = ?,
+                 sandbox_destroyed_at = CASE WHEN ? IN ('cancelled', 'merged')
+                                             THEN sandbox_destroyed_at ELSE NULL END,
+                 target_sha = ?, branch = ?, pr_number = ?,
                  updated_at = ?
              WHERE id = ?",
         )
         .bind(to.kind())
         .bind(to.detail())
+        .bind(to.kind())
         .bind(target_sha)
         .bind(branch)
         .bind(pr_number)
