@@ -115,6 +115,35 @@ async fn the_cli_walks_the_m1_loop() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_cli_dismisses_one_or_all_inbox_items() {
+    let (store, base) = daemon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let campaign_file = dir.path().join("campaign.yaml");
+    std::fs::write(&campaign_file, campaign_yaml()).unwrap();
+    let submit = run_anvil(
+        &base,
+        &["campaign", "submit", campaign_file.to_str().unwrap()],
+    );
+    assert!(submit.status.success());
+    let commissions = store.commissions().await.unwrap();
+    let commission = commissions[0].id;
+    store.agent_attention(commission, "first").await.unwrap();
+    store.agent_attention(commission, "second").await.unwrap();
+
+    let inbox =
+        serde_json::from_slice::<serde_json::Value>(&run_anvil(&base, &["inbox", "--json"]).stdout)
+            .unwrap();
+    let first = inbox["attention"][0]["id"].as_str().unwrap();
+    let dismiss = run_anvil(&base, &["inbox", "dismiss", first]);
+    assert!(dismiss.status.success());
+    assert_eq!(store.open_attention().await.unwrap().len(), 1);
+
+    let dismiss_all = run_anvil(&base, &["inbox", "dismiss", "--all"]);
+    assert!(dismiss_all.status.success());
+    assert!(store.open_attention().await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_cli_onboards_credentials_without_echoing_them() {
     let (store, base) = daemon().await;
     let add = run_anvil(

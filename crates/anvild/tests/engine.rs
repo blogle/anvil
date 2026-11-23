@@ -54,6 +54,7 @@ fn engine(store: &Store, heartbeat_timeout: Duration, turn_timeout: Duration) ->
             tick_interval: Duration::from_secs(10),
             heartbeat_timeout,
             turn_timeout,
+            sandbox_teardown_grace: Duration::ZERO,
             ..EngineConfig::default()
         },
     )
@@ -77,23 +78,38 @@ async fn terminal_commission_sandbox_is_destroyed_once_and_logged() {
         .unwrap();
 
     let sandbox = Arc::new(SandboxProvider::Memory(Default::default()));
-    sandbox
-        .start(&SandboxSpec {
-            name: "anvil-payments-invoice-1".to_owned(),
-            image: "anvil-sandbox:latest".to_owned(),
-            workspace: _dir.path().join(PathBuf::from("workspace")),
-            files: BTreeMap::new(),
-            env: BTreeMap::new(),
-        })
+    let stable = "anvil-payments-invoice-1";
+    let legacy = "anvil-payments-invoice-1-a1";
+    for name in [stable, legacy] {
+        sandbox
+            .start(&SandboxSpec {
+                name: name.to_owned(),
+                image: "anvil-sandbox:latest".to_owned(),
+                workspace: _dir.path().join(name),
+                files: BTreeMap::new(),
+                env: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+    }
+    let within_grace =
+        Engine::new(store.clone(), EngineConfig::default()).with_sandbox(sandbox.clone());
+    within_grace.tick().await.unwrap();
+    for name in [stable, legacy] {
+        assert!(sandbox.is_running(name).await.unwrap());
+    }
+    assert!(store
+        .events_since(0, 100)
         .await
-        .unwrap();
+        .unwrap()
+        .iter()
+        .all(|event| { event.kind != EventKind::SandboxDestroyed }));
     let engine = engine(&store, mins(30), hrs(2)).with_sandbox(sandbox.clone());
 
     engine.tick().await.unwrap();
-    assert!(!sandbox
-        .is_running("anvil-payments-invoice-1")
-        .await
-        .unwrap());
+    for name in [stable, legacy] {
+        assert!(!sandbox.is_running(name).await.unwrap());
+    }
     let events = store.events_since(0, 100).await.unwrap();
     assert_eq!(
         events
@@ -266,7 +282,6 @@ fn transition_table_rejects_illegal_paths() {
         (S::Pending, Transition::Merge),
         (S::Pending, Transition::Converge),
         (S::Active, Transition::Admit),
-        (S::Active, Transition::Merge),
         (S::Interactive, Transition::Converge),
         (S::Merged, Transition::Retry),
         (S::Merged, Transition::Cancel),
@@ -527,7 +542,7 @@ async fn exhausted_attempt_budget_escalates() {
             .await
             .unwrap();
         store
-            .end_attempt(attempt, None, json!({"outcome": "reprompt"}))
+            .end_attempt(attempt, json!({"outcome": "reprompt"}))
             .await
             .unwrap();
     }
@@ -558,7 +573,7 @@ async fn running_attempt_keeps_budget_unescalated() {
         .await
         .unwrap();
     store
-        .end_attempt(first, None, json!({"outcome": "reprompt"}))
+        .end_attempt(first, json!({"outcome": "reprompt"}))
         .await
         .unwrap();
     store
@@ -587,7 +602,7 @@ fn receipt(session: &str, tokens: i64) -> Result<TurnReceipt, HarnessError> {
 
 #[tokio::test]
 async fn a_failed_teardown_does_not_stop_unrelated_progress() {
-    let (store, _dir) = temp_store().await;
+    let (store, dir) = temp_store().await;
     let dirty_campaign = store.insert_campaign(campaign("dirty_work")).await.unwrap();
     let dirty = store
         .insert_commission(commission(dirty_campaign, 1))
@@ -605,9 +620,16 @@ async fn a_failed_teardown_does_not_stop_unrelated_progress() {
         .unwrap();
 
     let scripted = ScriptedHarness::new(vec![receipt("s-1", 1_000)]);
-    let engine = engine(&store, mins(30), hrs(2))
-        .with_sandbox(Arc::new(SandboxProvider::Memory(Default::default())))
-        .with_harness(Arc::new(Harness::Scripted(scripted)));
+    let engine = Engine::new(
+        store.clone(),
+        EngineConfig {
+            state_dir: dir.path().to_owned(),
+            sandbox_teardown_grace: Duration::ZERO,
+            ..EngineConfig::default()
+        },
+    )
+    .with_sandbox(Arc::new(SandboxProvider::Memory(Default::default())))
+    .with_harness(Arc::new(Harness::Scripted(scripted)));
 
     engine.tick().await.unwrap();
 
@@ -637,6 +659,64 @@ async fn a_failed_teardown_does_not_stop_unrelated_progress() {
         2,
         "the marker stays unset, so a failed removal retries on later ticks"
     );
+}
+
+async fn wait_for_finished_turn(store: &Store, attempt: anvil_api::AttemptId) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if store
+                .turns(attempt)
+                .await
+                .unwrap()
+                .last()
+                .is_some_and(|turn| turn.ended_at.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("turn should finish");
+}
+
+#[tokio::test]
+async fn a_failed_replacement_ends_the_attempt_without_running_the_harness() {
+    let (store, dir) = temp_store().await;
+    let campaign = store
+        .insert_campaign(campaign("invalid_slug"))
+        .await
+        .unwrap();
+    let commission = store
+        .insert_commission(commission(campaign, 1))
+        .await
+        .unwrap();
+    let scripted = ScriptedHarness::new(vec![receipt("unexpected", 1)]);
+    let engine = Engine::new(
+        store.clone(),
+        EngineConfig {
+            state_dir: dir.path().to_owned(),
+            ..EngineConfig::default()
+        },
+    )
+    .with_sandbox(Arc::new(SandboxProvider::Memory(Default::default())))
+    .with_harness(Arc::new(Harness::Scripted(scripted.clone())));
+
+    engine.tick().await.unwrap();
+    let attempt = store.attempts(commission).await.unwrap()[0].id;
+    wait_for_finished_turn(&store, attempt).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let attempts = store.attempts(commission).await.unwrap();
+            if attempts[0].ended_at.is_some() {
+                assert!(attempts[0].outcome.as_ref().unwrap()["error"].as_str().unwrap()
+                    .starts_with("sandbox: could not remove anvil-invalid_slug-invoice-1 before starting the attempt"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("attempt should end after failed removal");
+    assert!(scripted.received.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -673,6 +753,7 @@ async fn a_retry_recreates_the_sandbox_with_updated_configuration() {
     .with_harness(Arc::new(Harness::Scripted(scripted)));
 
     engine.tick().await.unwrap();
+    wait_for_finished_turn(&store, store.attempts(commission_id).await.unwrap()[0].id).await;
     engine.tick().await.unwrap();
     let commission = store.commission(commission_id).await.unwrap().unwrap();
     assert!(matches!(
@@ -699,7 +780,7 @@ async fn a_retry_recreates_the_sandbox_with_updated_configuration() {
         .unwrap();
 
     engine.tick().await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    wait_for_finished_turn(&store, store.attempts(commission_id).await.unwrap()[1].id).await;
 
     let opencode =
         std::fs::read_to_string(dir.path().join("workspaces/invoice-1/opencode.json")).unwrap();

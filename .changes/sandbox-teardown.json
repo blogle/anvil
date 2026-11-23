@@ -1,5 +1,5 @@
 {
   "type": "feature",
   "semver": "minor",
-  "summary": "Destroy commission sandboxes when commissions are cancelled or merged. A durable per-commission teardown marker makes the sweep cheap and idempotent, and a failed removal is isolated: it surfaces as a sandbox-destroy-failed event with the commission's context, leaves the marker unset so it retries on later ticks, and never blocks unrelated active work from being driven. Sandboxes keep their stable commission name but are recreated at each new attempt - within an attempt turns reuse the container, across attempts a fresh one materializes the current strategy and credentials, so anvil retry --model takes effect for the run that follows."
+  "summary": "Destroy stable and legacy per-attempt sandboxes after a one-hour grace period when a commission is cancelled or merged. A durable marker records completed teardown; failed removals are reported and retried without blocking unrelated work. A new attempt recreates its sandbox with the current configuration and credentials, and fails explicitly if it cannot remove the previous container."
 }

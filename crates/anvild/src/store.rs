@@ -181,14 +181,17 @@ impl Store {
 
     pub async fn terminal_commissions_pending_teardown(
         &self,
+        terminal_before: OffsetDateTime,
     ) -> Result<Vec<Commission>, StoreError> {
         let rows = sqlx::query_as::<_, CommissionRow>(
             "SELECT id, campaign_id, title, slug, spec, repo, target_ref, target_sha, wave,
                     state, state_detail, budget, strategy, branch, pr_number, created_at, updated_at
              FROM commissions
              WHERE state IN ('cancelled', 'merged') AND sandbox_destroyed_at IS NULL
+               AND updated_at <= ?
              ORDER BY updated_at, slug",
         )
+        .bind(to_millis(terminal_before))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -480,20 +483,18 @@ impl Store {
         Self::require_row(result, "attempt", &id.to_string())
     }
 
-    pub async fn end_attempt(
-        &self,
-        id: AttemptId,
-        tokens: Option<i64>,
-        outcome: Value,
-    ) -> Result<(), StoreError> {
-        let result =
-            sqlx::query("UPDATE attempts SET ended_at = ?, tokens = ?, outcome = ? WHERE id = ?")
-                .bind(now_millis())
-                .bind(tokens)
-                .bind(encode_json(&outcome))
-                .bind(id.to_string())
-                .execute(&self.pool)
-                .await?;
+    pub async fn end_attempt(&self, id: AttemptId, outcome: Value) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            "UPDATE attempts SET ended_at = ?,
+                    tokens = (SELECT COALESCE(SUM(tokens), 0) FROM turns WHERE attempt_id = ?),
+                    outcome = ? WHERE id = ?",
+        )
+        .bind(now_millis())
+        .bind(id.to_string())
+        .bind(encode_json(&outcome))
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
         Self::require_row(result, "attempt", &id.to_string())
     }
 

@@ -154,6 +154,18 @@ impl Anvil {
         Ok(response.json().await?)
     }
 
+    pub async fn dismiss_attention(&self, attention: &str) -> Result<(), AnvilError> {
+        self.send(
+            "POST",
+            &format!("/v1/inbox/{attention}/dismiss"),
+            Some(json!({})),
+            None,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn action(
         &self,
         commission: &str,
@@ -297,6 +309,16 @@ pub fn status_view(detail: &Value) -> String {
         "state:    {}",
         commission["state"]["kind"].as_str().unwrap_or("")
     );
+    match commission["state"]["kind"].as_str() {
+        Some("failed") | Some("escalated") => {
+            let cause = commission["state"]["cause"]
+                .as_str()
+                .or_else(|| commission["state"]["reason"].as_str())
+                .unwrap_or("");
+            let _ = writeln!(out, "cause:    {cause}");
+        }
+        _ => {}
+    }
     let _ = writeln!(
         out,
         "repo:     {} @ {}",
@@ -308,6 +330,10 @@ pub fn status_view(detail: &Value) -> String {
         "branch:   {}",
         commission["branch"].as_str().unwrap_or("")
     );
+    if let Some(pr) = commission["pr_number"].as_i64() {
+        let repo = commission["repo"].as_str().unwrap_or("");
+        let _ = writeln!(out, "pr:       https://github.com/{repo}/pull/{pr}");
+    }
     let _ = writeln!(
         out,
         "spec:     {}",
@@ -322,6 +348,9 @@ pub fn status_view(detail: &Value) -> String {
             obligation["text"].as_str().unwrap_or("")
         );
     }
+    if let Some(notes) = detail["claim"]["notes"].as_str() {
+        let _ = writeln!(out, "claim:    {notes}");
+    }
     let _ = writeln!(out, "attempts:");
     for attempt in detail["attempts"].as_array().into_iter().flatten() {
         let ended = if attempt["ended_at"].is_null() {
@@ -329,18 +358,39 @@ pub fn status_view(detail: &Value) -> String {
         } else {
             "ended"
         };
+        let tokens = attempt["tokens"]
+            .as_i64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".to_owned());
         let _ = writeln!(
             out,
-            "  #{} {} tokens:{}",
+            "  #{} {} tokens:{} {}",
             attempt["n"].as_i64().unwrap_or(0),
             ended,
-            attempt["tokens"]
-                .as_i64()
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "-".to_owned())
+            tokens,
+            attempt_outcome(&attempt["outcome"])
         );
     }
     out
+}
+
+fn attempt_outcome(outcome: &Value) -> String {
+    if outcome.is_null() {
+        return String::new();
+    }
+    if outcome["converged"].as_bool().is_some() {
+        return "converged".to_owned();
+    }
+    if outcome["stale"].as_bool().is_some() {
+        return "stale".to_owned();
+    }
+    if let Some(error) = outcome["error"].as_str() {
+        return format!("error: {error}");
+    }
+    if let Some(reason) = outcome["escalated"].as_str() {
+        return format!("escalated: {reason}");
+    }
+    String::new()
 }
 
 pub fn inbox_view(inbox: &Value) -> String {
@@ -434,5 +484,71 @@ impl SseLines {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_view;
+    use serde_json::json;
+
+    #[test]
+    fn status_view_shows_only_failure_and_escalation_causes() {
+        let failed = status_view(&json!({
+            "commission": {
+                "title": "broken",
+                "slug": "broken",
+                "state": {"kind": "failed", "cause": "sandbox did not start"}
+            }
+        }));
+        assert!(failed.contains("cause:    sandbox did not start"));
+
+        let escalated = status_view(&json!({
+            "commission": {
+                "title": "stuck",
+                "slug": "stuck",
+                "state": {"kind": "escalated", "reason": "turn budget exhausted"}
+            }
+        }));
+        assert!(escalated.contains("cause:    turn budget exhausted"));
+
+        let active = status_view(&json!({
+            "commission": {
+                "title": "running",
+                "slug": "running",
+                "state": {"kind": "active", "cause": "not displayed"}
+            }
+        }));
+        assert!(!active.contains("cause:"));
+    }
+
+    #[test]
+    fn status_view_renders_completion_evidence() {
+        let rendered = status_view(&json!({
+            "commission": {
+                "title": "cli observability",
+                "slug": "cli-observability",
+                "state": {"kind": "merged"},
+                "repo": "blogle/anvil",
+                "target_ref": "main",
+                "branch": "anvil/dogfood/cli-observability",
+                "pr_number": 204,
+            },
+            "obligations": [],
+            "attempts": [
+                {"n": 1, "ended_at": 1795287900000i64, "tokens": 2255748, "outcome": {"converged": true}},
+                {"n": 2, "ended_at": null, "tokens": null, "outcome": null}
+            ],
+            "claim": {
+                "attempt": "077e32d9",
+                "notes": "Implemented status causes and inbox dismissal; pushed and verified."
+            }
+        }));
+        assert!(rendered.contains("pr:       https://github.com/blogle/anvil/pull/204"));
+        assert!(rendered.contains(
+            "claim:    Implemented status causes and inbox dismissal; pushed and verified."
+        ));
+        assert!(rendered.contains("#1 ended tokens:2255748 converged"));
+        assert!(rendered.contains("#2 running tokens:-"));
     }
 }

@@ -197,8 +197,13 @@ async fn attempts_number_sequentially_and_end() {
         .await
         .unwrap();
     store.touch_attempt(second).await.unwrap();
+    let turn = store.insert_turn(second, "sha256:tokens").await.unwrap();
     store
-        .end_attempt(second, Some(41_000), json!({"outcome": "converged"}))
+        .end_turn(turn, Some(41_000), json!({"status": "ok"}))
+        .await
+        .unwrap();
+    store
+        .end_attempt(second, json!({"outcome": "converged"}))
         .await
         .unwrap();
 

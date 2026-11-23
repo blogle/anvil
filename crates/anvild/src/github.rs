@@ -230,6 +230,14 @@ impl GithubClient {
         Ok(())
     }
 
+    pub async fn pull_merged(&self, repo: &str, pr_number: i64) -> Result<bool, GithubError> {
+        let body = self
+            .call("GET", &format!("/repos/{repo}/pulls/{pr_number}"), None)
+            .await?;
+        Ok(body.get("state").and_then(Value::as_str) == Some("closed")
+            && body.get("merged").and_then(Value::as_bool) == Some(true))
+    }
+
     pub async fn pull(&self, repo: &str, pr_number: i64) -> Result<PullInfo, GithubError> {
         let body = self
             .call("GET", &format!("/repos/{repo}/pulls/{pr_number}"), None)

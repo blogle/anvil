@@ -50,20 +50,24 @@ pub fn apply(
         (S::Pending, T::Fail { cause }) => S::Failed { cause },
         (S::Pending, T::Cancel) => S::Cancelled,
         (S::Active, T::Converge) => S::NeedsReview,
+        (S::Active, T::Merge) => S::Merged,
         (S::Active, T::Pause) => S::Interactive,
         (S::Active, T::Escalate { reason }) => S::Escalated { reason },
         (S::Active, T::Fail { cause }) => S::Failed { cause },
         (S::Active, T::Cancel) => S::Cancelled,
         (S::Interactive, T::Resume) => S::Active,
+        (S::Interactive, T::Merge) => S::Merged,
         (S::Interactive, T::Cancel) => S::Cancelled,
         (S::NeedsReview, T::Reopen) => S::Active,
         (S::NeedsReview, T::Merge) => S::Merged,
         (S::NeedsReview, T::Escalate { reason }) => S::Escalated { reason },
         (S::NeedsReview, T::Cancel) => S::Cancelled,
         (S::Escalated { .. }, T::Retry) => S::Active,
+        (S::Escalated { .. }, T::Merge) => S::Merged,
         (S::Escalated { .. }, T::Cancel) => S::Cancelled,
         (S::Failed { .. }, T::Retry) => S::Active,
         (S::Failed { .. }, T::Requeue) => S::Pending,
+        (S::Failed { .. }, T::Merge) => S::Merged,
         (S::Failed { .. }, T::Cancel) => S::Cancelled,
         (S::Merged, t) | (S::Cancelled, t) => {
             return Err(IllegalTransition {
@@ -86,6 +90,7 @@ pub struct EngineConfig {
     pub tick_interval: Duration,
     pub heartbeat_timeout: Duration,
     pub turn_timeout: Duration,
+    pub sandbox_teardown_grace: Duration,
     pub state_dir: PathBuf,
     pub daemon_url: String,
     pub sandbox_image: String,
@@ -98,6 +103,7 @@ impl Default for EngineConfig {
             tick_interval: Duration::from_secs(10),
             heartbeat_timeout: Duration::from_secs(30 * 60),
             turn_timeout: Duration::from_secs(15 * 60),
+            sandbox_teardown_grace: Duration::from_secs(60 * 60),
             state_dir: PathBuf::from(format!("{home}/.local/state/anvil")),
             daemon_url: "http://127.0.0.1:8788".to_owned(),
             sandbox_image: "anvil-sandbox:latest".to_owned(),
@@ -109,6 +115,7 @@ impl Default for EngineConfig {
 pub struct TickReport {
     pub admitted: usize,
     pub escalated: usize,
+    pub merged: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -161,6 +168,7 @@ impl Engine {
         self.escalate_stalled_attempts(&mut report).await?;
         self.escalate_stalled_turns(&mut report).await?;
         self.escalate_exhausted_commissions(&mut report).await?;
+        self.settle_merged_commissions(&mut report).await?;
         self.teardown_terminal_sandboxes().await?;
         self.drive_active_commissions(&mut report).await?;
         Ok(report)
@@ -171,23 +179,33 @@ impl Engine {
             return Ok(());
         };
 
-        let commissions = self.store.terminal_commissions_pending_teardown().await?;
-        for commission in commissions {
+        let cutoff = OffsetDateTime::now_utc() - self.config.sandbox_teardown_grace;
+        let commissions = self
+            .store
+            .terminal_commissions_pending_teardown(cutoff)
+            .await?;
+        'commission: for commission in commissions {
             let Some(campaign) = self.store.campaign(commission.campaign_id).await? else {
                 continue;
             };
             let name = format!("anvil-{}-{}", campaign.slug, commission.slug);
-            if let Err(error) = sandbox.destroy(&name).await {
-                let _ = self
-                    .store
-                    .append_events(&[NewEvent {
-                        kind: EventKind::SandboxDestroyFailed,
-                        campaign_id: Some(commission.campaign_id),
-                        commission_id: Some(commission.id),
-                        payload: json!({"name": name, "error": error.to_string()}),
-                    }])
-                    .await;
-                continue;
+            let names = self.sandbox_names(&name, commission.id).await?;
+            for candidate in &names {
+                if let Err(error) = sandbox.destroy(candidate).await {
+                    if let Err(event_error) = self
+                        .store
+                        .append_events(&[NewEvent {
+                            kind: EventKind::SandboxDestroyFailed,
+                            campaign_id: Some(commission.campaign_id),
+                            commission_id: Some(commission.id),
+                            payload: json!({"name": candidate, "error": error.to_string()}),
+                        }])
+                        .await
+                    {
+                        eprintln!("anvild: teardown for {} failed for {candidate}: {error}; could not record event: {event_error}", commission.id);
+                    }
+                    continue 'commission;
+                }
             }
             self.store
                 .mark_sandbox_destroyed(
@@ -196,12 +214,28 @@ impl Engine {
                         kind: EventKind::SandboxDestroyed,
                         campaign_id: Some(commission.campaign_id),
                         commission_id: Some(commission.id),
-                        payload: json!({"name": name}),
+                        payload: json!({"name": name, "names": names}),
                     },
                 )
                 .await?;
         }
         Ok(())
+    }
+
+    async fn sandbox_names(
+        &self,
+        name: &str,
+        commission: anvil_api::CommissionId,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut names = vec![name.to_owned()];
+        names.extend(
+            self.store
+                .attempts(commission)
+                .await?
+                .iter()
+                .map(|attempt| format!("{name}-a{}", attempt.n)),
+        );
+        Ok(names)
     }
 
     async fn drive_active_commissions(&self, report: &mut TickReport) -> Result<(), EngineError> {
@@ -265,7 +299,7 @@ impl Engine {
                     if turns.is_empty() {
                         let _ = self
                             .store
-                            .end_attempt(attempt.id, None, json!({"stale": true}))
+                            .end_attempt(attempt.id, json!({"stale": true}))
                             .await;
                         continue;
                     }
@@ -364,10 +398,8 @@ impl Engine {
         };
         match parsed.evaluate(&external) {
             Verdict::Converge => {
-                let turns = self.store.turns(attempt.id).await?;
-                let tokens: i64 = turns.iter().filter_map(|t| t.tokens).sum();
                 self.store
-                    .end_attempt(attempt.id, Some(tokens), json!({"converged": true}))
+                    .end_attempt(attempt.id, json!({"converged": true}))
                     .await?;
                 let to = apply(&commission.state, Transition::Converge)?;
                 let event = state_changed(commission, &to, json!({"via": "done claim"}));
@@ -566,12 +598,15 @@ impl Engine {
         let prompt = parsed.compose_turn(&context);
         let prompt_hash = strategy::prompt_hash(&prompt);
 
-        let turn_id = self.store.insert_turn(attempt.id, &prompt_hash).await?;
-
         let sandbox_name = format!("anvil-{}-{}", campaign.slug, commission.slug);
-        let first_turn_of_attempt = turns.is_empty();
+        let replace = if turns.is_empty() {
+            self.sandbox_names(&sandbox_name, commission.id).await?
+        } else {
+            Vec::new()
+        };
+        let turn_id = self.store.insert_turn(attempt.id, &prompt_hash).await?;
         let spec = SandboxSpec {
-            name: sandbox_name.clone(),
+            name: sandbox_name,
             image: self.config.sandbox_image.clone(),
             workspace: self
                 .config
@@ -587,32 +622,36 @@ impl Engine {
         let harness = Arc::clone(self.harness.as_ref().expect("checked in drive"));
         let attempt_id = attempt.id;
         tokio::spawn(async move {
-            if first_turn_of_attempt {
-                let _ = sandbox.destroy(&spec.name).await;
-            }
-            let handle = match sandbox.handle(&spec.name).await {
-                Ok(Some(handle)) => handle,
-                Ok(None) => match sandbox.start(&spec).await {
-                    Ok(handle) => handle,
-                    Err(error) => {
-                        let _ = store
-                            .end_attempt(
-                                attempt_id,
-                                None,
-                                json!({"error": format!("sandbox: {error}")}),
-                            )
-                            .await;
-                        return;
+            let prepared = async {
+                if replace.is_empty() {
+                    if let Some(handle) = sandbox
+                        .handle(&spec.name)
+                        .await
+                        .map_err(|error| error.to_string())?
+                    {
+                        return Ok(handle);
                     }
-                },
+                } else {
+                    for name in &replace {
+                        sandbox.destroy(name).await.map_err(|error| {
+                            format!("could not remove {name} before starting the attempt: {error}")
+                        })?;
+                    }
+                }
+                sandbox
+                    .start(&spec)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            .await;
+            let handle = match prepared {
+                Ok(handle) => handle,
                 Err(error) => {
+                    let error = format!("sandbox: {error}");
                     let _ = store
-                        .end_attempt(
-                            attempt_id,
-                            None,
-                            json!({"error": format!("sandbox: {error}")}),
-                        )
+                        .end_turn(turn_id, None, json!({"status": "error", "error": error}))
                         .await;
+                    let _ = store.end_attempt(attempt_id, json!({"error": error})).await;
                     return;
                 }
             };
@@ -644,11 +683,7 @@ impl Engine {
                         )
                         .await;
                     let _ = store
-                        .end_attempt(
-                            attempt_id,
-                            None,
-                            json!({"error": format!("harness: {error}")}),
-                        )
+                        .end_attempt(attempt_id, json!({"error": format!("harness: {error}")}))
                         .await;
                 }
             }
@@ -838,6 +873,52 @@ impl Engine {
         .await
     }
 
+    async fn settle_merged_commissions(&self, report: &mut TickReport) -> Result<(), EngineError> {
+        let Some(github) = &self.github else {
+            return Ok(());
+        };
+        let candidates = self
+            .store
+            .commissions()
+            .await?
+            .into_iter()
+            .filter(|commission| {
+                commission.pr_number.is_some()
+                    && matches!(
+                        commission.state,
+                        CommissionState::Active
+                            | CommissionState::Interactive
+                            | CommissionState::NeedsReview
+                            | CommissionState::Escalated { .. }
+                            | CommissionState::Failed { .. }
+                    )
+            })
+            .collect::<Vec<_>>();
+        for commission in candidates {
+            let Some(pr_number) = commission.pr_number else {
+                continue;
+            };
+            let merged = github
+                .pull_merged(&commission.repo, pr_number)
+                .await
+                .unwrap_or(false);
+            if !merged {
+                continue;
+            }
+            let to = apply(&commission.state, Transition::Merge)?;
+            let event = state_changed(
+                &commission,
+                &to,
+                json!({"via": "pr merged", "pr": pr_number}),
+            );
+            self.store
+                .transition_commission(commission.id, to, &[event], None)
+                .await?;
+            report.merged += 1;
+        }
+        Ok(())
+    }
+
     async fn escalate_stalled_attempts(&self, report: &mut TickReport) -> Result<(), EngineError> {
         for commission in self
             .store
@@ -856,7 +937,6 @@ impl Engine {
                     self.store
                         .end_attempt(
                             attempt.id,
-                            None,
                             json!({"escalated": "attempt stalled: no heartbeat within timeout"}),
                         )
                         .await?;
@@ -900,7 +980,6 @@ impl Engine {
                     self.store
                         .end_attempt(
                             attempt_id,
-                            None,
                             json!({"escalated": "turn stalled: no turn completion within timeout"}),
                         )
                         .await?;
@@ -958,7 +1037,7 @@ impl Engine {
         if let Some(running) = attempts.iter().rev().find(|a| a.ended_at.is_none()) {
             let _ = self
                 .store
-                .end_attempt(running.id, None, json!({"escalated": reason}))
+                .end_attempt(running.id, json!({"escalated": reason}))
                 .await;
         }
         let to = apply(
