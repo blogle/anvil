@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "Destroy stable and legacy per-attempt sandboxes after a one-hour grace period when a commission is cancelled or merged. A durable marker records completed teardown; failed removals are reported and retried without blocking unrelated work. A new attempt recreates its sandbox with the current configuration and credentials, and fails explicitly if it cannot remove the previous container."
+}
