@@ -46,6 +46,8 @@ rewrite that supersedes the incumbent; it develops on `origin/main` of
 | [docs/index.md](docs/index.md) | Documentation entry + table of contents |
 | [docs/spec.md](docs/spec.md) | Product specification (normative MUSTs) |
 | [docs/architecture.md](docs/architecture.md) | Structure, invariants, decisions |
+| [docs/walkthrough.md](docs/walkthrough.md) | Source-anchored code tour (non-normative) |
 | [docs/research.md](docs/research.md) | Prior-art digests |
 | [docs/mockups/](docs/mockups/) | Non-normative UI sketches |
 | [skills/software-craft/SKILL.md](skills/software-craft/SKILL.md) | Craft principles |
+| [skills/walkthrough-author/SKILL.md](skills/walkthrough-author/SKILL.md) | Reconcile the walkthrough after structural changes |
