@@ -1,7 +1,12 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anvil_api::{AttentionKind, CommissionState, EventKind, NewCampaign, NewCommission};
 use anvild::engine::{apply, Engine, EngineConfig, Transition};
+use anvild::harness::{Harness, HarnessError, ScriptedHarness, TurnReceipt};
+use anvild::sandbox::{SandboxProvider, SandboxSpec};
 use anvild::store::Store;
 use serde_json::json;
 
@@ -49,9 +54,198 @@ fn engine(store: &Store, heartbeat_timeout: Duration, turn_timeout: Duration) ->
             tick_interval: Duration::from_secs(10),
             heartbeat_timeout,
             turn_timeout,
+            sandbox_teardown_grace: Duration::ZERO,
             ..EngineConfig::default()
         },
     )
+}
+
+#[tokio::test]
+async fn terminal_commission_sandbox_is_destroyed_once_and_logged() {
+    let (store, _dir) = temp_store().await;
+    let campaign_id = store.insert_campaign(campaign("payments")).await.unwrap();
+    let commission_id = store
+        .insert_commission(commission(campaign_id, 1))
+        .await
+        .unwrap();
+    store
+        .insert_attempt(commission_id, &json!({}))
+        .await
+        .unwrap();
+    store
+        .set_commission_state(commission_id, CommissionState::Cancelled)
+        .await
+        .unwrap();
+
+    let sandbox = Arc::new(SandboxProvider::Memory(Default::default()));
+    let stable = "anvil-payments-invoice-1";
+    let legacy = "anvil-payments-invoice-1-a1";
+    for name in [stable, legacy] {
+        sandbox
+            .start(&SandboxSpec {
+                name: name.to_owned(),
+                image: "anvil-sandbox:latest".to_owned(),
+                workspace: _dir.path().join(name),
+                files: BTreeMap::new(),
+                env: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+    }
+    let within_grace =
+        Engine::new(store.clone(), EngineConfig::default()).with_sandbox(sandbox.clone());
+    within_grace.tick().await.unwrap();
+    for name in [stable, legacy] {
+        assert!(sandbox.is_running(name).await.unwrap());
+    }
+    assert!(store
+        .events_since(0, 100)
+        .await
+        .unwrap()
+        .iter()
+        .all(|event| { event.kind != EventKind::SandboxDestroyed }));
+    let engine = engine(&store, mins(30), hrs(2)).with_sandbox(sandbox.clone());
+
+    engine.tick().await.unwrap();
+    for name in [stable, legacy] {
+        assert!(!sandbox.is_running(name).await.unwrap());
+    }
+    let events = store.events_since(0, 100).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == EventKind::SandboxDestroyed)
+            .count(),
+        1
+    );
+
+    engine.tick().await.unwrap();
+    let events = store.events_since(0, 100).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == EventKind::SandboxDestroyed)
+            .count(),
+        1
+    );
+
+    store
+        .set_commission_state(commission_id, CommissionState::Active)
+        .await
+        .unwrap();
+    sandbox
+        .start(&SandboxSpec {
+            name: "anvil-payments-invoice-1".to_owned(),
+            image: "anvil-sandbox:latest".to_owned(),
+            workspace: _dir.path().join(PathBuf::from("workspace-retry")),
+            files: BTreeMap::new(),
+            env: BTreeMap::new(),
+        })
+        .await
+        .unwrap();
+    store
+        .set_commission_state(commission_id, CommissionState::Cancelled)
+        .await
+        .unwrap();
+    engine.tick().await.unwrap();
+    let events = store.events_since(0, 100).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == EventKind::SandboxDestroyed)
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn only_cancelled_and_merged_commissions_are_torn_down() {
+    let (store, dir) = temp_store().await;
+    let campaign_id = store.insert_campaign(campaign("payments")).await.unwrap();
+    let cancelled = store
+        .insert_commission(commission(campaign_id, 1))
+        .await
+        .unwrap();
+    let merged = store
+        .insert_commission(commission(campaign_id, 2))
+        .await
+        .unwrap();
+    let failed = store
+        .insert_commission(commission(campaign_id, 3))
+        .await
+        .unwrap();
+    let escalated = store
+        .insert_commission(commission(campaign_id, 4))
+        .await
+        .unwrap();
+    store
+        .set_commission_state(cancelled, CommissionState::Cancelled)
+        .await
+        .unwrap();
+    store
+        .set_commission_state(merged, CommissionState::Merged)
+        .await
+        .unwrap();
+    store
+        .set_commission_state(
+            failed,
+            CommissionState::Failed {
+                cause: "test".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .set_commission_state(
+            escalated,
+            CommissionState::Escalated {
+                reason: "test".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let sandbox = Arc::new(SandboxProvider::Memory(Default::default()));
+    for (name, index) in [
+        ("anvil-payments-invoice-1", 1),
+        ("anvil-payments-invoice-2", 2),
+        ("anvil-payments-invoice-3", 3),
+        ("anvil-payments-invoice-4", 4),
+    ] {
+        sandbox
+            .start(&SandboxSpec {
+                name: name.to_owned(),
+                image: "anvil-sandbox:latest".to_owned(),
+                workspace: dir.path().join(format!("workspace-{index}")),
+                files: BTreeMap::new(),
+                env: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    engine(&store, mins(30), hrs(2))
+        .with_sandbox(sandbox.clone())
+        .tick()
+        .await
+        .unwrap();
+
+    assert!(!sandbox
+        .is_running("anvil-payments-invoice-1")
+        .await
+        .unwrap());
+    assert!(!sandbox
+        .is_running("anvil-payments-invoice-2")
+        .await
+        .unwrap());
+    assert!(sandbox
+        .is_running("anvil-payments-invoice-3")
+        .await
+        .unwrap());
+    assert!(sandbox
+        .is_running("anvil-payments-invoice-4")
+        .await
+        .unwrap());
 }
 
 #[test]
@@ -397,4 +591,201 @@ fn mins(n: u64) -> Duration {
 
 fn hrs(n: u64) -> Duration {
     Duration::from_secs(3600 * n)
+}
+
+fn receipt(session: &str, tokens: i64) -> Result<TurnReceipt, HarnessError> {
+    Ok(TurnReceipt {
+        session: session.to_owned(),
+        tokens: Some(tokens),
+    })
+}
+
+#[tokio::test]
+async fn a_failed_teardown_does_not_stop_unrelated_progress() {
+    let (store, dir) = temp_store().await;
+    let dirty_campaign = store.insert_campaign(campaign("dirty_work")).await.unwrap();
+    let dirty = store
+        .insert_commission(commission(dirty_campaign, 1))
+        .await
+        .unwrap();
+    store
+        .set_commission_state(dirty, CommissionState::Cancelled)
+        .await
+        .unwrap();
+
+    let live_campaign = store.insert_campaign(campaign("healthy")).await.unwrap();
+    let live = store
+        .insert_commission(commission(live_campaign, 1))
+        .await
+        .unwrap();
+
+    let scripted = ScriptedHarness::new(vec![receipt("s-1", 1_000)]);
+    let engine = Engine::new(
+        store.clone(),
+        EngineConfig {
+            state_dir: dir.path().to_owned(),
+            sandbox_teardown_grace: Duration::ZERO,
+            ..EngineConfig::default()
+        },
+    )
+    .with_sandbox(Arc::new(SandboxProvider::Memory(Default::default())))
+    .with_harness(Arc::new(Harness::Scripted(scripted)));
+
+    engine.tick().await.unwrap();
+
+    let live_attempts = store.attempts(live).await.unwrap();
+    assert_eq!(
+        live_attempts.len(),
+        1,
+        "an active commission must still be driven the same tick a teardown fails"
+    );
+    let events = store.events_since(0, 100).await.unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.kind == EventKind::SandboxDestroyFailed
+            && event.commission_id == Some(dirty)));
+    assert!(!events.iter().any(
+        |event| event.kind == EventKind::SandboxDestroyed && event.commission_id == Some(dirty)
+    ));
+
+    engine.tick().await.unwrap();
+    let events = store.events_since(0, 100).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == EventKind::SandboxDestroyFailed
+                && event.commission_id == Some(dirty))
+            .count(),
+        2,
+        "the marker stays unset, so a failed removal retries on later ticks"
+    );
+}
+
+async fn wait_for_finished_turn(store: &Store, attempt: anvil_api::AttemptId) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if store
+                .turns(attempt)
+                .await
+                .unwrap()
+                .last()
+                .is_some_and(|turn| turn.ended_at.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("turn should finish");
+}
+
+#[tokio::test]
+async fn a_failed_replacement_ends_the_attempt_without_running_the_harness() {
+    let (store, dir) = temp_store().await;
+    let campaign = store
+        .insert_campaign(campaign("invalid_slug"))
+        .await
+        .unwrap();
+    let commission = store
+        .insert_commission(commission(campaign, 1))
+        .await
+        .unwrap();
+    let scripted = ScriptedHarness::new(vec![receipt("unexpected", 1)]);
+    let engine = Engine::new(
+        store.clone(),
+        EngineConfig {
+            state_dir: dir.path().to_owned(),
+            ..EngineConfig::default()
+        },
+    )
+    .with_sandbox(Arc::new(SandboxProvider::Memory(Default::default())))
+    .with_harness(Arc::new(Harness::Scripted(scripted.clone())));
+
+    engine.tick().await.unwrap();
+    let attempt = store.attempts(commission).await.unwrap()[0].id;
+    wait_for_finished_turn(&store, attempt).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let attempts = store.attempts(commission).await.unwrap();
+            if attempts[0].ended_at.is_some() {
+                assert!(attempts[0].outcome.as_ref().unwrap()["error"].as_str().unwrap()
+                    .starts_with("sandbox: could not remove anvil-invalid_slug-invoice-1 before starting the attempt"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("attempt should end after failed removal");
+    assert!(scripted.received.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_retry_recreates_the_sandbox_with_updated_configuration() {
+    let (store, dir) = temp_store().await;
+    let campaign_id = store.insert_campaign(campaign("payments")).await.unwrap();
+    let commission_id = store
+        .insert_commission(anvil_api::NewCommission {
+            campaign_id,
+            title: "invoice split".to_owned(),
+            slug: "invoice-1".to_owned(),
+            spec: "Extract the invoice line rendering.".to_owned(),
+            repo: "acme/payments".to_owned(),
+            target_ref: "main".to_owned(),
+            target_sha: String::new(),
+            wave: 1,
+            budget: json!({"turns": 1}),
+            strategy: json!({"model": "openai/first"}),
+        })
+        .await
+        .unwrap();
+
+    let scripted = ScriptedHarness::new(vec![receipt("s-1", 1_000), receipt("s-2", 1_000)]);
+    let engine = Engine::new(
+        store.clone(),
+        EngineConfig {
+            heartbeat_timeout: mins(30),
+            turn_timeout: hrs(2),
+            state_dir: dir.path().to_owned(),
+            ..EngineConfig::default()
+        },
+    )
+    .with_sandbox(Arc::new(SandboxProvider::Memory(Default::default())))
+    .with_harness(Arc::new(Harness::Scripted(scripted)));
+
+    engine.tick().await.unwrap();
+    wait_for_finished_turn(&store, store.attempts(commission_id).await.unwrap()[0].id).await;
+    engine.tick().await.unwrap();
+    let commission = store.commission(commission_id).await.unwrap().unwrap();
+    assert!(matches!(
+        commission.state,
+        CommissionState::Escalated { .. }
+    ));
+    let opencode =
+        std::fs::read_to_string(dir.path().join("workspaces/invoice-1/opencode.json")).unwrap();
+    assert!(opencode.contains("openai/first"));
+
+    store
+        .set_commission_strategy(commission_id, &json!({"model": "openai/second"}))
+        .await
+        .unwrap();
+    let event = anvil_api::NewEvent {
+        kind: EventKind::StateChanged,
+        campaign_id: Some(campaign_id),
+        commission_id: Some(commission_id),
+        payload: json!({"via": "retry"}),
+    };
+    store
+        .transition_commission(commission_id, CommissionState::Active, &[event], None)
+        .await
+        .unwrap();
+
+    engine.tick().await.unwrap();
+    wait_for_finished_turn(&store, store.attempts(commission_id).await.unwrap()[1].id).await;
+
+    let opencode =
+        std::fs::read_to_string(dir.path().join("workspaces/invoice-1/opencode.json")).unwrap();
+    assert!(
+        opencode.contains("openai/second"),
+        "the retried attempt must run with its updated configuration"
+    );
 }

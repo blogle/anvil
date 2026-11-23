@@ -13,7 +13,7 @@ use tokio::sync::watch;
 
 use crate::github::{pr_body, GithubClient, GithubError};
 use crate::harness::{materialize_provider_config, Harness};
-use crate::sandbox::{SandboxProvider, SandboxSpec};
+use crate::sandbox::{SandboxError, SandboxProvider, SandboxSpec};
 use crate::store::{Store, StoreError};
 use crate::strategy::{self, SessionContinuity};
 
@@ -90,6 +90,7 @@ pub struct EngineConfig {
     pub tick_interval: Duration,
     pub heartbeat_timeout: Duration,
     pub turn_timeout: Duration,
+    pub sandbox_teardown_grace: Duration,
     pub state_dir: PathBuf,
     pub daemon_url: String,
     pub sandbox_image: String,
@@ -102,6 +103,7 @@ impl Default for EngineConfig {
             tick_interval: Duration::from_secs(10),
             heartbeat_timeout: Duration::from_secs(30 * 60),
             turn_timeout: Duration::from_secs(15 * 60),
+            sandbox_teardown_grace: Duration::from_secs(60 * 60),
             state_dir: PathBuf::from(format!("{home}/.local/state/anvil")),
             daemon_url: "http://127.0.0.1:8788".to_owned(),
             sandbox_image: "anvil-sandbox:latest".to_owned(),
@@ -122,6 +124,8 @@ pub enum EngineError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Illegal(#[from] IllegalTransition),
+    #[error(transparent)]
+    Sandbox(#[from] SandboxError),
 }
 
 pub struct Engine {
@@ -165,8 +169,73 @@ impl Engine {
         self.escalate_stalled_turns(&mut report).await?;
         self.escalate_exhausted_commissions(&mut report).await?;
         self.settle_merged_commissions(&mut report).await?;
+        self.teardown_terminal_sandboxes().await?;
         self.drive_active_commissions(&mut report).await?;
         Ok(report)
+    }
+
+    async fn teardown_terminal_sandboxes(&self) -> Result<(), EngineError> {
+        let Some(sandbox) = &self.sandbox else {
+            return Ok(());
+        };
+
+        let cutoff = OffsetDateTime::now_utc() - self.config.sandbox_teardown_grace;
+        let commissions = self
+            .store
+            .terminal_commissions_pending_teardown(cutoff)
+            .await?;
+        'commission: for commission in commissions {
+            let Some(campaign) = self.store.campaign(commission.campaign_id).await? else {
+                continue;
+            };
+            let name = format!("anvil-{}-{}", campaign.slug, commission.slug);
+            let names = self.sandbox_names(&name, commission.id).await?;
+            for candidate in &names {
+                if let Err(error) = sandbox.destroy(candidate).await {
+                    if let Err(event_error) = self
+                        .store
+                        .append_events(&[NewEvent {
+                            kind: EventKind::SandboxDestroyFailed,
+                            campaign_id: Some(commission.campaign_id),
+                            commission_id: Some(commission.id),
+                            payload: json!({"name": candidate, "error": error.to_string()}),
+                        }])
+                        .await
+                    {
+                        eprintln!("anvild: teardown for {} failed for {candidate}: {error}; could not record event: {event_error}", commission.id);
+                    }
+                    continue 'commission;
+                }
+            }
+            self.store
+                .mark_sandbox_destroyed(
+                    commission.id,
+                    NewEvent {
+                        kind: EventKind::SandboxDestroyed,
+                        campaign_id: Some(commission.campaign_id),
+                        commission_id: Some(commission.id),
+                        payload: json!({"name": name, "names": names}),
+                    },
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn sandbox_names(
+        &self,
+        name: &str,
+        commission: anvil_api::CommissionId,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut names = vec![name.to_owned()];
+        names.extend(
+            self.store
+                .attempts(commission)
+                .await?
+                .iter()
+                .map(|attempt| format!("{name}-a{}", attempt.n)),
+        );
+        Ok(names)
     }
 
     async fn drive_active_commissions(&self, report: &mut TickReport) -> Result<(), EngineError> {
@@ -529,17 +598,15 @@ impl Engine {
         let prompt = parsed.compose_turn(&context);
         let prompt_hash = strategy::prompt_hash(&prompt);
 
+        let sandbox_name = format!("anvil-{}-{}", campaign.slug, commission.slug);
+        let replace = if turns.is_empty() {
+            self.sandbox_names(&sandbox_name, commission.id).await?
+        } else {
+            Vec::new()
+        };
         let turn_id = self.store.insert_turn(attempt.id, &prompt_hash).await?;
-
-        let sandbox_name = format!("anvil-{}-{}-a{}", campaign.slug, commission.slug, attempt.n);
-        let previous_name = format!(
-            "anvil-{}-{}-a{}",
-            campaign.slug,
-            commission.slug,
-            attempt.n.saturating_sub(1)
-        );
         let spec = SandboxSpec {
-            name: sandbox_name.clone(),
+            name: sandbox_name,
             image: self.config.sandbox_image.clone(),
             workspace: self
                 .config
@@ -554,26 +621,37 @@ impl Engine {
         let sandbox = Arc::clone(self.sandbox.as_ref().expect("checked in drive"));
         let harness = Arc::clone(self.harness.as_ref().expect("checked in drive"));
         let attempt_id = attempt.id;
-        let attempt_n = attempt.n;
         tokio::spawn(async move {
-            if attempt_n > 1 {
-                let _ = sandbox.destroy(&previous_name).await;
-            }
-            let handle = match sandbox.handle(&spec.name).await {
-                Ok(Some(handle)) => handle,
-                Ok(None) => match sandbox.start(&spec).await {
-                    Ok(handle) => handle,
-                    Err(error) => {
-                        let _ = store
-                            .end_attempt(attempt_id, json!({"error": format!("sandbox: {error}")}))
-                            .await;
-                        return;
+            let prepared = async {
+                if replace.is_empty() {
+                    if let Some(handle) = sandbox
+                        .handle(&spec.name)
+                        .await
+                        .map_err(|error| error.to_string())?
+                    {
+                        return Ok(handle);
                     }
-                },
+                } else {
+                    for name in &replace {
+                        sandbox.destroy(name).await.map_err(|error| {
+                            format!("could not remove {name} before starting the attempt: {error}")
+                        })?;
+                    }
+                }
+                sandbox
+                    .start(&spec)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            .await;
+            let handle = match prepared {
+                Ok(handle) => handle,
                 Err(error) => {
+                    let error = format!("sandbox: {error}");
                     let _ = store
-                        .end_attempt(attempt_id, json!({"error": format!("sandbox: {error}")}))
+                        .end_turn(turn_id, None, json!({"status": "error", "error": error}))
                         .await;
+                    let _ = store.end_attempt(attempt_id, json!({"error": error})).await;
                     return;
                 }
             };
