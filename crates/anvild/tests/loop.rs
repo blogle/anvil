@@ -82,6 +82,22 @@ async fn settle() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 }
 
+async fn wait_for_finished_turn(harness: &Loop, attempt_index: usize) {
+    let attempts = harness.store.attempts(harness.commission_id).await.unwrap();
+    let attempt = attempts[attempt_index].id;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let turns = harness.store.turns(attempt).await.unwrap();
+            if turns.last().is_some_and(|turn| turn.ended_at.is_some()) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the retried turn should finish");
+}
+
 #[tokio::test]
 async fn a_commission_runs_a_turn_and_converges_on_done() {
     let harness = loop_with(json!({}), vec![receipt("s-1", 12_000)]).await;
@@ -323,7 +339,7 @@ async fn a_retry_after_a_harness_failure_starts_a_fresh_attempt() {
         .await
         .unwrap();
     harness.engine.tick().await.unwrap();
-    settle().await;
+    wait_for_finished_turn(&harness, 1).await;
 
     let attempts = harness.store.attempts(harness.commission_id).await.unwrap();
     assert_eq!(attempts.len(), 2);
@@ -569,7 +585,7 @@ async fn an_operator_retry_resets_the_gap_tripwire() {
         .unwrap();
 
     harness.engine.tick().await.unwrap();
-    settle().await;
+    wait_for_finished_turn(&harness, 1).await;
 
     let received = harness.scripted.received.lock().unwrap().clone();
     assert_eq!(received.len(), 4, "the retried attempt earns fresh gaps");
