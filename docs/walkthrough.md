@@ -455,11 +455,13 @@ whoever judges the result: a human, or a reviewer-agent strategy that
 treats the claims adversarially (§ strategy examples). A turn that ends
 without a claim simply continues the loop (N20).
 
-The surface is intended to grow (operator review, 2026-11-23): agents
-should be able to toggle obligations complete *with evidence* as they work
-— progress visible to the operator, unmet obligations identifiable on
-early termination, and each obligation backed by auditable evidence for
-whoever reviews the work. Not yet implemented; ticketed as ANVIL-100.
+Agents report progress with `anvilctl report <obligation-id> --evidence <text>`
+and withdraw a claim with `anvilctl report <obligation-id> --clear`. The
+daemon restricts reports to the token's active commission. The store writes
+the latest claim and its audit event together. Later prompts and `anvil status
+--json` show which obligations have claims and what evidence was reported,
+including after termination. Reports are unverified and do not change the
+convergence gate; `anvilctl done` still requests evaluation.
 
 Credentials reach the daemon two ways: `anvil auth add <name>` (secret via
 flag or stdin), or the `just auth-onboard` recipe which pulls the GitHub App
