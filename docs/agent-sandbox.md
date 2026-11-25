@@ -30,7 +30,7 @@ separately. Launch files are mounted read-only, so credential files supplied
 this way must be refreshed by the operator before retries if they expire.
 
 `just agent-sandbox-smoke` uses a disposable Kind cluster and a dedicated
-kubeconfig. It checks real controller readiness, OpenCode session creation,
-shared Nix access, completion signaling to an in-cluster daemon, credential
-replacement, workspace persistence, and terminal teardown. It does not
-require a model subscription or submit a model-backed prompt.
+kubeconfig. It checks real controller readiness, an OpenCode session and
+prompt/wait cycle against an in-cluster model fixture, shared Nix access,
+completion signaling to an in-cluster daemon, credential replacement,
+workspace persistence, and terminal teardown. It needs no model subscription.
