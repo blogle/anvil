@@ -17,10 +17,21 @@ fn ctx() -> TurnContext {
         branch: "anvil/payments-refactor/invoice-split".to_owned(),
         wave: 1,
         attempt_n: 2,
-        obligations: vec![
-            "invoice rendering moves to invoices/service.go".to_owned(),
-            "the existing payments suite stays green".to_owned(),
-        ],
+        obligations: [
+            "invoice rendering moves to invoices/service.go",
+            "the existing payments suite stays green",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, text)| anvil_api::Obligation {
+            id: anvil_api::ObligationId::new(),
+            commission_id: anvil_api::CommissionId::new(),
+            position: i as i64 + 1,
+            text: text.to_owned(),
+            claimed_evidence: (i == 0).then(|| "commit abc123".to_owned()),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+        })
+        .collect(),
         gaps: vec!["check failed: go test".to_owned()],
         external: ExternalState {
             checks: vec![
@@ -147,7 +158,8 @@ fn resolve_prefers_commission_over_campaign() {
 
 #[test]
 fn compose_turn_layers_the_prompt_hierarchy() {
-    let prompt = DefaultStrategy::default().compose_turn(&ctx());
+    let context = ctx();
+    let prompt = DefaultStrategy::default().compose_turn(&context);
 
     let campaign_at = prompt.find("# Campaign: payments refactor").unwrap();
     let commission_at = prompt.find("# Commission: split invoice service").unwrap();
@@ -165,6 +177,9 @@ fn compose_turn_layers_the_prompt_hierarchy() {
     assert!(prompt.contains("Extract the invoice line rendering into its own service."));
     assert!(prompt.contains("1. invoice rendering moves to invoices/service.go"));
     assert!(prompt.contains("2. the existing payments suite stays green"));
+    assert!(prompt.contains(&context.obligations[0].id.to_string()));
+    assert!(prompt.contains("Agent claim (unverified): commit abc123"));
+    assert!(prompt.contains("No agent claim yet."));
     assert!(prompt.contains("- check FAIL: go test"));
     assert!(prompt.contains("- check PASS: golangci-lint"));
     assert!(prompt.contains("- mergeable: no"));

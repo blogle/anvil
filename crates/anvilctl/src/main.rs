@@ -1,12 +1,16 @@
 use std::process::ExitCode;
 
-use anvilctl::{attention, done, SignalError};
+use anvilctl::{attention, done, report, SignalError};
+
+const REPORT_USAGE: &str = "anvilctl report <obligation-id> (--evidence <text> | --clear)";
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(command) = args.next() else {
-        eprintln!("usage: anvilctl done [--notes <text>] | anvilctl attention <message>");
+        eprintln!(
+            "usage: anvilctl done [--notes <text>] | anvilctl attention <message> | {REPORT_USAGE}"
+        );
         return ExitCode::from(2);
     };
     let Ok(base) = std::env::var("ANVILCTL_URL") else {
@@ -46,6 +50,19 @@ async fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
             attention(&base, &token, &message).await
+        }
+        "report" => {
+            let rest = args.collect::<Vec<_>>();
+            match rest.as_slice() {
+                [id, flag, evidence] if flag == "--evidence" && !evidence.trim().is_empty() => {
+                    report(&base, &token, id, Some(evidence)).await
+                }
+                [id, flag] if flag == "--clear" => report(&base, &token, id, None).await,
+                _ => {
+                    eprintln!("usage: {REPORT_USAGE}");
+                    return ExitCode::from(2);
+                }
+            }
         }
         other => {
             eprintln!("anvilctl: unknown command {other}");

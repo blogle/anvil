@@ -532,13 +532,7 @@ impl Engine {
             serve_password.clone(),
         );
 
-        let obligations: Vec<String> = self
-            .store
-            .obligations(commission.id)
-            .await?
-            .into_iter()
-            .map(|o| o.text)
-            .collect();
+        let obligations = self.store.obligations(commission.id).await?;
 
         let turns = self.store.turns(attempt.id).await?;
         let session = match parsed.session {
