@@ -3,6 +3,9 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+mod kubernetes;
+pub use kubernetes::AgentSandboxProvider;
+
 const SERVE_PORT: u16 = 4096;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +29,10 @@ pub enum SandboxError {
     InvalidName { name: String },
     #[error("podman failed: {stderr}")]
     Podman { stderr: String },
+    #[error("Agent Sandbox: {0}")]
+    Kubernetes(String),
+    #[error("Kubernetes API: {0}")]
+    KubernetesApi(#[from] kube::Error),
     #[error("sandbox {name} never became reachable: {cause}")]
     Unreachable { name: String, cause: String },
     #[error("io: {0}")]

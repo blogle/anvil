@@ -24,6 +24,10 @@ sandbox-load:
 sandbox-smoke: sandbox-load
     nix develop -c env ANVIL_TEST_PODMAN=1 ANVIL_TEST_SANDBOX_IMAGE=docker.io/library/anvil-sandbox:latest cargo test -p anvild --test feedback
 
+# Verify the production provider through a disposable Kind cluster
+agent-sandbox-smoke: sandbox-load
+    nix develop -c nix shell nixpkgs#kind nixpkgs#kubectl nixpkgs#docker-client --command bash scripts/agent-sandbox-smoke.sh
+
 # Provision ANVIL_SECRET_KEY into .env if absent (the daemon refuses to boot without it)
 keygen:
     @if grep -q '^ANVIL_SECRET_KEY=' .env 2>/dev/null; then \

@@ -605,9 +605,10 @@ MCP server (N22), and the web UI.
 </div>
 
 <div class="w-note">
-<b>Kubernetes Agent Sandbox is not yet implemented.</b> The deployed runtime
-port currently has only a Podman implementation. ANVIL-108 tracks the Kubernetes
-provider and the end-to-end test required for the release gate.
+<b>Kubernetes Agent Sandbox is available.</b> See <a href="agent-sandbox.md">the
+runtime guide</a> for the namespace permissions, workspace lifecycle, and the
+isolated controller smoke test. ANVIL-108 tracks verification of a model-backed
+commission turn for the release gate.
 </div>
 
 ## 10. Where to read next
