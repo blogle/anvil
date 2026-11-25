@@ -77,6 +77,93 @@ async fn a_rejected_token_is_an_explicit_error() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn reports_are_scoped_auditable_and_survive_cancellation() {
+    let (store, base, commission, token) = daemon().await;
+    store
+        .set_commission_state(commission, anvil_api::CommissionState::Active)
+        .await
+        .unwrap();
+    let id = store
+        .insert_obligation(commission, "Run the suite")
+        .await
+        .unwrap()
+        .to_string();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_anvilctl"))
+            .env("ANVILCTL_URL", &base)
+            .env("ANVILCTL_TOKEN", &token)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let existing = store.commission(commission).await.unwrap().unwrap();
+    let foreign = store
+        .insert_commission(anvil_api::NewCommission {
+            campaign_id: existing.campaign_id,
+            title: "other".into(),
+            slug: "other".into(),
+            spec: String::new(),
+            repo: existing.repo,
+            target_ref: existing.target_ref,
+            target_sha: String::new(),
+            wave: 1,
+            budget: json!({}),
+            strategy: json!({}),
+        })
+        .await
+        .unwrap();
+    store
+        .set_commission_state(foreign, anvil_api::CommissionState::Active)
+        .await
+        .unwrap();
+    let foreign_token = store.issue_commission_token(foreign).await.unwrap();
+    assert!(matches!(
+        anvilctl::report(&base, &foreign_token, &id, Some("wrong scope")).await,
+        Err(SignalError::Status { status: 409, .. })
+    ));
+    assert!(run(&["report", &id, "--evidence", "suite passed"])
+        .status
+        .success());
+    assert!(run(&["report", &id, "--clear"]).status.success());
+    assert!(store.obligations(commission).await.unwrap()[0]
+        .claimed_evidence
+        .is_none());
+    assert!(run(&["report", &id, "--evidence", "run 42"])
+        .status
+        .success());
+    store
+        .set_commission_state(commission, anvil_api::CommissionState::Cancelled)
+        .await
+        .unwrap();
+    assert!(!run(&["report", &id, "--clear"]).status.success());
+    assert_eq!(
+        store.obligations(commission).await.unwrap()[0]
+            .claimed_evidence
+            .as_deref(),
+        Some("run 42")
+    );
+    let detail: serde_json::Value = reqwest::get(format!("{base}/v1/commissions/{commission}"))
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["obligations"][0]["claimed_evidence"], "run 42");
+    let events = store.events_since(0, 100).await.unwrap();
+    let evidence: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::ObligationClaimChanged)
+        .map(|e| &e.payload["evidence"])
+        .collect();
+    assert_eq!(
+        evidence,
+        vec![&json!("suite passed"), &json!(null), &json!("run 42")]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_binary_reads_env_and_reports_failures() {
     let (_store, base, _commission_id, token) = daemon().await;
     let binary = env!("CARGO_BIN_EXE_anvilctl");

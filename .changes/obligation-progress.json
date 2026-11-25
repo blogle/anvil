@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "Agents can report and withdraw per-obligation completion claims with evidence. Claims survive retries and termination, appear in subsequent prompts and commission detail JSON, and are audit-logged without changing convergence gates."
+}

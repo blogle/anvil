@@ -166,8 +166,17 @@ impl DefaultStrategy {
                 "None yet. Establish the commission scope with the operator."
             );
         } else {
-            for (i, text) in ctx.obligations.iter().enumerate() {
-                let _ = writeln!(out, "{}. {}", i + 1, text);
+            for obligation in &ctx.obligations {
+                let _ = writeln!(
+                    out,
+                    "{}. {} (ID: {})",
+                    obligation.position, obligation.text, obligation.id
+                );
+                if let Some(evidence) = &obligation.claimed_evidence {
+                    let _ = writeln!(out, "   Agent claim (unverified): {evidence}");
+                } else {
+                    let _ = writeln!(out, "   No agent claim yet.");
+                }
             }
             let _ = writeln!(out);
         }
@@ -222,6 +231,7 @@ impl DefaultStrategy {
             out,
             "- when the obligations are met: `anvilctl done --notes <summary>`"
         );
+        let _ = writeln!(out, "- report individual progress: `anvilctl report <obligation-id> --evidence <text>`; withdraw a claim with `anvilctl report <obligation-id> --clear`");
         let _ = writeln!(
             out,
             "- when blocked or needing a human: `anvilctl attention <message>`"

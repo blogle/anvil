@@ -189,11 +189,13 @@ pub struct NewCommission {
     pub strategy: Value,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct Obligation {
     pub id: ObligationId,
     pub commission_id: CommissionId,
     pub position: i64,
     pub text: String,
+    pub claimed_evidence: Option<String>,
     pub created_at: OffsetDateTime,
 }
 
@@ -235,6 +237,7 @@ pub enum EventKind {
     AttentionRaised,
     AttentionDismissed,
     ObligationMutated,
+    ObligationClaimChanged,
     SandboxDestroyed,
     SandboxDestroyFailed,
 }
@@ -255,6 +258,7 @@ impl EventKind {
             Self::AttentionRaised => "attention-raised",
             Self::AttentionDismissed => "attention-dismissed",
             Self::ObligationMutated => "obligation-mutated",
+            Self::ObligationClaimChanged => "obligation-claim-changed",
             Self::SandboxDestroyed => "sandbox-destroyed",
             Self::SandboxDestroyFailed => "sandbox-destroy-failed",
         }
@@ -275,6 +279,7 @@ impl EventKind {
             "attention-raised" => Self::AttentionRaised,
             "attention-dismissed" => Self::AttentionDismissed,
             "obligation-mutated" => Self::ObligationMutated,
+            "obligation-claim-changed" => Self::ObligationClaimChanged,
             "sandbox-destroyed" => Self::SandboxDestroyed,
             "sandbox-destroy-failed" => Self::SandboxDestroyFailed,
             _ => return None,
@@ -398,7 +403,7 @@ pub struct TurnContext {
     pub branch: String,
     pub wave: i64,
     pub attempt_n: i64,
-    pub obligations: Vec<String>,
+    pub obligations: Vec<Obligation>,
     pub gaps: Vec<String>,
     pub external: ExternalState,
 }

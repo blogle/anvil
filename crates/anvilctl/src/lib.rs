@@ -55,3 +55,16 @@ pub async fn done(base: &str, token: &str, notes: Option<&str>) -> Result<(), Si
 pub async fn attention(base: &str, token: &str, message: &str) -> Result<(), SignalError> {
     send(base, token, ATTENTION_PATH, json!({"message": message})).await
 }
+
+pub async fn report(
+    base: &str,
+    token: &str,
+    id: &str,
+    evidence: Option<&str>,
+) -> Result<(), SignalError> {
+    let body = match evidence {
+        Some(text) => json!({"action": "complete", "evidence": text}),
+        None => json!({"action": "clear"}),
+    };
+    send(base, token, &format!("/v1/signals/obligations/{id}"), body).await
+}
