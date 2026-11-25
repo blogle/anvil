@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::pin::Pin;
 
 const SERVE_PORT: u16 = 4096;
 
@@ -33,46 +34,16 @@ pub enum SandboxError {
     Transport(#[from] reqwest::Error),
 }
 
-pub enum SandboxProvider {
-    Podman(PodmanProvider),
-    Memory(MemoryProvider),
+pub type SandboxOperation<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, SandboxError>> + Send + 'a>>;
+
+pub trait SandboxProvider: Send + Sync {
+    fn start<'a>(&'a self, spec: &'a SandboxSpec) -> SandboxOperation<'a, SandboxHandle>;
+    fn handle<'a>(&'a self, name: &'a str) -> SandboxOperation<'a, Option<SandboxHandle>>;
+    fn destroy<'a>(&'a self, name: &'a str) -> SandboxOperation<'a, ()>;
 }
 
-impl SandboxProvider {
-    pub async fn start(&self, spec: &SandboxSpec) -> Result<SandboxHandle, SandboxError> {
-        validate_name(&spec.name)?;
-        match self {
-            Self::Podman(provider) => provider.start(spec).await,
-            Self::Memory(provider) => provider.start(spec).await,
-        }
-    }
-
-    pub async fn handle(&self, name: &str) -> Result<Option<SandboxHandle>, SandboxError> {
-        validate_name(name)?;
-        match self {
-            Self::Podman(provider) => provider.handle(name).await,
-            Self::Memory(provider) => provider.handle(name).await,
-        }
-    }
-
-    pub async fn destroy(&self, name: &str) -> Result<(), SandboxError> {
-        validate_name(name)?;
-        match self {
-            Self::Podman(provider) => provider.destroy(name).await,
-            Self::Memory(provider) => provider.destroy(name).await,
-        }
-    }
-
-    pub async fn is_running(&self, name: &str) -> Result<bool, SandboxError> {
-        validate_name(name)?;
-        match self {
-            Self::Podman(provider) => provider.is_running(name).await,
-            Self::Memory(provider) => provider.is_running(name).await,
-        }
-    }
-}
-
-fn validate_name(name: &str) -> Result<(), SandboxError> {
+pub fn validate_name(name: &str) -> Result<(), SandboxError> {
     let valid = !name.is_empty()
         && name.len() <= 64
         && name
@@ -104,6 +75,7 @@ impl Default for PodmanProvider {
 
 impl PodmanProvider {
     pub async fn start(&self, spec: &SandboxSpec) -> Result<SandboxHandle, SandboxError> {
+        validate_name(&spec.name)?;
         for (path, content) in &spec.files {
             let target = spec.workspace.join(path);
             if let Some(parent) = target.parent() {
@@ -141,6 +113,7 @@ impl PodmanProvider {
     }
 
     pub async fn destroy(&self, name: &str) -> Result<(), SandboxError> {
+        validate_name(name)?;
         let args = ["rm", "-f", name].map(str::to_owned);
         let result = podman(&args).await?;
         match result {
@@ -151,6 +124,7 @@ impl PodmanProvider {
     }
 
     pub async fn is_running(&self, name: &str) -> Result<bool, SandboxError> {
+        validate_name(name)?;
         let args = ["inspect", "-f", "{{.State.Running}}", name].map(str::to_owned);
         match podman(&args).await? {
             Ok(output) => Ok(String::from_utf8_lossy(&output.stdout).trim() == "true"),
@@ -242,49 +216,16 @@ async fn podman(args: &[String]) -> Result<Result<std::process::Output, String>,
     }
 }
 
-#[derive(Default)]
-pub struct MemoryProvider {
-    sandboxes: Mutex<BTreeMap<String, SandboxSpec>>,
-}
-
-impl MemoryProvider {
-    pub async fn handle(&self, name: &str) -> Result<Option<SandboxHandle>, SandboxError> {
-        Ok(self
-            .sandboxes
-            .lock()
-            .unwrap()
-            .get(name)
-            .map(|_| SandboxHandle {
-                name: name.to_owned(),
-                serve_url: format!("http://{name}/"),
-            }))
+impl SandboxProvider for PodmanProvider {
+    fn start<'a>(&'a self, spec: &'a SandboxSpec) -> SandboxOperation<'a, SandboxHandle> {
+        Box::pin(self.start(spec))
     }
 
-    pub async fn start(&self, spec: &SandboxSpec) -> Result<SandboxHandle, SandboxError> {
-        tokio::fs::create_dir_all(&spec.workspace).await?;
-        for (path, content) in &spec.files {
-            let target = spec.workspace.join(path);
-            if let Some(parent) = target.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            tokio::fs::write(target, content).await?;
-        }
-        self.sandboxes
-            .lock()
-            .unwrap()
-            .insert(spec.name.clone(), spec.clone());
-        Ok(SandboxHandle {
-            name: spec.name.clone(),
-            serve_url: format!("http://{}/", spec.name),
-        })
+    fn handle<'a>(&'a self, name: &'a str) -> SandboxOperation<'a, Option<SandboxHandle>> {
+        Box::pin(self.handle(name))
     }
 
-    pub async fn destroy(&self, name: &str) -> Result<(), SandboxError> {
-        self.sandboxes.lock().unwrap().remove(name);
-        Ok(())
-    }
-
-    pub async fn is_running(&self, name: &str) -> Result<bool, SandboxError> {
-        Ok(self.sandboxes.lock().unwrap().contains_key(name))
+    fn destroy<'a>(&'a self, name: &'a str) -> SandboxOperation<'a, ()> {
+        Box::pin(self.destroy(name))
     }
 }

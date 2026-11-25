@@ -6,7 +6,7 @@ use anvild::engine::{Engine, EngineConfig};
 use anvild::github::GithubClient;
 use anvild::harness::{Harness, OpencodeHarness};
 use anvild::http;
-use anvild::sandbox::{MemoryProvider, PodmanProvider, SandboxProvider};
+use anvild::sandbox::PodmanProvider;
 use anvild::store::Store;
 use tokio::sync::watch;
 
@@ -85,10 +85,13 @@ async fn daemon() -> ExitCode {
     if let Some(github) = github_from_credentials(&store).await {
         engine = engine.with_github(github);
     }
-    let sandbox = match std::env::var("ANVIL_SANDBOX").as_deref() {
-        Ok("memory") => SandboxProvider::Memory(MemoryProvider::default()),
-        _ => SandboxProvider::Podman(PodmanProvider::default()),
-    };
+    if let Ok(runtime) = std::env::var("ANVIL_SANDBOX") {
+        if runtime != "podman" {
+            eprintln!("anvild: unsupported ANVIL_SANDBOX={runtime}; use podman or unset it");
+            return ExitCode::FAILURE;
+        }
+    }
+    let sandbox = PodmanProvider::default();
     engine = engine
         .with_sandbox(Arc::new(sandbox))
         .with_harness(Arc::new(Harness::Opencode(OpencodeHarness::new())));
