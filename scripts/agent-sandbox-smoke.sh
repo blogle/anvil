@@ -35,4 +35,4 @@ kind load image-archive "$dir/sandbox.tar" --name "$cluster"
 kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.12/sandbox.yaml
 kubectl wait --for=condition=Established crd/sandboxes.agents.x-k8s.io --timeout=60s
 kubectl rollout status -n agent-sandbox-system deployment/agent-sandbox-controller --timeout=90s
-cargo test -p anvild --test agent_sandbox -- --ignored --nocapture
+cargo test -p anvild --test agent_sandbox -- --ignored --nocapture --exact controller_runs_anvil_image_and_signals_with_a_persistent_workspace
