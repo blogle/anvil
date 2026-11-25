@@ -6,7 +6,7 @@ use anvild::engine::{Engine, EngineConfig};
 use anvild::github::GithubClient;
 use anvild::harness::{Harness, OpencodeHarness};
 use anvild::http;
-use anvild::sandbox::PodmanProvider;
+use anvild::sandbox::{AgentSandboxProvider, PodmanProvider, SandboxProvider};
 use anvild::store::Store;
 use tokio::sync::watch;
 
@@ -73,27 +73,58 @@ async fn daemon() -> ExitCode {
         .next()
         .filter(|port| port.parse::<u16>().is_ok())
         .unwrap_or("8788");
-    let daemon_url = std::env::var("ANVIL_ADVERTISE_URL")
-        .unwrap_or_else(|_| format!("http://10.0.2.2:{advertise_port}"));
-
-    let config = EngineConfig {
-        daemon_url,
+    let mut config = EngineConfig {
+        daemon_url: std::env::var("ANVIL_ADVERTISE_URL")
+            .unwrap_or_else(|_| format!("http://10.0.2.2:{advertise_port}")),
         ..EngineConfig::default()
+    };
+    let sandbox: Arc<dyn SandboxProvider> = match std::env::var("ANVIL_SANDBOX").as_deref() {
+        Ok("podman") | Err(std::env::VarError::NotPresent) => Arc::new(PodmanProvider::default()),
+        Ok("agent-sandbox") => {
+            let (Ok(url), Ok(image), Ok(namespace)) = (
+                std::env::var("ANVIL_ADVERTISE_URL"),
+                std::env::var("ANVIL_SANDBOX_IMAGE"),
+                std::env::var("ANVIL_SANDBOX_NAMESPACE"),
+            ) else {
+                eprintln!("anvild: agent-sandbox requires ANVIL_ADVERTISE_URL, ANVIL_SANDBOX_IMAGE, and ANVIL_SANDBOX_NAMESPACE");
+                return ExitCode::FAILURE;
+            };
+            if [&url, &image, &namespace]
+                .iter()
+                .any(|value| value.trim().is_empty())
+            {
+                eprintln!("anvild: agent-sandbox URL, image, and namespace cannot be empty");
+                return ExitCode::FAILURE;
+            }
+            config.daemon_url = url;
+            config.sandbox_image = image;
+            let client = match kube::Config::incluster()
+                .map_err(|error| error.to_string())
+                .and_then(|config| {
+                    kube::Client::try_from(config).map_err(|error| error.to_string())
+                }) {
+                Ok(client) => client,
+                Err(error) => {
+                    eprintln!("anvild: cannot configure the in-cluster Kubernetes client: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            Arc::new(AgentSandboxProvider::new(client, &namespace))
+        }
+        other => {
+            eprintln!(
+                "anvild: unsupported ANVIL_SANDBOX value {other:?}; use podman or agent-sandbox"
+            );
+            return ExitCode::FAILURE;
+        }
     };
 
     let mut engine = Engine::new(store.clone(), config);
     if let Some(github) = github_from_credentials(&store).await {
         engine = engine.with_github(github);
     }
-    if let Ok(runtime) = std::env::var("ANVIL_SANDBOX") {
-        if runtime != "podman" {
-            eprintln!("anvild: unsupported ANVIL_SANDBOX={runtime}; use podman or unset it");
-            return ExitCode::FAILURE;
-        }
-    }
-    let sandbox = PodmanProvider::default();
     engine = engine
-        .with_sandbox(Arc::new(sandbox))
+        .with_sandbox(sandbox)
         .with_harness(Arc::new(Harness::Opencode(OpencodeHarness::new())));
     let (shutdown, shutdown_rx) = watch::channel(false);
     tokio::spawn(engine.run(shutdown_rx));

@@ -13,6 +13,7 @@ This documentation is the system of record for the anvil-next implementation.
 | [Specification](spec.md) | Normative MUSTs and invariants; WIP current design quarantined |
 | [Architecture](architecture.md) | Packages, modules, dependency rules, type invariants, decision log |
 | [Walkthrough](walkthrough.md) | Guided codebase tour: layout, packages, the loop, the seams, the tests |
+| [Agent Sandbox](agent-sandbox.md) | Kubernetes runtime setup and isolated smoke test |
 | [Mockups](mockups/inbox.html) | Non-normative UI sketches: [inbox](mockups/inbox.html) · [campaign](mockups/campaign.html) · [commission](mockups/commission.html) |
 | [Research](research.md) | Prior-art digests that informed the spec |
 
