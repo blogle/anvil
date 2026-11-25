@@ -4,11 +4,13 @@ use std::sync::Arc;
 use anvil_api::{CommissionState, EventKind, NewCampaign, NewCommission};
 use anvild::engine::{Engine, EngineConfig};
 use anvild::harness::{Harness, ScriptedHarness, TurnReceipt};
-use anvild::sandbox::SandboxProvider;
+use anvild::sandbox::{PodmanProvider, SandboxProvider};
 use anvild::store::Store;
 use serde_json::json;
 
 mod common;
+#[path = "fixtures/sandbox.rs"]
+mod sandbox_fixture;
 
 #[tokio::test]
 async fn failed_checks_reprompt_with_reported_evidence_then_green_checks_converge() {
@@ -17,11 +19,11 @@ async fn failed_checks_reprompt_with_reported_evidence_then_green_checks_converg
     let slug = format!("feedback-{}", anvil_api::CampaignId::new());
     let slug = &slug[..21];
     let sandbox_name = format!("anvil-{slug}-invoice");
-    let sandbox = Arc::new(if live {
-        SandboxProvider::Podman(Default::default())
+    let sandbox: Arc<dyn SandboxProvider> = if live {
+        Arc::new(PodmanProvider::default())
     } else {
-        SandboxProvider::Memory(Default::default())
-    });
+        Arc::new(sandbox_fixture::TestSandbox::default())
+    };
     let _cleanup = ContainerCleanup(live.then_some(sandbox_name.clone()));
     if live {
         let repo = dir.path().join("workspaces/invoice/repo");

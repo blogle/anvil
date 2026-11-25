@@ -3,8 +3,10 @@ use std::sync::Arc;
 use anvil_api::CommissionState;
 use anvild::engine::{Engine, EngineConfig};
 use anvild::harness::{Harness, HarnessError, ScriptedHarness, TurnReceipt};
-use anvild::sandbox::SandboxProvider;
+#[path = "fixtures/sandbox.rs"]
+mod sandbox_fixture;
 use anvild::store::Store;
+use sandbox_fixture::TestSandbox;
 use serde_json::{json, Value};
 
 fn receipt(session: &str, tokens: i64) -> Result<TurnReceipt, HarnessError> {
@@ -66,7 +68,7 @@ async fn loop_with(
 
     let scripted = ScriptedHarness::new(script);
     let engine = Engine::new(store.clone(), config)
-        .with_sandbox(Arc::new(SandboxProvider::Memory(Default::default())))
+        .with_sandbox(Arc::new(TestSandbox::default()))
         .with_harness(Arc::new(Harness::Scripted(scripted.clone())));
     Loop {
         store,
@@ -494,7 +496,7 @@ async fn an_attempt_with_an_in_flight_turn_is_not_heartbeat_stalled() {
     };
     let scripted = ScriptedHarness::new(vec![receipt("s-1", 1_000)]);
     let engine = Engine::new(store.clone(), config)
-        .with_sandbox(Arc::new(SandboxProvider::Memory(Default::default())))
+        .with_sandbox(Arc::new(TestSandbox::default()))
         .with_harness(Arc::new(Harness::Scripted(scripted.clone())));
 
     let campaign_id = store

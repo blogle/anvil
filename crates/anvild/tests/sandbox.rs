@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anvild::sandbox::{run_args, SandboxError, SandboxProvider, SandboxSpec};
+use anvild::sandbox::{run_args, PodmanProvider, SandboxError, SandboxSpec};
 
 fn spec(name: &str) -> SandboxSpec {
     SandboxSpec {
@@ -67,33 +67,10 @@ async fn start_rejects_names_podman_cannot_own() {
         "with space",
         &"x".repeat(65),
     ] {
-        let provider = SandboxProvider::Memory(Default::default());
+        let provider = PodmanProvider::default();
         let error = provider.start(&spec(name)).await.unwrap_err();
         assert!(matches!(error, SandboxError::InvalidName { .. }), "{name}");
     }
-}
-
-#[tokio::test]
-async fn memory_provider_lifecycle_records_and_destroys() {
-    let provider = SandboxProvider::Memory(Default::default());
-    let handle = provider.start(&spec("anvil-invoice-split")).await.unwrap();
-    assert_eq!(handle.name, "anvil-invoice-split");
-    assert!(provider.is_running("anvil-invoice-split").await.unwrap());
-    provider.destroy("anvil-invoice-split").await.unwrap();
-    assert!(!provider.is_running("anvil-invoice-split").await.unwrap());
-    provider.destroy("anvil-invoice-split").await.unwrap();
-    assert!(!provider.is_running("anvil-never-started").await.unwrap());
-}
-
-#[tokio::test]
-async fn memory_provider_materializes_files_into_the_workspace() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut context = spec("anvil-invoice-split");
-    context.workspace = dir.path().to_owned();
-    let provider = SandboxProvider::Memory(Default::default());
-    provider.start(&context).await.unwrap();
-    let written = std::fs::read_to_string(dir.path().join("opencode.json")).unwrap();
-    assert_eq!(written, "{\"model\":\"glm-5.3\"}");
 }
 
 #[tokio::test]
@@ -102,7 +79,7 @@ async fn podman_contract_test() {
         eprintln!("skipping: ANVIL_TEST_PODMAN is not set");
         return;
     }
-    let provider = SandboxProvider::Podman(Default::default());
+    let provider = PodmanProvider::default();
     let mut context = spec(&format!("anvil-test-{}", std::process::id()));
     context.workspace = tempfile::tempdir().unwrap().keep();
     context

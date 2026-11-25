@@ -330,13 +330,11 @@ wedged turn or a silent attempt trips a timeout detector.
 
 ### Inside the sandbox
 
-`SandboxProvider` is a two-variant port (`crates/anvild/src/sandbox.rs:36`):
-`Podman` for real runs, and `Memory` — an in-process stand-in that fakes
-handles and runs no container — for smoke runs and the engine-loop tests
-(`ANVIL_SANDBOX=memory` selects it at boot, `main.rs:89`). It exercises the
-engine, not the sandbox substrate; the drift note in §9 covers where that's
-headed. The podman `run` recipe is where the nix-sharing design (N14)
-becomes concrete (`sandbox.rs:205`):
+`SandboxProvider` is the runtime port in `crates/anvild/src/sandbox.rs`.
+The daemon uses `PodmanProvider`. Deterministic engine tests inject a fixture
+from `crates/anvild/tests/fixtures/sandbox.rs`; `just sandbox-smoke` runs the
+feedback loop against the real image. The Podman `run_args` function is where
+the Nix-sharing design (N14) becomes concrete:
 
 ```rust
 "--network=pasta:--map-host-loopback=10.0.2.2"      // sandbox → host daemon
@@ -498,7 +496,7 @@ Every read takes `--json`; there are no CLI-only powers.
 `anvild/src/main.rs:30`, in order: load `.env` → open (or create) the SQLite
 store → close turns left in flight by a previous boot → resolve the GitHub
 client from stored credentials (absent ⇒ degraded, no-op github) → pick the
-sandbox provider (`ANVIL_SANDBOX=memory` for smoke, podman otherwise) → spawn
+Podman sandbox provider → spawn
 the engine loop → bind `127.0.0.1:8788` (overridable via `ANVIL_BIND`) and
 serve HTTP. The engine advertises itself to sandboxes as
 `http://10.0.2.2:<port>` — the pasta-mapped loopback — unless
@@ -572,8 +570,9 @@ just ci-check        # cheap admission: fmt + clippy + tests
 just ci-verify       # merge-candidate: all distributables build
 ```
 
-For a no-podman smoke run: `ANVIL_SANDBOX=memory nix run .#anvild` boots the
-memory provider — the loop drives, turns are recorded, nothing containers.
+`just sandbox-smoke` builds and loads the sandbox image and runs the feedback
+loop through rootless Podman using a temporary workspace and an ephemeral
+daemon listener. It needs no GitHub or model credentials.
 Your `.env`, `~/.local/state/anvil/`, and credentials are operator-local and
 sacred: tests use their own scratch state, and nothing in this repo resets
 yours.
@@ -606,17 +605,9 @@ MCP server (N22), and the web UI.
 </div>
 
 <div class="w-note">
-<b>The sandbox port's second variant is an in-memory stand-in.</b>
-architecture.md specifies <code>podman | agent-sandbox</code>; today the enum
-is <code>Podman | Memory</code> (<code>ANVIL_SANDBOX=memory</code>,
-main.rs:89) — a provider that fakes handles and runs no container. It lets
-the engine loop be exercised without podman, but it catches no bugs in the
-sandbox substrate: the image, the shared nix store and daemon socket, the
-filesystem, the pasta networking. Intended direction (operator review,
-2026-11-23): local dev and testing run against a real daemonless runtime —
-podman by default — so smoke and tests exercise the sandbox image and its
-infra; k8s agent-sandbox remains the production variant (M3). Ticketed as
-ANVIL-99.
+<b>Kubernetes Agent Sandbox is not yet implemented.</b> The deployed runtime
+port currently has only a Podman implementation. ANVIL-108 tracks the Kubernetes
+provider and the end-to-end test required for the release gate.
 </div>
 
 ## 10. Where to read next

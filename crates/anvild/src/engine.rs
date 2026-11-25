@@ -132,7 +132,7 @@ pub struct Engine {
     store: Store,
     config: EngineConfig,
     github: Option<GithubClient>,
-    sandbox: Option<Arc<SandboxProvider>>,
+    sandbox: Option<Arc<dyn SandboxProvider>>,
     harness: Option<Arc<Harness>>,
 }
 
@@ -152,7 +152,7 @@ impl Engine {
         self
     }
 
-    pub fn with_sandbox(mut self, sandbox: Arc<SandboxProvider>) -> Self {
+    pub fn with_sandbox(mut self, sandbox: Arc<dyn SandboxProvider>) -> Self {
         self.sandbox = Some(sandbox);
         self
     }
