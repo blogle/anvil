@@ -1,0 +1,5 @@
+{
+  "type": "feature",
+  "semver": "minor",
+  "summary": "Run sandbox workloads through the Kubernetes Agent Sandbox controller, with persistent workspaces, fresh launch inputs on retry, and controller-backed terminal cleanup."
+}
