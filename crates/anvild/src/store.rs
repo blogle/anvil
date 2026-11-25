@@ -420,7 +420,7 @@ impl Store {
         commission: CommissionId,
     ) -> Result<Vec<Obligation>, StoreError> {
         let rows = sqlx::query_as::<_, ObligationRow>(
-            "SELECT id, commission_id, position, text, created_at
+            "SELECT id, commission_id, position, text, created_at, claimed_evidence
              FROM obligations WHERE commission_id = ? ORDER BY position",
         )
         .bind(commission.to_string())
@@ -437,6 +437,39 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Self::require_row(result, "obligation", &id.to_string())
+    }
+
+    pub async fn set_obligation_claim(
+        &self,
+        commission: CommissionId,
+        obligation: ObligationId,
+        evidence: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<String> = sqlx::query_scalar(
+            "UPDATE obligations SET claimed_evidence = ?
+             WHERE id = ? AND commission_id = ? AND EXISTS (
+                 SELECT 1 FROM commissions WHERE id = ? AND state = 'active'
+             ) RETURNING text",
+        )
+        .bind(evidence)
+        .bind(obligation.to_string())
+        .bind(commission.to_string())
+        .bind(commission.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(text) = row {
+            insert_event(&mut tx, &NewEvent {
+                kind: EventKind::ObligationClaimChanged,
+                campaign_id: None,
+                commission_id: Some(commission),
+                payload: json!({"obligation_id": obligation.to_string(), "text": text, "evidence": evidence}),
+            }).await?;
+            tx.commit().await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     pub async fn insert_attempt(
@@ -1020,6 +1053,7 @@ struct ObligationRow {
     position: i64,
     text: String,
     created_at: i64,
+    claimed_evidence: Option<String>,
 }
 
 impl ObligationRow {
@@ -1029,6 +1063,7 @@ impl ObligationRow {
             commission_id: CommissionId(decode_uuid("commission id", &self.commission_id)?),
             position: self.position,
             text: self.text,
+            claimed_evidence: self.claimed_evidence,
             created_at: from_millis(self.created_at)?,
         })
     }

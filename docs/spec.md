@@ -152,7 +152,9 @@ not inform this specification.
   teams) are expressible without new engine machinery.
 - **N20 — Signal channel.** The sandbox-facing control surface is a tiny
   preinstalled CLI, `anvilctl`, calling daemon HTTP with a per-commission token:
-  `anvilctl done [--notes]` and `anvilctl attention <message>`. It is NOT MCP.
+  `anvilctl done [--notes]`, `anvilctl attention <message>`, and obligation
+  progress reports. It is NOT MCP. Progress reports carry agent-supplied evidence,
+  recorded as claims rather than verified satisfaction.
   Evidence is extracted deterministically by the control plane (git diff, PR
   checks), never trusted from agent self-report alone. A turn that ends without
   `done` is not-done; the loop continues.
@@ -252,8 +254,10 @@ matches, encoded only at the store boundary.
 
 `anvilctl done [--notes]` — completion claim, triggers evaluation.
 `anvilctl attention <message>` — surfaces an attention item, may interrupt the turn.
-Possibly later: per-obligation evidence pointers. Keep the surface minimal unless
-proven otherwise.
+`anvilctl report <obligation-id> --evidence <text>` — records an obligation claim.
+`anvilctl report <obligation-id> --clear` — withdraws a claim. Both operations are
+audit-logged. Subsequent turns and commission detail JSON show the latest claim;
+the convergence verdict still relies on deterministic PR evidence.
 
 ### 4.3 Default strategy prompt composition
 

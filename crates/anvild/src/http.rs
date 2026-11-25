@@ -30,6 +30,7 @@ pub fn router(store: Store) -> Router {
     Router::new()
         .route(DONE_PATH, post(signal_done))
         .route(ATTENTION_PATH, post(signal_attention))
+        .route("/v1/signals/obligations/{id}", post(signal_obligation))
         .route("/v1/campaigns", post(create_campaign).get(list_campaigns))
         .route("/v1/campaigns/{id}/commissions", post(create_commission))
         .route("/v1/commissions", get(list_commissions))
@@ -223,6 +224,7 @@ fn obligation_view(obligation: &anvil_api::Obligation) -> Value {
         "commission_id": obligation.commission_id.to_string(),
         "position": obligation.position,
         "text": obligation.text,
+        "claimed_evidence": obligation.claimed_evidence,
         "created_at": millis(obligation.created_at),
     })
 }
@@ -686,6 +688,8 @@ async fn sse_pump(
 enum SignalError {
     Unauthorized,
     NoRunningAttempt,
+    BadClaim,
+    ClaimUnavailable,
     Internal(StoreError),
 }
 
@@ -698,6 +702,16 @@ impl IntoResponse for SignalError {
             Self::NoRunningAttempt => (
                 StatusCode::CONFLICT,
                 "no running attempt to claim done on\n",
+            )
+                .into_response(),
+            Self::BadClaim => (
+                StatusCode::BAD_REQUEST,
+                "invalid obligation ID or empty evidence\n",
+            )
+                .into_response(),
+            Self::ClaimUnavailable => (
+                StatusCode::CONFLICT,
+                "obligation is unavailable to this active commission\n",
             )
                 .into_response(),
             Self::Internal(error) => {
@@ -734,6 +748,38 @@ async fn signal_done(
         .claim_done(commission, notes.as_deref())
         .await
         .map_err(map_missing)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum ObligationClaimRequest {
+    Complete { evidence: String },
+    Clear,
+}
+
+async fn signal_obligation(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<ObligationClaimRequest>,
+) -> Result<StatusCode, SignalError> {
+    let commission = authorize(&store, &headers).await?;
+    let obligation = id.parse().map_err(|_| SignalError::BadClaim)?;
+    let evidence = match &request {
+        ObligationClaimRequest::Complete { evidence } if !evidence.trim().is_empty() => {
+            Some(evidence.trim())
+        }
+        ObligationClaimRequest::Complete { .. } => return Err(SignalError::BadClaim),
+        ObligationClaimRequest::Clear => None,
+    };
+    if !store
+        .set_obligation_claim(commission, obligation, evidence)
+        .await
+        .map_err(SignalError::Internal)?
+    {
+        return Err(SignalError::ClaimUnavailable);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
