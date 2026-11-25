@@ -16,7 +16,7 @@ permissions:
 jobs:
   release:
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
-    uses: blogle/sdlc/.github/workflows/release.yml@da9d60391bb480d685b795fce4461d11daf1f576
+    uses: blogle/sdlc/.github/workflows/release.yml@147445cf246d3e47c6c07c8678899f9ce86e70b4
     with:
-      sdlc_ref: da9d60391bb480d685b795fce4461d11daf1f576
+      sdlc_ref: 147445cf246d3e47c6c07c8678899f9ce86e70b4
     secrets: inherit
