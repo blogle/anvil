@@ -7,6 +7,15 @@ use anvil_api::{AttentionKind, CommissionState, EventKind, NewCampaign, NewCommi
 use anvild::engine::{apply, Engine, EngineConfig, Transition};
 use anvild::harness::{Harness, HarnessError, ScriptedHarness, TurnReceipt};
 use anvild::sandbox::{SandboxProvider, SandboxSpec};
+#[path = "fixtures/sandbox.rs"]
+mod sandbox_fixture;
+use sandbox_fixture::TestSandbox;
+
+impl TestSandbox {
+    async fn is_running(&self, name: &str) -> Result<bool, anvild::sandbox::SandboxError> {
+        Ok(self.handle(name).await?.is_some())
+    }
+}
 use anvild::store::Store;
 use serde_json::json;
 
@@ -77,7 +86,7 @@ async fn terminal_commission_sandbox_is_destroyed_once_and_logged() {
         .await
         .unwrap();
 
-    let sandbox = Arc::new(SandboxProvider::Memory(Default::default()));
+    let sandbox = Arc::new(TestSandbox::default());
     let stable = "anvil-payments-invoice-1";
     let legacy = "anvil-payments-invoice-1-a1";
     for name in [stable, legacy] {
@@ -205,7 +214,7 @@ async fn only_cancelled_and_merged_commissions_are_torn_down() {
         .await
         .unwrap();
 
-    let sandbox = Arc::new(SandboxProvider::Memory(Default::default()));
+    let sandbox = Arc::new(TestSandbox::default());
     for (name, index) in [
         ("anvil-payments-invoice-1", 1),
         ("anvil-payments-invoice-2", 2),
@@ -628,7 +637,7 @@ async fn a_failed_teardown_does_not_stop_unrelated_progress() {
             ..EngineConfig::default()
         },
     )
-    .with_sandbox(Arc::new(SandboxProvider::Memory(Default::default())))
+    .with_sandbox(Arc::new(TestSandbox::default()))
     .with_harness(Arc::new(Harness::Scripted(scripted)));
 
     engine.tick().await.unwrap();
@@ -699,7 +708,7 @@ async fn a_failed_replacement_ends_the_attempt_without_running_the_harness() {
             ..EngineConfig::default()
         },
     )
-    .with_sandbox(Arc::new(SandboxProvider::Memory(Default::default())))
+    .with_sandbox(Arc::new(TestSandbox::default()))
     .with_harness(Arc::new(Harness::Scripted(scripted.clone())));
 
     engine.tick().await.unwrap();
@@ -749,7 +758,7 @@ async fn a_retry_recreates_the_sandbox_with_updated_configuration() {
             ..EngineConfig::default()
         },
     )
-    .with_sandbox(Arc::new(SandboxProvider::Memory(Default::default())))
+    .with_sandbox(Arc::new(TestSandbox::default()))
     .with_harness(Arc::new(Harness::Scripted(scripted)));
 
     engine.tick().await.unwrap();

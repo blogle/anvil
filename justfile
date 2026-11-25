@@ -20,6 +20,10 @@ ci-verify:
 sandbox-load:
     nix develop -c bash -c 'out=$(nix build .#anvil-sandbox-image.copyToPodman --print-out-paths --no-link 2>/dev/null); $out/bin/*'
 
+# Run the full signal-to-reprompt scenario through a real Podman sandbox
+sandbox-smoke: sandbox-load
+    nix develop -c env ANVIL_TEST_PODMAN=1 ANVIL_TEST_SANDBOX_IMAGE=docker.io/library/anvil-sandbox:latest cargo test -p anvild --test feedback
+
 # Provision ANVIL_SECRET_KEY into .env if absent (the daemon refuses to boot without it)
 keygen:
     @if grep -q '^ANVIL_SECRET_KEY=' .env 2>/dev/null; then \

@@ -1,0 +1,5 @@
+{
+  "type": "fix",
+  "semver": "patch",
+  "summary": "Use Podman as the daemon's local sandbox runtime and expose a real-image feedback smoke test, with the in-memory fixture confined to deterministic engine tests."
+}
